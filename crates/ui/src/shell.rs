@@ -383,6 +383,9 @@ const CHAT_ROW_HEIGHT: f32 = 61.0;
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
 
+/// Fixed vertical slot occupied by one active sidebar card.
+const SIDEBAR_SESSION_SLOT: f32 = CHAT_ROW_HEIGHT + SIDEBAR_LIST_GAP;
+
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
@@ -407,6 +410,70 @@ struct RightTabDragState {
     over: usize,
     epoch: usize,
     prev_over: usize,
+}
+
+/// Device-local active-session reorder payload. The visible ids are shared by
+/// every row payload in a frame, so a drag can freeze one filtered projection
+/// without cloning the whole list per card.
+struct SidebarSessionDrag {
+    chat_id: String,
+    title: SharedString,
+    space_name: SharedString,
+    visible_ids: std::sync::Arc<Vec<String>>,
+}
+
+/// Live destination for a sidebar session drag. The dragged row stays in the
+/// layout as a spacer while siblings slide toward its current gap.
+struct SidebarSessionDragState {
+    chat_id: String,
+    visible_ids: std::sync::Arc<Vec<String>>,
+    from: usize,
+    over: usize,
+    prev_over: usize,
+    epoch: usize,
+}
+
+/// Compact card ghost following the pointer during sidebar reordering.
+struct SidebarSessionGhost {
+    title: SharedString,
+    space_name: SharedString,
+    width: f32,
+}
+
+impl Render for SidebarSessionGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .h(px(CHAT_ROW_HEIGHT))
+            .w(px(self.width))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .rounded(px(8.0))
+            .bg(theme.surface_raised)
+            .border_1()
+            .border_color(theme.border_strong)
+            .shadow_lg()
+            .opacity(0.92)
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(11.0))
+                    .line_height(px(14.0))
+                    .text_color(theme.text_muted)
+                    .child(self.space_name.clone()),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .line_height(px(17.0))
+                    .text_color(theme.text)
+                    .child(self.title.clone()),
+            )
+    }
 }
 
 /// Ghost chip following the pointer while a surface tab drags.
@@ -822,6 +889,8 @@ pub struct Shell {
     chat_status_hover: Option<String>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
+    /// In-flight active-session reorder. Purely local presentation state.
+    sidebar_session_drag: Option<SidebarSessionDragState>,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
@@ -1046,6 +1115,7 @@ impl Shell {
             spaces_menu: popover::Popup::default(),
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
+            sidebar_session_drag: None,
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
@@ -3017,6 +3087,7 @@ impl Shell {
         status: zeron_proto::ChatIndicator,
         selected: bool,
         archived: bool,
+        drag: Option<SidebarSessionDrag>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3208,6 +3279,17 @@ impl Shell {
                     cx.notify();
                 }),
             )
+            .when_some(drag, |el, payload| {
+                let ghost_width = (self.settings.sidebar_width - 2.0 * Theme::SPACE_SM).max(1.0);
+                el.on_drag(payload, move |payload, _point, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| SidebarSessionGhost {
+                        title: payload.title.clone(),
+                        space_name: payload.space_name.clone(),
+                        width: ghost_width,
+                    })
+                })
+            })
             // Line 1: "project @ device", status word / time-ago right.
             .child(
                 div()
@@ -3293,6 +3375,11 @@ impl Shell {
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        // A release outside the active-list drop target ends GPUI's drag but
+        // never calls our drop handler. Heal the ephemeral spacer state here.
+        if self.sidebar_session_drag.is_some() && !cx.has_active_drag() {
+            self.sidebar_session_drag = None;
+        }
         let (user, workspace_scope) = {
             let state = self.state.read(cx);
             (state.auth_user().cloned(), state.workspace_scope)
@@ -3311,7 +3398,7 @@ impl Shell {
         // just go (matching the original). First fill and chat switches (which
         // don't reorder) never animate.
         let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
-        if self.sidebar_prev_order != order {
+        if self.sidebar_session_drag.is_none() && self.sidebar_prev_order != order {
             if !self.sidebar_prev_order.is_empty() {
                 let offsets = resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
                 let prev_keys: std::collections::HashSet<&str> = self
@@ -3333,9 +3420,45 @@ impl Shell {
             self.sidebar_prev_order = order;
         }
         let epoch = self.resort_epoch;
+        let session_drag = self
+            .sidebar_session_drag
+            .as_ref()
+            .map(|drag| (drag.from, drag.over, drag.prev_over, drag.epoch));
         let list_items: Vec<AnyElement> = keyed
             .into_iter()
-            .map(|(key, _, element)| {
+            .enumerate()
+            .map(|(ix, (key, _, element))| {
+                if let Some((from, over, prev_over, drag_epoch)) = session_drag {
+                    if ix == from {
+                        return div()
+                            .h(px(CHAT_ROW_HEIGHT))
+                            .w_full()
+                            .flex_none()
+                            .into_any_element();
+                    }
+                    let target =
+                        crate::terminal::panel::slide_offset(ix, from, over) * SIDEBAR_SESSION_SLOT;
+                    let start = crate::terminal::panel::slide_offset(ix, from, prev_over)
+                        * SIDEBAR_SESSION_SLOT;
+                    if self.reduced_motion {
+                        return div()
+                            .relative()
+                            .top(px(target))
+                            .child(element)
+                            .into_any_element();
+                    }
+                    return div()
+                        .child(element)
+                        .with_animation(
+                            (
+                                "sidebar-session-slide",
+                                (ix as u64) | ((drag_epoch as u64) << 32),
+                            ),
+                            TAB_SLIDE.animation(),
+                            move |el, t| el.relative().top(px(motion::lerp(start, target, t))),
+                        )
+                        .into_any_element();
+                }
                 if let Some(dy) = self.sidebar_resort.get(&key).copied() {
                     let id = SharedString::from(format!("resort-{epoch}-{key}"));
                     div()
@@ -3392,6 +3515,42 @@ impl Shell {
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
+        let active_count = list_items.len();
+        let active_list = if active_count > 0 {
+            div()
+                .id("sidebar-active-sessions")
+                .flex()
+                .flex_col()
+                .gap(px(SIDEBAR_LIST_GAP))
+                .pb(px(Theme::SPACE_SM))
+                .on_drag_move::<SidebarSessionDrag>(cx.listener(
+                    move |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, cx| {
+                        let (chat_id, visible_ids) = {
+                            let payload = event.drag(cx);
+                            (payload.chat_id.clone(), payload.visible_ids.clone())
+                        };
+                        let rel_y =
+                            f32::from(event.event.position.y) - f32::from(event.bounds.top());
+                        let over = spaces::sidebar_session_drop_index(rel_y, active_count);
+                        this.update_sidebar_session_drag(chat_id, visible_ids, over, cx);
+                    },
+                ))
+                .on_drop::<SidebarSessionDrag>(cx.listener(
+                    |this, payload: &SidebarSessionDrag, _, cx| {
+                        this.commit_sidebar_session_drag(payload, cx);
+                    },
+                ))
+                .children(list_items)
+                .into_any_element()
+        } else {
+            div()
+                .px(px(Theme::SPACE_SM))
+                .pb(px(Theme::SPACE_SM))
+                .text_size(px(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from("No sessions yet"))
+                .into_any_element()
+        };
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -3427,23 +3586,7 @@ impl Shell {
                             // No "Sessions" header (user request) — the list
                             // is the whole column; a little air stands in.
                             .pt(px(4.0))
-                            .child(if !list_items.is_empty() {
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.0))
-                                    .pb(px(Theme::SPACE_SM))
-                                    .children(list_items)
-                                    .into_any_element()
-                            } else {
-                                div()
-                                    .px(px(Theme::SPACE_SM))
-                                    .pb(px(Theme::SPACE_SM))
-                                    .text_size(px(12.0))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from("No sessions yet"))
-                                    .into_any_element()
-                            })
+                            .child(active_list)
                             .children(archived_section),
                     ),
                 )

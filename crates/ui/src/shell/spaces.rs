@@ -89,6 +89,14 @@ pub(super) fn retain_known_sessions(
     saved_ids.len() != before
 }
 
+/// Quantize a pointer position within the active list into a card slot.
+pub(super) fn sidebar_session_drop_index(rel_y: f32, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    ((rel_y / super::SIDEBAR_SESSION_SLOT).floor().max(0.0) as usize).min(count - 1)
+}
+
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
 /// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
@@ -224,6 +232,86 @@ impl Shell {
     }
 
     // ---- sidebar sections ----
+
+    pub(super) fn update_sidebar_session_drag(
+        &mut self,
+        chat_id: String,
+        visible_ids: std::sync::Arc<Vec<String>>,
+        over: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(from) = visible_ids.iter().position(|id| id == &chat_id) else {
+            self.sidebar_session_drag = None;
+            return;
+        };
+        match &mut self.sidebar_session_drag {
+            Some(drag) if drag.chat_id == chat_id && drag.over != over => {
+                drag.prev_over = drag.over;
+                drag.over = over;
+                drag.epoch = drag.epoch.wrapping_add(1);
+                cx.notify();
+            }
+            Some(drag) if drag.chat_id == chat_id => {}
+            _ => {
+                self.sidebar_session_drag = Some(SidebarSessionDragState {
+                    chat_id,
+                    visible_ids,
+                    from,
+                    over,
+                    prev_over: from,
+                    epoch: 0,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    pub(super) fn commit_sidebar_session_drag(
+        &mut self,
+        payload: &SidebarSessionDrag,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.sidebar_session_drag.take() else {
+            return;
+        };
+        if drag.chat_id != payload.chat_id {
+            cx.notify();
+            return;
+        }
+        let Some(from) = drag.visible_ids.iter().position(|id| id == &drag.chat_id) else {
+            cx.notify();
+            return;
+        };
+        let to = drag.over.min(drag.visible_ids.len().saturating_sub(1));
+        if from == to {
+            cx.notify();
+            return;
+        }
+
+        let recency_ids: Vec<String> = self
+            .state
+            .read(cx)
+            .overview_chats(Utc::now())
+            .into_iter()
+            .map(|(_, chat)| chat.id.clone())
+            .collect();
+        let global = materialize_local_order(&recency_ids, &self.settings.sidebar_session_order);
+        let next = reorder_visible_projection(&global, drag.visible_ids.as_ref(), from, to);
+        if next != self.settings.sidebar_session_order {
+            self.settings.sidebar_session_order = next;
+            let mut visible = drag.visible_ids.as_ref().clone();
+            let moved = visible.remove(from);
+            visible.insert(to, moved);
+            self.sidebar_prev_order = visible
+                .iter()
+                .map(|id| (format!("c:{id}"), super::CHAT_ROW_HEIGHT))
+                .collect();
+            self.sidebar_resort.clear();
+            self.sidebar_new_keys.clear();
+            self.schedule_save(cx);
+        }
+        cx.notify();
+    }
 
     /// The filter's display rows: "All projects", then spaces matching the
     /// search (ranked — `popover::filter_indices`), then "New project…".
@@ -656,13 +744,18 @@ impl Shell {
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
         let filter = self.settings.space_filter.clone();
+        let frozen_visible = self
+            .sidebar_session_drag
+            .as_ref()
+            .map(|drag| drag.visible_ids.clone());
         let rows: Vec<(ChatIndicator, zeron_proto::Chat, String, Option<String>)> = {
             let state = self.state.read(cx);
             let overview = state.overview_chats(now);
             let recency_ids: Vec<String> =
                 overview.iter().map(|(_, chat)| chat.id.clone()).collect();
-            let ordered_ids =
-                project_local_order(&recency_ids, &self.settings.sidebar_session_order);
+            let ordered_ids = frozen_visible.as_deref().cloned().unwrap_or_else(|| {
+                project_local_order(&recency_ids, &self.settings.sidebar_session_order)
+            });
             let mut rows_by_id: std::collections::HashMap<
                 String,
                 (ChatIndicator, &zeron_proto::Chat),
@@ -702,6 +795,8 @@ impl Shell {
                 })
                 .collect()
         };
+        let visible_ids: std::sync::Arc<Vec<String>> =
+            std::sync::Arc::new(rows.iter().map(|(_, chat, _, _)| chat.id.clone()).collect());
         let selected = self.state.read(cx).selected_chat.clone();
         rows.into_iter()
             .map(|(status, chat, folder, branch)| {
@@ -710,19 +805,28 @@ impl Shell {
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
                 let height = super::CHAT_ROW_HEIGHT;
                 let harness = chat.config.as_ref().map(|c| c.harness);
+                let title: SharedString = transcript::single_line(
+                    &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                )
+                .into();
+                let space_name: SharedString = folder.into();
+                let drag = SidebarSessionDrag {
+                    chat_id: chat.id.clone(),
+                    title: title.clone(),
+                    space_name: space_name.clone(),
+                    visible_ids: visible_ids.clone(),
+                };
                 let element = self.render_chat_row(
                     chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )
-                    .into(),
+                    title,
                     time_ago,
-                    folder.into(),
+                    space_name,
                     branch.map(SharedString::from),
                     harness,
                     status,
                     is_selected,
                     false,
+                    Some(drag),
                     theme,
                     cx,
                 );
@@ -2214,7 +2318,7 @@ impl Shell {
 mod local_order_tests {
     use super::{
         materialize_local_order, project_local_order, reorder_visible_projection,
-        retain_known_sessions,
+        retain_known_sessions, sidebar_session_drop_index,
     };
     use std::collections::HashSet;
 
@@ -2301,5 +2405,15 @@ mod local_order_tests {
         assert!(retain_known_sessions(&mut saved, &known));
         assert_eq!(saved, ids(&["active", "archived"]));
         assert!(!retain_known_sessions(&mut saved, &known));
+    }
+
+    #[test]
+    fn sidebar_session_order_drop_index_quantizes_and_clamps() {
+        assert_eq!(sidebar_session_drop_index(-20.0, 3), 0);
+        assert_eq!(sidebar_session_drop_index(0.0, 3), 0);
+        assert_eq!(sidebar_session_drop_index(62.9, 3), 0);
+        assert_eq!(sidebar_session_drop_index(63.0, 3), 1);
+        assert_eq!(sidebar_session_drop_index(500.0, 3), 2);
+        assert_eq!(sidebar_session_drop_index(10.0, 0), 0);
     }
 }

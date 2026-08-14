@@ -515,7 +515,6 @@ enum AccountMenuAction {
 #[derive(Debug, Clone)]
 enum DiscardWorkingTreeFlow {
     Confirm(DiscardWorkingTreeRequest),
-    Discarding,
     Failed(SharedString),
 }
 
@@ -704,8 +703,8 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
-    /// Global confirmation/progress/error dialog for the Changes-pane trash
-    /// action. The RPC task is retained separately so rerenders do not cancel it.
+    /// Global confirmation/error dialog for the Changes-pane trash action. The
+    /// RPC task is retained separately so rerenders do not cancel it.
     discard_working_tree: Option<DiscardWorkingTreeFlow>,
     discard_working_tree_task: Option<Task<()>>,
     /// Space-row context menu (dropdown rows): (space id, window position).
@@ -1957,7 +1956,9 @@ impl Shell {
             params.insert("targetDeviceId".into(), serde_json::Value::String(target));
         }
 
-        self.discard_working_tree = Some(DiscardWorkingTreeFlow::Discarding);
+        // Dismiss the confirmation immediately. The task remains retained so
+        // repeat clicks cannot issue a second destructive request.
+        self.discard_working_tree = None;
         self.discard_working_tree_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -3874,12 +3875,7 @@ impl Shell {
 
         if let Some(flow) = self.discard_working_tree.clone() {
             let card = match flow {
-                DiscardWorkingTreeFlow::Confirm(request) => {
-                    let noun = if request.file_count == 1 {
-                        "file"
-                    } else {
-                        "files"
-                    };
+                DiscardWorkingTreeFlow::Confirm(_) => {
                     popover::dialog_card(&theme)
                         .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
                             if ev.keystroke.key == "escape" {
@@ -3893,10 +3889,7 @@ impl Shell {
                         ))
                         .child(div().mt(px(6.0)).child(popover::dialog_body(
                             &theme,
-                            format!(
-                                "This will permanently discard changes in {} {noun}, including staged changes and untracked files. Ignored files, commits, branches, submodule contents, and other worktrees won’t be changed. This can’t be undone.",
-                                request.file_count
-                            ),
+                            "Discard all uncommitted changes in this working tree? This can’t be undone.",
                         )))
                         .child(
                             div()
@@ -3927,13 +3920,6 @@ impl Shell {
                         )
                         .into_any_element()
                 }
-                DiscardWorkingTreeFlow::Discarding => popover::dialog_card(&theme)
-                    .child(popover::dialog_title(&theme, "Discarding changes…"))
-                    .child(div().mt(px(6.0)).child(popover::dialog_body(
-                        &theme,
-                        "Restoring tracked files and removing untracked files.",
-                    )))
-                    .into_any_element(),
                 DiscardWorkingTreeFlow::Failed(error) => popover::dialog_card(&theme)
                     .child(popover::dialog_title(&theme, "Couldn’t discard changes"))
                     .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, error)))

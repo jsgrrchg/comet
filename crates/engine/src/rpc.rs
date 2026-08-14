@@ -135,6 +135,14 @@ struct DeleteWorktreeParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DiscardWorkingTreeParams {
+    chat_id: String,
+    checkout_id: String,
+    expected_checksum: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListFoldersParams {
     #[serde(default)]
     path: Option<String>,
@@ -775,6 +783,7 @@ fn forwardable(method: &str) -> bool {
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::GET_CHECKOUT_DIFF
+            | methods::DISCARD_WORKING_TREE
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
             | methods::SUBSCRIBE_TERMINAL
@@ -1116,70 +1125,158 @@ impl RpcService for EngineRpc {
             // turn-start tree snapshot against the current tree; anything else
             // is the plain working-tree capture.
             methods::GET_CHECKOUT_DIFF => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct P {
-                    cwd: String,
-                    #[serde(default)]
-                    mode: String,
-                    base_ref: Option<String>,
-                    chat_id: Option<String>,
-                    commit_sha: Option<String>,
-                }
-                let p: P = parse_params(params)?;
-                let identity = self
-                    .repos
-                    .checkout_identity(std::path::Path::new(&p.cwd))
-                    .await
+                // Keep the existing multi-mode capture branch off the
+                // dispatcher's stack; adding another filesystem RPC would
+                // otherwise push the debug worker over its stack limit.
+                Box::pin(async move {
+                    #[derive(Deserialize)]
+                    #[serde(rename_all = "camelCase")]
+                    struct P {
+                        cwd: String,
+                        #[serde(default)]
+                        mode: String,
+                        base_ref: Option<String>,
+                        chat_id: Option<String>,
+                        commit_sha: Option<String>,
+                    }
+                    let p: P = parse_params(params)?;
+                    let identity = self
+                        .repos
+                        .checkout_identity(std::path::Path::new(&p.cwd))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let root = identity.root.as_path();
+                    let snapshot = match p.mode.as_str() {
+                        "branch" => {
+                            let base_ref = p
+                                .base_ref
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("baseRef required".into()))?;
+                            let base = crate::diff_sync::merge_base(root, base_ref)
+                                .await
+                                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                            crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base))
+                                .await
+                        }
+                        // One commit's own changes (History → per-commit tab):
+                        // parent (or the empty tree) vs the commit itself.
+                        "commit" => {
+                            let sha = p
+                                .commit_sha
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
+                            crate::diff_sync::capture_commit_diff(&self.repos, root, sha).await
+                        }
+                        "turn" => {
+                            let chat_id = p
+                                .chat_id
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("chatId required".into()))?;
+                            let snapshot = self
+                                .diff_sync
+                                .turn_snapshot(chat_id)
+                                .filter(|s| s.root == identity.root)
+                                .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
+                            crate::diff_sync::capture_turn_diff(&self.repos, root, &snapshot.tree)
+                                .await
+                        }
+                        _ => crate::diff_sync::capture_diff(&self.repos, root).await,
+                    }
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let root = identity.root.as_path();
-                let snapshot = match p.mode.as_str() {
-                    "branch" => {
-                        let base_ref = p
-                            .base_ref
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("baseRef required".into()))?;
-                        let base = crate::diff_sync::merge_base(root, base_ref)
-                            .await
-                            .map_err(|e| RpcError::Failed(e.to_string()))?;
-                        crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base)).await
-                    }
-                    // One commit's own changes (History → per-commit tab):
-                    // parent (or the empty tree) vs the commit itself.
-                    "commit" => {
-                        let sha = p
-                            .commit_sha
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
-                        crate::diff_sync::capture_commit_diff(&self.repos, root, sha).await
-                    }
-                    "turn" => {
-                        let chat_id = p
-                            .chat_id
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("chatId required".into()))?;
-                        let snapshot = self
-                            .diff_sync
-                            .turn_snapshot(chat_id)
-                            .filter(|s| s.root == identity.root)
-                            .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
-                        crate::diff_sync::capture_turn_diff(&self.repos, root, &snapshot.tree).await
-                    }
-                    _ => crate::diff_sync::capture_diff(&self.repos, root).await,
-                }
-                .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&zeron_proto::CheckoutDiff {
-                    checkout_id: identity.id,
-                    device_id: self.doc_host.device_id().to_string(),
-                    cwd: identity.root.to_string_lossy().to_string(),
-                    patch: snapshot.patch,
-                    files: snapshot.files,
-                    additions: snapshot.additions,
-                    deletions: snapshot.deletions,
-                    truncated: snapshot.truncated,
-                    checksum: snapshot.checksum,
-                    updated_at: chrono::Utc::now(),
+                    RpcReply::value(&zeron_proto::CheckoutDiff {
+                        checkout_id: identity.id,
+                        device_id: self.doc_host.device_id().to_string(),
+                        cwd: identity.root.to_string_lossy().to_string(),
+                        patch: snapshot.patch,
+                        files: snapshot.files,
+                        additions: snapshot.additions,
+                        deletions: snapshot.deletions,
+                        truncated: snapshot.truncated,
+                        checksum: snapshot.checksum,
+                        updated_at: chrono::Utc::now(),
+                    })
                 })
+                .await
+            }
+            methods::DISCARD_WORKING_TREE => {
+                // This destructive branch performs several nested filesystem
+                // futures. Box it so unrelated RPC calls do not inherit that
+                // state in the already-large dispatcher stack frame.
+                Box::pin(async move {
+                    let p: DiscardWorkingTreeParams = parse_params(params)?;
+                    let chat = self
+                        .workspace
+                        .chat(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+                    if chat.device_id != self.doc_host.device_id() {
+                        return Err(RpcError::Failed("chat is not hosted by this device".into()));
+                    }
+                    let cwd = chat
+                        .cwd
+                        .as_deref()
+                        .ok_or_else(|| RpcError::Failed("chat has no checkout".into()))?;
+                    let identity = self
+                        .repos
+                        .checkout_identity(std::path::Path::new(cwd))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if identity.id != p.checkout_id {
+                        return Err(RpcError::Failed(
+                            "chat checkout changed since the confirmation was opened".into(),
+                        ));
+                    }
+
+                    // Refuse the mutation when any local chat on this exact
+                    // checkout has a live run. We never interrupt an agent as a
+                    // side effect of discarding files.
+                    let chats = self.workspace.watch_chats().borrow().clone();
+                    for candidate in chats {
+                        if candidate.device_id != self.doc_host.device_id() {
+                            continue;
+                        }
+                        let same_checkout =
+                            if candidate.checkout_id.as_deref() == Some(identity.id.as_str()) {
+                                true
+                            } else if let Some(candidate_cwd) = candidate.cwd.as_deref() {
+                                self.repos
+                                    .checkout_identity(std::path::Path::new(candidate_cwd))
+                                    .await
+                                    .is_ok_and(|candidate_identity| {
+                                        candidate_identity.id == identity.id
+                                    })
+                            } else {
+                                false
+                            };
+                        if same_checkout
+                            && self
+                                .sessions
+                                .session_status(&candidate.id)
+                                .is_some_and(|session| {
+                                    matches!(
+                                        session.status,
+                                        zeron_proto::SessionStatus::Working
+                                            | zeron_proto::SessionStatus::AwaitingInput
+                                    )
+                                })
+                        {
+                            return Err(RpcError::Failed(
+                                "an agent is active in this working tree".into(),
+                            ));
+                        }
+                    }
+
+                    let snapshot = self
+                        .diff_sync
+                        .discard_working_tree(&identity.id, &p.expected_checksum)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    RpcReply::value(&serde_json::json!({
+                        "ok": true,
+                        "checksum": snapshot.checksum,
+                    }))
+                })
+                .await
             }
             methods::LIST_REPOS => RpcReply::value(&self.repos.list().await),
             methods::ADD_REPO => {
@@ -1517,6 +1614,7 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
+        assert!(forwardable(methods::DISCARD_WORKING_TREE));
     }
 
     #[test]

@@ -3332,9 +3332,6 @@ pub struct Composer {
     pub(crate) queue_edit_stash: Option<String>,
     /// Live drag over the queue panel: which row, and where it would land.
     pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
-    /// In-flight queue mutation (reorder / edit / remove / send now). Separate
-    /// from [`Self::send_task`]: reordering the queue must not cancel a send.
-    pub(crate) queue_task: Option<Task<()>>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -3455,7 +3452,6 @@ impl Composer {
             editing_queued: None,
             queue_edit_stash: None,
             queue_drag: None,
-            queue_task: None,
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,

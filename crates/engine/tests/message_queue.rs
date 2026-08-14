@@ -20,6 +20,7 @@ use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
+    UserInputQuestion,
 };
 
 const CHAT: &str = "chat-queue";
@@ -30,10 +31,21 @@ struct HeldHarness {
     steering: SteeringMode,
     finish: tokio::sync::broadcast::Sender<()>,
     prompts: Arc<Mutex<Vec<String>>>,
+    /// Park the first turn on a question instead of just hanging, so the chat
+    /// sits in `AwaitingInput` rather than `Working`.
+    asks: bool,
 }
 
 impl HeldHarness {
     fn new(steering: SteeringMode) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+        Self::build(steering, false)
+    }
+
+    fn asking(steering: SteeringMode) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+        Self::build(steering, true)
+    }
+
+    fn build(steering: SteeringMode, asks: bool) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
         let (finish, _) = tokio::sync::broadcast::channel(16);
         let prompts = Arc::new(Mutex::new(Vec::new()));
         (
@@ -41,6 +53,7 @@ impl HeldHarness {
                 steering,
                 finish,
                 prompts: prompts.clone(),
+                asks,
             }),
             prompts,
         )
@@ -73,6 +86,17 @@ impl Harness for HeldHarness {
         _controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.prompts.lock().unwrap().push(request.prompt.clone());
+        if self.asks {
+            // Only the engine can mint a request id it will honour, so the
+            // question has to go through controls rather than the stream.
+            let _answer = (_controls.request_input)(vec![UserInputQuestion {
+                id: "q1".into(),
+                header: "Choose".into(),
+                question: "which one?".into(),
+                options: vec!["a".into(), "b".into()],
+                multi_select: false,
+            }]);
+        }
         let mut finish = self.finish.subscribe();
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
             harness: HarnessId::Mock,
@@ -144,11 +168,24 @@ fn user_messages(core: &EngineCore) -> Vec<String> {
 }
 
 async fn setup(steering: SteeringMode) -> (EngineCore, Arc<HeldHarness>, Arc<Mutex<Vec<String>>>) {
+    setup_with(HeldHarness::new(steering)).await
+}
+
+/// [`setup`] with a harness whose turn parks on a question.
+async fn setup_asking(
+    steering: SteeringMode,
+) -> (EngineCore, Arc<HeldHarness>, Arc<Mutex<Vec<String>>>) {
+    setup_with(HeldHarness::asking(steering)).await
+}
+
+async fn setup_with(
+    built: (Arc<HeldHarness>, Arc<Mutex<Vec<String>>>),
+) -> (EngineCore, Arc<HeldHarness>, Arc<Mutex<Vec<String>>>) {
     let tmp = tempfile::tempdir().unwrap();
     // Leak the tempdir guard: the engine outlives this helper and the test only
     // cares that the path is unique per run.
     let path = tmp.keep();
-    let (harness, prompts) = HeldHarness::new(steering);
+    let (harness, prompts) = built;
     let registry = HarnessRegistry::new();
     registry.register(harness.clone());
     let core = EngineCore::assemble(
@@ -545,6 +582,95 @@ async fn queue_rpc_reorders_and_streams() {
         .await
         .expect("RemoveQueuedMessage");
     assert_eq!(queue_texts(&core), vec!["a", "b"]);
+
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+/// The regression the review caught: `drain_queue` runs from both the
+/// doc-change task and the turn-end status watcher, and there is nothing about
+/// those two callers that keeps them apart. Driven concurrently against an idle
+/// agent, an unserialized drain has both take a different head across the
+/// `dispatch` await and both send — the queue empties in one go, which is the
+/// "looks sent" failure the whole feature exists to prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_drains_release_one_message() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    let handle = core.doc_host.open(CHAT).expect("open chat");
+
+    for text in ["first", "second", "third"] {
+        core.doc_host
+            .queue_message(CHAT, text, Vec::new())
+            .expect("queue");
+    }
+
+    tokio::join!(
+        core.doc_host.drain_queue(&handle),
+        core.doc_host.drain_queue(&handle),
+        core.doc_host.drain_queue(&handle),
+    );
+
+    wait_for(
+        || !prompts.lock().unwrap().is_empty(),
+        "the released message to reach the agent",
+    )
+    .await;
+    // Long enough for a second escapee to show up if the drains interleaved.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        queue_texts(&core),
+        vec!["second", "third"],
+        "one drain released the head; the others found a busy agent"
+    );
+    assert_eq!(
+        prompts.lock().unwrap().clone(),
+        vec!["first".to_string()],
+        "the agent was handed exactly one prompt"
+    );
+
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+/// An agent parked on a question still owns the turn. The composer queues on
+/// that state, so the drain has to hold there too — reading `AwaitingInput` as
+/// idle sends the follow-up as a fresh turn and abandons the question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_holds_while_the_agent_waits_on_a_question() {
+    let (core, harness, prompts) = setup_asking(SteeringMode::TurnBoundary).await;
+
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "the first turn to start",
+    )
+    .await;
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == comet_proto::SessionStatus::AwaitingInput)
+        },
+        "the agent to park on its question",
+    )
+    .await;
+
+    core.doc_host
+        .queue_message(CHAT, "follow-up", Vec::new())
+        .expect("queue follow-up");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        queue_texts(&core),
+        vec!["follow-up"],
+        "the follow-up waits for the question to be answered"
+    );
+    assert!(
+        !prompts.lock().unwrap().iter().any(|p| p == "follow-up"),
+        "no fresh turn started under the parked question"
+    );
 
     let _ = harness.finish.send(());
     core.shutdown().await;

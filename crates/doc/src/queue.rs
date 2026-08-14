@@ -87,6 +87,24 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// Put a row back at `index` (clamped). The host's undo for a send that
+    /// failed after the row was taken: it goes back where it was rather than to
+    /// the back of the queue, so a failed "send now" doesn't demote the message
+    /// the user just called urgent.
+    pub fn insert_queued(&self, index: usize, item: &QueuedMessage) -> Result<(), DocError> {
+        if item.id.trim().is_empty() {
+            return Err(DocError::Schema("queued message id required".into()));
+        }
+        if item.text.trim().is_empty() {
+            return Err(DocError::Schema("queued message text required".into()));
+        }
+        let queue = self.doc().get_movable_list("queue");
+        let map = queue.insert_container(index.min(queue.len()), loro::LoroMap::new())?;
+        write_queued_map(&map, item)?;
+        self.doc().commit();
+        Ok(())
+    }
+
     /// Retype one row. Empty text means "I don't want to send this after all",
     /// so the row goes — that is the delete gesture, not an error.
     /// `false` when there is no such row, or the text is unchanged.
@@ -247,6 +265,29 @@ mod tests {
             .into_iter()
             .map(|i| i.text)
             .collect()
+    }
+
+    /// A send that fails after the row was taken puts it back where it was,
+    /// not at the end: the queue is an order the user chose.
+    #[test]
+    fn insert_restores_a_taken_row_at_the_head() {
+        let doc = doc();
+        for (id, text) in [("q1", "first"), ("q2", "second"), ("q3", "third")] {
+            doc.push_queued(&item(id, text)).unwrap();
+        }
+        let taken = doc.take_queued("q2").unwrap().expect("row taken");
+        assert_eq!(texts(&doc), vec!["first", "third"]);
+
+        doc.insert_queued(0, &taken).unwrap();
+        assert_eq!(texts(&doc), vec!["second", "first", "third"]);
+    }
+
+    #[test]
+    fn insert_past_the_end_appends_rather_than_failing() {
+        let doc = doc();
+        doc.push_queued(&item("q1", "first")).unwrap();
+        doc.insert_queued(99, &item("q2", "second")).unwrap();
+        assert_eq!(texts(&doc), vec!["first", "second"]);
     }
 
     #[test]

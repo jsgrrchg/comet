@@ -28,7 +28,7 @@ use comet_doc::{
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
-use comet_proto::{HarnessId, SessionStatus, UserInputAnswer, UserInputQuestion};
+use comet_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
 use comet_sync::{DocsStore, RoomClient};
 
 use crate::sessions::{SessionsEngine, SteerOutcome};
@@ -206,11 +206,16 @@ pub struct ChatDocHandle {
     /// of short rows — so unlike the transcript mirror it publishes on every
     /// change without a dirty flag.
     queue_tx: watch::Sender<Vec<QueuedMessage>>,
-    /// A "send this one now" is between interrupting the turn and starting its
-    /// own. That gap reads as Idle, and an idle chat with a queue is exactly
-    /// what the turn-end flush drains — so without this the override would take
-    /// the rest of the queue out with it. Held only across that dispatch.
-    sending_now: AtomicBool,
+    /// Serializes everything that TAKES from the queue. Both the doc-change
+    /// task and the turn-end status watcher call `drain_queue`, and nothing
+    /// keeps those two apart: without this they interleave across the
+    /// `dispatch` await, each taking a different head and each sending, so a
+    /// queue meant to release one message releases all of them.
+    ///
+    /// It also covers the gap a send-now's interrupt opens — between stopping
+    /// the turn and starting its own the chat reads Idle, and an idle chat with
+    /// a queue is exactly what the flush drains.
+    drain_lock: tokio::sync::Mutex<()>,
     /// True when the doc changed while nobody watched: the mirror rebuild is
     /// deferred to the next `watch_messages` attach instead of paid per commit.
     mirror_dirty: AtomicBool,
@@ -803,7 +808,7 @@ impl DocHost {
             doc: doc.clone(),
             messages_tx,
             queue_tx,
-            sending_now: AtomicBool::new(false),
+            drain_lock: tokio::sync::Mutex::new(()),
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
@@ -1880,20 +1885,20 @@ impl DocHost {
     /// head. `false` when another device already took the row.
     pub async fn send_queued_now(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
         let handle = self.open(chat_id)?;
+        // Sending one now sends ONE: the lock keeps the flush out of the idle
+        // window the interrupt opens, and out of the take itself.
+        let _drain = handle.drain_lock.lock().await;
         let Some(item) = handle.doc.take_queued(id)? else {
             return Ok(false);
         };
         handle.publish_queue();
-        // Sending one now sends ONE — the interrupt below makes the chat look
-        // idle, and an idle chat with a queue is what the flush drains.
-        handle.sending_now.store(true, Ordering::Relaxed);
-        let sent = self
+        if let Err(err) = self
             .dispatch_queued(&handle, &item, QueueSend::Interrupt)
-            .await;
-        handle.sending_now.store(false, Ordering::Relaxed);
-        if let Err(err) = sent {
-            // Put it back rather than swallowing what the user typed.
-            let _ = handle.doc.push_queued(&item);
+            .await
+        {
+            // Put it back rather than swallowing what the user typed — at the
+            // head, because the user just said this one was the urgent one.
+            let _ = handle.doc.insert_queued(0, &item);
             handle.publish_queue();
             return Err(err);
         }
@@ -1912,16 +1917,22 @@ impl DocHost {
         let Some(sessions) = self.inner.sessions.get() else {
             return; // executor not wired yet; the set_sessions kick re-drains
         };
-        if !self.is_host(&handle.chat_id) || handle.sending_now.load(Ordering::Relaxed) {
+        if !self.is_host(&handle.chat_id) {
             return;
         }
+        // One drain at a time per chat. Waiters are cheap: whoever takes the
+        // lock next re-reads the queue and the status, so a drain that became
+        // unnecessary while it waited simply finds nothing to do.
+        let _drain = handle.drain_lock.lock().await;
         loop {
             let Ok(Some(head)) = handle.doc.read_queue().map(|q| q.into_iter().next()) else {
                 return;
             };
-            let busy = sessions
-                .session_status(&handle.chat_id)
-                .is_some_and(|s| matches!(s.status, SessionStatus::Working));
+            // In flight, not just Working: an agent parked on a question owns
+            // the turn too, and the composer queues on the same reading. Taking
+            // `AwaitingInput` for idle would send the follow-up as a fresh turn
+            // and abandon the question.
+            let busy = sessions.turn_in_flight(&handle.chat_id);
             let send = if busy {
                 // Attachments never steer: the steer path carries a prompt and
                 // nothing else, so a message with files must wait for a turn
@@ -1943,7 +1954,9 @@ impl DocHost {
             handle.publish_queue();
             if let Err(err) = self.dispatch_queued(handle, &item, send).await {
                 tracing::warn!(chat = %handle.chat_id, error = %err, "queued send failed");
-                let _ = handle.doc.push_queued(&item);
+                // Back to the head it came from: a failed send must not reorder
+                // the queue behind the user's back.
+                let _ = handle.doc.insert_queued(0, &item);
                 handle.publish_queue();
                 return;
             }
@@ -1976,11 +1989,9 @@ impl DocHost {
                 SteerOutcome::NotSteerable => {}
             }
         }
-        if send == QueueSend::Interrupt
-            && sessions
-                .session_status(chat_id)
-                .is_some_and(|s| matches!(s.status, SessionStatus::Working))
-        {
+        // Same reading of "busy" as the drain: a turn parked on a question is
+        // still a turn, and it has to be stopped before this one starts.
+        if send == QueueSend::Interrupt && sessions.turn_in_flight(chat_id) {
             sessions.interrupt(chat_id).await?;
         }
         let request = sessions

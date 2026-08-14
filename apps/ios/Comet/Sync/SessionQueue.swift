@@ -135,15 +135,6 @@ extension SessionStore {
         }
     }
 
-    /// Send the head of the queue now — what Enter on an empty composer means
-    /// when messages are waiting.
-    @discardableResult
-    func sendQueueHeadNow() -> Bool {
-        guard let head = queue.first else { return false }
-        Task { await sendQueuedNow(id: head.id) }
-        return true
-    }
-
     // MARK: Plumbing
 
     private func queueIndex(of id: String, in list: LoroMovableList) -> Int? {

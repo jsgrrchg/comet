@@ -307,6 +307,14 @@ impl Composer {
                     .text_color(theme.text.opacity(0.9))
                     .child(text),
             )
+            // Files are why a row can sit through a steerable turn, so say so.
+            .when(!item.attachments.is_empty(), |el| {
+                el.child(
+                    crate::icons::icon(crate::icons::PAPERCLIP)
+                        .size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.7)),
+                )
+            })
             .when(being_edited, |el| {
                 el.child(
                     div()
@@ -567,7 +575,11 @@ impl Composer {
         if let Some(object) = params.as_object_mut() {
             object.insert("chatId".into(), serde_json::Value::String(chat_id));
         }
-        self.queue_task = Some(cx.spawn(async move |this, cx| {
+        // Detached, not held: these are independent one-shot mutations, and
+        // parking them in a single slot meant the next arrow tap dropped — and
+        // so cancelled — the move still in flight, leaving the optimistic list
+        // showing an order the doc never got.
+        cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(method, params).await {
                 tracing::warn!(method, error = %err, "queue mutation failed");
                 this.update(cx, |composer, cx| {
@@ -576,7 +588,8 @@ impl Composer {
                 })
                 .ok();
             }
-        }));
+        })
+        .detach();
     }
 }
 

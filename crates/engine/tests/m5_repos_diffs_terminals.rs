@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStringExt;
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
@@ -483,6 +486,27 @@ async fn diff_capture_tracked_untracked_and_checksum() {
         .await
         .expect("changed capture");
     assert_ne!(snapshot.checksum, changed.checksum);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn diff_capture_marks_non_utf8_paths_partial_and_discard_refuses_them() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = test_repos(&tmp.path().join("data"));
+
+    let invalid_name = std::ffi::OsString::from_vec(b"untracked-\xff.txt".to_vec());
+    let invalid_path = repo_dir.join(&invalid_name);
+    std::fs::write(&invalid_path, "must survive\n").expect("invalid UTF-8 path");
+
+    let snapshot = capture_diff(&repos, &repo_dir).await.expect("snapshot");
+    assert!(snapshot.truncated, "path cannot be represented losslessly");
+    let error = discard_working_tree(&repos, &repo_dir, &snapshot.checksum)
+        .await
+        .expect_err("partial snapshot must not be discarded");
+    assert!(error.to_string().contains("partial diff"), "{error}");
+    assert!(invalid_path.exists());
 }
 
 #[tokio::test]

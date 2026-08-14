@@ -702,6 +702,35 @@ fn split_z(value: &[u8]) -> Vec<String> {
         .collect()
 }
 
+/// Git paths are arbitrary bytes on Unix, while the diff protocol exposes
+/// paths as UTF-8 strings. Treat an unrepresentable path as a partial snapshot
+/// so destructive actions cannot operate on a file the UI could not faithfully
+/// display or checksum.
+fn has_non_utf8_status_path(value: &[u8]) -> bool {
+    let records: Vec<&[u8]> = value
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .collect();
+    let mut i = 0usize;
+    while i < records.len() {
+        let record = records[i];
+        i += 1;
+        if record.len() < 3 || record[2] != b' ' {
+            continue;
+        }
+        if std::str::from_utf8(&record[3..]).is_err() {
+            return true;
+        }
+        if (record.starts_with(b"R") || record.starts_with(b"C")) && i < records.len() {
+            if std::str::from_utf8(records[i]).is_err() {
+                return true;
+            }
+            i += 1;
+        }
+    }
+    false
+}
+
 fn parse_name_status(value: &[u8]) -> Vec<DiffFileSummary> {
     let fields = split_z(value);
     let mut out = Vec::new();
@@ -883,6 +912,9 @@ pub async fn capture_diff_against(
     apply_numstat(&mut files, &nums.stdout);
     let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
     let mut truncated = tracked.truncated || names.truncated || nums.truncated || status.truncated;
+    if has_non_utf8_status_path(&status.stdout) {
+        truncated = true;
+    }
 
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
@@ -1412,7 +1444,16 @@ pub async fn capture_turn_diff(
 
 #[cfg(test)]
 mod watch_budget_tests {
-    use super::{CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, watch_targets};
+    use super::{
+        CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, has_non_utf8_status_path,
+        watch_targets,
+    };
+
+    #[test]
+    fn non_utf8_status_paths_are_marked_unsafe_for_destructive_actions() {
+        assert!(has_non_utf8_status_path(b"?? invalid-\xff.txt\0"));
+        assert!(!has_non_utf8_status_path(b"?? valid.txt\0"));
+    }
 
     #[test]
     fn small_tree_is_watchable() {

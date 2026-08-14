@@ -646,8 +646,9 @@ impl Shell {
     }
 
     /// The sidebar's Sessions list: every session (idle included) of the
-    /// filter space — or all spaces under "All" — attention-sorted. Rows are
-    /// keyed for the FLIP resort glide.
+    /// filter space — or all spaces under "All". Untouched settings preserve
+    /// recency; a device-local manual order keeps known rows stable and lets
+    /// new sessions lead. Rows stay keyed for the FLIP resort glide.
     pub(super) fn render_active_rows(
         &mut self,
         theme: &Theme,
@@ -657,9 +658,21 @@ impl Shell {
         let filter = self.settings.space_filter.clone();
         let rows: Vec<(ChatIndicator, zeron_proto::Chat, String, Option<String>)> = {
             let state = self.state.read(cx);
-            state
-                .overview_chats(now)
+            let overview = state.overview_chats(now);
+            let recency_ids: Vec<String> =
+                overview.iter().map(|(_, chat)| chat.id.clone()).collect();
+            let ordered_ids =
+                project_local_order(&recency_ids, &self.settings.sidebar_session_order);
+            let mut rows_by_id: std::collections::HashMap<
+                String,
+                (ChatIndicator, &zeron_proto::Chat),
+            > = overview
                 .into_iter()
+                .map(|(status, chat)| (chat.id.clone(), (status, chat)))
+                .collect();
+            ordered_ids
+                .into_iter()
+                .filter_map(|id| rows_by_id.remove(&id))
                 .filter(|(_, chat)| match &filter {
                     Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
                     None => true,
@@ -2228,6 +2241,32 @@ mod local_order_tests {
             project_local_order(&ids(&["new-2", "b", "new-1", "a"]), &saved),
             ids(&["new-2", "new-1", "a", "b"])
         );
+    }
+
+    #[test]
+    fn sidebar_session_order_ignores_new_activity_for_saved_rows() {
+        let saved = ids(&["a", "b", "c"]);
+        assert_eq!(project_local_order(&ids(&["c", "b", "a"]), &saved), saved);
+    }
+
+    #[test]
+    fn sidebar_session_order_filters_are_consistent_projections() {
+        let ordered = project_local_order(
+            &ids(&["b2", "a2", "b1", "a1"]),
+            &ids(&["a1", "b1", "a2", "b2"]),
+        );
+        let project_a: Vec<String> = ordered
+            .iter()
+            .filter(|id| id.starts_with('a'))
+            .cloned()
+            .collect();
+        let project_b: Vec<String> = ordered
+            .iter()
+            .filter(|id| id.starts_with('b'))
+            .cloned()
+            .collect();
+        assert_eq!(project_a, ids(&["a1", "a2"]));
+        assert_eq!(project_b, ids(&["b1", "b2"]));
     }
 
     #[test]

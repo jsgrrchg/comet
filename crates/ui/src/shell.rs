@@ -1268,6 +1268,22 @@ impl Shell {
             self.settings.space_filter = None;
             self.schedule_save(cx);
         }
+        // Sidebar order is presentation-only. Keep archived ids so a restore
+        // returns to the same local slot; only hard-deleted chats are pruned.
+        if state.read(cx).chats_synced && !self.settings.sidebar_session_order.is_empty() {
+            let known_chat_ids = state
+                .read(cx)
+                .chats
+                .iter()
+                .map(|chat| chat.id.clone())
+                .collect();
+            if spaces::retain_known_sessions(
+                &mut self.settings.sidebar_session_order,
+                &known_chat_ids,
+            ) {
+                self.schedule_save(cx);
+            }
+        }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
         // snap, no tween — the panels belong to the destination chat).
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();

@@ -11,7 +11,83 @@
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use gpui::FocusHandle;
+use std::collections::HashSet;
 use zeron_proto::{ChatIndicator, Device, FolderListing, Space};
+
+/// Merge active sessions in recency order with the device-local manual order.
+/// New active ids lead; saved ids (including archived rows) retain their slots.
+pub(super) fn materialize_local_order(recency_ids: &[String], saved_ids: &[String]) -> Vec<String> {
+    if saved_ids.is_empty() {
+        let mut seen = HashSet::new();
+        return recency_ids
+            .iter()
+            .filter(|id| seen.insert(id.as_str()))
+            .cloned()
+            .collect();
+    }
+
+    let saved: HashSet<&str> = saved_ids.iter().map(String::as_str).collect();
+    let mut seen = HashSet::new();
+    recency_ids
+        .iter()
+        .filter(|id| !saved.contains(id.as_str()))
+        .chain(saved_ids.iter())
+        .filter(|id| seen.insert(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Active projection of [`materialize_local_order`]. A missing preference is
+/// exactly the current recency order; archived saved ids remain stored but do
+/// not enter this projection.
+pub(super) fn project_local_order(recency_ids: &[String], saved_ids: &[String]) -> Vec<String> {
+    let active: HashSet<&str> = recency_ids.iter().map(String::as_str).collect();
+    materialize_local_order(recency_ids, saved_ids)
+        .into_iter()
+        .filter(|id| active.contains(id.as_str()))
+        .collect()
+}
+
+/// Move within a filtered projection while preserving every hidden global
+/// slot. Callers materialize all currently visible ids before invoking this.
+pub(super) fn reorder_visible_projection(
+    global_ids: &[String],
+    visible_ids: &[String],
+    from: usize,
+    to: usize,
+) -> Vec<String> {
+    if from >= visible_ids.len() || to >= visible_ids.len() || from == to {
+        return global_ids.to_vec();
+    }
+
+    let mut reordered = visible_ids.to_vec();
+    let moved = reordered.remove(from);
+    reordered.insert(to, moved);
+    let visible: HashSet<&str> = visible_ids.iter().map(String::as_str).collect();
+    let mut replacements = reordered.into_iter();
+    global_ids
+        .iter()
+        .map(|id| {
+            if visible.contains(id.as_str()) {
+                replacements.next().unwrap_or_else(|| id.clone())
+            } else {
+                id.clone()
+            }
+        })
+        .collect()
+}
+
+/// Remove only ids absent from the workspace. Archived chats remain known so
+/// unarchiving restores their device-local position.
+pub(super) fn retain_known_sessions(
+    saved_ids: &mut Vec<String>,
+    known_chat_ids: &HashSet<String>,
+) -> bool {
+    let before = saved_ids.len();
+    let mut seen = HashSet::new();
+    saved_ids.retain(|id| known_chat_ids.contains(id) && seen.insert(id.clone()));
+    saved_ids.len() != before
+}
 
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
@@ -2118,5 +2194,73 @@ impl Shell {
         }
 
         overlays
+    }
+}
+
+#[cfg(test)]
+mod local_order_tests {
+    use super::{
+        materialize_local_order, project_local_order, reorder_visible_projection,
+        retain_known_sessions,
+    };
+    use std::collections::HashSet;
+
+    fn ids(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn sidebar_session_order_empty_preserves_recency() {
+        assert_eq!(
+            project_local_order(&ids(&["c", "b", "a"]), &[]),
+            ids(&["c", "b", "a"])
+        );
+    }
+
+    #[test]
+    fn sidebar_session_order_new_rows_lead_and_saved_rows_stay_stable() {
+        let saved = ids(&["a", "b", "archived"]);
+        assert_eq!(
+            materialize_local_order(&ids(&["new-2", "b", "new-1", "a"]), &saved),
+            ids(&["new-2", "new-1", "a", "b", "archived"])
+        );
+        assert_eq!(
+            project_local_order(&ids(&["new-2", "b", "new-1", "a"]), &saved),
+            ids(&["new-2", "new-1", "a", "b"])
+        );
+    }
+
+    #[test]
+    fn sidebar_session_order_deduplicates_inputs() {
+        assert_eq!(
+            materialize_local_order(&ids(&["new", "new", "a"]), &ids(&["a", "a", "old"])),
+            ids(&["new", "a", "old"])
+        );
+    }
+
+    #[test]
+    fn sidebar_session_order_reorders_only_visible_slots() {
+        let global = ids(&["a1", "b1", "a2", "archived", "b2"]);
+        let visible = ids(&["a1", "a2"]);
+        assert_eq!(
+            reorder_visible_projection(&global, &visible, 0, 1),
+            ids(&["a2", "b1", "a1", "archived", "b2"])
+        );
+    }
+
+    #[test]
+    fn sidebar_session_order_invalid_move_is_a_noop() {
+        let global = ids(&["a", "b"]);
+        assert_eq!(reorder_visible_projection(&global, &global, 0, 0), global);
+        assert_eq!(reorder_visible_projection(&global, &global, 8, 0), global);
+    }
+
+    #[test]
+    fn sidebar_session_order_retains_archived_and_prunes_deleted() {
+        let mut saved = ids(&["active", "archived", "deleted", "active"]);
+        let known = HashSet::from(["active".to_string(), "archived".to_string()]);
+        assert!(retain_known_sessions(&mut saved, &known));
+        assert_eq!(saved, ids(&["active", "archived"]));
+        assert!(!retain_known_sessions(&mut saved, &known));
     }
 }

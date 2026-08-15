@@ -121,6 +121,13 @@ pub fn run_app(config: UiConfig) {
             cx,
         );
         appearance::init(settings.appearance, cx);
+        history::init(
+            settings.git_history_columns,
+            settings.git_history_column_widths,
+            settings.git_history_column_order,
+            settings.git_history_author_display,
+            cx,
+        );
         composer::init(cx);
         terminal::panel::init(cx);
         app_menus::init(cx);

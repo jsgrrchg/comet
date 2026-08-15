@@ -36,7 +36,10 @@ use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
 use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
+use crate::history::{
+    GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton, GitHistorySearchControl,
+    GitHistoryViewButton,
+};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
@@ -994,7 +997,9 @@ pub struct Changes {
     ref_menu: Popup<RefMenu>,
     history: Option<Entity<GitHistory>>,
     history_count: Option<Entity<GitHistoryCount>>,
+    history_search_control: Option<Entity<GitHistorySearchControl>>,
     history_fetch_button: Option<Entity<GitHistoryFetchButton>>,
+    history_view_button: Option<Entity<GitHistoryViewButton>>,
     history_events: Option<Subscription>,
     /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
     /// the fetch and the surface-tab title).
@@ -1044,7 +1049,9 @@ impl Changes {
             ref_menu: Popup::default(),
             history: None,
             history_count: None,
+            history_search_control: None,
             history_fetch_button: None,
+            history_view_button: None,
             history_events: None,
             commit: None,
             _observe: observe,
@@ -1460,6 +1467,29 @@ impl Changes {
         let history = self.history_pane(cx);
         let button = cx.new(|cx| GitHistoryFetchButton::new(history, cx));
         self.history_fetch_button = Some(button.clone());
+        button
+    }
+
+    fn history_search_control(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<GitHistorySearchControl> {
+        if let Some(control) = &self.history_search_control {
+            return control.clone();
+        }
+        let history = self.history_pane(cx);
+        let control = cx.new(|cx| GitHistorySearchControl::new(history, cx));
+        self.history_search_control = Some(control.clone());
+        control
+    }
+
+    fn history_view_button(&mut self, cx: &mut Context<Self>) -> Entity<GitHistoryViewButton> {
+        if let Some(button) = &self.history_view_button {
+            return button.clone();
+        }
+        let history = self.history_pane(cx);
+        let button = cx.new(|cx| GitHistoryViewButton::new(history, cx));
+        self.history_view_button = Some(button.clone());
         button
     }
 
@@ -2222,8 +2252,12 @@ impl Changes {
         }
         let scope = self.scope;
         let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
+        let history_search_control =
+            (scope == DiffScope::History).then(|| self.history_search_control(cx));
         let history_fetch_button =
             (scope == DiffScope::History).then(|| self.history_fetch_button(cx));
+        let history_view_button =
+            (scope == DiffScope::History).then(|| self.history_view_button(cx));
         let trigger = div()
             .id("changes-scope-trigger")
             .h(px(24.0))
@@ -2261,6 +2295,7 @@ impl Changes {
             .child(
                 div()
                     .text_size(px(12.0))
+                    .line_height(px(14.0))
                     .text_color(theme.text)
                     .child(SharedString::from(scope.label())),
             )
@@ -2288,7 +2323,9 @@ impl Changes {
                 .flex()
                 .items_center()
                 .gap(px(2.0))
+                .children(history_search_control)
                 .children(history_fetch_button)
+                .children(history_view_button)
                 .child(
                     Self::header_button("history-refresh", crate::icons::REFRESH, &theme).on_click(
                         cx.listener(|this, _, _, cx| {
@@ -2316,7 +2353,15 @@ impl Changes {
             .gap(px(6.0))
             .child(trigger)
             .when_some(history_count, |element, count| {
-                element.child(div().flex_1().min_w_0().h_full().child(count))
+                element.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(24.0))
+                        .flex()
+                        .items_center()
+                        .child(count),
+                )
             })
             .children(self.render_ref_selector(&theme, cx))
             .when(scope != DiffScope::History, |element| {

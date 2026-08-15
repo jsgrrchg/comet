@@ -1724,6 +1724,10 @@ impl Shell {
         self.settings.appearance = crate::appearance::mode(cx);
         self.settings.ui_font_family = crate::typography::requested(cx);
         self.settings.ui_font_size = crate::typography::font_size(cx);
+        self.settings.git_history_columns = crate::history::configured_columns(cx);
+        self.settings.git_history_column_widths = crate::history::configured_column_widths(cx);
+        self.settings.git_history_column_order = crate::history::configured_column_order(cx);
+        self.settings.git_history_author_display = crate::history::configured_author_display(cx);
         settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
     }
 

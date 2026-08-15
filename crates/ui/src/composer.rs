@@ -34,6 +34,7 @@ use zeron_rpc::{RpcError, methods};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::Pickers;
+use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
 use crate::theme::Theme;
 
@@ -610,6 +611,7 @@ actions!(
         Cut,
         Paste,
         Newline,
+        MessageNewlineOrAccept,
         Submit,
         Undo,
         Redo,
@@ -1074,11 +1076,26 @@ enum EditKind {
     Delete,
 }
 
-/// Bind the composer keymap. Call once at app boot.
-pub fn init(cx: &mut App) {
-    let ctx = Some("Composer");
+const GENERIC_COMPOSER_CONTEXT: &str = "Composer";
+const MESSAGE_COMPOSER_CONTEXT: &str = "MessageComposer";
+const PALETTE_SEARCH_CONTEXT: &str = "PaletteSearch";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessagePlainEnterAction {
+    Submit,
+    NewlineOrAccept,
+}
+
+pub fn message_plain_enter_action(behavior: ComposerSendBehavior) -> MessagePlainEnterAction {
+    match behavior {
+        ComposerSendBehavior::Enter => MessagePlainEnterAction::Submit,
+        ComposerSendBehavior::ModEnter => MessagePlainEnterAction::NewlineOrAccept,
+    }
+}
+
+fn input_bindings(context: &'static str) -> Vec<KeyBinding> {
+    let ctx = Some(context);
     let mut bindings = vec![
-        KeyBinding::new("enter", Submit, ctx),
         KeyBinding::new("tab", MentionTab, ctx),
         KeyBinding::new("escape", MentionEscape, ctx),
         KeyBinding::new("shift-enter", Newline, ctx),
@@ -1156,12 +1173,50 @@ pub fn init(cx: &mut App) {
         bindings.push(KeyBinding::new(&format!("{prefix}-x"), Cut, ctx));
         bindings.push(KeyBinding::new(&format!("{prefix}-v"), Paste, ctx));
     }
+    bindings
+}
+
+/// Bind the composer keymap. Call once at app boot.
+pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
+    let mut generic_bindings = input_bindings(GENERIC_COMPOSER_CONTEXT);
+    generic_bindings.push(KeyBinding::new(
+        "enter",
+        Submit,
+        Some(GENERIC_COMPOSER_CONTEXT),
+    ));
+
+    let mut message_bindings = input_bindings(MESSAGE_COMPOSER_CONTEXT);
+    match message_plain_enter_action(send_behavior) {
+        MessagePlainEnterAction::Submit => message_bindings.push(KeyBinding::new(
+            "enter",
+            Submit,
+            Some(MESSAGE_COMPOSER_CONTEXT),
+        )),
+        MessagePlainEnterAction::NewlineOrAccept => {
+            message_bindings.push(KeyBinding::new(
+                "enter",
+                MessageNewlineOrAccept,
+                Some(MESSAGE_COMPOSER_CONTEXT),
+            ));
+            message_bindings.push(KeyBinding::new(
+                &platform_combo("mod-enter"),
+                Submit,
+                Some(MESSAGE_COMPOSER_CONTEXT),
+            ));
+        }
+    }
+
+    let word_edit_prefix = if cfg!(target_os = "macos") {
+        "alt"
+    } else {
+        "ctrl"
+    };
     // Palette-search context: TEXT-EDITING keys only. gpui dispatches matched
     // keybindings BEFORE raw key listeners (window.rs `dispatch_key_event`),
     // so anything bound here can never reach a palette's `on_key_down` —
     // navigation keys (up/down/left/right/enter) are deliberately unbound and
     // bubble to the palette frame instead.
-    let palette = Some("PaletteSearch");
+    let palette = Some(PALETTE_SEARCH_CONTEXT);
     let mut palette_bindings = vec![
         KeyBinding::new("backspace", Backspace, palette),
         KeyBinding::new("delete", Delete, palette),
@@ -1216,7 +1271,8 @@ pub fn init(cx: &mut App) {
         palette_bindings.push(KeyBinding::new(&format!("shift-{prefix}-z"), Redo, palette));
     }
     cx.bind_keys(palette_bindings);
-    cx.bind_keys(bindings);
+    cx.bind_keys(generic_bindings);
+    cx.bind_keys(message_bindings);
 }
 
 /// Events the composer wrapper listens for.
@@ -1309,7 +1365,7 @@ pub struct ComposerInput {
 
 impl ComposerInput {
     pub fn new(placeholder: impl Into<SharedString>, cx: &mut Context<Self>) -> Self {
-        Self::with_context(placeholder, "Composer", cx)
+        Self::with_context(placeholder, GENERIC_COMPOSER_CONTEXT, cx)
     }
 
     /// An input in a custom KEY context — palettes use `"PaletteSearch"`,
@@ -1359,6 +1415,13 @@ impl ComposerInput {
             mention_tooltip_popup: None,
             mention_tooltip_task: None,
             mention_tooltip_view: None,
+        }
+    }
+
+    fn set_key_context(&mut self, key_context: &'static str, cx: &mut Context<Self>) {
+        if self.key_context != key_context {
+            self.key_context = key_context;
+            cx.notify();
         }
     }
 
@@ -2106,6 +2169,19 @@ impl ComposerInput {
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
         self.replace_text_in_range(None, "\n", window, cx);
+    }
+
+    fn message_newline_or_accept(
+        &mut self,
+        _: &MessageNewlineOrAccept,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mention_has_selection {
+            cx.emit(ComposerInputEvent::MentionAccept);
+        } else {
+            self.replace_text_in_range(None, "\n", window, cx);
+        }
     }
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
@@ -3120,6 +3196,7 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::newline))
+            .on_action(cx.listener(Self::message_newline_or_accept))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
@@ -3366,7 +3443,8 @@ impl Composer {
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
-            let mut input = ComposerInput::new("Do anything…", cx);
+            let mut input =
+                ComposerInput::with_context("Do anything…", MESSAGE_COMPOSER_CONTEXT, cx);
             input.enable_mentions();
             input
         });
@@ -4338,6 +4416,13 @@ impl Composer {
                 }
             }
         }
+        let input_context = if self.wizard.is_some() {
+            GENERIC_COMPOSER_CONTEXT
+        } else {
+            MESSAGE_COMPOSER_CONTEXT
+        };
+        self.input
+            .update(cx, |input, cx| input.set_key_context(input_context, cx));
         cx.notify();
     }
 
@@ -4852,6 +4937,7 @@ impl Composer {
             input.set_text("", cx);
             // The panel borrowed the composer input; hand back its identity.
             input.set_placeholder("Do anything…", cx);
+            input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
         });
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -5647,6 +5733,18 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_plain_enter_follows_the_send_preference() {
+        assert_eq!(
+            message_plain_enter_action(ComposerSendBehavior::Enter),
+            MessagePlainEnterAction::Submit
+        );
+        assert_eq!(
+            message_plain_enter_action(ComposerSendBehavior::ModEnter),
+            MessagePlainEnterAction::NewlineOrAccept
+        );
+    }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
         MentionTooltipTarget {

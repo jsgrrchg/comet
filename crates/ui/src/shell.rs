@@ -423,14 +423,12 @@ struct RightTabDragState {
 #[derive(Clone)]
 struct SidebarSessionDrag {
     chat_id: String,
-    title: SharedString,
-    space_name: SharedString,
     visible_ids: std::sync::Arc<Vec<String>>,
     filter: Option<String>,
 }
 
-/// Live destination for a sidebar session drag. The dragged row stays in the
-/// layout as a spacer while siblings slide toward its current gap.
+/// Live destination for a sidebar session drag. The real row remains clipped
+/// to the sidebar and slides between slots with its siblings.
 struct SidebarSessionDragState {
     chat_id: String,
     visible_ids: std::sync::Arc<Vec<String>>,
@@ -444,49 +442,6 @@ struct SidebarSessionDragState {
     viewport_bottom: f32,
     generation: u64,
     autoscroll_active: bool,
-}
-
-/// Compact card ghost following the pointer during sidebar reordering.
-struct SidebarSessionGhost {
-    title: SharedString,
-    space_name: SharedString,
-    width: f32,
-}
-
-impl Render for SidebarSessionGhost {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .h(px(CHAT_ROW_HEIGHT))
-            .w(px(self.width))
-            .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .rounded(px(8.0))
-            .bg(theme.surface_raised)
-            .border_1()
-            .border_color(theme.border_strong)
-            .shadow_lg()
-            .opacity(0.92)
-            .child(
-                div()
-                    .truncate()
-                    .text_size(px(11.0))
-                    .line_height(px(14.0))
-                    .text_color(theme.text_muted)
-                    .child(self.space_name.clone()),
-            )
-            .child(
-                div()
-                    .truncate()
-                    .text_size(px(13.0))
-                    .line_height(px(17.0))
-                    .text_color(theme.text)
-                    .child(self.title.clone()),
-            )
-    }
 }
 
 /// Ghost chip following the pointer while a surface tab drags.
@@ -516,7 +471,8 @@ impl Render for SurfaceTabGhost {
 /// Drag marker for the terminal-panel height handle.
 struct TerminalResize;
 
-/// Invisible drag ghost — resize drags render nothing at the cursor.
+/// Invisible drag ghost — resize drags and contained sidebar reorders render
+/// nothing at the cursor.
 struct DragGhost;
 
 impl Render for DragGhost {
@@ -1805,6 +1761,22 @@ impl Shell {
         self.sidebar_tween = None; // live drag tracks the pointer directly
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    fn contain_sidebar_session_drag(
+        &mut self,
+        event: &gpui::DragMoveEvent<SidebarSessionDrag>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inside_window = event.bounds.contains(&event.event.position);
+        let pointer_x = f32::from(event.event.position.x);
+        let sidebar_left = f32::from(event.bounds.left());
+        let inside_sidebar =
+            pointer_x >= sidebar_left && pointer_x <= sidebar_left + self.settings.sidebar_width;
+        if !inside_window || !inside_sidebar {
+            self.cancel_sidebar_session_drag(cx);
+        }
     }
 
     fn on_right_pane_drag(
@@ -3299,14 +3271,9 @@ impl Shell {
                 }),
             )
             .when_some(drag, |el, payload| {
-                let ghost_width = (self.settings.sidebar_width - 2.0 * Theme::SPACE_SM).max(1.0);
-                el.on_drag(payload, move |payload, _point, _, cx| {
+                el.on_drag(payload, move |_, _point, _, cx| {
                     cx.stop_propagation();
-                    cx.new(|_| SidebarSessionGhost {
-                        title: payload.title.clone(),
-                        space_name: payload.space_name.clone(),
-                        width: ghost_width,
-                    })
+                    cx.new(|_| DragGhost)
                 })
             })
             // Line 1: "project @ device", status word / time-ago right.
@@ -3450,17 +3417,19 @@ impl Shell {
             .enumerate()
             .map(|(ix, (key, _, element))| {
                 if let Some((from, over, prev_over, drag_epoch)) = session_drag {
-                    if ix == from {
-                        return div()
-                            .h(px(CHAT_ROW_HEIGHT))
-                            .w_full()
-                            .flex_none()
-                            .into_any_element();
-                    }
-                    let target =
-                        crate::terminal::panel::slide_offset(ix, from, over) * SIDEBAR_SESSION_SLOT;
-                    let start = crate::terminal::panel::slide_offset(ix, from, prev_over)
-                        * SIDEBAR_SESSION_SLOT;
+                    let (start, target) = if ix == from {
+                        (
+                            (prev_over as f32 - from as f32) * SIDEBAR_SESSION_SLOT,
+                            (over as f32 - from as f32) * SIDEBAR_SESSION_SLOT,
+                        )
+                    } else {
+                        (
+                            crate::terminal::panel::slide_offset(ix, from, prev_over)
+                                * SIDEBAR_SESSION_SLOT,
+                            crate::terminal::panel::slide_offset(ix, from, over)
+                                * SIDEBAR_SESSION_SLOT,
+                        )
+                    };
                     if self.reduced_motion {
                         return div()
                             .relative()
@@ -6396,6 +6365,7 @@ impl Render for Shell {
             .text_color(text)
             .font_family(font)
             .text_size(px(14.0))
+            .on_drag_move::<SidebarSessionDrag>(cx.listener(Self::contain_sidebar_session_drag))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))

@@ -1038,8 +1038,6 @@ impl Shell {
                 let space_name: SharedString = folder.into();
                 let drag = SidebarSessionDrag {
                     chat_id: chat.id.clone(),
-                    title: title.clone(),
-                    space_name: space_name.clone(),
                     visible_ids: visible_ids.clone(),
                     filter: filter.clone(),
                 };

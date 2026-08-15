@@ -41,12 +41,15 @@ pub enum ShortcutsEvent {
     KeymapChanged(KeymapConfig),
     /// The composer send behavior changed — persist + re-apply.
     ComposerSendBehaviorChanged(ComposerSendBehavior),
+    /// The Escape fallback changed — persist it locally.
+    EscapeStopsActiveAgentChanged(bool),
 }
 
 pub struct ShortcutsPage {
     /// Working copy (kept in sync with the shell via change events).
     keymap: KeymapConfig,
     composer_send_behavior: ComposerSendBehavior,
+    escape_stops_active_agent: bool,
     recording: Option<ShortcutId>,
     /// A rejected record attempt ("{Combo} is already assigned to {label}.") —
     /// conflicts never persist; they're refused at record time, as in zeron.
@@ -64,11 +67,13 @@ impl ShortcutsPage {
         state: Entity<AppState>,
         keymap: KeymapConfig,
         composer_send_behavior: ComposerSendBehavior,
+        escape_stops_active_agent: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             keymap,
             composer_send_behavior,
+            escape_stops_active_agent,
             recording: None,
             conflict_notice: None,
             focus: cx.focus_handle(),
@@ -104,6 +109,14 @@ impl ShortcutsPage {
             self.composer_send_behavior = behavior;
             self.conflict_notice = None;
             cx.emit(ShortcutsEvent::ComposerSendBehaviorChanged(behavior));
+            cx.notify();
+        }
+    }
+
+    fn set_escape_stops_active_agent(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.escape_stops_active_agent != enabled {
+            self.escape_stops_active_agent = enabled;
+            cx.emit(ShortcutsEvent::EscapeStopsActiveAgentChanged(enabled));
             cx.notify();
         }
     }
@@ -202,8 +215,10 @@ impl Render for ShortcutsPage {
         let theme = Theme::of(cx).clone();
         let recording = self.recording;
         let send_behavior = self.composer_send_behavior;
+        let escape_stops_active_agent = self.escape_stops_active_agent;
         let customized = self.keymap != KeymapConfig::default()
-            || send_behavior != ComposerSendBehavior::default();
+            || send_behavior != ComposerSendBehavior::default()
+            || escape_stops_active_agent;
         let modifier_label = modifier_send_label(cfg!(target_os = "macos"));
 
         let send_behavior_control = div()
@@ -309,6 +324,37 @@ impl Render for ShortcutsPage {
                     )
                     .child(send_behavior_control),
             );
+        let escape_behavior_row = widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .min_h(px(84.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(widgets::row_title(&theme, "Stop active agent with Escape"))
+                        .child(
+                            div()
+                                .mt(px(4.0))
+                                .max_w(px(430.0))
+                                .text_size(px(11.5))
+                                .line_height(px(17.0))
+                                .text_color(theme.text_muted.opacity(0.65))
+                                .child(SharedString::from(
+                                    "When no dialog, menu, picker, or terminal handles Escape, stop the agent in the active session.",
+                                )),
+                        ),
+                )
+                .child(
+                    widgets::toggle_switch(&theme, escape_stops_active_agent)
+                        .id("escape-stops-active-agent-toggle")
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_escape_stops_active_agent(!escape_stops_active_agent, cx);
+                        })),
+                ),
+        );
 
         let rows = ShortcutId::ALL.into_iter().enumerate().map(|(ix, id)| {
             let combo = self.keymap.get(id).to_string();
@@ -472,6 +518,7 @@ impl Render for ShortcutsPage {
                                                     ComposerSendBehavior::Enter,
                                                     cx,
                                                 );
+                                                this.set_escape_stops_active_agent(false, cx);
                                             }),
                                         )
                                     })
@@ -490,10 +537,13 @@ impl Render for ShortcutsPage {
                             .mt(px(12.0))
                             .px(px(4.0))
                             .min_h(px(20.0))
+                            .flex()
+                            .justify_center()
                             .text_size(crate::typography::ui_rems(12.0))
                             .text_color(theme.text_muted)
                             .child(helper),
-                    ),
+                    )
+                    .child(escape_behavior_row),
             )
     }
 }

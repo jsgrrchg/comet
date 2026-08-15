@@ -385,6 +385,10 @@ const SIDEBAR_LIST_GAP: f32 = 2.0;
 
 /// Fixed vertical slot occupied by one active sidebar card.
 const SIDEBAR_SESSION_SLOT: f32 = CHAT_ROW_HEIGHT + SIDEBAR_LIST_GAP;
+/// Divider box between pinned and regular sessions. With the list's 2px gaps,
+/// its centered 1px hairline has 8px of air on each side.
+const SIDEBAR_PINNED_DIVIDER_HEIGHT: f32 = 13.0;
+const SIDEBAR_PINNED_DIVIDER_KEY: &str = "sidebar-pinned-divider";
 
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
@@ -425,6 +429,9 @@ struct SidebarSessionDrag {
     chat_id: String,
     visible_ids: std::sync::Arc<Vec<String>>,
     filter: Option<String>,
+    section_start: usize,
+    section_len: usize,
+    section_offset_y: f32,
 }
 
 /// Live destination for a sidebar session drag. The real row remains clipped
@@ -437,11 +444,21 @@ struct SidebarSessionDragState {
     prev_over: usize,
     epoch: usize,
     filter: Option<String>,
+    section_start: usize,
+    section_len: usize,
+    section_offset_y: f32,
     pointer_y: Option<f32>,
     viewport_top: f32,
     viewport_bottom: f32,
     generation: u64,
     autoscroll_active: bool,
+}
+
+type SidebarKeyedRow = (String, f32, AnyElement);
+
+struct SidebarSessionRows {
+    rows: Vec<SidebarKeyedRow>,
+    pinned_count: usize,
 }
 
 /// Ghost chip following the pointer while a surface tab drags.
@@ -1309,19 +1326,28 @@ impl Shell {
             self.settings.space_filter = None;
             self.schedule_save(cx);
         }
-        // Sidebar order is presentation-only. Keep archived ids so a restore
-        // returns to the same local slot; only hard-deleted chats are pruned.
-        if state.read(cx).chats_synced && !self.settings.sidebar_session_order.is_empty() {
+        // Sidebar order and pins are presentation-only. Keep archived ids so
+        // a restore returns to the same local slot and pinned section; only
+        // hard-deleted chats are pruned.
+        if state.read(cx).chats_synced
+            && (!self.settings.sidebar_session_order.is_empty()
+                || !self.settings.sidebar_pinned_session_ids.is_empty())
+        {
             let known_chat_ids = state
                 .read(cx)
                 .chats
                 .iter()
                 .map(|chat| chat.id.clone())
                 .collect();
-            if spaces::retain_known_sessions(
+            let order_changed = spaces::retain_known_sessions(
                 &mut self.settings.sidebar_session_order,
                 &known_chat_ids,
-            ) {
+            );
+            let pins_changed = spaces::retain_known_sessions(
+                &mut self.settings.sidebar_pinned_session_ids,
+                &known_chat_ids,
+            );
+            if order_changed || pins_changed {
                 self.schedule_save(cx);
             }
         }
@@ -2074,6 +2100,34 @@ impl Shell {
 
     fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.set_chat_archived(chat_id, true, cx);
+    }
+
+    fn set_chat_pinned(&mut self, chat_id: String, pinned: bool, cx: &mut Context<Self>) {
+        self.close_chat_menu(cx);
+        self.cancel_sidebar_session_drag(cx);
+        let changed = if pinned {
+            if self
+                .settings
+                .sidebar_pinned_session_ids
+                .iter()
+                .any(|id| id == &chat_id)
+            {
+                false
+            } else {
+                self.settings.sidebar_pinned_session_ids.push(chat_id);
+                true
+            }
+        } else {
+            let before = self.settings.sidebar_pinned_session_ids.len();
+            self.settings
+                .sidebar_pinned_session_ids
+                .retain(|id| id != &chat_id);
+            self.settings.sidebar_pinned_session_ids.len() != before
+        };
+        if changed {
+            self.schedule_save(cx);
+        }
+        cx.notify();
     }
 
     pub(super) fn set_chat_archived(
@@ -3357,6 +3411,49 @@ impl Shell {
             .into_any_element()
     }
 
+    fn render_sidebar_session_group(
+        id: &'static str,
+        items: Vec<AnyElement>,
+        section_start: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let section_len = items.len();
+        div()
+            .id(id)
+            .flex()
+            .flex_col()
+            .gap(px(SIDEBAR_LIST_GAP))
+            .on_drag_move::<SidebarSessionDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, cx| {
+                    let payload = event.drag(cx).clone();
+                    if payload.section_start != section_start || payload.section_len != section_len
+                    {
+                        return;
+                    }
+                    let rel_y = f32::from(event.event.position.y) - f32::from(event.bounds.top());
+                    if let Some(over) = spaces::sidebar_session_section_drop_index(
+                        rel_y,
+                        section_start,
+                        section_len,
+                    ) {
+                        this.update_sidebar_session_drag(&payload, over, cx);
+                    }
+                },
+            ))
+            .on_drop::<SidebarSessionDrag>(cx.listener(
+                move |this, payload: &SidebarSessionDrag, _, cx| {
+                    if payload.section_start == section_start && payload.section_len == section_len
+                    {
+                        this.commit_sidebar_session_drag(payload, cx);
+                    } else {
+                        this.cancel_sidebar_session_drag(cx);
+                    }
+                },
+            ))
+            .children(items)
+            .into_any_element()
+    }
+
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
@@ -3376,7 +3473,10 @@ impl Shell {
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
         // promotions glide; cleared rows just go).
-        let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+        let session_rows = self.render_active_rows(theme, cx);
+        let pinned_count = session_rows.pinned_count;
+        let has_pinned_divider = pinned_count > 0 && pinned_count < session_rows.rows.len();
+        let keyed = session_rows.rows;
 
         // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
         // list changes (new activity resort, grouping flip), surviving rows
@@ -3385,7 +3485,17 @@ impl Shell {
         // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
         // just go (matching the original). First fill and chat switches (which
         // don't reorder) never animate.
-        let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
+        let mut order: Vec<(String, f32)> =
+            Vec::with_capacity(keyed.len() + usize::from(has_pinned_divider));
+        for (ix, (key, height, _)) in keyed.iter().enumerate() {
+            if has_pinned_divider && ix == pinned_count {
+                order.push((
+                    SIDEBAR_PINNED_DIVIDER_KEY.to_string(),
+                    SIDEBAR_PINNED_DIVIDER_HEIGHT,
+                ));
+            }
+            order.push((key.clone(), *height));
+        }
         if self.sidebar_session_drag.is_none() && self.sidebar_prev_order != order {
             if !self.sidebar_prev_order.is_empty() {
                 let offsets = resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
@@ -3507,27 +3617,38 @@ impl Shell {
         let filter_row = self.render_spaces_filter(theme, cx);
         let active_count = list_items.len();
         let active_list = if active_count > 0 {
+            let mut pinned_items = list_items;
+            let regular_items = pinned_items.split_off(pinned_count);
+            let pinned_group = (!pinned_items.is_empty()).then(|| {
+                Self::render_sidebar_session_group("sidebar-pinned-sessions", pinned_items, 0, cx)
+            });
+            let regular_group = (!regular_items.is_empty()).then(|| {
+                Self::render_sidebar_session_group(
+                    "sidebar-regular-sessions",
+                    regular_items,
+                    pinned_count,
+                    cx,
+                )
+            });
             div()
                 .id("sidebar-active-sessions")
                 .flex()
                 .flex_col()
                 .gap(px(SIDEBAR_LIST_GAP))
                 .pb(px(Theme::SPACE_SM))
-                .on_drag_move::<SidebarSessionDrag>(cx.listener(
-                    move |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, cx| {
-                        let payload = event.drag(cx).clone();
-                        let rel_y =
-                            f32::from(event.event.position.y) - f32::from(event.bounds.top());
-                        let over = spaces::sidebar_session_drop_index(rel_y, active_count);
-                        this.update_sidebar_session_drag(&payload, over, cx);
-                    },
-                ))
-                .on_drop::<SidebarSessionDrag>(cx.listener(
-                    |this, payload: &SidebarSessionDrag, _, cx| {
-                        this.commit_sidebar_session_drag(payload, cx);
-                    },
-                ))
-                .children(list_items)
+                .when_some(pinned_group, |el, group| el.child(group))
+                .when(has_pinned_divider, |el| {
+                    el.child(
+                        div()
+                            .id(SIDEBAR_PINNED_DIVIDER_KEY)
+                            .h(px(SIDEBAR_PINNED_DIVIDER_HEIGHT))
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .child(div().h(px(1.0)).w_full().bg(theme.border.opacity(0.6))),
+                    )
+                })
+                .when_some(regular_group, |el, group| el.child(group))
                 .into_any_element()
         } else {
             div()
@@ -3578,7 +3699,6 @@ impl Shell {
                                         f32::from(event.event.position.y),
                                         f32::from(event.bounds.top()),
                                         f32::from(event.bounds.bottom()),
-                                        active_count,
                                         cx,
                                     );
                                 },
@@ -4362,7 +4482,13 @@ impl Shell {
 
         if let Some((chat_id, position)) = self.chat_menu.get().cloned() {
             let chat_menu_closing = self.chat_menu.closing_since();
+            let is_pinned = self
+                .settings
+                .sidebar_pinned_session_ids
+                .iter()
+                .any(|id| id == &chat_id);
             let rename_id = chat_id.clone();
+            let pin_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
@@ -4380,6 +4506,15 @@ impl Shell {
                         }))
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
+                )
+                .child(
+                    popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                        .id("chat-menu-pin")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
+                        }))
+                        .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" })),
                 )
                 .child(
                     popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))

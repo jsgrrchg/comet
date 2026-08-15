@@ -1081,15 +1081,59 @@ const MESSAGE_COMPOSER_CONTEXT: &str = "MessageComposer";
 const PALETTE_SEARCH_CONTEXT: &str = "PaletteSearch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessagePlainEnterAction {
+enum MessageEnterBindingAction {
     Submit,
     NewlineOrAccept,
 }
 
-pub fn message_plain_enter_action(behavior: ComposerSendBehavior) -> MessagePlainEnterAction {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessageEnterBinding {
+    keystroke: String,
+    action: MessageEnterBindingAction,
+}
+
+fn message_enter_bindings(
+    behavior: ComposerSendBehavior,
+    modifier_combo: &str,
+) -> Vec<MessageEnterBinding> {
     match behavior {
-        ComposerSendBehavior::Enter => MessagePlainEnterAction::Submit,
-        ComposerSendBehavior::ModEnter => MessagePlainEnterAction::NewlineOrAccept,
+        ComposerSendBehavior::Enter => vec![MessageEnterBinding {
+            keystroke: "enter".into(),
+            action: MessageEnterBindingAction::Submit,
+        }],
+        ComposerSendBehavior::ModEnter => vec![
+            MessageEnterBinding {
+                keystroke: "enter".into(),
+                action: MessageEnterBindingAction::NewlineOrAccept,
+            },
+            MessageEnterBinding {
+                keystroke: modifier_combo.into(),
+                action: MessageEnterBindingAction::Submit,
+            },
+        ],
+    }
+}
+
+fn message_input_context(wizard_active: bool) -> &'static str {
+    if wizard_active {
+        GENERIC_COMPOSER_CONTEXT
+    } else {
+        MESSAGE_COMPOSER_CONTEXT
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnterOutcome {
+    AcceptCompletion,
+    Submit,
+    Newline,
+}
+
+fn enter_outcome(has_completion: bool, fallback: EnterOutcome) -> EnterOutcome {
+    if has_completion {
+        EnterOutcome::AcceptCompletion
+    } else {
+        fallback
     }
 }
 
@@ -1186,23 +1230,18 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
     ));
 
     let mut message_bindings = input_bindings(MESSAGE_COMPOSER_CONTEXT);
-    match message_plain_enter_action(send_behavior) {
-        MessagePlainEnterAction::Submit => message_bindings.push(KeyBinding::new(
-            "enter",
-            Submit,
-            Some(MESSAGE_COMPOSER_CONTEXT),
-        )),
-        MessagePlainEnterAction::NewlineOrAccept => {
-            message_bindings.push(KeyBinding::new(
-                "enter",
-                MessageNewlineOrAccept,
-                Some(MESSAGE_COMPOSER_CONTEXT),
-            ));
-            message_bindings.push(KeyBinding::new(
-                &platform_combo("mod-enter"),
+    for binding in message_enter_bindings(send_behavior, &platform_combo("mod-enter")) {
+        match binding.action {
+            MessageEnterBindingAction::Submit => message_bindings.push(KeyBinding::new(
+                &binding.keystroke,
                 Submit,
                 Some(MESSAGE_COMPOSER_CONTEXT),
-            ));
+            )),
+            MessageEnterBindingAction::NewlineOrAccept => message_bindings.push(KeyBinding::new(
+                &binding.keystroke,
+                MessageNewlineOrAccept,
+                Some(MESSAGE_COMPOSER_CONTEXT),
+            )),
         }
     }
 
@@ -2177,19 +2216,19 @@ impl ComposerInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.mention_has_selection {
-            cx.emit(ComposerInputEvent::MentionAccept);
-        } else {
-            self.replace_text_in_range(None, "\n", window, cx);
+        match enter_outcome(self.mention_has_selection, EnterOutcome::Newline) {
+            EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
+            EnterOutcome::Newline => self.replace_text_in_range(None, "\n", window, cx),
+            EnterOutcome::Submit => unreachable!("newline action cannot submit"),
         }
     }
 
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(if self.mention_has_selection {
-            ComposerInputEvent::MentionAccept
-        } else {
-            ComposerInputEvent::Submitted
-        });
+        match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
+            EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
+            EnterOutcome::Submit => cx.emit(ComposerInputEvent::Submitted),
+            EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
+        }
     }
 
     fn mention_tab(&mut self, _: &MentionTab, _: &mut Window, cx: &mut Context<Self>) {
@@ -4416,11 +4455,7 @@ impl Composer {
                 }
             }
         }
-        let input_context = if self.wizard.is_some() {
-            GENERIC_COMPOSER_CONTEXT
-        } else {
-            MESSAGE_COMPOSER_CONTEXT
-        };
+        let input_context = message_input_context(self.wizard.is_some());
         self.input
             .update(cx, |input, cx| input.set_key_context(input_context, cx));
         cx.notify();
@@ -5735,15 +5770,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn message_plain_enter_follows_the_send_preference() {
+    fn message_enter_bindings_cover_both_platform_modifiers() {
         assert_eq!(
-            message_plain_enter_action(ComposerSendBehavior::Enter),
-            MessagePlainEnterAction::Submit
+            message_enter_bindings(ComposerSendBehavior::Enter, "cmd-enter"),
+            vec![MessageEnterBinding {
+                keystroke: "enter".into(),
+                action: MessageEnterBindingAction::Submit,
+            }]
         );
         assert_eq!(
-            message_plain_enter_action(ComposerSendBehavior::ModEnter),
-            MessagePlainEnterAction::NewlineOrAccept
+            message_enter_bindings(ComposerSendBehavior::ModEnter, "cmd-enter"),
+            vec![
+                MessageEnterBinding {
+                    keystroke: "enter".into(),
+                    action: MessageEnterBindingAction::NewlineOrAccept,
+                },
+                MessageEnterBinding {
+                    keystroke: "cmd-enter".into(),
+                    action: MessageEnterBindingAction::Submit,
+                },
+            ]
         );
+        assert_eq!(
+            message_enter_bindings(ComposerSendBehavior::ModEnter, "ctrl-enter"),
+            vec![
+                MessageEnterBinding {
+                    keystroke: "enter".into(),
+                    action: MessageEnterBindingAction::NewlineOrAccept,
+                },
+                MessageEnterBinding {
+                    keystroke: "ctrl-enter".into(),
+                    action: MessageEnterBindingAction::Submit,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn message_enter_never_adds_extra_modifier_bindings() {
+        let bindings = message_enter_bindings(ComposerSendBehavior::ModEnter, "cmd-enter");
+        assert!(!bindings.iter().any(|binding| {
+            matches!(
+                binding.keystroke.as_str(),
+                "ctrl-enter" | "shift-cmd-enter" | "alt-cmd-enter"
+            )
+        }));
+    }
+
+    #[test]
+    fn enter_accepts_a_completion_before_submit_or_newline() {
+        assert_eq!(
+            enter_outcome(true, EnterOutcome::Submit),
+            EnterOutcome::AcceptCompletion
+        );
+        assert_eq!(
+            enter_outcome(true, EnterOutcome::Newline),
+            EnterOutcome::AcceptCompletion
+        );
+        assert_eq!(
+            enter_outcome(false, EnterOutcome::Submit),
+            EnterOutcome::Submit
+        );
+        assert_eq!(
+            enter_outcome(false, EnterOutcome::Newline),
+            EnterOutcome::Newline
+        );
+    }
+
+    #[test]
+    fn wizard_borrows_the_generic_enter_context_only_while_active() {
+        assert_eq!(message_input_context(false), MESSAGE_COMPOSER_CONTEXT);
+        assert_eq!(message_input_context(true), GENERIC_COMPOSER_CONTEXT);
     }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {

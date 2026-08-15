@@ -290,6 +290,14 @@ pub enum GitHistoryAuthorDisplay {
     Name,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ComposerSendBehavior {
+    #[default]
+    Enter,
+    ModEnter,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -343,6 +351,9 @@ pub struct UiSettings {
     pub terminal_open: bool,
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
+    /// Whether the message composer sends with Enter or the platform modifier
+    /// plus Enter. Device-local and opt-in.
+    pub composer_send_behavior: ComposerSendBehavior,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
     /// Interface and conversational-prose family. Device-local by design.
@@ -380,6 +391,7 @@ impl Default for UiSettings {
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
+            composer_send_behavior: ComposerSendBehavior::default(),
             appearance: crate::appearance::AppearanceMode::default(),
             ui_font_family: crate::typography::UiFontFamily::default(),
             ui_font_size: crate::typography::UiFontSize::default(),
@@ -729,6 +741,7 @@ mod tests {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
             },
+            composer_send_behavior: ComposerSendBehavior::ModEnter,
             appearance: crate::appearance::AppearanceMode::Light,
             ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
             ui_font_size: crate::typography::UiFontSize::ALL[5],
@@ -828,6 +841,7 @@ mod tests {
             GitHistoryAuthorDisplay::Avatar,
             "pre-author-display files default to avatars"
         );
+        assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
     }
 
     #[test]
@@ -1055,6 +1069,7 @@ mod tests {
         assert_eq!(d.right_pane_width, 520.0);
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
+        assert_eq!(d.composer_send_behavior, ComposerSendBehavior::Enter);
     }
 
     #[test]
@@ -1143,6 +1158,21 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
+    }
+
+    #[test]
+    fn composer_send_behavior_is_opt_in_for_old_and_partial_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert!(!loaded.sound_enabled);
     }
 
     #[test]

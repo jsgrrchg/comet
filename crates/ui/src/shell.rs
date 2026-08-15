@@ -1909,14 +1909,26 @@ impl Shell {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
-                    let page = cx.new(|cx| ShortcutsPage::new(state, keymap, cx));
+                    let composer_send_behavior = self.settings.composer_send_behavior;
+                    let page =
+                        cx.new(|cx| ShortcutsPage::new(state, keymap, composer_send_behavior, cx));
                     // Persist + re-apply the keymap whenever the page changes it.
                     self.shortcuts_sub = Some(cx.subscribe(
                         &page,
                         |this: &mut Shell, _, event: &ShortcutsEvent, cx| {
-                            let ShortcutsEvent::Changed(keymap) = event;
-                            this.settings.keymap = keymap.clone();
-                            apply_keymap(cx, keymap, this.settings.composer_send_behavior);
+                            match event {
+                                ShortcutsEvent::KeymapChanged(keymap) => {
+                                    this.settings.keymap = keymap.clone();
+                                }
+                                ShortcutsEvent::ComposerSendBehaviorChanged(behavior) => {
+                                    this.settings.composer_send_behavior = *behavior;
+                                }
+                            }
+                            apply_keymap(
+                                cx,
+                                &this.settings.keymap,
+                                this.settings.composer_send_behavior,
+                            );
                             this.schedule_save(cx);
                             cx.notify();
                         },

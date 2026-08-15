@@ -210,6 +210,12 @@ fn right_pane_max_width(viewport: f32, sidebar: f32) -> f32 {
     (viewport - sidebar - CHAT_PANEL_MIN).max(0.0)
 }
 
+/// Width used by right-pane takeover. Unlike manual resizing, takeover is
+/// intentionally allowed to consume the conversation column completely.
+fn right_pane_takeover_width(viewport: f32, sidebar: f32) -> f32 {
+    (viewport - sidebar).max(0.0)
+}
+
 /// One right-pane surface tab (t3code RightPanelSurface): a Diff or History
 /// page (each backed by its own [`Changes`] viewer) or one embedded terminal keyed by its
 /// [`TerminalPanel`] tab key. `Picker` is the empty state ("Open a surface").
@@ -1529,15 +1535,16 @@ impl Shell {
         if !self.right_pane_open(cx) {
             0.0
         } else {
-            // Preserve a usable conversation column while giving everything
-            // else physically available to the right pane. Rides the sidebar
+            // Manual sizing preserves a usable conversation column. Takeover
+            // intentionally consumes it completely. Both ride the sidebar
             // tween so toggling it remains seamless.
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-            let available = right_pane_max_width(self.viewport_width, sidebar_now);
             if self.right_pane_expanded {
-                available
+                right_pane_takeover_width(self.viewport_width, sidebar_now)
             } else {
-                self.settings.right_pane_width.min(available)
+                self.settings
+                    .right_pane_width
+                    .min(right_pane_max_width(self.viewport_width, sidebar_now))
             }
         }
     }
@@ -7239,6 +7246,12 @@ mod tests {
         assert!(SyncFlow::SwitchOffer { notice_open: true }.has_visible_overlay());
         assert!(SyncFlow::Importing { done: 1, total: 3 }.has_visible_overlay());
         assert!(SyncFlow::SignOutConfirm.has_visible_overlay());
+    }
+
+    #[test]
+    fn right_pane_takeover_consumes_the_chat_column() {
+        assert_eq!(right_pane_takeover_width(1200.0, 256.0), 944.0);
+        assert_eq!(1200.0 - 256.0 - 944.0, 0.0);
     }
 
     #[tokio::test]

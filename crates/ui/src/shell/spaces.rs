@@ -89,6 +89,57 @@ pub(super) fn retain_known_sessions(
     saved_ids.len() != before
 }
 
+/// Edge-scroll speed is proportional inside the band and capped per frame.
+pub(super) fn sidebar_drag_scroll_delta(
+    pointer_y: f32,
+    viewport_top: f32,
+    viewport_bottom: f32,
+) -> f32 {
+    if viewport_bottom <= viewport_top {
+        return 0.0;
+    }
+    if pointer_y < viewport_top + super::SIDEBAR_DRAG_SCROLL_BAND {
+        let penetration = ((viewport_top + super::SIDEBAR_DRAG_SCROLL_BAND - pointer_y)
+            / super::SIDEBAR_DRAG_SCROLL_BAND)
+            .clamp(0.0, 1.0);
+        -super::SIDEBAR_DRAG_SCROLL_MAX * penetration
+    } else if pointer_y > viewport_bottom - super::SIDEBAR_DRAG_SCROLL_BAND {
+        let penetration = ((pointer_y - (viewport_bottom - super::SIDEBAR_DRAG_SCROLL_BAND))
+            / super::SIDEBAR_DRAG_SCROLL_BAND)
+            .clamp(0.0, 1.0);
+        super::SIDEBAR_DRAG_SCROLL_MAX * penetration
+    } else {
+        0.0
+    }
+}
+
+/// Return the next logical scroll top, or `None` when a frame loop should stop.
+pub(super) fn sidebar_drag_scroll_step(
+    drag_active: bool,
+    loop_generation: u64,
+    drag_generation: u64,
+    current: f32,
+    max: f32,
+    delta: f32,
+) -> Option<f32> {
+    if !drag_active || loop_generation != drag_generation || delta == 0.0 {
+        return None;
+    }
+    let next = (current + delta).clamp(0.0, max.max(0.0));
+    (next != current).then_some(next)
+}
+
+/// A frozen drag remains valid when all snapshotted rows are still active in
+/// the same filter. Newly arrived rows are deliberately allowed.
+pub(super) fn sidebar_drag_snapshot_is_valid(
+    dragged_id: &str,
+    snapshot_ids: &[String],
+    current_ids: &HashSet<String>,
+) -> bool {
+    snapshot_ids.iter().any(|id| id == dragged_id)
+        && snapshot_ids.iter().all(|id| current_ids.contains(id))
+}
+
 /// Quantize a pointer position within the active list into a card slot.
 pub(super) fn sidebar_session_drop_index(rel_y: f32, count: usize) -> usize {
     if count == 0 {
@@ -195,6 +246,9 @@ impl Shell {
     /// new-session canvas the space context follows the filter — the canvas
     /// default is "the space you're looking at".
     pub(super) fn set_space_filter(&mut self, filter: Option<String>, cx: &mut Context<Self>) {
+        if self.settings.space_filter != filter {
+            self.cancel_sidebar_session_drag(cx);
+        }
         self.settings.space_filter = filter.clone();
         if let Some(space_id) = filter
             && self.state.read(cx).selected_chat.is_none()
@@ -220,6 +274,7 @@ impl Shell {
     /// Land in a just-added space: filter the sidebar to it and open the
     /// new-session canvas there.
     pub(super) fn land_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+        self.cancel_sidebar_session_drag(cx);
         self.route = Route::Chat;
         self.settings.space_filter = Some(space_id.clone());
         self.settings.last_space_id = Some(space_id.clone());
@@ -235,34 +290,197 @@ impl Shell {
 
     pub(super) fn update_sidebar_session_drag(
         &mut self,
-        chat_id: String,
-        visible_ids: std::sync::Arc<Vec<String>>,
+        payload: &SidebarSessionDrag,
         over: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(from) = visible_ids.iter().position(|id| id == &chat_id) else {
-            self.sidebar_session_drag = None;
+        let Some(from) = payload
+            .visible_ids
+            .iter()
+            .position(|id| id == &payload.chat_id)
+        else {
+            self.cancel_sidebar_session_drag(cx);
             return;
         };
         match &mut self.sidebar_session_drag {
-            Some(drag) if drag.chat_id == chat_id && drag.over != over => {
+            Some(drag)
+                if drag.chat_id == payload.chat_id
+                    && drag.filter == payload.filter
+                    && drag.over != over =>
+            {
                 drag.prev_over = drag.over;
                 drag.over = over;
                 drag.epoch = drag.epoch.wrapping_add(1);
                 cx.notify();
             }
-            Some(drag) if drag.chat_id == chat_id => {}
+            Some(drag) if drag.chat_id == payload.chat_id && drag.filter == payload.filter => {}
             _ => {
+                self.sidebar_session_drag_generation =
+                    self.sidebar_session_drag_generation.wrapping_add(1);
                 self.sidebar_session_drag = Some(SidebarSessionDragState {
-                    chat_id,
-                    visible_ids,
+                    chat_id: payload.chat_id.clone(),
+                    visible_ids: payload.visible_ids.clone(),
                     from,
                     over,
                     prev_over: from,
                     epoch: 0,
+                    filter: payload.filter.clone(),
+                    pointer_y: None,
+                    viewport_top: 0.0,
+                    viewport_bottom: 0.0,
+                    generation: self.sidebar_session_drag_generation,
+                    autoscroll_active: false,
                 });
                 cx.notify();
             }
+        }
+    }
+
+    pub(super) fn track_sidebar_session_drag_pointer(
+        &mut self,
+        payload: SidebarSessionDrag,
+        pointer_y: f32,
+        viewport_top: f32,
+        viewport_bottom: f32,
+        active_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let scroll_top = -f32::from(self.sidebar_scroll.offset().y);
+        let rel_y = pointer_y - viewport_top + scroll_top - super::SIDEBAR_LIST_PAD_TOP;
+        let active_height =
+            active_count as f32 * super::SIDEBAR_SESSION_SLOT - super::SIDEBAR_LIST_GAP;
+        if active_count == 0 || rel_y < 0.0 || rel_y > active_height {
+            if let Some(drag) = self.sidebar_session_drag.as_mut() {
+                drag.pointer_y = None;
+                drag.autoscroll_active = false;
+            }
+            return;
+        }
+
+        let over = sidebar_session_drop_index(rel_y, active_count);
+        self.update_sidebar_session_drag(&payload, over, cx);
+        let delta = sidebar_drag_scroll_delta(pointer_y, viewport_top, viewport_bottom);
+        let Some(drag) = self.sidebar_session_drag.as_mut() else {
+            return;
+        };
+        drag.pointer_y = Some(pointer_y);
+        drag.viewport_top = viewport_top;
+        drag.viewport_bottom = viewport_bottom;
+        let should_start = delta != 0.0 && !drag.autoscroll_active;
+        let generation = drag.generation;
+        if should_start {
+            drag.autoscroll_active = true;
+            self.start_sidebar_session_autoscroll(generation, cx);
+        }
+    }
+
+    fn start_sidebar_session_autoscroll(&mut self, generation: u64, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(
+                        super::SIDEBAR_DRAG_SCROLL_FRAME_MS,
+                    ))
+                    .await;
+                let keep_running = this
+                    .update(cx, |shell, cx| {
+                        shell.sidebar_session_autoscroll_tick(generation, cx)
+                    })
+                    .unwrap_or(false);
+                if !keep_running {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn sidebar_session_autoscroll_tick(&mut self, generation: u64, cx: &mut Context<Self>) -> bool {
+        let Some(drag) = self.sidebar_session_drag.as_ref() else {
+            return false;
+        };
+        if drag.generation != generation || !cx.has_active_drag() {
+            if let Some(drag) = self.sidebar_session_drag.as_mut() {
+                drag.autoscroll_active = false;
+            }
+            return false;
+        }
+        let Some(pointer_y) = drag.pointer_y else {
+            if let Some(drag) = self.sidebar_session_drag.as_mut() {
+                drag.autoscroll_active = false;
+            }
+            return false;
+        };
+        let viewport_top = drag.viewport_top;
+        let viewport_bottom = drag.viewport_bottom;
+        let active_count = drag.visible_ids.len();
+        let delta = sidebar_drag_scroll_delta(pointer_y, viewport_top, viewport_bottom);
+        let scroll_top = -f32::from(self.sidebar_scroll.offset().y);
+        let max_scroll = f32::from(self.sidebar_scroll.max_offset().y);
+        let Some(next_scroll) = sidebar_drag_scroll_step(
+            true,
+            generation,
+            drag.generation,
+            scroll_top,
+            max_scroll,
+            delta,
+        ) else {
+            if let Some(drag) = self.sidebar_session_drag.as_mut() {
+                drag.autoscroll_active = false;
+            }
+            return false;
+        };
+
+        let rel_y = pointer_y - viewport_top + next_scroll - super::SIDEBAR_LIST_PAD_TOP;
+        let active_height =
+            active_count as f32 * super::SIDEBAR_SESSION_SLOT - super::SIDEBAR_LIST_GAP;
+        if active_count == 0 || rel_y < 0.0 || rel_y > active_height {
+            if let Some(drag) = self.sidebar_session_drag.as_mut() {
+                drag.autoscroll_active = false;
+            }
+            return false;
+        }
+
+        let offset = self.sidebar_scroll.offset();
+        self.sidebar_scroll
+            .set_offset(gpui::point(offset.x, px(-next_scroll)));
+        let over = sidebar_session_drop_index(rel_y, active_count);
+        if let Some(drag) = self.sidebar_session_drag.as_mut()
+            && drag.over != over
+        {
+            drag.prev_over = drag.over;
+            drag.over = over;
+            drag.epoch = drag.epoch.wrapping_add(1);
+        }
+        cx.notify();
+        true
+    }
+
+    pub(super) fn sidebar_session_drag_is_valid(&self, cx: &App) -> bool {
+        let Some(drag) = self.sidebar_session_drag.as_ref() else {
+            return true;
+        };
+        if drag.filter != self.settings.space_filter {
+            return false;
+        }
+        let state = self.state.read(cx);
+        let current_ids: HashSet<String> = state
+            .overview_chats(Utc::now())
+            .into_iter()
+            .filter(|(_, chat)| match &drag.filter {
+                Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
+                None => true,
+            })
+            .map(|(_, chat)| chat.id.clone())
+            .collect();
+        sidebar_drag_snapshot_is_valid(&drag.chat_id, drag.visible_ids.as_ref(), &current_ids)
+    }
+
+    pub(super) fn cancel_sidebar_session_drag(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_session_drag.take().is_some() {
+            self.sidebar_session_drag_generation =
+                self.sidebar_session_drag_generation.wrapping_add(1);
+            cx.notify();
         }
     }
 
@@ -271,10 +489,18 @@ impl Shell {
         payload: &SidebarSessionDrag,
         cx: &mut Context<Self>,
     ) {
+        if !self.sidebar_session_drag_is_valid(cx) {
+            self.cancel_sidebar_session_drag(cx);
+            return;
+        }
         let Some(drag) = self.sidebar_session_drag.take() else {
             return;
         };
-        if drag.chat_id != payload.chat_id {
+        self.sidebar_session_drag_generation = self.sidebar_session_drag_generation.wrapping_add(1);
+        if drag.chat_id != payload.chat_id
+            || drag.filter != payload.filter
+            || drag.visible_ids.as_ref() != payload.visible_ids.as_ref()
+        {
             cx.notify();
             return;
         }
@@ -815,6 +1041,7 @@ impl Shell {
                     title: title.clone(),
                     space_name: space_name.clone(),
                     visible_ids: visible_ids.clone(),
+                    filter: filter.clone(),
                 };
                 let element = self.render_chat_row(
                     chat.id.clone(),
@@ -2318,7 +2545,8 @@ impl Shell {
 mod local_order_tests {
     use super::{
         materialize_local_order, project_local_order, reorder_visible_projection,
-        retain_known_sessions, sidebar_session_drop_index,
+        retain_known_sessions, sidebar_drag_scroll_delta, sidebar_drag_scroll_step,
+        sidebar_drag_snapshot_is_valid, sidebar_session_drop_index,
     };
     use std::collections::HashSet;
 
@@ -2415,5 +2643,55 @@ mod local_order_tests {
         assert_eq!(sidebar_session_drop_index(63.0, 3), 1);
         assert_eq!(sidebar_session_drop_index(500.0, 3), 2);
         assert_eq!(sidebar_session_drop_index(10.0, 0), 0);
+    }
+
+    #[test]
+    fn sidebar_session_order_edge_scroll_is_proportional_and_capped() {
+        let top = 100.0;
+        let bottom = 300.0;
+        assert_eq!(sidebar_drag_scroll_delta(200.0, top, bottom), 0.0);
+        assert_eq!(sidebar_drag_scroll_delta(124.0, top, bottom), -6.0);
+        assert_eq!(sidebar_drag_scroll_delta(276.0, top, bottom), 6.0);
+        assert_eq!(sidebar_drag_scroll_delta(0.0, top, bottom), -12.0);
+        assert_eq!(sidebar_drag_scroll_delta(400.0, top, bottom), 12.0);
+    }
+
+    #[test]
+    fn sidebar_session_order_edge_scroll_stops_with_drag_lifecycle() {
+        assert_eq!(
+            sidebar_drag_scroll_step(true, 4, 4, 20.0, 100.0, 6.0),
+            Some(26.0)
+        );
+        assert_eq!(
+            sidebar_drag_scroll_step(false, 4, 4, 20.0, 100.0, 6.0),
+            None
+        );
+        assert_eq!(sidebar_drag_scroll_step(true, 3, 4, 20.0, 100.0, 6.0), None);
+        assert_eq!(
+            sidebar_drag_scroll_step(true, 4, 4, 100.0, 100.0, 6.0),
+            None
+        );
+        assert_eq!(sidebar_drag_scroll_step(true, 4, 4, 0.0, 100.0, -6.0), None);
+    }
+
+    #[test]
+    fn sidebar_session_order_drag_snapshot_allows_additions_but_not_removals() {
+        let snapshot = ids(&["a", "b"]);
+        let with_new = HashSet::from(["new".to_string(), "a".to_string(), "b".to_string()]);
+        assert!(sidebar_drag_snapshot_is_valid("a", &snapshot, &with_new));
+
+        let without_dragged = HashSet::from(["b".to_string()]);
+        assert!(!sidebar_drag_snapshot_is_valid(
+            "a",
+            &snapshot,
+            &without_dragged
+        ));
+
+        let without_sibling = HashSet::from(["a".to_string()]);
+        assert!(!sidebar_drag_snapshot_is_valid(
+            "a",
+            &snapshot,
+            &without_sibling
+        ));
     }
 }

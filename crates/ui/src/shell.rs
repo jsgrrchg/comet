@@ -389,6 +389,11 @@ const SIDEBAR_SESSION_SLOT: f32 = CHAT_ROW_HEIGHT + SIDEBAR_LIST_GAP;
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
+/// Pointer band and per-frame cap for session-card edge autoscroll.
+const SIDEBAR_DRAG_SCROLL_BAND: f32 = 48.0;
+const SIDEBAR_DRAG_SCROLL_MAX: f32 = 12.0;
+const SIDEBAR_DRAG_SCROLL_FRAME_MS: u64 = 16;
+const SIDEBAR_LIST_PAD_TOP: f32 = 4.0;
 
 /// Drag marker for the sidebar resize handle.
 struct SidebarResize;
@@ -415,11 +420,13 @@ struct RightTabDragState {
 /// Device-local active-session reorder payload. The visible ids are shared by
 /// every row payload in a frame, so a drag can freeze one filtered projection
 /// without cloning the whole list per card.
+#[derive(Clone)]
 struct SidebarSessionDrag {
     chat_id: String,
     title: SharedString,
     space_name: SharedString,
     visible_ids: std::sync::Arc<Vec<String>>,
+    filter: Option<String>,
 }
 
 /// Live destination for a sidebar session drag. The dragged row stays in the
@@ -431,6 +438,12 @@ struct SidebarSessionDragState {
     over: usize,
     prev_over: usize,
     epoch: usize,
+    filter: Option<String>,
+    pointer_y: Option<f32>,
+    viewport_top: f32,
+    viewport_bottom: f32,
+    generation: u64,
+    autoscroll_active: bool,
 }
 
 /// Compact card ghost following the pointer during sidebar reordering.
@@ -891,6 +904,7 @@ pub struct Shell {
     sidebar_scroll: gpui::ScrollHandle,
     /// In-flight active-session reorder. Purely local presentation state.
     sidebar_session_drag: Option<SidebarSessionDragState>,
+    sidebar_session_drag_generation: u64,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
@@ -1116,6 +1130,7 @@ impl Shell {
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             sidebar_session_drag: None,
+            sidebar_session_drag_generation: 0,
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
@@ -1353,6 +1368,9 @@ impl Shell {
             ) {
                 self.schedule_save(cx);
             }
+        }
+        if !self.sidebar_session_drag_is_valid(cx) {
+            self.cancel_sidebar_session_drag(cx);
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
         // snap, no tween — the panels belong to the destination chat).
@@ -3210,10 +3228,11 @@ impl Shell {
                 .items_center()
                 .cursor_pointer()
                 .when(corner_hovered, |el| {
-                    el.on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.set_chat_archived(archive_id.clone(), !archived, cx);
-                    }))
+                    el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_chat_archived(archive_id.clone(), !archived, cx);
+                        }))
                 })
                 .child(corner_body)
                 .into_any_element()
@@ -3377,8 +3396,10 @@ impl Shell {
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         // A release outside the active-list drop target ends GPUI's drag but
         // never calls our drop handler. Heal the ephemeral spacer state here.
-        if self.sidebar_session_drag.is_some() && !cx.has_active_drag() {
-            self.sidebar_session_drag = None;
+        if self.sidebar_session_drag.is_some()
+            && (!cx.has_active_drag() || !self.sidebar_session_drag_is_valid(cx))
+        {
+            self.cancel_sidebar_session_drag(cx);
         }
         let (user, workspace_scope) = {
             let state = self.state.read(cx);
@@ -3525,14 +3546,11 @@ impl Shell {
                 .pb(px(Theme::SPACE_SM))
                 .on_drag_move::<SidebarSessionDrag>(cx.listener(
                     move |this, event: &gpui::DragMoveEvent<SidebarSessionDrag>, _, cx| {
-                        let (chat_id, visible_ids) = {
-                            let payload = event.drag(cx);
-                            (payload.chat_id.clone(), payload.visible_ids.clone())
-                        };
+                        let payload = event.drag(cx).clone();
                         let rel_y =
                             f32::from(event.event.position.y) - f32::from(event.bounds.top());
                         let over = spaces::sidebar_session_drop_index(rel_y, active_count);
-                        this.update_sidebar_session_drag(chat_id, visible_ids, over, cx);
+                        this.update_sidebar_session_drag(&payload, over, cx);
                     },
                 ))
                 .on_drop::<SidebarSessionDrag>(cx.listener(
@@ -3580,12 +3598,28 @@ impl Shell {
                             .size_full()
                             .overflow_y_scroll()
                             .track_scroll(&self.sidebar_scroll)
+                            .on_drag_move::<SidebarSessionDrag>(cx.listener(
+                                move |this,
+                                      event: &gpui::DragMoveEvent<SidebarSessionDrag>,
+                                      _,
+                                      cx| {
+                                    let payload = event.drag(cx).clone();
+                                    this.track_sidebar_session_drag_pointer(
+                                        payload,
+                                        f32::from(event.event.position.y),
+                                        f32::from(event.bounds.top()),
+                                        f32::from(event.bounds.bottom()),
+                                        active_count,
+                                        cx,
+                                    );
+                                },
+                            ))
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
                             // No "Sessions" header (user request) — the list
                             // is the whole column; a little air stands in.
-                            .pt(px(4.0))
+                            .pt(px(SIDEBAR_LIST_PAD_TOP))
                             .child(active_list)
                             .children(archived_section),
                     ),

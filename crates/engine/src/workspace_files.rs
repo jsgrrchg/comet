@@ -6,18 +6,21 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zeron_proto::{
     ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
-    WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFileConflictReason,
-    WorkspaceFileSearchMatch, WorkspaceFileText, WorkspaceFileWriteResult, WorkspaceLineEnding,
-    WorkspaceReadOnlyReason, WorkspaceTarget, WorkspaceTextEncoding, WorkspaceWritableEncoding,
-    WorkspaceWritableLineEnding, WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
+    WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind,
+    WorkspaceFileChange, WorkspaceFileChangeKind, WorkspaceFileChanges,
+    WorkspaceFileConflictReason, WorkspaceFileSearchMatch, WorkspaceFileText,
+    WorkspaceFileWriteResult, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTarget,
+    WorkspaceTextEncoding, WorkspaceWritableEncoding, WorkspaceWritableLineEnding,
+    WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
 };
 use zeron_rpc::RpcError;
 
@@ -32,6 +35,11 @@ pub const MAX_SEARCH_RESULTS: usize = 200;
 pub const WORKSPACE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 pub const MAX_EDITABLE_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_PREVIEW_FILE_BYTES: u64 = 8 * 1024 * 1024;
+pub const WATCH_DEBOUNCE: Duration = Duration::from_millis(100);
+pub const WATCH_REPAIR_INTERVAL: Duration = Duration::from_secs(120);
+pub const MAX_WATCH_DIRS: usize = 8_000;
+const WATCH_EVENT_BUFFER: usize = 256;
+const WATCH_BROADCAST_BUFFER: usize = 64;
 
 #[derive(Clone)]
 pub struct WorkspaceFiles {
@@ -53,7 +61,23 @@ struct WorkspaceFileKey {
     path: PathBuf,
 }
 
-struct CheckoutWatch;
+struct CheckoutWatch {
+    checkout_id: String,
+    root: PathBuf,
+    sequence: AtomicU64,
+    subscribers: AtomicUsize,
+    changes_tx: broadcast::Sender<WorkspaceFileChanges>,
+    cancel: CancellationToken,
+    watcher: Mutex<Option<notify::RecommendedWatcher>>,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+pub struct WorkspaceFileSubscription {
+    receiver: broadcast::Receiver<WorkspaceFileChanges>,
+    watch: Arc<CheckoutWatch>,
+    owner: Weak<WorkspaceFilesInner>,
+    initial: Option<WorkspaceFileChanges>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedWorkspace {
@@ -380,12 +404,367 @@ impl WorkspaceFiles {
         result
     }
 
+    pub async fn watch_files(
+        &self,
+        request: WatchWorkspaceFilesRequest,
+    ) -> Result<WorkspaceFileSubscription, WorkspaceFilesError> {
+        if self.inner.cancel.is_cancelled() {
+            return Err(WorkspaceFilesError::Io(
+                "workspace file service is shutting down".into(),
+            ));
+        }
+        let workspace = self.resolve_target(&request.target).await?;
+        if let Some(existing) = lock(&self.inner.watches)
+            .get(&workspace.checkout_id)
+            .cloned()
+        {
+            return Ok(existing.subscribe(Arc::downgrade(&self.inner)));
+        }
+
+        let root = workspace.root.clone();
+        let over_budget = tokio::task::spawn_blocking(move || exceeds_watch_budget(&root))
+            .await
+            .map_err(|error| {
+                WorkspaceFilesError::Io(format!("watch budget worker failed: {error}"))
+            })?;
+        let candidate = CheckoutWatch::start(
+            workspace.checkout_id.clone(),
+            workspace.root,
+            over_budget,
+            self.inner.cancel.child_token(),
+        );
+        let watch = {
+            let mut watches = lock(&self.inner.watches);
+            if let Some(existing) = watches.get(&workspace.checkout_id) {
+                candidate.cancel.cancel();
+                lock(&candidate.watcher).take();
+                existing.clone()
+            } else {
+                watches.insert(workspace.checkout_id, candidate.clone());
+                candidate
+            }
+        };
+        Ok(watch.subscribe(Arc::downgrade(&self.inner)))
+    }
+
     /// Cancel all service-owned work. This operation is idempotent.
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
-        lock(&self.inner.watches).clear();
+        let watches: Vec<_> = {
+            let mut watches = lock(&self.inner.watches);
+            let values = watches.values().cloned().collect();
+            watches.clear();
+            values
+        };
+        let mut tasks = Vec::new();
+        for watch in watches {
+            watch.cancel.cancel();
+            lock(&watch.watcher).take();
+            if let Some(task) = lock(&watch.task).take() {
+                tasks.push(task);
+            }
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
         lock(&self.inner.write_locks).clear();
     }
+}
+
+impl CheckoutWatch {
+    fn start(
+        checkout_id: String,
+        root: PathBuf,
+        over_budget: bool,
+        cancel: CancellationToken,
+    ) -> Arc<Self> {
+        let (changes_tx, _) = broadcast::channel(WATCH_BROADCAST_BUFFER);
+        let (event_tx, event_rx) = mpsc::channel(WATCH_EVENT_BUFFER);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let overflow_notify = Arc::new(Notify::new());
+        let watcher = if over_budget {
+            None
+        } else {
+            let callback_overflow = overflow.clone();
+            let callback_notify = overflow_notify.clone();
+            notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+                match event_tx.try_send(event) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        callback_overflow.store(true, Ordering::Release);
+                        callback_notify.notify_one();
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {}
+                }
+            })
+            .ok()
+            .and_then(|mut watcher| {
+                use notify::Watcher as _;
+                watcher
+                    .watch(&root, notify::RecursiveMode::Recursive)
+                    .ok()
+                    .map(|()| watcher)
+            })
+        };
+        let repair_only = over_budget || watcher.is_none();
+        let watch = Arc::new(Self {
+            checkout_id,
+            root,
+            sequence: AtomicU64::new(0),
+            subscribers: AtomicUsize::new(0),
+            changes_tx,
+            cancel,
+            watcher: Mutex::new(watcher),
+            task: Mutex::new(None),
+        });
+        let task = tokio::spawn(watch_task(
+            Arc::downgrade(&watch),
+            event_rx,
+            overflow,
+            overflow_notify,
+            repair_only,
+        ));
+        *lock(&watch.task) = Some(task);
+        watch
+    }
+
+    fn subscribe(self: &Arc<Self>, owner: Weak<WorkspaceFilesInner>) -> WorkspaceFileSubscription {
+        self.subscribers.fetch_add(1, Ordering::AcqRel);
+        let initial = self.resync();
+        WorkspaceFileSubscription {
+            receiver: self.changes_tx.subscribe(),
+            watch: self.clone(),
+            owner,
+            initial: Some(initial),
+        }
+    }
+
+    fn resync(&self) -> WorkspaceFileChanges {
+        WorkspaceFileChanges {
+            sequence: self.sequence.fetch_add(1, Ordering::AcqRel) + 1,
+            resync_required: true,
+            changes: Vec::new(),
+        }
+    }
+
+    fn publish(&self, resync_required: bool, changes: Vec<WorkspaceFileChange>) {
+        let _ = self.changes_tx.send(WorkspaceFileChanges {
+            sequence: self.sequence.fetch_add(1, Ordering::AcqRel) + 1,
+            resync_required,
+            changes,
+        });
+    }
+}
+
+impl WorkspaceFileSubscription {
+    pub async fn recv(&mut self) -> Option<WorkspaceFileChanges> {
+        if self.watch.cancel.is_cancelled() {
+            return None;
+        }
+        if let Some(initial) = self.initial.take() {
+            return Some(initial);
+        }
+        loop {
+            let received = tokio::select! {
+                _ = self.watch.cancel.cancelled() => return None,
+                received = self.receiver.recv() => received,
+            };
+            match received {
+                Ok(changes) => return Some(changes),
+                Err(broadcast::error::RecvError::Lagged(_)) => return Some(self.watch.resync()),
+                Err(broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
+impl Drop for WorkspaceFileSubscription {
+    fn drop(&mut self) {
+        if self.watch.subscribers.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        self.watch.cancel.cancel();
+        lock(&self.watch.watcher).take();
+        if let Some(owner) = self.owner.upgrade() {
+            let mut watches = lock(&owner.watches);
+            if watches
+                .get(&self.watch.checkout_id)
+                .is_some_and(|watch| Arc::ptr_eq(watch, &self.watch))
+            {
+                watches.remove(&self.watch.checkout_id);
+            }
+        }
+    }
+}
+
+async fn watch_task(
+    watch: Weak<CheckoutWatch>,
+    mut event_rx: mpsc::Receiver<Result<notify::Event, notify::Error>>,
+    overflow: Arc<AtomicBool>,
+    overflow_notify: Arc<Notify>,
+    repair_only: bool,
+) {
+    let Some(initial) = watch.upgrade() else {
+        return;
+    };
+    let cancel = initial.cancel.clone();
+    drop(initial);
+    let mut repair = tokio::time::interval(WATCH_REPAIR_INTERVAL);
+    repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    repair.tick().await;
+    loop {
+        enum Wake {
+            Event(Result<notify::Event, notify::Error>),
+            Overflow,
+            Repair,
+        }
+        let wake = tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = overflow_notify.notified() => Wake::Overflow,
+            _ = repair.tick() => Wake::Repair,
+            event = event_rx.recv(), if !repair_only => match event {
+                Some(event) => Wake::Event(event),
+                None => return,
+            },
+        };
+        let Some(watch) = watch.upgrade() else {
+            return;
+        };
+        match wake {
+            Wake::Overflow | Wake::Repair => {
+                overflow.store(false, Ordering::Release);
+                watch.publish(true, Vec::new());
+            }
+            Wake::Event(first) => {
+                let mut events = vec![first];
+                loop {
+                    match tokio::time::timeout(WATCH_DEBOUNCE, event_rx.recv()).await {
+                        Ok(Some(event)) => events.push(event),
+                        Ok(None) => return,
+                        Err(_) => break,
+                    }
+                }
+                let overflowed = overflow.swap(false, Ordering::AcqRel);
+                let (mut resync_required, changes) = normalize_watch_events(&watch.root, events);
+                resync_required |= overflowed;
+                if resync_required || !changes.is_empty() {
+                    watch.publish(resync_required, changes);
+                }
+            }
+        }
+    }
+}
+
+fn normalize_watch_events(
+    root: &Path,
+    events: Vec<Result<notify::Event, notify::Error>>,
+) -> (bool, Vec<WorkspaceFileChange>) {
+    use notify::EventKind;
+    use notify::event::{ModifyKind, RenameMode};
+
+    let mut resync_required = false;
+    let mut changes: HashMap<String, WorkspaceFileChange> = HashMap::new();
+    for event in events {
+        let event = match event {
+            Ok(event) => event,
+            Err(_) => {
+                resync_required = true;
+                continue;
+            }
+        };
+        if matches!(
+            event.kind,
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both))
+        ) && event.paths.len() >= 2
+        {
+            let old_path = normalize_watch_path(root, &event.paths[0]);
+            let path = event
+                .paths
+                .last()
+                .and_then(|path| normalize_watch_path(root, path));
+            if let (Some(old_path), Some(path)) = (old_path, path) {
+                changes.insert(
+                    path.clone(),
+                    WorkspaceFileChange {
+                        kind: WorkspaceFileChangeKind::Renamed,
+                        path,
+                        old_path: Some(old_path),
+                    },
+                );
+            }
+            continue;
+        }
+        let kind = match event.kind {
+            EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
+                Some(WorkspaceFileChangeKind::Created)
+            }
+            EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From)) => {
+                Some(WorkspaceFileChangeKind::Removed)
+            }
+            EventKind::Modify(_) | EventKind::Any | EventKind::Other => {
+                Some(WorkspaceFileChangeKind::Modified)
+            }
+            EventKind::Access(_) => None,
+        };
+        let Some(kind) = kind else { continue };
+        for path in event.paths {
+            let Some(path) = normalize_watch_path(root, &path) else {
+                continue;
+            };
+            let incoming = WorkspaceFileChange {
+                kind,
+                path: path.clone(),
+                old_path: None,
+            };
+            match changes.get(&path) {
+                Some(existing)
+                    if watch_change_priority(existing.kind) > watch_change_priority(kind) => {}
+                _ => {
+                    changes.insert(path, incoming);
+                }
+            }
+        }
+    }
+    let mut changes: Vec<_> = changes.into_values().collect();
+    changes.sort_by(|left, right| left.path.cmp(&right.path));
+    (resync_required, changes)
+}
+
+fn watch_change_priority(kind: WorkspaceFileChangeKind) -> u8 {
+    match kind {
+        WorkspaceFileChangeKind::Modified => 0,
+        WorkspaceFileChangeKind::Created => 1,
+        WorkspaceFileChangeKind::Renamed => 2,
+        WorkspaceFileChangeKind::Removed => 3,
+    }
+}
+
+fn normalize_watch_path(root: &Path, path: &Path) -> Option<String> {
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.as_os_str().is_empty() || contains_git_component(relative) {
+        return None;
+    }
+    path_to_wire(relative).ok()
+}
+
+fn exceeds_watch_budget(root: &Path) -> bool {
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    let mut seen = 0usize;
+    while let Some(directory) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+                seen += 1;
+                if seen > MAX_WATCH_DIRS {
+                    return true;
+                }
+                queue.push_back(entry.path());
+            }
+        }
+    }
+    false
 }
 
 struct CancelOnDrop(Option<Arc<AtomicBool>>);
@@ -1689,5 +2068,100 @@ mod tests {
             }
         ));
         assert!(!root.path().join("file.txt").exists());
+    }
+
+    #[test]
+    fn watch_normalizes_renames_deduplicates_and_filters_git() {
+        use notify::EventKind;
+        use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
+
+        let root = Path::new("/workspace");
+        let events = vec![
+            Ok(notify::Event::new(EventKind::Modify(ModifyKind::Any))
+                .add_path(root.join("src/lib.rs"))),
+            Ok(notify::Event::new(EventKind::Remove(RemoveKind::File))
+                .add_path(root.join("src/lib.rs"))),
+            Ok(notify::Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.join(".git/index"))),
+            Ok(
+                notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                    .add_path(root.join("old.rs"))
+                    .add_path(root.join("new.rs")),
+            ),
+        ];
+        let (resync, changes) = normalize_watch_events(root, events);
+        assert!(!resync);
+        assert_eq!(changes.len(), 2);
+        assert!(changes.iter().any(|change| {
+            change.path == "src/lib.rs" && change.kind == WorkspaceFileChangeKind::Removed
+        }));
+        assert!(changes.iter().any(|change| {
+            change.path == "new.rs"
+                && change.old_path.as_deref() == Some("old.rs")
+                && change.kind == WorkspaceFileChangeKind::Renamed
+        }));
+    }
+
+    #[tokio::test]
+    async fn watch_starts_with_resync_and_shares_one_checkout_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let watch = CheckoutWatch::start(
+            "checkout".into(),
+            canonical,
+            false,
+            CancellationToken::new(),
+        );
+        let owner = Weak::<WorkspaceFilesInner>::new();
+        let mut first = watch.subscribe(owner.clone());
+        let second = watch.subscribe(owner);
+        assert_eq!(watch.subscribers.load(Ordering::Acquire), 2);
+        let baseline = first.recv().await.unwrap();
+        assert!(baseline.resync_required);
+        assert!(baseline.changes.is_empty());
+        drop(second);
+        assert_eq!(watch.subscribers.load(Ordering::Acquire), 1);
+        assert!(!watch.cancel.is_cancelled());
+        drop(first);
+        assert!(watch.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn watch_streams_native_file_changes_and_stops_on_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let watch = CheckoutWatch::start(
+            "checkout".into(),
+            canonical.clone(),
+            false,
+            CancellationToken::new(),
+        );
+        let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
+        subscription.recv().await.unwrap();
+        std::fs::write(canonical.join("created.txt"), b"hello").unwrap();
+        let batch = tokio::time::timeout(Duration::from_secs(3), subscription.recv())
+            .await
+            .expect("watch event timeout")
+            .expect("watch closed");
+        assert!(
+            batch
+                .changes
+                .iter()
+                .any(|change| change.path == "created.txt")
+        );
+        watch.cancel.cancel();
+        assert!(subscription.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_repair_only_mode_keeps_the_stream_recoverable() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let watch =
+            CheckoutWatch::start("checkout".into(), canonical, true, CancellationToken::new());
+        assert!(lock(&watch.watcher).is_none());
+        let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
+        assert!(subscription.recv().await.unwrap().resync_required);
+        watch.cancel.cancel();
     }
 }

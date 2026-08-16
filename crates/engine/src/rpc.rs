@@ -1533,6 +1533,20 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::from)?;
                 RpcReply::value(&outcome)
             }
+            methods::WATCH_WORKSPACE_FILES => {
+                let request: zeron_proto::WatchWorkspaceFilesRequest = parse_params(params)?;
+                let subscription = self
+                    .workspace_files
+                    .watch_files(request)
+                    .await
+                    .map_err(RpcError::from)?;
+                let stream = futures::stream::unfold(subscription, |mut subscription| async move {
+                    let changes = subscription.recv().await?;
+                    let value = serde_json::to_value(changes).ok()?;
+                    Some((value, subscription))
+                });
+                Ok(RpcReply::Stream(stream.boxed()))
+            }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
                 let worktree = self

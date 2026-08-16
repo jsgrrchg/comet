@@ -28,6 +28,7 @@ use search::FileSearchState;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesEvent {
     OpenFile(String),
+    TitleChanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,6 +365,26 @@ impl FilesSurface {
         self.sync_tree_list();
         self.started = true;
         self.load_directory(String::new(), None, cx);
+    }
+
+    pub fn tab_title(&self) -> SharedString {
+        self.editor_path
+            .as_deref()
+            .and_then(|path| path.rsplit('/').next())
+            .unwrap_or("Files")
+            .into()
+    }
+
+    pub(super) fn open_tree_file(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.presentation.is_editor() {
+            cx.emit(FilesEvent::OpenFile(path));
+            return;
+        }
+
+        self.presentation = FilesPresentation::Editor;
+        self.editor_path = Some(path.clone());
+        self.open_file(path, cx);
+        cx.emit(FilesEvent::TitleChanged);
     }
 
     fn toggle_ignored(&mut self, cx: &mut Context<Self>) {

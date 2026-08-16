@@ -1477,7 +1477,7 @@ impl Shell {
                 RightSurface::Files => self
                     .files
                     .get(&key)
-                    .map(|_| (*surface, SharedString::from("Files"))),
+                    .map(|files| (*surface, files.read(cx).tab_title())),
                 RightSurface::File(id) => self.file_surfaces.get(id).map(|_| {
                     let title = self
                         .file_surface_paths
@@ -1606,6 +1606,7 @@ impl Shell {
                 cx.new(|cx| FilesSurface::new(self.state.clone(), self.active_chat.clone(), cx));
             let sub = cx.subscribe(&files, |this: &mut Self, _, event, cx| match event {
                 FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
+                FilesEvent::TitleChanged => cx.notify(),
             });
             self.files.insert(key.clone(), files);
             self.files_subs.insert(key.clone(), sub);
@@ -1641,6 +1642,7 @@ impl Shell {
         });
         let sub = cx.subscribe(&file, |this: &mut Self, _, event, cx| match event {
             FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
+            FilesEvent::TitleChanged => cx.notify(),
         });
         self.file_surfaces.insert(id, file);
         self.file_surface_paths.insert(id, path);

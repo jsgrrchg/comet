@@ -211,7 +211,7 @@ impl FilesSurface {
         }
     }
 
-    fn activate_tree_path(&mut self, path: String, cx: &mut Context<Self>) {
+    pub(super) fn activate_tree_path(&mut self, path: String, cx: &mut Context<Self>) {
         self.tree.select(path.clone());
         if self
             .tree
@@ -300,7 +300,7 @@ impl FilesSurface {
         }
     }
 
-    fn reveal_tree_selection(&self) {
+    pub(super) fn reveal_tree_selection(&self) {
         let Some(selected) = self.tree.selected() else {
             return;
         };

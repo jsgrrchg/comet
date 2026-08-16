@@ -1,6 +1,9 @@
 //! Workspace file browsing surface.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use gpui::{
     App, Context, Entity, FocusHandle, ListAlignment, ListState, Render, SharedString,
@@ -8,14 +11,20 @@ use gpui::{
 };
 use zeron_proto::ListWorkspaceDirectoryRequest;
 
-use crate::state::AppState;
+use crate::{
+    composer::{ComposerInput, ComposerInputEvent},
+    state::AppState,
+};
 
 pub mod client;
 pub mod model;
+pub mod search;
 pub mod tree;
+pub mod watch;
 
 use client::{FilesRequestContext, WorkspaceFilesClient};
 use model::{DirectoryLoadState, FileTreeModel};
+use search::FileSearchState;
 
 pub struct FilesSurface {
     state: Entity<AppState>,
@@ -24,17 +33,27 @@ pub struct FilesSurface {
     tree: FileTreeModel,
     tree_list: ListState,
     tree_focus: FocusHandle,
+    search: Entity<ComposerInput>,
+    search_state: FileSearchState,
+    search_list: ListState,
+    watch_task: Option<Task<()>>,
+    watch_sequence: Option<u64>,
+    watch_error: Option<SharedString>,
+    externally_modified: HashSet<String>,
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
     started: bool,
     _observe: Subscription,
+    _search_events: Subscription,
 }
 
 impl Render for FilesSurface {
     fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::Theme::of(cx).clone();
-        let phase = self.tree.node("").map(|root| &root.load);
-        let content = if let Some(error) = self.error.clone() {
+        let phase = self.tree.node("").map(|root| root.load.clone());
+        let content = if !self.search_state.query.is_empty() {
+            self.render_search_results(cx)
+        } else if let Some(error) = self.error.clone() {
             div()
                 .flex_1()
                 .flex()
@@ -70,7 +89,7 @@ impl Render for FilesSurface {
                 )
                 .into_any_element()
         } else if matches!(
-            phase,
+            phase.as_ref(),
             Some(DirectoryLoadState::Unloaded | DirectoryLoadState::Loading { .. })
         ) {
             div()
@@ -107,36 +126,38 @@ impl Render for FilesSurface {
             .flex()
             .flex_col()
             .bg(crate::theme::ink(0.0))
-            .child(
-                div()
-                    .h(px(36.0))
-                    .flex_none()
-                    .px(px(12.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .bg(header_bg)
-                    .child(
-                        crate::icons::icon(crate::icons::FOLDER_WITH_FILES)
-                            .size(px(13.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child("Files"),
-                    ),
-            )
+            .child(self.render_header(&theme, header_bg, cx))
             .child(content)
     }
 }
 
 impl FilesSurface {
     pub fn new(state: Entity<AppState>, chat_id: String, cx: &mut Context<Self>) -> Self {
+        let search = cx.new(|cx| ComposerInput::new("Search files", cx));
+        let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::Edited => this.on_search_edited(cx),
+            ComposerInputEvent::Submitted | ComposerInputEvent::MentionAccept => {
+                this.activate_search_result(cx)
+            }
+            ComposerInputEvent::MentionNavigate(delta) => {
+                let len = this.search_state.results.len();
+                if len > 0 {
+                    this.search_state.active = if *delta < 0 {
+                        this.search_state.active.saturating_sub(1)
+                    } else {
+                        (this.search_state.active + 1).min(len - 1)
+                    };
+                    this.search_list
+                        .scroll_to_reveal_item(this.search_state.active);
+                    cx.notify();
+                }
+            }
+            ComposerInputEvent::MentionDismiss => this.clear_search(cx),
+            ComposerInputEvent::PastedImages(_)
+            | ComposerInputEvent::PastedPaths(_)
+            | ComposerInputEvent::CursorMoved
+            | ComposerInputEvent::ViewportChanged => {}
+        });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| {
             if this.sync_target(cx) {
                 this.ensure_loaded(cx);
@@ -149,10 +170,18 @@ impl FilesSurface {
             tree: FileTreeModel::new(),
             tree_list: ListState::new(0, ListAlignment::Top, px(560.0)),
             tree_focus: cx.focus_handle(),
+            search,
+            search_state: FileSearchState::default(),
+            search_list: ListState::new(0, ListAlignment::Top, px(420.0)),
+            watch_task: None,
+            watch_sequence: None,
+            watch_error: None,
+            externally_modified: HashSet::new(),
             loads: HashMap::new(),
             error: None,
             started: false,
             _observe: observe,
+            _search_events: search_events,
         };
         surface.sync_target(cx);
         surface
@@ -160,7 +189,11 @@ impl FilesSurface {
 
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
         self.sync_target(cx);
-        if self.started || self.request_context.is_none() {
+        if self.request_context.is_none() {
+            return;
+        }
+        self.ensure_watch(cx);
+        if self.started {
             return;
         }
         self.started = true;
@@ -171,6 +204,30 @@ impl FilesSurface {
         self.error = None;
         self.started = true;
         self.load_directory(String::new(), None, cx);
+    }
+
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.loads.clear();
+        self.error = None;
+        self.tree.reset();
+        self.sync_tree_list();
+        self.started = true;
+        self.load_directory(String::new(), None, cx);
+    }
+
+    fn toggle_ignored(&mut self, cx: &mut Context<Self>) {
+        let include = !self.tree.include_ignored();
+        if self.tree.set_include_ignored(include) {
+            self.loads.clear();
+            self.error = None;
+            self.sync_tree_list();
+            self.started = true;
+            self.load_directory(String::new(), None, cx);
+            if !self.search_state.query.is_empty() {
+                self.search_state.query.clear();
+                self.on_search_edited(cx);
+            }
+        }
     }
 
     pub fn load_directory(
@@ -261,6 +318,10 @@ impl FilesSurface {
             return false;
         }
         self.loads.clear();
+        self.watch_task = None;
+        self.watch_sequence = None;
+        self.watch_error = None;
+        self.externally_modified.clear();
         self.tree.reset();
         self.sync_tree_list();
         self.error = if next.is_none() {
@@ -276,5 +337,81 @@ impl FilesSurface {
     fn sync_tree_list(&self) {
         self.tree_list
             .reset_with_uniform_height(self.tree.visible_rows().len(), px(tree::TREE_ROW_HEIGHT));
+    }
+
+    fn render_header(
+        &mut self,
+        theme: &crate::theme::Theme,
+        background: gpui::Hsla,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let include_ignored = self.tree.include_ignored();
+        let icon_button = |id: &'static str| {
+            div()
+                .id(id)
+                .size(px(25.0))
+                .flex_none()
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_pointer()
+                .hover(|style| style.bg(crate::theme::wash(0.09)))
+        };
+        div()
+            .h(px(38.0))
+            .flex_none()
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(background)
+            .child(
+                div()
+                    .h(px(26.0))
+                    .min_w_0()
+                    .flex_1()
+                    .px(px(8.0))
+                    .rounded(px(7.0))
+                    .bg(crate::theme::ink(0.035))
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(11.5))
+                    .child(
+                        crate::icons::icon(crate::icons::MAGNIFER)
+                            .size(px(12.0))
+                            .flex_none()
+                            .text_color(theme.text_faint),
+                    )
+                    .child(div().min_w_0().flex_1().child(self.search.clone())),
+            )
+            .child(
+                icon_button("files-refresh")
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
+                    .child(
+                        crate::icons::icon(crate::icons::REFRESH)
+                            .size(px(12.5))
+                            .text_color(theme.text_muted),
+                    ),
+            )
+            .child(
+                icon_button("files-toggle-ignored")
+                    .when(include_ignored, |element| {
+                        element.bg(crate::theme::wash(0.1))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_ignored(cx)))
+                    .child(
+                        crate::icons::icon(crate::icons::TUNING)
+                            .size(px(12.5))
+                            .text_color(if include_ignored {
+                                theme.text
+                            } else {
+                                theme.text_muted
+                            }),
+                    ),
+            )
     }
 }

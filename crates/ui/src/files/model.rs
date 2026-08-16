@@ -122,6 +122,24 @@ impl FileTreeModel {
         self.expanded.contains(path)
     }
 
+    pub fn expanded_directories(&self) -> Vec<String> {
+        let mut paths = self
+            .expanded
+            .iter()
+            .filter(|path| !path.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|path| (path.matches('/').count(), path.clone()));
+        paths
+    }
+
+    pub fn is_directory_loaded(&self, path: &str) -> bool {
+        self.nodes.get(path).is_some_and(|node| {
+            node.entry.kind == WorkspaceEntryKind::Directory
+                && matches!(node.load, DirectoryLoadState::Loaded { .. })
+        })
+    }
+
     pub fn reset(&mut self) -> u64 {
         self.generation = self.generation.wrapping_add(1);
         self.nodes.clear();

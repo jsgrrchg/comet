@@ -32,6 +32,7 @@ pub mod spaces;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
+pub mod workspace_files;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -53,6 +54,7 @@ pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
+pub use workspace_files::WorkspaceFiles;
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
@@ -112,6 +114,7 @@ pub struct EngineCore {
     pub workspace: WorkspaceHost,
     pub registry: Arc<HarnessRegistry>,
     pub repos: Repos,
+    pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
@@ -229,6 +232,8 @@ impl EngineCore {
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
+        let workspace_files =
+            WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         let terminals = Terminals::new();
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
@@ -274,6 +279,7 @@ impl EngineCore {
             workspace,
             registry,
             repos,
+            workspace_files,
             terminals,
             diff_sync,
             spaces_sync,
@@ -401,6 +407,7 @@ impl EngineCore {
             self.workspace.clone(),
             self.registry.clone(),
             self.repos.clone(),
+            self.workspace_files.clone(),
             self.terminals.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
@@ -459,6 +466,7 @@ impl EngineCore {
             updater.shutdown().await;
         }
         self.diff_sync.shutdown().await;
+        self.workspace_files.shutdown().await;
         self.spaces_sync.shutdown().await;
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();

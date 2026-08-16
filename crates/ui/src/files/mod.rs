@@ -1,9 +1,6 @@
 //! Workspace file browsing surface.
 
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use gpui::{
     App, Context, Entity, FocusHandle, ListAlignment, ListState, Render, SharedString,
@@ -18,12 +15,14 @@ use crate::{
 
 pub mod client;
 pub mod model;
+pub mod preview;
 pub mod search;
 pub mod tree;
 pub mod watch;
 
 use client::{FilesRequestContext, WorkspaceFilesClient};
 use model::{DirectoryLoadState, FileTreeModel};
+use preview::{FilePreviewState, FilesNarrowView};
 use search::FileSearchState;
 
 pub struct FilesSurface {
@@ -39,7 +38,7 @@ pub struct FilesSurface {
     watch_task: Option<Task<()>>,
     watch_sequence: Option<u64>,
     watch_error: Option<SharedString>,
-    externally_modified: HashSet<String>,
+    preview: FilePreviewState,
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
     started: bool,
@@ -121,13 +120,66 @@ impl Render for FilesSurface {
         } else {
             theme.surface
         };
-        div()
+        let tree_pane = div()
             .size_full()
+            .min_w_0()
             .flex()
             .flex_col()
-            .bg(crate::theme::ink(0.0))
             .child(self.render_header(&theme, header_bg, cx))
-            .child(content)
+            .child(content);
+        let wide = self.preview.has_active() && self.preview.is_wide();
+        let body = if wide {
+            div()
+                .size_full()
+                .min_w_0()
+                .flex()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.render_preview(false, cx)),
+                )
+                .child(self.preview_split_handle(cx))
+                .child(
+                    div()
+                        .w(px(self.preview.tree_width()))
+                        .h_full()
+                        .flex_none()
+                        .border_l_1()
+                        .border_color(theme.border)
+                        .child(tree_pane),
+                )
+                .into_any_element()
+        } else if self.preview.has_active()
+            && self.preview.narrow_view() == FilesNarrowView::Preview
+        {
+            self.render_preview(true, cx)
+        } else {
+            tree_pane.into_any_element()
+        };
+        let measured_width = self.preview.width_cell();
+        let entity = cx.entity();
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .bg(crate::theme::ink(0.0))
+            .on_drag_move(cx.listener(Self::on_preview_split_drag))
+            .child(
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        let width = f32::from(bounds.size.width);
+                        if (measured_width.get() - width).abs() > 1.0 {
+                            measured_width.set(width);
+                            let _ = entity.update(cx, |_, cx| cx.notify());
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .child(body)
     }
 }
 
@@ -176,7 +228,7 @@ impl FilesSurface {
             watch_task: None,
             watch_sequence: None,
             watch_error: None,
-            externally_modified: HashSet::new(),
+            preview: FilePreviewState::new(),
             loads: HashMap::new(),
             error: None,
             started: false,
@@ -321,7 +373,7 @@ impl FilesSurface {
         self.watch_task = None;
         self.watch_sequence = None;
         self.watch_error = None;
-        self.externally_modified.clear();
+        self.preview.reset();
         self.tree.reset();
         self.sync_tree_list();
         self.error = if next.is_none() {

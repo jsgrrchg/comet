@@ -88,7 +88,7 @@ impl FilesSurface {
                     }
                 }
                 WorkspaceFileChangeKind::Modified => {
-                    self.externally_modified.insert(change.path);
+                    self.preview.mark_external(&change.path);
                 }
                 WorkspaceFileChangeKind::Removed => {
                     self.tree.remove(&change.path);

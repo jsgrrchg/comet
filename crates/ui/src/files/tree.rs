@@ -213,12 +213,14 @@ impl FilesSurface {
 
     pub(super) fn activate_tree_path(&mut self, path: String, cx: &mut Context<Self>) {
         self.tree.select(path.clone());
-        if self
+        let is_directory = self
             .tree
             .node(&path)
-            .is_some_and(|node| node.entry.kind == WorkspaceEntryKind::Directory)
-        {
+            .is_some_and(|node| node.entry.kind == WorkspaceEntryKind::Directory);
+        if is_directory {
             self.toggle_tree_directory(path, cx);
+        } else {
+            self.open_file(path, cx);
         }
         self.reveal_tree_selection();
         cx.notify();

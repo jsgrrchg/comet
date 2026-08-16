@@ -129,7 +129,11 @@ impl FilesSurface {
         self.reveal_search_result(result, cx);
     }
 
-    fn reveal_search_result(&mut self, result: WorkspaceFileSearchMatch, cx: &mut Context<Self>) {
+    pub(super) fn reveal_search_result(
+        &mut self,
+        result: WorkspaceFileSearchMatch,
+        cx: &mut Context<Self>,
+    ) {
         let Some(context) = self.request_context.clone() else {
             return;
         };
@@ -191,6 +195,11 @@ impl FilesSurface {
                     .search
                     .update(cx, |search, cx| search.set_text("", cx));
                 surface.reveal_tree_selection();
+                if result.kind == WorkspaceEntryKind::Directory {
+                    surface.show_tree(cx);
+                } else {
+                    surface.open_file(result.path.clone(), cx);
+                }
                 cx.notify();
             });
         }));

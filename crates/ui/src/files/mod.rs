@@ -259,7 +259,8 @@ impl FilesSurface {
         editor_path: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search = cx.new(|cx| ComposerInput::new("Search files", cx));
+        let search =
+            cx.new(|cx| ComposerInput::new("Search files", cx).with_text_metrics(11.0, 16.0));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => this.on_search_edited(cx),
             ComposerInputEvent::Submitted | ComposerInputEvent::MentionAccept => {
@@ -493,7 +494,7 @@ impl FilesSurface {
                 .hover(|style| style.bg(crate::theme::wash(0.09)))
         };
         div()
-            .h(px(38.0))
+            .h(px(31.0))
             .flex_none()
             .px(px(8.0))
             .flex()

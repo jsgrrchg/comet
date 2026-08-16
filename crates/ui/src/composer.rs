@@ -1257,6 +1257,8 @@ pub struct ComposerInput {
     /// Normally keeps the caret visible through edits and rewraps. Manual
     /// wheel scrolling pauses it until the next caret move or edit.
     follow_cursor: bool,
+    text_size: f32,
+    configured_line_height: f32,
     // -- measured state (written during layout/paint) --
     last_lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
@@ -1334,6 +1336,8 @@ impl ComposerInput {
             drag_autoscroll_active: false,
             scroll_top: 0.0,
             follow_cursor: true,
+            text_size: INPUT_TEXT_SIZE,
+            configured_line_height: INPUT_LINE_HEIGHT,
             last_lines: Vec::new(),
             line_starts: vec![0],
             last_bounds: None,
@@ -1360,6 +1364,14 @@ impl ComposerInput {
             mention_tooltip_task: None,
             mention_tooltip_view: None,
         }
+    }
+
+    pub fn with_text_metrics(mut self, text_size: f32, line_height: f32) -> Self {
+        self.text_size = text_size;
+        self.configured_line_height = line_height;
+        self.line_height = px(line_height);
+        self.content_height = line_height;
+        self
     }
 
     /// Reset the caret blink phase (solid again) — called on every edit and
@@ -2450,7 +2462,7 @@ impl ComposerInput {
             (SharedString::from(self.projection.display.clone()), false)
         };
         let font_size = style.font_size.to_pixels(window.rem_size());
-        self.line_height = px(INPUT_LINE_HEIGHT);
+        self.line_height = px(self.configured_line_height);
 
         // Chips read as inline code: the markdown renderer's recipe (mono font
         // + `code_text` violet) over the rounded `code_wash` painted beneath.
@@ -2536,7 +2548,7 @@ impl ComposerInput {
         self.display_is_placeholder = is_placeholder;
         self.last_lines = lines;
         self.line_starts = line_starts;
-        self.content_height = content_height.max(INPUT_LINE_HEIGHT);
+        self.content_height = content_height.max(self.configured_line_height);
         self.max_line_width = if is_placeholder { 0.0 } else { max_line_width };
         self.last_width = f32::from(width);
         self.layout_epoch += 1;
@@ -3128,8 +3140,8 @@ impl Render for ComposerInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
-            .text_size(px(INPUT_TEXT_SIZE))
-            .line_height(px(INPUT_LINE_HEIGHT))
+            .text_size(px(self.text_size))
+            .line_height(px(self.configured_line_height))
             .text_color(text_color)
             .font_family(theme.font_sans.clone())
             .child(ComposerTextElement {

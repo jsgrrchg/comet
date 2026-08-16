@@ -135,16 +135,6 @@ impl FilesSurface {
                             .text_color(text_color)
                             .child(node.entry.name),
                     )
-                    .when(node.entry.read_only, |element| {
-                        element.child(
-                            div()
-                                .ml_auto()
-                                .flex_none()
-                                .text_size(px(9.5))
-                                .text_color(theme.text_faint.opacity(0.65))
-                                .child("read-only"),
-                        )
-                    })
                     .into_any_element()
             }
             VisibleRowKind::Loading { .. } => status_row(

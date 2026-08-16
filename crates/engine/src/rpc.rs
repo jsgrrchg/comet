@@ -1489,6 +1489,28 @@ impl RpcService for EngineRpc {
                 .map_err(|_| RpcError::Failed("file search timed out".into()))??;
                 RpcReply::value(&matches)
             }
+            methods::LIST_WORKSPACE_DIRECTORY => {
+                let request: zeron_proto::ListWorkspaceDirectoryRequest = parse_params(params)?;
+                let page = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.list_directory(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace directory listing timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&page)
+            }
+            methods::SEARCH_WORKSPACE_FILES => {
+                let request: zeron_proto::SearchWorkspaceFilesRequest = parse_params(params)?;
+                let matches = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.search(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace file search timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&matches)
+            }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
                 let worktree = self

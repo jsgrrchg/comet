@@ -1522,6 +1522,17 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::from)?;
                 RpcReply::value(&file)
             }
+            methods::WRITE_WORKSPACE_FILE => {
+                let request: zeron_proto::WriteWorkspaceFileRequest = parse_params(params)?;
+                let outcome = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.write_file(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace file write timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&outcome)
+            }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;
                 let worktree = self

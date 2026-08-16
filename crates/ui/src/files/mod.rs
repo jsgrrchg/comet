@@ -2,7 +2,7 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use gpui::{App, Context, Entity, SharedString, Subscription, Task};
+use gpui::{App, Context, Entity, Render, SharedString, Subscription, Task, div, prelude::*, px};
 use zeron_proto::ListWorkspaceDirectoryRequest;
 
 use crate::state::AppState;
@@ -11,7 +11,7 @@ pub mod client;
 pub mod model;
 
 use client::{FilesRequestContext, WorkspaceFilesClient};
-use model::FileTreeModel;
+use model::{DirectoryLoadState, FileTreeModel};
 
 pub struct FilesSurface {
     state: Entity<AppState>,
@@ -22,6 +22,119 @@ pub struct FilesSurface {
     error: Option<SharedString>,
     started: bool,
     _observe: Subscription,
+}
+
+impl Render for FilesSurface {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::Theme::of(cx).clone();
+        let phase = self.tree.node("").map(|root| &root.load);
+        let content = if let Some(error) = self.error.clone() {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.0))
+                .px(px(28.0))
+                .child(
+                    div()
+                        .text_center()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(error),
+                )
+                .child(
+                    div()
+                        .id("files-retry-root")
+                        .h(px(28.0))
+                        .px(px(12.0))
+                        .rounded(px(7.0))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(crate::theme::wash(0.04))
+                        .hover(|style| style.bg(crate::theme::wash(0.09)))
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.5))
+                        .text_color(theme.text)
+                        .child("Retry")
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_root(cx))),
+                )
+                .into_any_element()
+        } else if matches!(
+            phase,
+            Some(DirectoryLoadState::Unloaded | DirectoryLoadState::Loading { .. })
+        ) {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(10.0))
+                .child(crate::loaders::gradient_spinner(
+                    "files-loading-root",
+                    &theme,
+                    3.0,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .text_color(theme.text_faint)
+                        .child("Loading workspace…"),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(px(11.5))
+                .text_color(theme.text_faint)
+                .child("Workspace ready")
+                .into_any_element()
+        };
+        let header_bg = if theme.is_glass() {
+            theme.surface.opacity(0.26)
+        } else {
+            theme.surface
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(crate::theme::ink(0.0))
+            .child(
+                div()
+                    .h(px(36.0))
+                    .flex_none()
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .bg(header_bg)
+                    .child(
+                        crate::icons::icon(crate::icons::FOLDER_WITH_FILES)
+                            .size(px(13.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child("Files"),
+                    ),
+            )
+            .child(content)
+    }
 }
 
 impl FilesSurface {

@@ -28,6 +28,7 @@ use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+use crate::files::FilesSurface;
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -197,16 +198,25 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// One right-pane surface tab (t3code RightPanelSurface, narrowed to our two
-/// kinds): a git-diff page (each tab its own [`Changes`] viewer — multiple
-/// diff panels, user request) or one embedded terminal keyed by its
-/// [`TerminalPanel`] tab key. `Picker` is the empty state ("Open a surface").
+/// One right-pane surface tab: a single workspace browser per chat, a git-diff
+/// page (each tab its own [`Changes`] viewer), or one embedded terminal keyed
+/// by its [`TerminalPanel`] tab key. `Picker` is the empty state.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RightSurface {
     #[default]
     Picker,
+    Files,
     Diff(u64),
     Terminal(u64),
+}
+
+fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
+    if tabs.contains(&surface) {
+        false
+    } else {
+        tabs.push(surface);
+        true
+    }
 }
 
 /// Per-chat panel open flags (zeron parity: `sessionPanels` — the terminal and
@@ -777,6 +787,9 @@ pub struct Shell {
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
+    /// One workspace browser per chat/panel key. Dropping the entity closes
+    /// its file watcher and every in-flight workspace request.
+    files: std::collections::HashMap<String, Entity<FilesSurface>>,
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
@@ -1020,6 +1033,7 @@ impl Shell {
             right_terminal: None,
             right_plus: popover::Popup::default(),
             diffs: std::collections::HashMap::new(),
+            files: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
             right_tabs: std::collections::HashMap::new(),
@@ -1441,6 +1455,10 @@ impl Shell {
         stored
             .iter()
             .filter_map(|surface| match surface {
+                RightSurface::Files => self
+                    .files
+                    .get(&key)
+                    .map(|_| (*surface, SharedString::from("Files"))),
                 RightSurface::Diff(id) => self
                     .diffs
                     .get(id)
@@ -1516,6 +1534,11 @@ impl Shell {
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
         match surface {
+            RightSurface::Files => {
+                if let Some(files) = self.files.get(&key).cloned() {
+                    files.update(cx, |files, cx| files.ensure_loaded(cx));
+                }
+            }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
                 panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
@@ -1536,6 +1559,22 @@ impl Shell {
     fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
         self.register_diff_surface(changes, cx);
+    }
+
+    /// Files is single-instance per chat: both the picker and the `+` menu
+    /// focus the existing surface instead of creating duplicate trees and
+    /// duplicate workspace subscriptions.
+    fn add_files_surface(&mut self, cx: &mut Context<Self>) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        let key = self.panel_key(cx);
+        self.files.entry(key.clone()).or_insert_with(|| {
+            cx.new(|cx| FilesSurface::new(self.state.clone(), self.active_chat.clone(), cx))
+        });
+        let tabs = self.right_tabs.entry(key).or_default();
+        push_unique_right_surface(tabs, RightSurface::Files);
+        self.set_right_active(RightSurface::Files, cx);
     }
 
     /// A History row click: the commit opens as its own pinned diff tab
@@ -1598,6 +1637,9 @@ impl Shell {
             tabs.retain(|s| *s != surface);
         }
         match surface {
+            RightSurface::Files => {
+                self.files.remove(&key);
+            }
             RightSurface::Diff(id) => {
                 // Dropping the entity tears down its diff watch.
                 self.diffs.remove(&id);
@@ -4869,13 +4911,22 @@ impl Shell {
 
     /// Right pane — the surface host (t3code RightPanelTabs): hidden by
     /// default, drag-resizable. Content is the ACTIVE surface — the Diff
-    /// page (its options row + the lazy [`Changes`] viewer), an embedded
-    /// terminal, or the "Open a surface" picker when no tabs exist.
+    /// page (its options row + the lazy [`Changes`] viewer), workspace Files,
+    /// an embedded terminal, or the picker when no tabs exist.
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
         let content: AnyElement = if self.right_pane_open(cx) {
             match self.resolved_right_active(cx) {
+                RightSurface::Files => {
+                    let key = self.panel_key(cx);
+                    if let Some(files) = self.files.get(&key).cloned() {
+                        files.update(cx, |files, cx| files.ensure_loaded(cx));
+                        files.into_any_element()
+                    } else {
+                        self.render_surface_picker(cx)
+                    }
+                }
                 RightSurface::Diff(id) if self.diffs.contains_key(&id) => {
                     let changes = self.diffs.get(&id).cloned().expect("checked");
                     // Idempotent — also covers a persisted-open pane on boot.
@@ -5042,6 +5093,12 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .gap(px(8.0))
+                            .child(
+                                row("surface-card-files", icons::FOLDER_WITH_FILES, "Files")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_files_surface(cx);
+                                    })),
+                            )
                             .child(
                                 row("surface-card-terminal", icons::TERMINAL, "Terminal").on_click(
                                     cx.listener(|this, _, _, cx| {
@@ -5231,8 +5288,10 @@ impl Shell {
         for (ix, (surface, title)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
             let icon_path = match surface {
+                RightSurface::Files => icons::FOLDER_WITH_FILES,
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
-                _ => icons::TERMINAL,
+                RightSurface::Terminal(_) => icons::TERMINAL,
+                RightSurface::Picker => icons::PLUS,
             };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
             // (same slot, no width jump) — the ✕ only shows while the tab is
@@ -5374,8 +5433,7 @@ impl Shell {
             };
             strip = strip.child(wrapped);
         }
-        // The `+` — a small menu offering the two surfaces (t3 "Add panel
-        // surface"); mirrors the picker cards.
+        // The `+` — a small menu offering the same surfaces as the picker.
         let plus_open = self.right_plus.get().is_some();
         let plus_fade = "right-surface-add-fade";
         let mut plus = div()
@@ -5426,6 +5484,20 @@ impl Shell {
                         .flex_col()
                         .gap(px(2.0))
                         .child(
+                            popover::menu_row(&theme, false, "right-plus-files")
+                                .id("right-plus-files-row")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_files_surface(cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::FOLDER_WITH_FILES)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Files")),
+                        )
+                        .child(
                             popover::menu_row(&theme, false, "right-plus-terminal")
                                 .id("right-plus-terminal-row")
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -5439,23 +5511,22 @@ impl Shell {
                                 )
                                 .child(SharedString::from("Terminal")),
                         )
-                        .child(
-                            popover::menu_row(&theme, false, "right-plus-diff")
-                                .id("right-plus-diff-row")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.add_diff_surface(cx);
-                                    this.close_right_plus(cx);
-                                }))
-                                .child(
-                                    icon(icons::GIT_BRANCH)
-                                        .size(px(13.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                // "Git", not "Git diff" — the surface hosts
-                                // history and per-commit views too (user
-                                // request; matches the picker card).
-                                .child(SharedString::from("Git")),
-                        ),
+                        .when(self.space_git_detected(cx), |menu| {
+                            menu.child(
+                                popover::menu_row(&theme, false, "right-plus-diff")
+                                    .id("right-plus-diff-row")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.add_diff_surface(cx);
+                                        this.close_right_plus(cx);
+                                    }))
+                                    .child(
+                                        icon(icons::GIT_BRANCH)
+                                            .size(px(13.0))
+                                            .text_color(theme.text_muted),
+                                    )
+                                    .child(SharedString::from("Git")),
+                            )
+                        }),
                 )
                 .into_any_element();
             plus = plus.relative().child(popover::anchored_menu_below_gap(
@@ -6898,6 +6969,16 @@ mod tests {
         assert_eq!(panels.get("b").right_active, RightSurface::Picker);
         panels.update("a", |p| p.right_active = RightSurface::Terminal(7));
         assert_eq!(panels.get("a").right_active, RightSurface::Terminal(7));
+        panels.update("a", |p| p.right_active = RightSurface::Files);
+        assert_eq!(panels.get("a").right_active, RightSurface::Files);
+    }
+
+    #[test]
+    fn files_surface_is_single_instance_per_tab_list() {
+        let mut tabs = vec![RightSurface::Terminal(1)];
+        assert!(push_unique_right_surface(&mut tabs, RightSurface::Files));
+        assert!(!push_unique_right_surface(&mut tabs, RightSurface::Files));
+        assert_eq!(tabs, vec![RightSurface::Terminal(1), RightSurface::Files]);
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----

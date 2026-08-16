@@ -706,4 +706,33 @@ mod tests {
             Some(VisibleRowKind::Empty { .. })
         ));
     }
+
+    #[test]
+    fn keyboard_selection_follows_visible_rows() {
+        let mut tree = FileTreeModel::new();
+        let generation = tree.generation();
+        tree.begin_load("", None, generation);
+        tree.apply_page(
+            page(
+                "",
+                vec![
+                    entry("src", WorkspaceEntryKind::Directory),
+                    entry("README.md", WorkspaceEntryKind::File),
+                ],
+                None,
+            ),
+            generation,
+        );
+        assert_eq!(tree.select_next(), Some("src"));
+        assert_eq!(tree.select_next(), Some("README.md"));
+        assert_eq!(tree.select_previous(), Some("src"));
+    }
+
+    #[test]
+    fn an_inflight_directory_load_is_not_duplicated() {
+        let mut tree = FileTreeModel::new();
+        let generation = tree.generation();
+        assert!(tree.begin_load("", None, generation));
+        assert!(!tree.begin_load("", None, generation));
+    }
 }

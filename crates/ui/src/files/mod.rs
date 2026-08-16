@@ -2,13 +2,17 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use gpui::{App, Context, Entity, Render, SharedString, Subscription, Task, div, prelude::*, px};
+use gpui::{
+    App, Context, Entity, FocusHandle, ListAlignment, ListState, Render, SharedString,
+    Subscription, Task, div, prelude::*, px,
+};
 use zeron_proto::ListWorkspaceDirectoryRequest;
 
 use crate::state::AppState;
 
 pub mod client;
 pub mod model;
+pub mod tree;
 
 use client::{FilesRequestContext, WorkspaceFilesClient};
 use model::{DirectoryLoadState, FileTreeModel};
@@ -18,6 +22,8 @@ pub struct FilesSurface {
     chat_id: String,
     request_context: Option<FilesRequestContext>,
     tree: FileTreeModel,
+    tree_list: ListState,
+    tree_focus: FocusHandle,
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
     started: bool,
@@ -89,15 +95,7 @@ impl Render for FilesSurface {
                 )
                 .into_any_element()
         } else {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(11.5))
-                .text_color(theme.text_faint)
-                .child("Workspace ready")
-                .into_any_element()
+            self.render_tree(cx)
         };
         let header_bg = if theme.is_glass() {
             theme.surface.opacity(0.26)
@@ -149,6 +147,8 @@ impl FilesSurface {
             chat_id,
             request_context: None,
             tree: FileTreeModel::new(),
+            tree_list: ListState::new(0, ListAlignment::Top, px(560.0)),
+            tree_focus: cx.focus_handle(),
             loads: HashMap::new(),
             error: None,
             started: false,
@@ -188,6 +188,7 @@ impl FilesSurface {
         if !self.tree.begin_load(&directory, cursor.clone(), generation) {
             return;
         }
+        self.sync_tree_list();
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.tree.fail_load(
                 &directory,
@@ -195,6 +196,7 @@ impl FilesSurface {
                 "Workspace service is still starting.",
                 generation,
             );
+            self.sync_tree_list();
             cx.notify();
             return;
         };
@@ -233,6 +235,7 @@ impl FilesSurface {
                             .fail_load(&directory, cursor, message, generation);
                     }
                 }
+                surface.sync_tree_list();
                 cx.notify();
             });
         });
@@ -259,6 +262,7 @@ impl FilesSurface {
         }
         self.loads.clear();
         self.tree.reset();
+        self.sync_tree_list();
         self.error = if next.is_none() {
             Some("No workspace available for this chat.".into())
         } else {
@@ -267,5 +271,10 @@ impl FilesSurface {
         self.request_context = next;
         self.started = false;
         true
+    }
+
+    fn sync_tree_list(&self) {
+        self.tree_list
+            .reset_with_uniform_height(self.tree.visible_rows().len(), px(tree::TREE_ROW_HEIGHT));
     }
 }

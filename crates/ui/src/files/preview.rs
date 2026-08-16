@@ -50,6 +50,7 @@ pub(super) struct FilePreviewState {
     list: ListState,
     horizontal_scroll: ScrollHandle,
     surface_width: Rc<Cell<f32>>,
+    word_wrap: bool,
     tree_sidebar_visible: bool,
     tree_width: f32,
 }
@@ -66,6 +67,7 @@ impl FilePreviewState {
             list: ListState::new(0, ListAlignment::Top, px(520.0)),
             horizontal_scroll: ScrollHandle::new(),
             surface_width: Rc::new(Cell::new(520.0)),
+            word_wrap: false,
             tree_sidebar_visible: false,
             tree_width: TREE_SPLIT_DEFAULT,
         }
@@ -95,6 +97,10 @@ impl FilePreviewState {
 
     pub(super) fn tree_sidebar_visible(&self) -> bool {
         self.tree_sidebar_visible
+    }
+
+    fn word_wrap(&self) -> bool {
+        self.word_wrap
     }
 
     pub(super) fn tree_width(&self) -> f32 {
@@ -130,6 +136,12 @@ impl FilesSurface {
 
     fn toggle_tree_sidebar(&mut self, cx: &mut Context<Self>) {
         self.preview.tree_sidebar_visible = !self.preview.tree_sidebar_visible;
+        cx.notify();
+    }
+
+    fn toggle_word_wrap(&mut self, cx: &mut Context<Self>) {
+        self.preview.word_wrap = !self.preview.word_wrap;
+        self.preview.list.remeasure();
         cx.notify();
     }
 
@@ -465,6 +477,35 @@ impl FilesSurface {
                             .text_color(theme.text_muted),
                     ),
             )
+            .child(
+                div()
+                    .id("files-toggle-word-wrap")
+                    .size(px(22.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .when(self.preview.word_wrap(), |element| {
+                        element.bg(crate::theme::wash(0.1))
+                    })
+                    .hover(|style| style.bg(crate::theme::wash(0.07)))
+                    .role(gpui::Role::Button)
+                    .aria_label(if self.preview.word_wrap() {
+                        "Disable word wrap"
+                    } else {
+                        "Enable word wrap"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_word_wrap(cx)))
+                    .child(icon(icons::RETURN).size(px(11.0)).text_color(
+                        if self.preview.word_wrap() {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        },
+                    )),
+            )
             .when(show_sidebar_toggle, |element| {
                 element.child(
                     div()
@@ -514,27 +555,47 @@ impl FilesSurface {
                     );
                 }
                 let truncated = ready.file.truncated;
-                let mut code_scroll = div()
-                    .id("files-preview-code-scroll")
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .flex()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.preview.horizontal_scroll)
-                    .child(
-                        div().flex_none().min_w_full().h_full().child(
+                let word_wrap = self.preview.word_wrap();
+                let code_scroll = if word_wrap {
+                    div()
+                        .id("files-preview-code-scroll")
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .flex()
+                        .child(
                             list(
                                 self.preview.list.clone(),
                                 cx.processor(Self::render_preview_line),
                             )
-                            .h_full()
-                            .with_sizing_behavior(ListSizingBehavior::Infer),
-                        ),
-                    );
-                // GPUI otherwise maps a vertical wheel gesture to X for an
-                // x-only scroller, preventing the list from receiving it.
-                code_scroll.style().restrict_scroll_to_axis = Some(true);
+                            .flex_1()
+                            .min_h_0()
+                            .with_sizing_behavior(ListSizingBehavior::Auto),
+                        )
+                } else {
+                    let mut scroll = div()
+                        .id("files-preview-code-scroll")
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .flex()
+                        .overflow_x_scroll()
+                        .track_scroll(&self.preview.horizontal_scroll)
+                        .child(
+                            div().flex_none().min_w_full().h_full().child(
+                                list(
+                                    self.preview.list.clone(),
+                                    cx.processor(Self::render_preview_line),
+                                )
+                                .h_full()
+                                .with_sizing_behavior(ListSizingBehavior::Infer),
+                            ),
+                        );
+                    // GPUI otherwise maps a vertical wheel gesture to X for an
+                    // x-only scroller, preventing the list from receiving it.
+                    scroll.style().restrict_scroll_to_axis = Some(true);
+                    scroll
+                };
 
                 div()
                     .flex_1()
@@ -582,6 +643,7 @@ impl FilesSurface {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
+        let word_wrap = self.preview.word_wrap();
         let spans = self
             .preview
             .highlights
@@ -601,15 +663,20 @@ impl FilesSurface {
             &theme,
         );
         div()
-            .h(px(PREVIEW_LINE_HEIGHT))
-            .min_w_full()
+            .min_h(px(PREVIEW_LINE_HEIGHT))
             .flex_none()
             .flex()
-            .items_center()
+            .when(word_wrap, |element| element.w_full().items_stretch())
+            .when(!word_wrap, |element| {
+                element
+                    .h(px(PREVIEW_LINE_HEIGHT))
+                    .min_w_full()
+                    .items_center()
+            })
             .child(
                 div()
                     .w(px(48.0))
-                    .h_full()
+                    .when(!word_wrap, |element| element.h_full())
                     .flex_none()
                     .pr(px(10.0))
                     .border_r_1()
@@ -624,9 +691,12 @@ impl FilesSurface {
             )
             .child(
                 div()
+                    .when(word_wrap, |element| {
+                        element.flex_1().min_w_0().py(px(2.0)).whitespace_normal()
+                    })
                     .pl(px(12.0))
                     .pr(px(18.0))
-                    .whitespace_nowrap()
+                    .when(!word_wrap, |element| element.whitespace_nowrap())
                     .font_family(theme.font_mono.clone())
                     .text_size(px(11.5))
                     .child(gpui::StyledText::new(line.clone()).with_runs(runs)),

@@ -22,6 +22,8 @@
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//! - Workspace files: lazy directory listing, recursive path search, bounded text
+//!   reads, hash-guarded writes, and a checkout-scoped filesystem change stream.
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
@@ -45,8 +47,8 @@
 //! forward can never loop. Streaming methods are proxied by re-subscribing remotely and
 //! piping items. To make another method device-addressable, nothing per-method is needed
 //! beyond listing it in [`forwardable`] (and [`is_stream_method`] if it streams);
-//! handlers stay transport-agnostic. Currently routed: `ListHarnesses`, `ListModels`,
-//! `QueueCommand`, and `WatchDocMessages`.
+//! handlers stay transport-agnostic. This includes the workspace file surface,
+//! whose checkout always lives on the routed target device.
 
 use async_trait::async_trait;
 use futures::StreamExt;

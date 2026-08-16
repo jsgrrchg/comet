@@ -139,6 +139,12 @@ impl WorkspaceRelativePath {
         {
             return Err(bad_path("path must be workspace-relative"));
         }
+        if path
+            .split('/')
+            .any(|component| component == "." || component == "..")
+        {
+            return Err(bad_path("path must not contain . or .."));
+        }
 
         let parsed = Path::new(path);
         let mut count = 0usize;
@@ -185,6 +191,16 @@ impl WorkspaceRelativePath {
 
 fn bad_path(message: &str) -> WorkspaceFilesError {
     WorkspaceFilesError::BadParams(message.to_string())
+}
+
+fn plain_folder_identity(device_id: &str, root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(device_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(b"plain-folder");
+    hasher.update([0]);
+    hasher.update(root.to_string_lossy().as_bytes());
+    format!("folder-{}", hex(&hasher.finalize()))
 }
 
 impl WorkspaceFiles {
@@ -286,16 +302,19 @@ impl WorkspaceFiles {
             }
         };
 
-        let identity = self
-            .inner
-            .repos
-            .checkout_identity(&root)
-            .await
-            .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
-        Ok(ResolvedWorkspace {
-            checkout_id: identity.id,
-            root: identity.root,
-        })
+        // Spaces also support plain folders. Git checkouts use their canonical
+        // git-dir identity; plain roots get a device-scoped stable key so the
+        // existing SearchFiles behavior and shared watcher semantics remain intact.
+        match self.inner.repos.checkout_identity(&root).await {
+            Ok(identity) => Ok(ResolvedWorkspace {
+                checkout_id: identity.id,
+                root: identity.root,
+            }),
+            Err(_) => Ok(ResolvedWorkspace {
+                checkout_id: plain_folder_identity(&self.inner.device_id, &root),
+                root,
+            }),
+        }
     }
 
     pub async fn list_directory(
@@ -414,11 +433,14 @@ impl WorkspaceFiles {
             ));
         }
         let workspace = self.resolve_target(&request.target).await?;
-        if let Some(existing) = lock(&self.inner.watches)
-            .get(&workspace.checkout_id)
-            .cloned()
         {
-            return Ok(existing.subscribe(Arc::downgrade(&self.inner)));
+            let mut watches = lock(&self.inner.watches);
+            if let Some(existing) = watches.get(&workspace.checkout_id).cloned() {
+                if !existing.cancel.is_cancelled() {
+                    return Ok(existing.subscribe(Arc::downgrade(&self.inner)));
+                }
+                watches.remove(&workspace.checkout_id);
+            }
         }
 
         let root = workspace.root.clone();
@@ -433,18 +455,18 @@ impl WorkspaceFiles {
             over_budget,
             self.inner.cancel.child_token(),
         );
-        let watch = {
+        let subscription = {
             let mut watches = lock(&self.inner.watches);
             if let Some(existing) = watches.get(&workspace.checkout_id) {
                 candidate.cancel.cancel();
                 lock(&candidate.watcher).take();
-                existing.clone()
+                existing.subscribe(Arc::downgrade(&self.inner))
             } else {
                 watches.insert(workspace.checkout_id, candidate.clone());
-                candidate
+                candidate.subscribe(Arc::downgrade(&self.inner))
             }
         };
-        Ok(watch.subscribe(Arc::downgrade(&self.inner)))
+        Ok(subscription)
     }
 
     /// Cancel all service-owned work. This operation is idempotent.
@@ -564,35 +586,40 @@ impl WorkspaceFileSubscription {
         if let Some(initial) = self.initial.take() {
             return Some(initial);
         }
-        loop {
-            let received = tokio::select! {
-                _ = self.watch.cancel.cancelled() => return None,
-                received = self.receiver.recv() => received,
-            };
-            match received {
-                Ok(changes) => return Some(changes),
-                Err(broadcast::error::RecvError::Lagged(_)) => return Some(self.watch.resync()),
-                Err(broadcast::error::RecvError::Closed) => return None,
-            }
+        let received = tokio::select! {
+            _ = self.watch.cancel.cancelled() => return None,
+            received = self.receiver.recv() => received,
+        };
+        match received {
+            Ok(changes) => Some(changes),
+            Err(broadcast::error::RecvError::Lagged(_)) => Some(self.watch.resync()),
+            Err(broadcast::error::RecvError::Closed) => None,
         }
     }
 }
 
 impl Drop for WorkspaceFileSubscription {
     fn drop(&mut self) {
-        if self.watch.subscribers.fetch_sub(1, Ordering::AcqRel) != 1 {
-            return;
-        }
-        self.watch.cancel.cancel();
-        lock(&self.watch.watcher).take();
         if let Some(owner) = self.owner.upgrade() {
             let mut watches = lock(&owner.watches);
-            if watches
-                .get(&self.watch.checkout_id)
-                .is_some_and(|watch| Arc::ptr_eq(watch, &self.watch))
+            let last = self.watch.subscribers.fetch_sub(1, Ordering::AcqRel) == 1;
+            if last
+                && watches
+                    .get(&self.watch.checkout_id)
+                    .is_some_and(|watch| Arc::ptr_eq(watch, &self.watch))
             {
                 watches.remove(&self.watch.checkout_id);
             }
+            drop(watches);
+            if last {
+                self.watch.cancel.cancel();
+                lock(&self.watch.watcher).take();
+            }
+            return;
+        }
+        if self.watch.subscribers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.watch.cancel.cancel();
+            lock(&self.watch.watcher).take();
         }
     }
 }
@@ -677,12 +704,23 @@ fn normalize_watch_events(
             EventKind::Modify(ModifyKind::Name(RenameMode::Both))
         ) && event.paths.len() >= 2
         {
-            let old_path = normalize_watch_path(root, &event.paths[0]);
+            let old_path = normalize_watch_path_including_temp(root, &event.paths[0]);
             let path = event
                 .paths
                 .last()
                 .and_then(|path| normalize_watch_path(root, path));
             if let (Some(old_path), Some(path)) = (old_path, path) {
+                if is_internal_temp_wire_path(&old_path) {
+                    changes.insert(
+                        path.clone(),
+                        WorkspaceFileChange {
+                            kind: WorkspaceFileChangeKind::Modified,
+                            path,
+                            old_path: None,
+                        },
+                    );
+                    continue;
+                }
                 changes.insert(
                     path.clone(),
                     WorkspaceFileChange {
@@ -740,11 +778,22 @@ fn watch_change_priority(kind: WorkspaceFileChangeKind) -> u8 {
 }
 
 fn normalize_watch_path(root: &Path, path: &Path) -> Option<String> {
+    let path = normalize_watch_path_including_temp(root, path)?;
+    (!is_internal_temp_wire_path(&path)).then_some(path)
+}
+
+fn normalize_watch_path_including_temp(root: &Path, path: &Path) -> Option<String> {
     let relative = path.strip_prefix(root).ok()?;
     if relative.as_os_str().is_empty() || contains_git_component(relative) {
         return None;
     }
     path_to_wire(relative).ok()
+}
+
+fn is_internal_temp_wire_path(path: &str) -> bool {
+    path.rsplit('/')
+        .next()
+        .is_some_and(|name| name.starts_with(".zeron-save-") && name.ends_with(".tmp"))
 }
 
 fn exceeds_watch_budget(root: &Path) -> bool {
@@ -835,6 +884,12 @@ fn list_directory_blocking(
             .strip_prefix(root)
             .map_err(|_| WorkspaceFilesError::Authorization("entry escaped workspace".into()))?;
         if contains_git_component(relative) {
+            continue;
+        }
+        if path_to_wire(relative)
+            .ok()
+            .is_some_and(|path| is_internal_temp_wire_path(&path))
+        {
             continue;
         }
         if entries.len() == MAX_DIRECTORY_ENTRIES {
@@ -985,6 +1040,9 @@ fn search_workspace_blocking(
             continue;
         };
         let path = path_to_wire(relative)?;
+        if is_internal_temp_wire_path(&path) {
+            continue;
+        }
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(score) = workspace_search_score(&name, &path, &query_lower) else {
             continue;
@@ -1252,6 +1310,11 @@ fn same_file_revision(before: &std::fs::Metadata, after: &std::fs::Metadata) -> 
 }
 
 fn encode_write_text(request: &WriteWorkspaceFileRequest) -> Result<Vec<u8>, WorkspaceFilesError> {
+    if request.text.contains('\0') {
+        return Err(WorkspaceFilesError::BadParams(
+            "write text must not contain NUL bytes".into(),
+        ));
+    }
     if request.text.contains('\r') {
         return Err(WorkspaceFilesError::BadParams(
             "write text must use normalized LF line endings".into(),
@@ -1279,6 +1342,24 @@ fn encode_write_text(request: &WriteWorkspaceFileRequest) -> Result<Vec<u8>, Wor
         )));
     }
     Ok(bytes)
+}
+
+fn validate_writable_source(bytes: &[u8]) -> Result<(), WorkspaceFilesError> {
+    if bytes.contains(&0) {
+        return Err(WorkspaceFilesError::Unsupported(
+            "binary files are not writable".into(),
+        ));
+    }
+    let source = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    let source = std::str::from_utf8(source).map_err(|_| {
+        WorkspaceFilesError::Unsupported("unsupported text encoding is not writable".into())
+    })?;
+    if detect_line_ending(source.as_bytes()) == WorkspaceLineEnding::Mixed {
+        return Err(WorkspaceFilesError::Unsupported(
+            "mixed line endings are not writable".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn write_file_blocking(
@@ -1321,6 +1402,7 @@ fn write_file_blocking(
         }
         Err(error) => return Err(error),
     };
+    validate_writable_source(&current_bytes)?;
     let current_hash = hash_bytes(&current_bytes);
     if current_hash != expected_hash {
         return Ok(write_conflict(
@@ -1385,6 +1467,7 @@ fn write_file_blocking(
         }
         Err(error) => return Err(error),
     };
+    validate_writable_source(&latest_bytes)?;
     let latest_hash = hash_bytes(&latest_bytes);
     if latest_hash != expected_hash || !same_file_revision(&metadata, &latest_metadata) {
         return Ok(write_conflict(
@@ -1696,6 +1779,7 @@ mod tests {
             "",
             "/tmp/file",
             "./file",
+            "src/./file",
             "src/../file",
             "src\\file",
             "src\0file",
@@ -2044,6 +2128,13 @@ mod tests {
             WorkspaceWritableLineEnding::Lf,
         );
         assert!(encode_write_text(&cr).is_err());
+        let nul = write_request(
+            "not\0text",
+            "hash".into(),
+            WorkspaceWritableEncoding::Utf8,
+            WorkspaceWritableLineEnding::Lf,
+        );
+        assert!(encode_write_text(&nul).is_err());
         let large = write_request(
             &"x".repeat(MAX_EDITABLE_FILE_BYTES as usize + 1),
             "hash".into(),
@@ -2051,6 +2142,27 @@ mod tests {
             WorkspaceWritableLineEnding::Lf,
         );
         assert!(encode_write_text(&large).is_err());
+    }
+
+    #[test]
+    fn write_rejects_binary_and_mixed_source_files() {
+        for source in [
+            b"binary\0source".as_slice(),
+            b"mixed\r\nsource\n".as_slice(),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("file.txt"), source).unwrap();
+            let canonical = std::fs::canonicalize(root.path()).unwrap();
+            let result = write_file_blocking(
+                &canonical,
+                &WorkspaceRelativePath::file("file.txt").unwrap(),
+                &hash_bytes(source),
+                b"replacement\n",
+                &no_cancel(),
+            );
+            assert!(result.is_err());
+            assert_eq!(std::fs::read(root.path().join("file.txt")).unwrap(), source);
+        }
     }
 
     #[test]
@@ -2088,10 +2200,15 @@ mod tests {
                     .add_path(root.join("old.rs"))
                     .add_path(root.join("new.rs")),
             ),
+            Ok(
+                notify::Event::new(EventKind::Modify(ModifyKind::Name(RenameMode::Both)))
+                    .add_path(root.join(".zeron-save-dead.tmp"))
+                    .add_path(root.join("saved.rs")),
+            ),
         ];
         let (resync, changes) = normalize_watch_events(root, events);
         assert!(!resync);
-        assert_eq!(changes.len(), 2);
+        assert_eq!(changes.len(), 3);
         assert!(changes.iter().any(|change| {
             change.path == "src/lib.rs" && change.kind == WorkspaceFileChangeKind::Removed
         }));
@@ -2099,6 +2216,11 @@ mod tests {
             change.path == "new.rs"
                 && change.old_path.as_deref() == Some("old.rs")
                 && change.kind == WorkspaceFileChangeKind::Renamed
+        }));
+        assert!(changes.iter().any(|change| {
+            change.path == "saved.rs"
+                && change.old_path.is_none()
+                && change.kind == WorkspaceFileChangeKind::Modified
         }));
     }
 

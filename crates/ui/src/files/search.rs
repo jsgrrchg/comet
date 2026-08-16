@@ -283,7 +283,7 @@ impl FilesSurface {
                     .child(
                         div()
                             .truncate()
-                            .font_family(theme.font_mono.clone())
+                            .font_family(theme.font_sans.clone())
                             .text_size(px(11.5))
                             .text_color(theme.text)
                             .child(result.name),
@@ -291,7 +291,7 @@ impl FilesSurface {
                     .child(
                         div()
                             .truncate()
-                            .font_family(theme.font_mono.clone())
+                            .font_family(theme.font_sans.clone())
                             .text_size(px(9.5))
                             .text_color(theme.text_faint)
                             .child(parent),

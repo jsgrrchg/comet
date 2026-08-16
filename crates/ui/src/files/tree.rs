@@ -131,7 +131,7 @@ impl FilesSurface {
                         div()
                             .min_w_0()
                             .truncate()
-                            .font_family(theme.font_mono.clone())
+                            .font_family(theme.font_sans.clone())
                             .text_size(px(11.5))
                             .text_color(text_color)
                             .child(node.entry.name),
@@ -339,7 +339,7 @@ fn status_row(
         .pr(px(8.0))
         .flex()
         .items_center()
-        .font_family(theme.font_mono.clone())
+        .font_family(theme.font_sans.clone())
         .text_size(px(10.5))
         .text_color(color)
         .child(label)

@@ -308,8 +308,7 @@ impl FilesSurface {
         let Some(active) = self.preview.active.clone() else {
             return gpui::Empty.into_any_element();
         };
-        let toolbar = narrow.then(|| self.render_preview_toolbar(&theme, cx));
-        let breadcrumb = self.render_breadcrumb(&active, &theme, cx);
+        let breadcrumb = self.render_breadcrumb(&active, narrow, &theme, cx);
         let external = self
             .preview
             .documents
@@ -321,7 +320,6 @@ impl FilesSurface {
             .min_w_0()
             .flex()
             .flex_col()
-            .when_some(toolbar, |element, toolbar| element.child(toolbar))
             .child(breadcrumb)
             .when(external, |element| {
                 element.child(
@@ -355,55 +353,10 @@ impl FilesSurface {
             .into_any_element()
     }
 
-    fn render_preview_toolbar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        div()
-            .h(px(34.0))
-            .flex_none()
-            .px(px(6.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(if theme.is_glass() {
-                theme.surface.opacity(0.24)
-            } else {
-                theme.surface
-            })
-            .flex()
-            .items_center()
-            .gap(px(4.0))
-            .child(
-                div()
-                    .id("files-preview-back")
-                    .h(px(24.0))
-                    .px(px(5.0))
-                    .flex_none()
-                    .rounded(px(5.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(2.0))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(crate::theme::wash(0.07)))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_tree(cx);
-                    }))
-                    .child(
-                        icon(icons::ALT_ARROW_LEFT)
-                            .size(px(11.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(10.5))
-                            .text_color(theme.text_muted)
-                            .child("Files"),
-                    ),
-            )
-            .child(div().min_w_0().flex_1())
-            .into_any_element()
-    }
-
     fn render_breadcrumb(
         &mut self,
         path: &str,
+        narrow: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -429,7 +382,7 @@ impl FilesSurface {
                 div()
                     .min_w_0()
                     .truncate()
-                    .font_family(theme.font_mono.clone())
+                    .font_family(theme.font_sans.clone())
                     .text_size(px(10.0))
                     .text_color(if index + 1 == parts.len() {
                         theme.text_muted
@@ -448,6 +401,26 @@ impl FilesSurface {
             .flex()
             .items_center()
             .gap(px(6.0))
+            .when(narrow, |element| {
+                element.child(
+                    div()
+                        .id("files-preview-back")
+                        .size(px(22.0))
+                        .flex_none()
+                        .rounded(px(5.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::wash(0.07)))
+                        .on_click(cx.listener(|this, _, _, cx| this.show_tree(cx)))
+                        .child(
+                            icon(icons::ALT_ARROW_LEFT)
+                                .size(px(11.0))
+                                .text_color(theme.text_muted),
+                        ),
+                )
+            })
             .child(crumbs)
             .child(
                 div()

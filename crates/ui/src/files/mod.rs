@@ -22,7 +22,7 @@ pub mod watch;
 
 use client::{FilesRequestContext, WorkspaceFilesClient};
 use model::{DirectoryLoadState, FileTreeModel};
-use preview::{FilePreviewState, FilesNarrowView};
+use preview::FilePreviewState;
 use search::FileSearchState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,11 +195,27 @@ impl Render for FilesSurface {
                         .child(tree_pane),
                 )
                 .into_any_element()
-        } else if is_editor
-            && self.preview.has_active()
-            && self.preview.narrow_view() == FilesNarrowView::Preview
-        {
-            self.render_preview(true, cx)
+        } else if is_editor && self.preview.has_active() {
+            let preview = self.render_preview(true, cx);
+            if self.preview.tree_sidebar_visible() {
+                div()
+                    .size_full()
+                    .min_w_0()
+                    .flex()
+                    .child(div().flex_1().min_w_0().child(preview))
+                    .child(
+                        div()
+                            .w(px(self.preview.narrow_tree_width()))
+                            .h_full()
+                            .flex_none()
+                            .border_l_1()
+                            .border_color(theme.border)
+                            .child(tree_pane),
+                    )
+                    .into_any_element()
+            } else {
+                preview
+            }
         } else {
             tree_pane.into_any_element()
         };

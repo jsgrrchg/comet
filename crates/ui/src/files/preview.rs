@@ -19,12 +19,6 @@ const PREVIEW_LINE_HEIGHT: f32 = 20.0;
 const WIDE_BREAKPOINT: f32 = 680.0;
 const TREE_SPLIT_DEFAULT: f32 = 286.0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum FilesNarrowView {
-    Tree,
-    Preview,
-}
-
 enum DocumentPhase {
     Loading,
     Ready(ReadyDocument),
@@ -56,7 +50,7 @@ pub(super) struct FilePreviewState {
     list: ListState,
     horizontal_scroll: ScrollHandle,
     surface_width: Rc<Cell<f32>>,
-    narrow_view: FilesNarrowView,
+    tree_sidebar_visible: bool,
     tree_width: f32,
 }
 
@@ -72,7 +66,7 @@ impl FilePreviewState {
             list: ListState::new(0, ListAlignment::Top, px(520.0)),
             horizontal_scroll: ScrollHandle::new(),
             surface_width: Rc::new(Cell::new(520.0)),
-            narrow_view: FilesNarrowView::Tree,
+            tree_sidebar_visible: false,
             tree_width: TREE_SPLIT_DEFAULT,
         }
     }
@@ -84,7 +78,7 @@ impl FilePreviewState {
         self.highlight_tasks.clear();
         self.highlights.clear();
         self.list.reset(0);
-        self.narrow_view = FilesNarrowView::Tree;
+        self.tree_sidebar_visible = false;
     }
 
     pub(super) fn has_active(&self) -> bool {
@@ -99,12 +93,16 @@ impl FilePreviewState {
         self.surface_width.clone()
     }
 
-    pub(super) fn narrow_view(&self) -> FilesNarrowView {
-        self.narrow_view
+    pub(super) fn tree_sidebar_visible(&self) -> bool {
+        self.tree_sidebar_visible
     }
 
     pub(super) fn tree_width(&self) -> f32 {
         self.tree_width
+    }
+
+    pub(super) fn narrow_tree_width(&self) -> f32 {
+        (self.surface_width.get() * 0.44).clamp(152.0, self.tree_width)
     }
 
     pub(super) fn mark_external(&mut self, path: &str) {
@@ -125,14 +123,19 @@ impl Render for PreviewDragGhost {
 }
 
 impl FilesSurface {
-    pub(super) fn show_tree(&mut self, cx: &mut Context<Self>) {
-        self.preview.narrow_view = FilesNarrowView::Tree;
+    pub(super) fn show_tree_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.preview.tree_sidebar_visible = true;
+        cx.notify();
+    }
+
+    fn toggle_tree_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.preview.tree_sidebar_visible = !self.preview.tree_sidebar_visible;
         cx.notify();
     }
 
     pub(super) fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
         self.preview.active = Some(path.clone());
-        self.preview.narrow_view = FilesNarrowView::Preview;
+        self.preview.tree_sidebar_visible = false;
         if !self.preview.documents.contains_key(&path) {
             self.preview.documents.insert(
                 path.clone(),
@@ -308,12 +311,16 @@ impl FilesSurface {
         }
     }
 
-    pub(super) fn render_preview(&mut self, narrow: bool, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_preview(
+        &mut self,
+        show_sidebar_toggle: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(active) = self.preview.active.clone() else {
             return gpui::Empty.into_any_element();
         };
-        let breadcrumb = self.render_breadcrumb(&active, narrow, &theme, cx);
+        let breadcrumb = self.render_breadcrumb(&active, show_sidebar_toggle, &theme, cx);
         let external = self
             .preview
             .documents
@@ -361,7 +368,7 @@ impl FilesSurface {
     fn render_breadcrumb(
         &mut self,
         path: &str,
-        narrow: bool,
+        show_sidebar_toggle: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -406,26 +413,6 @@ impl FilesSurface {
             .flex()
             .items_center()
             .gap(px(6.0))
-            .when(narrow, |element| {
-                element.child(
-                    div()
-                        .id("files-preview-back")
-                        .size(px(22.0))
-                        .flex_none()
-                        .rounded(px(5.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(crate::theme::wash(0.07)))
-                        .on_click(cx.listener(|this, _, _, cx| this.show_tree(cx)))
-                        .child(
-                            icon(icons::ALT_ARROW_LEFT)
-                                .size(px(11.0))
-                                .text_color(theme.text_muted),
-                        ),
-                )
-            })
             .child(crumbs)
             .child(
                 div()
@@ -478,6 +465,32 @@ impl FilesSurface {
                             .text_color(theme.text_muted),
                     ),
             )
+            .when(show_sidebar_toggle, |element| {
+                element.child(
+                    div()
+                        .id("files-toggle-tree-sidebar")
+                        .size(px(22.0))
+                        .flex_none()
+                        .rounded(px(5.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::wash(0.07)))
+                        .role(gpui::Role::Button)
+                        .aria_label(if self.preview.tree_sidebar_visible {
+                            "Hide files sidebar"
+                        } else {
+                            "Show files sidebar"
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_tree_sidebar(cx)))
+                        .child(
+                            icon(icons::SIDEBAR_MINIMALISTIC)
+                                .size(px(11.0))
+                                .text_color(theme.text_muted),
+                        ),
+                )
+            })
             .into_any_element()
     }
 
@@ -704,12 +717,12 @@ mod tests {
                 externally_modified: true,
             },
         );
-        preview.narrow_view = FilesNarrowView::Preview;
+        preview.tree_sidebar_visible = true;
 
         preview.reset();
 
         assert!(preview.documents.is_empty());
         assert!(preview.active.is_none());
-        assert_eq!(preview.narrow_view, FilesNarrowView::Tree);
+        assert!(!preview.tree_sidebar_visible);
     }
 }

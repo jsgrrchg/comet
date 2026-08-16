@@ -196,7 +196,7 @@ impl FilesSurface {
                     .update(cx, |search, cx| search.set_text("", cx));
                 surface.reveal_tree_selection();
                 if result.kind == WorkspaceEntryKind::Directory {
-                    surface.show_tree(cx);
+                    surface.show_tree_sidebar(cx);
                 } else {
                     cx.emit(super::FilesEvent::OpenFile(result.path.clone()));
                 }

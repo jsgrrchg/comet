@@ -1,4 +1,4 @@
-use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
 use gpui::{
     AnyElement, Context, ListAlignment, ListSizingBehavior, ListState, Point, Render, ScrollHandle,
@@ -123,9 +123,30 @@ pub(super) struct PreviewSplitResize;
 
 struct PreviewDragGhost;
 
+struct FilePathTooltip(SharedString);
+
 impl Render for PreviewDragGhost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size(px(1.0))
+    }
+}
+
+impl Render for FilePathTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .max_w(px(420.0))
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .font_family(theme.font_mono.clone())
+            .text_size(px(10.5))
+            .text_color(theme.text_muted)
+            .child(self.0.clone())
     }
 }
 
@@ -409,9 +430,13 @@ impl FilesSurface {
             let name = path.rsplit('/').next().unwrap_or(&path).to_string();
             let select_path = path.clone();
             let close_path = path.clone();
+            let tooltip_path: SharedString = path.clone().into();
             tabs = tabs.child(
                 div()
                     .id(("files-document-tab", index))
+                    .role(gpui::Role::Tab)
+                    .aria_label(path.clone())
+                    .aria_selected(selected)
                     .h(px(25.0))
                     .max_w(px(150.0))
                     .flex_none()
@@ -429,6 +454,8 @@ impl FilesSurface {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_document(select_path.clone(), cx)
                     }))
+                    .tooltip(move |_, cx| cx.new(|_| FilePathTooltip(tooltip_path.clone())).into())
+                    .tooltip_show_delay(Duration::from_millis(350))
                     .child(
                         div()
                             .min_w_0()
@@ -440,11 +467,13 @@ impl FilesSurface {
                             } else {
                                 theme.text_muted
                             })
-                            .child(name),
+                            .child(name.clone()),
                     )
                     .child(
                         div()
                             .id(("files-document-close", index))
+                            .role(gpui::Role::Button)
+                            .aria_label(format!("Close {name}"))
                             .size(px(16.0))
                             .flex_none()
                             .rounded(px(4.0))
@@ -836,5 +865,27 @@ mod tests {
             read_only_message(Some(WorkspaceReadOnlyReason::UnsupportedEncoding))
                 .contains("encoding")
         );
+    }
+
+    #[test]
+    fn reset_drops_documents_and_active_preview_from_the_previous_target() {
+        let mut preview = FilePreviewState::new();
+        preview.tabs.push("private.env".into());
+        preview.active = Some("private.env".into());
+        preview.documents.insert(
+            "private.env".into(),
+            FileDocument {
+                phase: DocumentPhase::Loading,
+                externally_modified: true,
+            },
+        );
+        preview.narrow_view = FilesNarrowView::Preview;
+
+        preview.reset();
+
+        assert!(preview.tabs.is_empty());
+        assert!(preview.documents.is_empty());
+        assert!(preview.active.is_none());
+        assert_eq!(preview.narrow_view, FilesNarrowView::Tree);
     }
 }

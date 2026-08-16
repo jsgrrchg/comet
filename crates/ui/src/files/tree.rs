@@ -17,6 +17,8 @@ impl FilesSurface {
     pub(super) fn render_tree(&mut self, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("files-tree")
+            .role(gpui::Role::Tree)
+            .aria_label("Workspace file tree")
             .relative()
             .flex_1()
             .min_h_0()
@@ -73,6 +75,10 @@ impl FilesSurface {
                 };
                 div()
                     .id(("files-tree-entry", index))
+                    .role(gpui::Role::TreeItem)
+                    .aria_label(node.entry.name.clone())
+                    .aria_selected(selected)
+                    .when(is_directory, |element| element.aria_expanded(expanded))
                     .h(px(TREE_ROW_HEIGHT))
                     .w_full()
                     .flex_none()

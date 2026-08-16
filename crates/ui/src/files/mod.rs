@@ -120,12 +120,35 @@ impl Render for FilesSurface {
         } else {
             theme.surface
         };
+        let watch_error = self.watch_error.clone();
         let tree_pane = div()
             .size_full()
             .min_w_0()
             .flex()
             .flex_col()
             .child(self.render_header(&theme, header_bg, cx))
+            .when_some(watch_error, |element, error| {
+                element.child(
+                    div()
+                        .h(px(27.0))
+                        .flex_none()
+                        .px(px(10.0))
+                        .border_b_1()
+                        .border_color(theme.warning.opacity(0.22))
+                        .bg(theme.warning.opacity(0.045))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(px(10.0))
+                        .text_color(theme.warning_muted)
+                        .child(
+                            crate::icons::icon(crate::icons::REFRESH)
+                                .size(px(10.5))
+                                .flex_none(),
+                        )
+                        .child(div().min_w_0().truncate().child(error)),
+                )
+            })
             .child(content);
         let wide = self.preview.has_active() && self.preview.is_wide();
         let body = if wide {
@@ -160,6 +183,12 @@ impl Render for FilesSurface {
         let measured_width = self.preview.width_cell();
         let entity = cx.entity();
         div()
+            .id(SharedString::from(format!(
+                "files-surface-{}",
+                self.chat_id
+            )))
+            .role(gpui::Role::Group)
+            .aria_label("Workspace files")
             .size_full()
             .relative()
             .flex()
@@ -171,7 +200,7 @@ impl Render for FilesSurface {
                         let width = f32::from(bounds.size.width);
                         if (measured_width.get() - width).abs() > 1.0 {
                             measured_width.set(width);
-                            let _ = entity.update(cx, |_, cx| cx.notify());
+                            entity.update(cx, |_, cx| cx.notify());
                         }
                     },
                     |_, _, _, _| {},
@@ -365,7 +394,7 @@ impl FilesSurface {
     }
 
     fn sync_target(&mut self, cx: &App) -> bool {
-        let next = FilesRequestContext::for_chat(&self.state.read(cx), &self.chat_id);
+        let next = FilesRequestContext::for_chat(self.state.read(cx), &self.chat_id);
         if self.request_context == next {
             return false;
         }
@@ -442,6 +471,8 @@ impl FilesSurface {
             )
             .child(
                 icon_button("files-refresh")
+                    .role(gpui::Role::Button)
+                    .aria_label("Refresh files")
                     .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
                     .child(
                         crate::icons::icon(crate::icons::REFRESH)
@@ -451,6 +482,12 @@ impl FilesSurface {
             )
             .child(
                 icon_button("files-toggle-ignored")
+                    .role(gpui::Role::Button)
+                    .aria_label(if include_ignored {
+                        "Hide ignored files"
+                    } else {
+                        "Show ignored files"
+                    })
                     .when(include_ignored, |element| {
                         element.bg(crate::theme::wash(0.1))
                     })

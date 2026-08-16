@@ -221,6 +221,11 @@ impl FileTreeModel {
             }
         }
 
+        let mut known_children = self
+            .nodes
+            .get(&directory)
+            .map(|node| node.children.iter().cloned().collect::<HashSet<_>>())
+            .unwrap_or_default();
         for entry in page.entries {
             let path = entry.path.clone();
             self.nodes
@@ -228,7 +233,7 @@ impl FileTreeModel {
                 .and_modify(|node| node.entry = entry.clone())
                 .or_insert_with(|| TreeNode::new(entry));
             if let Some(parent) = self.nodes.get_mut(&directory)
-                && !parent.children.contains(&path)
+                && known_children.insert(path.clone())
             {
                 parent.children.push(path);
             }
@@ -752,5 +757,47 @@ mod tests {
         let generation = tree.generation();
         assert!(tree.begin_load("", None, generation));
         assert!(!tree.begin_load("", None, generation));
+    }
+
+    #[test]
+    fn a_large_monorepo_page_stays_flat_and_addressable() {
+        let mut tree = FileTreeModel::new();
+        let generation = tree.generation();
+        tree.begin_load("", None, generation);
+        let entries = (0..10_000)
+            .map(|index| entry(&format!("package-{index:05}.rs"), WorkspaceEntryKind::File))
+            .chain([
+                entry("arquitectura rápida.md", WorkspaceEntryKind::File),
+                entry("packages", WorkspaceEntryKind::Directory),
+            ])
+            .collect();
+        assert!(tree.apply_page(page("", entries, None), generation));
+        assert_eq!(tree.node("").unwrap().children.len(), 10_002);
+        assert_eq!(tree.visible_rows().len(), 10_002);
+        assert!(tree.node("arquitectura rápida.md").is_some());
+        assert_eq!(tree.visible_rows()[0].path, "packages");
+    }
+
+    #[test]
+    fn reset_discards_loaded_content_and_invalidates_inflight_pages() {
+        let mut tree = FileTreeModel::new();
+        let stale_generation = tree.generation();
+        tree.begin_load("", None, stale_generation);
+        tree.apply_page(
+            page(
+                "",
+                vec![entry("secret.env", WorkspaceEntryKind::File)],
+                None,
+            ),
+            stale_generation,
+        );
+        let current_generation = tree.reset();
+        assert_ne!(current_generation, stale_generation);
+        assert!(tree.node("secret.env").is_none());
+        assert!(tree.visible_rows().is_empty());
+        assert!(!tree.apply_page(
+            page("", vec![entry("stale.env", WorkspaceEntryKind::File)], None),
+            stale_generation,
+        ));
     }
 }

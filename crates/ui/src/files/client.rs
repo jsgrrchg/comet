@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use async_trait::async_trait;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -67,13 +70,51 @@ impl From<RpcError> for FilesClientError {
 
 #[derive(Clone)]
 pub struct WorkspaceFilesClient {
-    engine: EngineHandle,
+    transport: Arc<dyn WorkspaceFilesTransport>,
     context: FilesRequestContext,
+}
+
+#[async_trait]
+trait WorkspaceFilesTransport: Send + Sync {
+    async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError>;
+    async fn subscribe(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<mpsc::Receiver<Value>, RpcError>;
+}
+
+struct EngineFilesTransport(EngineHandle);
+
+#[async_trait]
+impl WorkspaceFilesTransport for EngineFilesTransport {
+    async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.0.client().call(method, params).await
+    }
+
+    async fn subscribe(
+        &self,
+        method: &str,
+        params: Value,
+    ) -> Result<mpsc::Receiver<Value>, RpcError> {
+        self.0.client().subscribe(method, params).await
+    }
 }
 
 impl WorkspaceFilesClient {
     pub fn new(engine: EngineHandle, context: FilesRequestContext) -> Self {
-        Self { engine, context }
+        Self {
+            transport: Arc::new(EngineFilesTransport(engine)),
+            context,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_transport(
+        transport: Arc<dyn WorkspaceFilesTransport>,
+        context: FilesRequestContext,
+    ) -> Self {
+        Self { transport, context }
     }
 
     pub async fn list_directory(
@@ -102,8 +143,7 @@ impl WorkspaceFilesClient {
             target: self.context.target.clone(),
         };
         let params = request_params(&request, self.context.target_device_id.as_deref())?;
-        self.engine
-            .client()
+        self.transport
             .subscribe(methods::WATCH_WORKSPACE_FILES, params)
             .await
             .map_err(Into::into)
@@ -119,7 +159,7 @@ impl WorkspaceFilesClient {
         Response: DeserializeOwned,
     {
         let params = request_params(request, self.context.target_device_id.as_deref())?;
-        let response = self.engine.client().call(method, params).await?;
+        let response = self.transport.call(method, params).await?;
         serde_json::from_value(response)
             .map_err(|error| FilesClientError::Decode(error.to_string()))
     }
@@ -145,7 +185,37 @@ pub fn request_params<Request: Serialize>(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, sync::Mutex};
+
     use super::*;
+
+    #[derive(Default)]
+    struct DeterministicTransport {
+        responses: HashMap<String, Value>,
+        calls: Mutex<Vec<(String, Value)>>,
+        watch_values: Vec<Value>,
+    }
+
+    #[async_trait]
+    impl WorkspaceFilesTransport for DeterministicTransport {
+        async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+            self.calls.lock().unwrap().push((method.into(), params));
+            Ok(self.responses.get(method).cloned().unwrap())
+        }
+
+        async fn subscribe(
+            &self,
+            method: &str,
+            params: Value,
+        ) -> Result<mpsc::Receiver<Value>, RpcError> {
+            self.calls.lock().unwrap().push((method.into(), params));
+            let (sender, receiver) = mpsc::channel(self.watch_values.len().max(1));
+            for value in &self.watch_values {
+                sender.try_send(value.clone()).unwrap();
+            }
+            Ok(receiver)
+        }
+    }
 
     fn target() -> WorkspaceTarget {
         WorkspaceTarget {
@@ -230,5 +300,91 @@ mod tests {
         }))
         .map_err(|error| FilesClientError::Decode(error.to_string()));
         assert!(matches!(result, Err(FilesClientError::Decode(_))));
+    }
+
+    #[tokio::test]
+    async fn deterministic_transport_covers_list_search_read_and_watch_routing() {
+        let transport = Arc::new(DeterministicTransport {
+            responses: HashMap::from([
+                (
+                    methods::LIST_WORKSPACE_DIRECTORY.into(),
+                    serde_json::json!({
+                        "directory": "",
+                        "entries": [],
+                        "nextCursor": null,
+                        "truncated": false
+                    }),
+                ),
+                (
+                    methods::SEARCH_WORKSPACE_FILES.into(),
+                    serde_json::json!([{
+                        "path": "src/lib.rs",
+                        "name": "lib.rs",
+                        "kind": "file",
+                        "score": 100
+                    }]),
+                ),
+                (
+                    methods::READ_WORKSPACE_FILE.into(),
+                    serde_json::json!({
+                        "path": "src/lib.rs",
+                        "text": "fn lib() {}",
+                        "contentHash": "hash",
+                        "size": 11,
+                        "modifiedAt": null,
+                        "encoding": "utf8",
+                        "lineEnding": "lf",
+                        "readOnlyReason": null,
+                        "truncated": false
+                    }),
+                ),
+            ]),
+            watch_values: vec![serde_json::json!({ "sequence": 1, "changes": [] })],
+            ..Default::default()
+        });
+        let context = FilesRequestContext {
+            target: target(),
+            target_device_id: Some("remote-device".into()),
+            cwd: "/workspace".into(),
+            checkout_id: Some("checkout-1".into()),
+        };
+        let client = WorkspaceFilesClient::with_transport(transport.clone(), context);
+
+        let page = client
+            .list_directory(ListWorkspaceDirectoryRequest {
+                target: target(),
+                directory: String::new(),
+                include_ignored: false,
+                cursor: None,
+            })
+            .await
+            .unwrap();
+        let search = client
+            .search(SearchWorkspaceFilesRequest {
+                target: target(),
+                query: "lib".into(),
+                include_ignored: false,
+                limit: Some(20),
+            })
+            .await
+            .unwrap();
+        let file = client
+            .read_file(ReadWorkspaceFileRequest {
+                target: target(),
+                path: "src/lib.rs".into(),
+            })
+            .await
+            .unwrap();
+        let mut watch = client.watch().await.unwrap();
+
+        assert!(page.entries.is_empty());
+        assert_eq!(search[0].path, "src/lib.rs");
+        assert_eq!(file.text.as_deref(), Some("fn lib() {}"));
+        assert_eq!(watch.recv().await.unwrap()["sequence"], 1);
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert!(calls.iter().all(|(_, params)| {
+            params["chatId"] == "chat-1" && params["targetDeviceId"] == "remote-device"
+        }));
     }
 }

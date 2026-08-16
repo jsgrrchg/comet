@@ -563,13 +563,17 @@ impl FilesSurface {
                     })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_ignored(cx)))
                     .child(
-                        crate::icons::icon(crate::icons::TUNING)
-                            .size(px(12.5))
-                            .text_color(if include_ignored {
-                                theme.text
-                            } else {
-                                theme.text_muted
-                            }),
+                        crate::icons::icon(if include_ignored {
+                            crate::icons::EYE
+                        } else {
+                            crate::icons::EYE_CLOSED
+                        })
+                        .size(px(12.5))
+                        .text_color(if include_ignored {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        }),
                     ),
             )
     }

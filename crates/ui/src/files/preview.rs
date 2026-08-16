@@ -514,6 +514,28 @@ impl FilesSurface {
                     );
                 }
                 let truncated = ready.file.truncated;
+                let mut code_scroll = div()
+                    .id("files-preview-code-scroll")
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .flex()
+                    .overflow_x_scroll()
+                    .track_scroll(&self.preview.horizontal_scroll)
+                    .child(
+                        div().flex_none().min_w_full().h_full().child(
+                            list(
+                                self.preview.list.clone(),
+                                cx.processor(Self::render_preview_line),
+                            )
+                            .h_full()
+                            .with_sizing_behavior(ListSizingBehavior::Infer),
+                        ),
+                    );
+                // GPUI otherwise maps a vertical wheel gesture to X for an
+                // x-only scroller, preventing the list from receiving it.
+                code_scroll.style().restrict_scroll_to_axis = Some(true);
+
                 div()
                     .flex_1()
                     .min_h_0()
@@ -535,26 +557,7 @@ impl FilesSurface {
                                 .child("Large file preview is truncated and read-only."),
                         )
                     })
-                    .child(
-                        div()
-                            .id("files-preview-code-scroll")
-                            .flex_1()
-                            .min_w_0()
-                            .min_h_0()
-                            .flex()
-                            .overflow_x_scroll()
-                            .track_scroll(&self.preview.horizontal_scroll)
-                            .child(
-                                div().flex_none().min_w_full().h_full().child(
-                                    list(
-                                        self.preview.list.clone(),
-                                        cx.processor(Self::render_preview_line),
-                                    )
-                                    .h_full()
-                                    .with_sizing_behavior(ListSizingBehavior::Infer),
-                                ),
-                            ),
-                    )
+                    .child(code_scroll)
                     .into_any_element()
             }
         }

@@ -784,6 +784,11 @@ fn forwardable(method: &str) -> bool {
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
             | methods::SEARCH_FILES
+            | methods::LIST_WORKSPACE_DIRECTORY
+            | methods::SEARCH_WORKSPACE_FILES
+            | methods::READ_WORKSPACE_FILE
+            | methods::WRITE_WORKSPACE_FILE
+            | methods::WATCH_WORKSPACE_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             // Checkout diffs are produced on the device holding the checkout.
@@ -823,6 +828,7 @@ fn is_stream_method(method: &str) -> bool {
         methods::WATCH_DOC_MESSAGES
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
+            | methods::WATCH_WORKSPACE_FILES
             | methods::UPDATE_STATUS
     )
 }
@@ -1746,6 +1752,16 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
+        assert!(forwardable(methods::LIST_WORKSPACE_DIRECTORY));
+        assert!(forwardable(methods::SEARCH_WORKSPACE_FILES));
+        assert!(forwardable(methods::READ_WORKSPACE_FILE));
+        assert!(forwardable(methods::WRITE_WORKSPACE_FILE));
+        assert!(forwardable(methods::WATCH_WORKSPACE_FILES));
+        assert!(!is_stream_method(methods::LIST_WORKSPACE_DIRECTORY));
+        assert!(!is_stream_method(methods::SEARCH_WORKSPACE_FILES));
+        assert!(!is_stream_method(methods::READ_WORKSPACE_FILE));
+        assert!(!is_stream_method(methods::WRITE_WORKSPACE_FILE));
+        assert!(is_stream_method(methods::WATCH_WORKSPACE_FILES));
     }
 
     #[test]

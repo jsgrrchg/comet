@@ -498,7 +498,7 @@ impl FilesSurface {
                         "Enable word wrap"
                     })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_word_wrap(cx)))
-                    .child(icon(icons::RETURN).size(px(11.0)).text_color(
+                    .child(icon(icons::LIST).size(px(11.0)).text_color(
                         if self.preview.word_wrap() {
                             theme.text
                         } else {

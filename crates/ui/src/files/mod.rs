@@ -3,8 +3,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use gpui::{
-    App, Context, Entity, FocusHandle, ListAlignment, ListState, Render, SharedString,
-    Subscription, Task, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Render,
+    SharedString, Subscription, Task, div, prelude::*, px,
 };
 use zeron_proto::ListWorkspaceDirectoryRequest;
 
@@ -25,9 +25,30 @@ use model::{DirectoryLoadState, FileTreeModel};
 use preview::{FilePreviewState, FilesNarrowView};
 use search::FileSearchState;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilesEvent {
+    OpenFile(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilesPresentation {
+    Browser,
+    Editor,
+}
+
+impl FilesPresentation {
+    fn is_editor(self) -> bool {
+        matches!(self, Self::Editor)
+    }
+}
+
+impl EventEmitter<FilesEvent> for FilesSurface {}
+
 pub struct FilesSurface {
     state: Entity<AppState>,
     chat_id: String,
+    presentation: FilesPresentation,
+    editor_path: Option<String>,
     request_context: Option<FilesRequestContext>,
     tree: FileTreeModel,
     tree_list: ListState,
@@ -150,7 +171,8 @@ impl Render for FilesSurface {
                 )
             })
             .child(content);
-        let wide = self.preview.has_active() && self.preview.is_wide();
+        let is_editor = self.presentation.is_editor();
+        let wide = is_editor && self.preview.has_active() && self.preview.is_wide();
         let body = if wide {
             div()
                 .size_full()
@@ -173,7 +195,8 @@ impl Render for FilesSurface {
                         .child(tree_pane),
                 )
                 .into_any_element()
-        } else if self.preview.has_active()
+        } else if is_editor
+            && self.preview.has_active()
             && self.preview.narrow_view() == FilesNarrowView::Preview
         {
             self.render_preview(true, cx)
@@ -193,27 +216,49 @@ impl Render for FilesSurface {
             .relative()
             .flex()
             .bg(crate::theme::ink(0.0))
-            .on_drag_move(cx.listener(Self::on_preview_split_drag))
-            .child(
-                gpui::canvas(
-                    move |bounds, _, cx| {
-                        let width = f32::from(bounds.size.width);
-                        if (measured_width.get() - width).abs() > 1.0 {
-                            measured_width.set(width);
-                            entity.update(cx, |_, cx| cx.notify());
-                        }
-                    },
-                    |_, _, _, _| {},
-                )
-                .absolute()
-                .inset_0(),
-            )
+            .when(is_editor, |element| {
+                element
+                    .on_drag_move(cx.listener(Self::on_preview_split_drag))
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, cx| {
+                                let width = f32::from(bounds.size.width);
+                                if (measured_width.get() - width).abs() > 1.0 {
+                                    measured_width.set(width);
+                                    entity.update(cx, |_, cx| cx.notify());
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+            })
             .child(body)
     }
 }
 
 impl FilesSurface {
     pub fn new(state: Entity<AppState>, chat_id: String, cx: &mut Context<Self>) -> Self {
+        Self::new_with_presentation(state, chat_id, FilesPresentation::Browser, None, cx)
+    }
+
+    pub fn new_editor(
+        state: Entity<AppState>,
+        chat_id: String,
+        path: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_presentation(state, chat_id, FilesPresentation::Editor, Some(path), cx)
+    }
+
+    fn new_with_presentation(
+        state: Entity<AppState>,
+        chat_id: String,
+        presentation: FilesPresentation,
+        editor_path: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let search = cx.new(|cx| ComposerInput::new("Search files", cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => this.on_search_edited(cx),
@@ -247,6 +292,8 @@ impl FilesSurface {
         let mut surface = Self {
             state,
             chat_id,
+            presentation,
+            editor_path: editor_path.clone(),
             request_context: None,
             tree: FileTreeModel::new(),
             tree_list: ListState::new(0, ListAlignment::Top, px(560.0)),
@@ -274,6 +321,12 @@ impl FilesSurface {
             return;
         }
         self.ensure_watch(cx);
+        if self.presentation.is_editor()
+            && !self.preview.has_active()
+            && let Some(path) = self.editor_path.clone()
+        {
+            self.open_file(path, cx);
+        }
         if self.started {
             return;
         }

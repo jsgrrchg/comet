@@ -1,4 +1,4 @@
-use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
 
 use gpui::{
     AnyElement, Context, ListAlignment, ListSizingBehavior, ListState, Point, Render, ScrollHandle,
@@ -48,7 +48,6 @@ struct HighlightedFile {
 
 pub(super) struct FilePreviewState {
     documents: HashMap<String, FileDocument>,
-    tabs: Vec<String>,
     active: Option<String>,
     reads: HashMap<String, Task<()>>,
     highlight_tasks: HashMap<String, Task<()>>,
@@ -56,7 +55,6 @@ pub(super) struct FilePreviewState {
     syntax_cache: SyntaxHighlightCache,
     list: ListState,
     horizontal_scroll: ScrollHandle,
-    tab_scroll: ScrollHandle,
     surface_width: Rc<Cell<f32>>,
     narrow_view: FilesNarrowView,
     tree_width: f32,
@@ -66,7 +64,6 @@ impl FilePreviewState {
     pub(super) fn new() -> Self {
         Self {
             documents: HashMap::new(),
-            tabs: Vec::new(),
             active: None,
             reads: HashMap::new(),
             highlight_tasks: HashMap::new(),
@@ -74,7 +71,6 @@ impl FilePreviewState {
             syntax_cache: SyntaxHighlightCache::default(),
             list: ListState::new(0, ListAlignment::Top, px(520.0)),
             horizontal_scroll: ScrollHandle::new(),
-            tab_scroll: ScrollHandle::new(),
             surface_width: Rc::new(Cell::new(520.0)),
             narrow_view: FilesNarrowView::Tree,
             tree_width: TREE_SPLIT_DEFAULT,
@@ -83,7 +79,6 @@ impl FilePreviewState {
 
     pub(super) fn reset(&mut self) {
         self.documents.clear();
-        self.tabs.clear();
         self.active = None;
         self.reads.clear();
         self.highlight_tasks.clear();
@@ -123,30 +118,9 @@ pub(super) struct PreviewSplitResize;
 
 struct PreviewDragGhost;
 
-struct FilePathTooltip(SharedString);
-
 impl Render for PreviewDragGhost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size(px(1.0))
-    }
-}
-
-impl Render for FilePathTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .max_w(px(420.0))
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded(px(5.0))
-            .border_1()
-            .border_color(theme.border_strong)
-            .bg(theme.surface_raised)
-            .shadow_md()
-            .font_family(theme.font_mono.clone())
-            .text_size(px(10.5))
-            .text_color(theme.text_muted)
-            .child(self.0.clone())
     }
 }
 
@@ -157,9 +131,6 @@ impl FilesSurface {
     }
 
     pub(super) fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
-        if !self.preview.tabs.contains(&path) {
-            self.preview.tabs.push(path.clone());
-        }
         self.preview.active = Some(path.clone());
         self.preview.narrow_view = FilesNarrowView::Preview;
         if !self.preview.documents.contains_key(&path) {
@@ -326,32 +297,6 @@ impl FilesSurface {
             .reset_with_uniform_height(count, px(PREVIEW_LINE_HEIGHT));
     }
 
-    pub(super) fn close_document(&mut self, path: &str, cx: &mut Context<Self>) {
-        let Some(index) = self.preview.tabs.iter().position(|tab| tab == path) else {
-            return;
-        };
-        self.preview.tabs.remove(index);
-        self.preview.documents.remove(path);
-        self.preview.reads.remove(path);
-        self.preview.highlight_tasks.remove(path);
-        self.preview.highlights.remove(path);
-        if self.preview.active.as_deref() == Some(path) {
-            self.preview.active = next_tab_after_close(&self.preview.tabs, index);
-        }
-        if self.preview.active.is_none() {
-            self.preview.narrow_view = FilesNarrowView::Tree;
-        }
-        self.sync_preview_list();
-        cx.notify();
-    }
-
-    fn select_document(&mut self, path: String, cx: &mut Context<Self>) {
-        self.preview.active = Some(path);
-        self.preview.narrow_view = FilesNarrowView::Preview;
-        self.sync_preview_list();
-        cx.notify();
-    }
-
     fn reload_active_document(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.preview.active.clone() {
             self.read_file(path, cx);
@@ -363,7 +308,7 @@ impl FilesSurface {
         let Some(active) = self.preview.active.clone() else {
             return gpui::Empty.into_any_element();
         };
-        let tabs = self.render_document_tabs(narrow, &theme, cx);
+        let toolbar = narrow.then(|| self.render_preview_toolbar(&theme, cx));
         let breadcrumb = self.render_breadcrumb(&active, &theme, cx);
         let external = self
             .preview
@@ -376,7 +321,7 @@ impl FilesSurface {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(tabs)
+            .when_some(toolbar, |element, toolbar| element.child(toolbar))
             .child(breadcrumb)
             .when(external, |element| {
                 element.child(
@@ -410,89 +355,7 @@ impl FilesSurface {
             .into_any_element()
     }
 
-    fn render_document_tabs(
-        &mut self,
-        narrow: bool,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let active = self.preview.active.clone();
-        let mut tabs = div()
-            .id("files-preview-tabs")
-            .flex()
-            .items_center()
-            .gap(px(2.0))
-            .min_w_0()
-            .overflow_x_scroll()
-            .track_scroll(&self.preview.tab_scroll);
-        for (index, path) in self.preview.tabs.clone().into_iter().enumerate() {
-            let selected = active.as_deref() == Some(path.as_str());
-            let name = path.rsplit('/').next().unwrap_or(&path).to_string();
-            let select_path = path.clone();
-            let close_path = path.clone();
-            let tooltip_path: SharedString = path.clone().into();
-            tabs = tabs.child(
-                div()
-                    .id(("files-document-tab", index))
-                    .role(gpui::Role::Tab)
-                    .aria_label(path.clone())
-                    .aria_selected(selected)
-                    .h(px(25.0))
-                    .max_w(px(150.0))
-                    .flex_none()
-                    .pl(px(8.0))
-                    .pr(px(4.0))
-                    .rounded(px(6.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .cursor_pointer()
-                    .when(selected, |element| element.bg(crate::theme::wash(0.1)))
-                    .when(!selected, |element| {
-                        element.hover(|style| style.bg(crate::theme::wash(0.055)))
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.select_document(select_path.clone(), cx)
-                    }))
-                    .tooltip(move |_, cx| cx.new(|_| FilePathTooltip(tooltip_path.clone())).into())
-                    .tooltip_show_delay(Duration::from_millis(350))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .font_family(theme.font_mono.clone())
-                            .text_size(px(10.5))
-                            .text_color(if selected {
-                                theme.text
-                            } else {
-                                theme.text_muted
-                            })
-                            .child(name.clone()),
-                    )
-                    .child(
-                        div()
-                            .id(("files-document-close", index))
-                            .role(gpui::Role::Button)
-                            .aria_label(format!("Close {name}"))
-                            .size(px(16.0))
-                            .flex_none()
-                            .rounded(px(4.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .hover(|style| style.bg(crate::theme::wash(0.1)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_document(&close_path, cx);
-                            }))
-                            .child(
-                                icon(icons::CLOSE)
-                                    .size(px(10.0))
-                                    .text_color(theme.text_faint),
-                            ),
-                    ),
-            );
-        }
+    fn render_preview_toolbar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         div()
             .h(px(34.0))
             .flex_none()
@@ -507,36 +370,34 @@ impl FilesSurface {
             .flex()
             .items_center()
             .gap(px(4.0))
-            .when(narrow, |element| {
-                element.child(
-                    div()
-                        .id("files-preview-back")
-                        .h(px(24.0))
-                        .px(px(5.0))
-                        .flex_none()
-                        .rounded(px(5.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(2.0))
-                        .cursor_pointer()
-                        .hover(|style| style.bg(crate::theme::wash(0.07)))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_tree(cx);
-                        }))
-                        .child(
-                            icon(icons::ALT_ARROW_LEFT)
-                                .size(px(11.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(theme.text_muted)
-                                .child("Files"),
-                        ),
-                )
-            })
-            .child(div().min_w_0().flex_1().child(tabs))
+            .child(
+                div()
+                    .id("files-preview-back")
+                    .h(px(24.0))
+                    .px(px(5.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::wash(0.07)))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.show_tree(cx);
+                    }))
+                    .child(
+                        icon(icons::ALT_ARROW_LEFT)
+                            .size(px(11.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_muted)
+                            .child("Files"),
+                    ),
+            )
+            .child(div().min_w_0().flex_1())
             .into_any_element()
     }
 
@@ -838,25 +699,9 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
     .into()
 }
 
-pub(super) fn next_tab_after_close(tabs: &[String], closed: usize) -> Option<String> {
-    if tabs.is_empty() {
-        None
-    } else {
-        tabs.get(closed.min(tabs.len() - 1)).cloned()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn closing_a_tab_selects_the_next_or_previous_neighbor() {
-        let tabs = vec!["a".into(), "c".into()];
-        assert_eq!(next_tab_after_close(&tabs, 1).as_deref(), Some("c"));
-        assert_eq!(next_tab_after_close(&tabs, 2).as_deref(), Some("c"));
-        assert_eq!(next_tab_after_close(&[], 0), None);
-    }
 
     #[test]
     fn read_only_reasons_have_specific_messages() {
@@ -870,7 +715,6 @@ mod tests {
     #[test]
     fn reset_drops_documents_and_active_preview_from_the_previous_target() {
         let mut preview = FilePreviewState::new();
-        preview.tabs.push("private.env".into());
         preview.active = Some("private.env".into());
         preview.documents.insert(
             "private.env".into(),
@@ -883,7 +727,6 @@ mod tests {
 
         preview.reset();
 
-        assert!(preview.tabs.is_empty());
         assert!(preview.documents.is_empty());
         assert!(preview.active.is_none());
         assert_eq!(preview.narrow_view, FilesNarrowView::Tree);

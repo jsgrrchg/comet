@@ -28,7 +28,7 @@ use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
-use crate::files::FilesSurface;
+use crate::files::{FilesEvent, FilesSurface};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -198,14 +198,15 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// One right-pane surface tab: a single workspace browser per chat, a git-diff
-/// page (each tab its own [`Changes`] viewer), or one embedded terminal keyed
-/// by its [`TerminalPanel`] tab key. `Picker` is the empty state.
+/// One right-pane surface tab: a workspace browser, an individual workspace
+/// file editor, a git-diff page, or one embedded terminal. `Picker` is the
+/// empty state.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum RightSurface {
     #[default]
     Picker,
     Files,
+    File(u64),
     Diff(u64),
     Terminal(u64),
 }
@@ -217,6 +218,10 @@ fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface
         tabs.push(surface);
         true
     }
+}
+
+fn workspace_file_title(path: &str) -> SharedString {
+    path.rsplit('/').next().unwrap_or(path).to_string().into()
 }
 
 /// Per-chat panel open flags (zeron parity: `sessionPanels` — the terminal and
@@ -782,7 +787,7 @@ pub struct Shell {
     /// entity from the bottom drawer's (own PTYs, own grid geometry; one
     /// panel can only size one visible grid at a time).
     right_terminal: Option<Entity<TerminalPanel>>,
-    /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
+    /// The surface-tab strip's `+` menu (Files / Terminal / Git diff rows).
     right_plus: popover::Popup<()>,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
@@ -790,6 +795,14 @@ pub struct Shell {
     /// One workspace browser per chat/panel key. Dropping the entity closes
     /// its file watcher and every in-flight workspace request.
     files: std::collections::HashMap<String, Entity<FilesSurface>>,
+    files_subs: std::collections::HashMap<String, Subscription>,
+    /// One independent editor/tree per opened workspace file. IDs are global
+    /// while the lookup key keeps a file tab scoped to its chat panel.
+    file_surfaces: std::collections::HashMap<u64, Entity<FilesSurface>>,
+    file_surface_paths: std::collections::HashMap<u64, String>,
+    file_surface_keys: std::collections::HashMap<(String, String), u64>,
+    file_surface_subs: std::collections::HashMap<u64, Subscription>,
+    file_surface_seq: u64,
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
@@ -1034,6 +1047,12 @@ impl Shell {
             right_plus: popover::Popup::default(),
             diffs: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
+            files_subs: std::collections::HashMap::new(),
+            file_surfaces: std::collections::HashMap::new(),
+            file_surface_paths: std::collections::HashMap::new(),
+            file_surface_keys: std::collections::HashMap::new(),
+            file_surface_subs: std::collections::HashMap::new(),
+            file_surface_seq: 0,
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
             right_tabs: std::collections::HashMap::new(),
@@ -1459,6 +1478,14 @@ impl Shell {
                     .files
                     .get(&key)
                     .map(|_| (*surface, SharedString::from("Files"))),
+                RightSurface::File(id) => self.file_surfaces.get(id).map(|_| {
+                    let title = self
+                        .file_surface_paths
+                        .get(id)
+                        .map(|path| workspace_file_title(path))
+                        .unwrap_or_else(|| SharedString::from("File"));
+                    (*surface, title)
+                }),
                 RightSurface::Diff(id) => self
                     .diffs
                     .get(id)
@@ -1539,6 +1566,11 @@ impl Shell {
                     files.update(cx, |files, cx| files.ensure_loaded(cx));
                 }
             }
+            RightSurface::File(id) => {
+                if let Some(file) = self.file_surfaces.get(&id).cloned() {
+                    file.update(cx, |file, cx| file.ensure_loaded(cx));
+                }
+            }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
                 panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
@@ -1569,12 +1601,56 @@ impl Shell {
             return;
         }
         let key = self.panel_key(cx);
-        self.files.entry(key.clone()).or_insert_with(|| {
-            cx.new(|cx| FilesSurface::new(self.state.clone(), self.active_chat.clone(), cx))
-        });
+        if !self.files.contains_key(&key) {
+            let files =
+                cx.new(|cx| FilesSurface::new(self.state.clone(), self.active_chat.clone(), cx));
+            let sub = cx.subscribe(&files, |this: &mut Self, _, event, cx| match event {
+                FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
+            });
+            self.files.insert(key.clone(), files);
+            self.files_subs.insert(key.clone(), sub);
+        }
         let tabs = self.right_tabs.entry(key).or_default();
         push_unique_right_surface(tabs, RightSurface::Files);
         self.set_right_active(RightSurface::Files, cx);
+    }
+
+    /// Open a workspace file as a first-class right-pane tab. Every editor is
+    /// a separate FilesSurface so its tree, search, watcher and split layout
+    /// stay stable while users move among open files.
+    fn add_file_surface(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        let panel_key = self.panel_key(cx);
+        let lookup = (panel_key.clone(), path.clone());
+        if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
+            self.set_right_active(RightSurface::File(id), cx);
+            return;
+        }
+
+        self.file_surface_seq += 1;
+        let id = self.file_surface_seq;
+        let file = cx.new(|cx| {
+            FilesSurface::new_editor(
+                self.state.clone(),
+                self.active_chat.clone(),
+                path.clone(),
+                cx,
+            )
+        });
+        let sub = cx.subscribe(&file, |this: &mut Self, _, event, cx| match event {
+            FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
+        });
+        self.file_surfaces.insert(id, file);
+        self.file_surface_paths.insert(id, path);
+        self.file_surface_keys.insert(lookup, id);
+        self.file_surface_subs.insert(id, sub);
+        self.right_tabs
+            .entry(panel_key)
+            .or_default()
+            .push(RightSurface::File(id));
+        self.set_right_active(RightSurface::File(id), cx);
     }
 
     /// A History row click: the commit opens as its own pinned diff tab
@@ -1639,6 +1715,13 @@ impl Shell {
         match surface {
             RightSurface::Files => {
                 self.files.remove(&key);
+                self.files_subs.remove(&key);
+            }
+            RightSurface::File(id) => {
+                self.file_surfaces.remove(&id);
+                self.file_surface_paths.remove(&id);
+                self.file_surface_subs.remove(&id);
+                self.file_surface_keys.retain(|_, value| *value != id);
             }
             RightSurface::Diff(id) => {
                 // Dropping the entity tears down its diff watch.
@@ -4927,6 +5010,14 @@ impl Shell {
                         self.render_surface_picker(cx)
                     }
                 }
+                RightSurface::File(id) => {
+                    if let Some(file) = self.file_surfaces.get(&id).cloned() {
+                        file.update(cx, |file, cx| file.ensure_loaded(cx));
+                        file.into_any_element()
+                    } else {
+                        self.render_surface_picker(cx)
+                    }
+                }
                 RightSurface::Diff(id) if self.diffs.contains_key(&id) => {
                     let changes = self.diffs.get(&id).cloned().expect("checked");
                     // Idempotent — also covers a persisted-open pane on boot.
@@ -5289,6 +5380,7 @@ impl Shell {
             let is_active = surface == active;
             let icon_path = match surface {
                 RightSurface::Files => icons::FOLDER_WITH_FILES,
+                RightSurface::File(_) => icons::DOCUMENT,
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Picker => icons::PLUS,
@@ -6979,6 +7071,15 @@ mod tests {
         assert!(push_unique_right_surface(&mut tabs, RightSurface::Files));
         assert!(!push_unique_right_surface(&mut tabs, RightSurface::Files));
         assert_eq!(tabs, vec![RightSurface::Terminal(1), RightSurface::Files]);
+    }
+
+    #[test]
+    fn file_editors_are_distinct_surface_tabs_with_stable_titles() {
+        let mut tabs = vec![RightSurface::Files];
+        assert!(push_unique_right_surface(&mut tabs, RightSurface::File(1)));
+        assert!(push_unique_right_surface(&mut tabs, RightSurface::File(2)));
+        assert!(!push_unique_right_surface(&mut tabs, RightSurface::File(1)));
+        assert_eq!(workspace_file_title("src/árbol.rs"), "árbol.rs");
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----

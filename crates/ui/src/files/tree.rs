@@ -226,7 +226,7 @@ impl FilesSurface {
         if is_directory {
             self.toggle_tree_directory(path, cx);
         } else {
-            self.open_file(path, cx);
+            cx.emit(super::FilesEvent::OpenFile(path));
         }
         self.reveal_tree_selection();
         cx.notify();

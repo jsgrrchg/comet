@@ -198,7 +198,7 @@ impl FilesSurface {
                 if result.kind == WorkspaceEntryKind::Directory {
                     surface.show_tree(cx);
                 } else {
-                    surface.open_file(result.path.clone(), cx);
+                    cx.emit(super::FilesEvent::OpenFile(result.path.clone()));
                 }
                 cx.notify();
             });

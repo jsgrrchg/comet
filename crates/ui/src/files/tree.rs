@@ -62,9 +62,7 @@ impl FilesSurface {
                 let focused = self.tree_focus.is_focused(window);
                 let is_directory = node.entry.kind == WorkspaceEntryKind::Directory;
                 let expanded = is_directory && self.tree.is_expanded(&path);
-                let text_color = if node.entry.ignored {
-                    theme.text_faint.opacity(0.72)
-                } else if selected {
+                let text_color = if selected {
                     theme.text
                 } else {
                     theme.text_muted
@@ -88,6 +86,7 @@ impl FilesSurface {
                     .items_center()
                     .gap(px(4.0))
                     .cursor_pointer()
+                    .when(node.entry.ignored, |element| element.opacity(0.52))
                     .when(selected, |element| {
                         element.bg(crate::theme::wash(if focused { 0.12 } else { 0.08 }))
                     })

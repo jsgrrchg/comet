@@ -12,8 +12,10 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use zeron_proto::{
-    ListWorkspaceDirectoryRequest, SearchWorkspaceFilesRequest, WorkspaceDirectoryPage,
-    WorkspaceEntry, WorkspaceEntryKind, WorkspaceFileSearchMatch, WorkspaceTarget,
+    ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
+    WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFileSearchMatch,
+    WorkspaceFileText, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTarget,
+    WorkspaceTextEncoding,
 };
 use zeron_rpc::RpcError;
 
@@ -26,6 +28,8 @@ pub const MAX_DIRECTORY_ENTRIES: usize = 50_000;
 pub const MAX_SEARCH_QUERY_CHARS: usize = 256;
 pub const MAX_SEARCH_RESULTS: usize = 200;
 pub const WORKSPACE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(6);
+pub const MAX_EDITABLE_FILE_BYTES: u64 = 1024 * 1024;
+pub const MAX_PREVIEW_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct WorkspaceFiles {
@@ -321,6 +325,23 @@ impl WorkspaceFiles {
         result
     }
 
+    pub async fn read_file(
+        &self,
+        request: ReadWorkspaceFileRequest,
+    ) -> Result<WorkspaceFileText, WorkspaceFilesError> {
+        let workspace = self.resolve_target(&request.target).await?;
+        let relative = WorkspaceRelativePath::file(&request.path)?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_on_drop = CancelOnDrop::new(cancel.clone());
+        let result = tokio::task::spawn_blocking(move || {
+            read_file_blocking(&workspace.root, &relative, &cancel)
+        })
+        .await
+        .map_err(|error| WorkspaceFilesError::Io(format!("file read worker failed: {error}")))?;
+        cancel_on_drop.disarm();
+        result
+    }
+
     /// Cancel all service-owned work. This operation is idempotent.
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
@@ -567,6 +588,250 @@ fn search_workspace_blocking(
     });
     matches.truncate(limit);
     Ok(matches)
+}
+
+fn read_file_blocking(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+    cancel: &AtomicBool,
+) -> Result<WorkspaceFileText, WorkspaceFilesError> {
+    let path = root.join(relative.as_path());
+    let wire_path = relative.wire_path();
+    let metadata = match checked_file_metadata(root, relative) {
+        Ok(metadata) => metadata,
+        Err(WorkspaceFilesError::Unsupported(message)) if message == "path is a symlink" => {
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+            return Ok(non_text_file(
+                wire_path,
+                &metadata,
+                WorkspaceReadOnlyReason::Symlink,
+            ));
+        }
+        Err(WorkspaceFilesError::Unsupported(message))
+            if message == "path is not a regular file" =>
+        {
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+            return Ok(non_text_file(
+                wire_path,
+                &metadata,
+                WorkspaceReadOnlyReason::NotRegularFile,
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.len() > MAX_PREVIEW_FILE_BYTES {
+        return Ok(WorkspaceFileText {
+            path: wire_path,
+            text: None,
+            content_hash: None,
+            size: metadata.len(),
+            modified_at: metadata.modified().ok().map(chrono::DateTime::from),
+            encoding: WorkspaceTextEncoding::Unsupported,
+            line_ending: None,
+            read_only_reason: Some(WorkspaceReadOnlyReason::TooLarge),
+            truncated: true,
+        });
+    }
+
+    for attempt in 0..2 {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(WorkspaceFilesError::Io("file read cancelled".into()));
+        }
+        let before = checked_file_metadata(root, relative)?;
+        let bytes =
+            std::fs::read(&path).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        let after = checked_file_metadata(root, relative)?;
+        if same_file_revision(&before, &after) && bytes.len() as u64 == after.len() {
+            return Ok(classify_file_text(wire_path, bytes, &after));
+        }
+        if attempt == 1 {
+            return Err(WorkspaceFilesError::Io(
+                "file changed while it was being read; retry".into(),
+            ));
+        }
+    }
+    unreachable!("read retry loop always returns")
+}
+
+fn checked_file_metadata(
+    root: &Path,
+    relative: &WorkspaceRelativePath,
+) -> Result<std::fs::Metadata, WorkspaceFilesError> {
+    let mut current = root.to_path_buf();
+    let components: Vec<_> = relative.as_path().components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(component) = component else {
+            return Err(bad_path("invalid file component"));
+        };
+        current.push(component);
+        let metadata = std::fs::symlink_metadata(&current).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                WorkspaceFilesError::NotFound("file not found".into())
+            } else {
+                WorkspaceFilesError::Io(error.to_string())
+            }
+        })?;
+        if metadata.file_type().is_symlink() {
+            let message = if index + 1 == components.len() {
+                "path is a symlink"
+            } else {
+                "path traverses a symlink"
+            };
+            return Err(WorkspaceFilesError::Unsupported(message.into()));
+        }
+        if index + 1 < components.len() && !metadata.is_dir() {
+            return Err(WorkspaceFilesError::Unsupported(
+                "file parent is not a directory".into(),
+            ));
+        }
+        if index + 1 == components.len() && !metadata.is_file() {
+            return Err(WorkspaceFilesError::Unsupported(
+                "path is not a regular file".into(),
+            ));
+        }
+    }
+    let canonical = std::fs::canonicalize(&current)
+        .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+    if !canonical.starts_with(root) {
+        return Err(WorkspaceFilesError::Authorization(
+            "file escaped workspace".into(),
+        ));
+    }
+    std::fs::symlink_metadata(canonical).map_err(|error| WorkspaceFilesError::Io(error.to_string()))
+}
+
+fn non_text_file(
+    path: String,
+    metadata: &std::fs::Metadata,
+    reason: WorkspaceReadOnlyReason,
+) -> WorkspaceFileText {
+    WorkspaceFileText {
+        path,
+        text: None,
+        content_hash: None,
+        size: metadata.len(),
+        modified_at: metadata.modified().ok().map(chrono::DateTime::from),
+        encoding: WorkspaceTextEncoding::Unsupported,
+        line_ending: None,
+        read_only_reason: Some(reason),
+        truncated: false,
+    }
+}
+
+fn classify_file_text(
+    path: String,
+    bytes: Vec<u8>,
+    metadata: &std::fs::Metadata,
+) -> WorkspaceFileText {
+    let content_hash = Some(hash_bytes(&bytes));
+    let size = bytes.len() as u64;
+    let modified_at = metadata.modified().ok().map(chrono::DateTime::from);
+    if bytes.contains(&0) {
+        return WorkspaceFileText {
+            path,
+            text: None,
+            content_hash,
+            size,
+            modified_at,
+            encoding: WorkspaceTextEncoding::Binary,
+            line_ending: None,
+            read_only_reason: Some(WorkspaceReadOnlyReason::Binary),
+            truncated: false,
+        };
+    }
+
+    let (encoding, source) = if let Some(source) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
+        (WorkspaceTextEncoding::Utf8Bom, source)
+    } else {
+        (WorkspaceTextEncoding::Utf8, bytes.as_slice())
+    };
+    let Ok(source) = std::str::from_utf8(source) else {
+        return WorkspaceFileText {
+            path,
+            text: None,
+            content_hash,
+            size,
+            modified_at,
+            encoding: WorkspaceTextEncoding::Unsupported,
+            line_ending: None,
+            read_only_reason: Some(WorkspaceReadOnlyReason::UnsupportedEncoding),
+            truncated: false,
+        };
+    };
+    let line_ending = detect_line_ending(source.as_bytes());
+    let text = match line_ending {
+        WorkspaceLineEnding::Crlf => source.replace("\r\n", "\n"),
+        _ => source.to_string(),
+    };
+    let read_only_reason = if size > MAX_EDITABLE_FILE_BYTES {
+        Some(WorkspaceReadOnlyReason::TooLarge)
+    } else if line_ending == WorkspaceLineEnding::Mixed {
+        Some(WorkspaceReadOnlyReason::MixedLineEndings)
+    } else {
+        None
+    };
+    WorkspaceFileText {
+        path,
+        text: Some(text),
+        content_hash,
+        size,
+        modified_at,
+        encoding,
+        line_ending: Some(line_ending),
+        read_only_reason,
+        truncated: false,
+    }
+}
+
+fn detect_line_ending(bytes: &[u8]) -> WorkspaceLineEnding {
+    let mut crlf = 0usize;
+    let mut lf = 0usize;
+    let mut lone_cr = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                crlf += 1;
+                index += 2;
+            }
+            b'\r' => {
+                lone_cr += 1;
+                index += 1;
+            }
+            b'\n' => {
+                lf += 1;
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    match (crlf, lf, lone_cr) {
+        (0, 0, 0) => WorkspaceLineEnding::None,
+        (0, _, 0) => WorkspaceLineEnding::Lf,
+        (_, 0, 0) => WorkspaceLineEnding::Crlf,
+        _ => WorkspaceLineEnding::Mixed,
+    }
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
+}
+
+fn same_file_revision(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
+    if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev() && before.ino() == after.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 fn checked_directory(
@@ -872,5 +1137,120 @@ mod tests {
                 .any(|entry| entry.path == "src/configuration.rs")
         );
         assert!(matches.len() <= MAX_SEARCH_RESULTS);
+    }
+
+    fn read_fixture(bytes: &[u8]) -> WorkspaceFileText {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file.txt"), bytes).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        read_file_blocking(
+            &canonical,
+            &WorkspaceRelativePath::file("file.txt").unwrap(),
+            &no_cancel(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn read_classifies_utf8_bom_and_line_endings() {
+        let lf = read_fixture("hello\n世界\n".as_bytes());
+        assert_eq!(lf.encoding, WorkspaceTextEncoding::Utf8);
+        assert_eq!(lf.line_ending, Some(WorkspaceLineEnding::Lf));
+        assert_eq!(lf.text.as_deref(), Some("hello\n世界\n"));
+
+        let crlf = read_fixture(b"first\r\nsecond\r\n");
+        assert_eq!(crlf.line_ending, Some(WorkspaceLineEnding::Crlf));
+        assert_eq!(crlf.text.as_deref(), Some("first\nsecond\n"));
+
+        let bom = read_fixture(b"\xef\xbb\xbfhello\r\n");
+        assert_eq!(bom.encoding, WorkspaceTextEncoding::Utf8Bom);
+        assert_eq!(bom.text.as_deref(), Some("hello\n"));
+
+        let mixed = read_fixture(b"first\r\nsecond\n");
+        assert_eq!(mixed.line_ending, Some(WorkspaceLineEnding::Mixed));
+        assert_eq!(
+            mixed.read_only_reason,
+            Some(WorkspaceReadOnlyReason::MixedLineEndings)
+        );
+    }
+
+    #[test]
+    fn read_hashes_original_bytes_and_rejects_lossy_text() {
+        let lf = read_fixture(b"hello\n");
+        let crlf = read_fixture(b"hello\r\n");
+        assert_ne!(lf.content_hash, crlf.content_hash);
+        assert_eq!(
+            lf.content_hash.as_deref(),
+            Some(hash_bytes(b"hello\n").as_str())
+        );
+
+        let binary = read_fixture(b"hello\0world");
+        assert_eq!(binary.encoding, WorkspaceTextEncoding::Binary);
+        assert!(binary.text.is_none());
+        let unsupported = read_fixture(&[0xff, 0xfe, 0xfd]);
+        assert_eq!(unsupported.encoding, WorkspaceTextEncoding::Unsupported);
+        assert!(unsupported.text.is_none());
+    }
+
+    #[test]
+    fn read_enforces_editable_and_preview_limits() {
+        let editable = read_fixture(&vec![b'a'; MAX_EDITABLE_FILE_BYTES as usize]);
+        assert!(editable.read_only_reason.is_none());
+        let preview = read_fixture(&vec![b'a'; MAX_EDITABLE_FILE_BYTES as usize + 1]);
+        assert_eq!(
+            preview.read_only_reason,
+            Some(WorkspaceReadOnlyReason::TooLarge)
+        );
+        assert!(preview.text.is_some());
+
+        let root = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(root.path().join("large.txt")).unwrap();
+        file.set_len(MAX_PREVIEW_FILE_BYTES + 1).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let large = read_file_blocking(
+            &canonical,
+            &WorkspaceRelativePath::file("large.txt").unwrap(),
+            &no_cancel(),
+        )
+        .unwrap();
+        assert!(large.truncated);
+        assert!(large.text.is_none());
+        assert!(large.content_hash.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_does_not_follow_file_or_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("file.txt"),
+        )
+        .unwrap();
+        symlink(outside.path(), root.path().join("dir")).unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+
+        let file = read_file_blocking(
+            &canonical,
+            &WorkspaceRelativePath::file("file.txt").unwrap(),
+            &no_cancel(),
+        )
+        .unwrap();
+        assert_eq!(
+            file.read_only_reason,
+            Some(WorkspaceReadOnlyReason::Symlink)
+        );
+        assert!(
+            read_file_blocking(
+                &canonical,
+                &WorkspaceRelativePath::file("dir/secret.txt").unwrap(),
+                &no_cancel(),
+            )
+            .is_err()
+        );
     }
 }

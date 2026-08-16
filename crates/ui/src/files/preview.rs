@@ -163,17 +163,22 @@ impl FilesSurface {
             document.phase = DocumentPhase::Loading;
             document.externally_modified = false;
         }
-        let generation = self.tree.generation();
         let request = ReadWorkspaceFileRequest {
             target: context.target.clone(),
             path: path.clone(),
         };
-        let client = WorkspaceFilesClient::new(engine, context);
+        let client = WorkspaceFilesClient::new(engine, context.clone());
         let task_path = path.clone();
         let task = cx.spawn(async move |this, cx| {
-            let result = client.read_file(request).await;
+            let mut result = client.read_file(request.clone()).await;
+            if result.as_ref().is_err_and(|error| error.retryable()) {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(250))
+                    .await;
+                result = client.read_file(request).await;
+            }
             let _ = this.update(cx, |surface, cx| {
-                if surface.tree.generation() != generation {
+                if surface.request_context.as_ref() != Some(&context) {
                     return;
                 }
                 let Some(document) = surface.preview.documents.get_mut(&task_path) else {
@@ -521,17 +526,20 @@ impl FilesSurface {
                         div()
                             .id("files-preview-code-scroll")
                             .flex_1()
+                            .min_w_0()
                             .min_h_0()
+                            .flex()
                             .overflow_x_scroll()
                             .track_scroll(&self.preview.horizontal_scroll)
                             .child(
-                                list(
-                                    self.preview.list.clone(),
-                                    cx.processor(Self::render_preview_line),
-                                )
-                                .min_w_full()
-                                .h_full()
-                                .with_sizing_behavior(ListSizingBehavior::Auto),
+                                div().flex_none().min_w_full().h_full().child(
+                                    list(
+                                        self.preview.list.clone(),
+                                        cx.processor(Self::render_preview_line),
+                                    )
+                                    .h_full()
+                                    .with_sizing_behavior(ListSizingBehavior::Infer),
+                                ),
                             ),
                     )
                     .into_any_element()

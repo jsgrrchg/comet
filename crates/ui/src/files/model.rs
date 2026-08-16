@@ -209,6 +209,7 @@ impl FileTreeModel {
         if parent.entry.kind != WorkspaceEntryKind::Directory {
             return false;
         }
+        let parent_ignored = parent.entry.ignored;
 
         let append = matches!(parent.load, DirectoryLoadState::Loading { cursor: Some(_) });
         if !append {
@@ -226,7 +227,8 @@ impl FileTreeModel {
             .get(&directory)
             .map(|node| node.children.iter().cloned().collect::<HashSet<_>>())
             .unwrap_or_default();
-        for entry in page.entries {
+        for mut entry in page.entries {
+            entry.ignored |= parent_ignored;
             let path = entry.path.clone();
             self.nodes
                 .entry(path.clone())
@@ -617,6 +619,42 @@ mod tests {
             .find(|row| row.path == "src/lib.rs")
             .unwrap();
         assert_eq!(row.depth, 1);
+    }
+
+    #[test]
+    fn ignored_directories_propagate_ignored_state_to_all_descendants() {
+        let mut tree = FileTreeModel::new();
+        let generation = tree.generation();
+        let mut ignored_directory = entry("target", WorkspaceEntryKind::Directory);
+        ignored_directory.ignored = true;
+
+        tree.begin_load("", None, generation);
+        tree.apply_page(page("", vec![ignored_directory], None), generation);
+        tree.begin_load("target", None, generation);
+        tree.apply_page(
+            page(
+                "target",
+                vec![
+                    entry("target/cache", WorkspaceEntryKind::Directory),
+                    entry("target/output.bin", WorkspaceEntryKind::File),
+                ],
+                None,
+            ),
+            generation,
+        );
+        tree.begin_load("target/cache", None, generation);
+        tree.apply_page(
+            page(
+                "target/cache",
+                vec![entry("target/cache/nested.bin", WorkspaceEntryKind::File)],
+                None,
+            ),
+            generation,
+        );
+
+        assert!(tree.node("target/cache").unwrap().entry.ignored);
+        assert!(tree.node("target/output.bin").unwrap().entry.ignored);
+        assert!(tree.node("target/cache/nested.bin").unwrap().entry.ignored);
     }
 
     #[test]

@@ -1654,6 +1654,31 @@ impl Shell {
         }
     }
 
+    fn set_files_word_wrap(
+        &mut self,
+        word_wrap: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.files_word_wrap = word_wrap;
+        if let Some(page) = self.files_settings_page.clone() {
+            page.update(cx, |page, cx| page.set_word_wrap(word_wrap, cx));
+        }
+        let surfaces = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        for surface in surfaces {
+            surface.update(cx, |surface, cx| {
+                surface.set_word_wrap(word_wrap, window, cx)
+            });
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     /// The picker's Git card / the `+` menu's Diff row: every click opens a
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
@@ -1672,8 +1697,15 @@ impl Shell {
         let key = self.panel_key(cx);
         if !self.files.contains_key(&key) {
             let delay = self.settings.files_autosave_delay_ms;
+            let word_wrap = self.settings.files_word_wrap;
             let files = cx.new(|cx| {
-                FilesSurface::new(self.state.clone(), self.active_chat.clone(), delay, cx)
+                FilesSurface::new(
+                    self.state.clone(),
+                    self.active_chat.clone(),
+                    delay,
+                    word_wrap,
+                    cx,
+                )
             });
             let event_key = key.clone();
             let sub = cx.subscribe_in(
@@ -1683,6 +1715,9 @@ impl Shell {
                     FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
                     FilesEvent::TitleChanged => cx.notify(),
                     FilesEvent::FileRenamed { .. } => cx.notify(),
+                    FilesEvent::WordWrapChanged(word_wrap) => {
+                        this.set_files_word_wrap(*word_wrap, window, cx)
+                    }
                     FilesEvent::CloseReady => {
                         this.on_file_close_ready(RightSurface::Files, &event_key, cx)
                     }
@@ -1722,6 +1757,7 @@ impl Shell {
                 self.active_chat.clone(),
                 path.clone(),
                 self.settings.files_autosave_delay_ms,
+                self.settings.files_word_wrap,
                 cx,
             )
         });
@@ -1734,6 +1770,9 @@ impl Shell {
                 FilesEvent::TitleChanged => cx.notify(),
                 FilesEvent::FileRenamed { old_path, new_path } => {
                     this.rename_file_surface(id, &event_panel_key, old_path, new_path, cx)
+                }
+                FilesEvent::WordWrapChanged(word_wrap) => {
+                    this.set_files_word_wrap(*word_wrap, window, cx)
                 }
                 FilesEvent::CloseReady => {
                     this.on_file_close_ready(RightSurface::File(id), &event_panel_key, cx)
@@ -2161,7 +2200,12 @@ impl Shell {
     }
 
     /// Lazily create the entity for a settings section and return it renderable.
-    fn settings_outlet(&mut self, section: SettingsSection, cx: &mut Context<Self>) -> AnyElement {
+    fn settings_outlet(
+        &mut self,
+        section: SettingsSection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match section {
             SettingsSection::Devices => {
                 if self.devices_page.is_none() {
@@ -2205,20 +2249,31 @@ impl Shell {
             SettingsSection::Files => {
                 if self.files_settings_page.is_none() {
                     let page = cx.new(|cx| {
-                        FilesSettingsPage::new(self.settings.files_autosave_delay_ms, cx)
+                        FilesSettingsPage::new(
+                            self.settings.files_autosave_delay_ms,
+                            self.settings.files_word_wrap,
+                            cx,
+                        )
                     });
-                    self.files_settings_sub = Some(cx.subscribe(
+                    self.files_settings_sub = Some(cx.subscribe_in(
                         &page,
-                        |this: &mut Shell, _, event: &FilesSettingsEvent, cx| {
-                            let FilesSettingsEvent::Changed { autosave_delay_ms } = *event;
-                            this.settings.files_autosave_delay_ms = autosave_delay_ms;
-                            for surface in this.files.values().chain(this.file_surfaces.values()) {
-                                surface.update(cx, |surface, cx| {
-                                    surface.set_autosave_delay_ms(autosave_delay_ms, cx)
-                                });
+                        window,
+                        |this: &mut Shell, _, event: &FilesSettingsEvent, window, cx| match *event {
+                            FilesSettingsEvent::AutosaveDelayChanged(autosave_delay_ms) => {
+                                this.settings.files_autosave_delay_ms = autosave_delay_ms;
+                                for surface in
+                                    this.files.values().chain(this.file_surfaces.values())
+                                {
+                                    surface.update(cx, |surface, cx| {
+                                        surface.set_autosave_delay_ms(autosave_delay_ms, cx)
+                                    });
+                                }
+                                this.schedule_save(cx);
+                                cx.notify();
                             }
-                            this.schedule_save(cx);
-                            cx.notify();
+                            FilesSettingsEvent::WordWrapChanged(word_wrap) => {
+                                this.set_files_word_wrap(word_wrap, window, cx);
+                            }
                         },
                     ));
                     self.files_settings_page = Some(page);
@@ -4755,7 +4810,7 @@ impl Shell {
             )
     }
 
-    fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
@@ -4764,7 +4819,7 @@ impl Shell {
         // the unified window titlebar now (render_title_bar). Settings never
         // underlaps: pad below the overlaid titlebar.
         if let Route::Settings(section) = self.route {
-            let outlet = self.settings_outlet(section, cx);
+            let outlet = self.settings_outlet(section, window, cx);
             return div()
                 .flex_1()
                 .min_w_0()
@@ -6721,7 +6776,7 @@ impl Render for Shell {
                     |shell, _| shell.settings.sidebar_width = SIDEBAR_DEFAULT,
                     cx,
                 );
-                let main = self.render_main(cx);
+                let main = self.render_main(window, cx);
                 // The Changes pane is chat-scoped chrome: the Settings route
                 // never renders it (zeron __root.tsx `!isSettings && activeChat`
                 // around the diff column) — the per-session open flags stay

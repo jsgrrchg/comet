@@ -33,6 +33,7 @@ pub enum FilesEvent {
     OpenFile(String),
     TitleChanged,
     FileRenamed { old_path: String, new_path: String },
+    WordWrapChanged(bool),
     CloseReady,
     CloseCancelled,
 }
@@ -275,6 +276,7 @@ impl FilesSurface {
         state: Entity<AppState>,
         chat_id: String,
         autosave_delay_ms: u64,
+        word_wrap: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_with_presentation(
@@ -283,6 +285,7 @@ impl FilesSurface {
             FilesPresentation::Browser,
             None,
             autosave_delay_ms,
+            word_wrap,
             cx,
         )
     }
@@ -292,6 +295,7 @@ impl FilesSurface {
         chat_id: String,
         path: String,
         autosave_delay_ms: u64,
+        word_wrap: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_with_presentation(
@@ -300,6 +304,7 @@ impl FilesSurface {
             FilesPresentation::Editor,
             Some(path),
             autosave_delay_ms,
+            word_wrap,
             cx,
         )
     }
@@ -310,6 +315,7 @@ impl FilesSurface {
         presentation: FilesPresentation,
         editor_path: Option<String>,
         autosave_delay_ms: u64,
+        word_wrap: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let search =
@@ -360,7 +366,7 @@ impl FilesSurface {
             watch_task: None,
             watch_sequence: None,
             watch_error: None,
-            preview: FilePreviewState::new(autosave_delay_ms),
+            preview: FilePreviewState::new(autosave_delay_ms, word_wrap),
             loads: HashMap::new(),
             error: None,
             started: false,
@@ -377,6 +383,15 @@ impl FilesSurface {
             self.schedule_autosave(path, cx);
         }
         cx.notify();
+    }
+
+    pub fn set_word_wrap(
+        &mut self,
+        word_wrap: bool,
+        window: &mut gpui::Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_word_wrap(word_wrap, window, cx);
     }
 
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {

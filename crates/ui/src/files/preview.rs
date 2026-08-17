@@ -95,7 +95,7 @@ pub(super) struct FilePreviewState {
 }
 
 impl FilePreviewState {
-    pub(super) fn new(autosave_delay_ms: u64) -> Self {
+    pub(super) fn new(autosave_delay_ms: u64, word_wrap: bool) -> Self {
         Self {
             documents: HashMap::new(),
             active: None,
@@ -104,7 +104,7 @@ impl FilePreviewState {
             list: ListState::new(0, ListAlignment::Top, px(520.0)),
             horizontal_scroll: ScrollHandle::new(),
             surface_width: Rc::new(Cell::new(520.0)),
-            word_wrap: false,
+            word_wrap,
             autosave_delay_ms,
             reload_confirmation: None,
             close_requested: false,
@@ -371,17 +371,29 @@ impl FilesSurface {
         cx.notify();
     }
 
-    fn toggle_word_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.preview.word_wrap = !self.preview.word_wrap;
+    fn toggle_word_wrap(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let word_wrap = !self.preview.word_wrap;
+        cx.emit(FilesEvent::WordWrapChanged(word_wrap));
+    }
+
+    pub(super) fn apply_word_wrap(
+        &mut self,
+        word_wrap: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.preview.word_wrap == word_wrap {
+            return;
+        }
+        self.preview.word_wrap = word_wrap;
         self.preview.list.remeasure();
-        if let Some(editor) = self
+        let editors = self
             .preview
-            .active
-            .as_deref()
-            .and_then(|path| self.preview.documents.get(path))
-            .and_then(|document| document.editor.clone())
-        {
-            let word_wrap = self.preview.word_wrap;
+            .documents
+            .values()
+            .filter_map(|document| document.editor.clone())
+            .collect::<Vec<_>>();
+        for editor in editors {
             editor.update(cx, |state, cx| state.set_soft_wrap(word_wrap, window, cx));
         }
         cx.notify();
@@ -2467,7 +2479,7 @@ mod tests {
 
     #[test]
     fn reset_drops_documents_and_active_preview_from_the_previous_target() {
-        let mut preview = FilePreviewState::new(900);
+        let mut preview = FilePreviewState::new(900, false);
         preview.active = Some("private.env".into());
         preview.documents.insert(
             "private.env".into(),
@@ -2492,9 +2504,18 @@ mod tests {
     }
 
     #[test]
+    fn reset_preserves_the_global_word_wrap_preference() {
+        let mut preview = FilePreviewState::new(900, true);
+
+        preview.reset();
+
+        assert!(preview.word_wrap());
+    }
+
+    #[test]
     fn dirty_reload_waits_for_explicit_discard_confirmation() {
         let path = "src/lib.rs";
-        let mut preview = FilePreviewState::new(900);
+        let mut preview = FilePreviewState::new(900, false);
         let mut document = FileDocument::loading(DocumentKey {
             chat_id: "chat-1".into(),
             checkout_id: Some("checkout-1".into()),
@@ -2520,7 +2541,7 @@ mod tests {
     #[test]
     fn clean_reload_proceeds_without_confirmation() {
         let path = "src/lib.rs";
-        let mut preview = FilePreviewState::new(900);
+        let mut preview = FilePreviewState::new(900, false);
         preview.documents.insert(
             path.into(),
             FileDocument::loading(DocumentKey {

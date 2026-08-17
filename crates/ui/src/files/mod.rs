@@ -387,7 +387,7 @@ impl FilesSurface {
                 this.activate_search_result(cx)
             }
             ComposerInputEvent::MentionNavigate(delta) => {
-                let len = this.search_state.results.len();
+                let len = this.search_state.visible_len();
                 if len > 0 {
                     this.search_state.active = if *delta < 0 {
                         this.search_state.active.saturating_sub(1)

@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use gpui::{
     AnyElement, Context, ListSizingBehavior, SharedString, Task, Window, div, list, prelude::*, px,
@@ -17,7 +20,227 @@ use crate::{
     theme::Theme,
 };
 
-pub const SEARCH_ROW_HEIGHT: f32 = 42.0;
+pub const SEARCH_ROW_HEIGHT: f32 = 27.0;
+const SEARCH_TREE_INDENT: f32 = 14.0;
+const SEARCH_RESULT_LIMIT: usize = 200;
+
+#[derive(Debug, Clone)]
+struct SearchTreeNode {
+    path: String,
+    name: String,
+    kind: WorkspaceEntryKind,
+    score: Option<i64>,
+    best_score: i64,
+    children: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchTreeRow {
+    path: String,
+    name: String,
+    kind: WorkspaceEntryKind,
+    depth: usize,
+    has_children: bool,
+    score: i64,
+}
+
+impl SearchTreeRow {
+    fn as_match(&self) -> WorkspaceFileSearchMatch {
+        WorkspaceFileSearchMatch {
+            path: self.path.clone(),
+            name: self.name.clone(),
+            kind: self.kind,
+            score: self.score,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SearchTreeModel {
+    nodes: HashMap<String, SearchTreeNode>,
+    roots: Vec<String>,
+    collapsed: HashSet<String>,
+    rows: Vec<SearchTreeRow>,
+}
+
+impl SearchTreeModel {
+    fn clear(&mut self) {
+        self.nodes.clear();
+        self.roots.clear();
+        self.collapsed.clear();
+        self.rows.clear();
+    }
+
+    fn rebuild(&mut self, results: &[WorkspaceFileSearchMatch]) {
+        self.clear();
+        for result in results {
+            let mut parent = None;
+            let mut path = String::new();
+            for component in result
+                .path
+                .split('/')
+                .filter(|component| !component.is_empty())
+            {
+                if !path.is_empty() {
+                    path.push('/');
+                }
+                path.push_str(component);
+                let is_match = path == result.path;
+                self.nodes
+                    .entry(path.clone())
+                    .and_modify(|node| {
+                        if is_match {
+                            node.name = result.name.clone();
+                            node.kind = result.kind;
+                            node.score = Some(node.score.unwrap_or(i64::MIN).max(result.score));
+                        }
+                    })
+                    .or_insert_with(|| SearchTreeNode {
+                        path: path.clone(),
+                        name: if is_match {
+                            result.name.clone()
+                        } else {
+                            component.to_string()
+                        },
+                        kind: if is_match {
+                            result.kind
+                        } else {
+                            WorkspaceEntryKind::Directory
+                        },
+                        score: is_match.then_some(result.score),
+                        best_score: result.score,
+                        children: Vec::new(),
+                    });
+                if let Some(parent) = parent.as_ref() {
+                    let children = &mut self
+                        .nodes
+                        .get_mut(parent)
+                        .expect("search ancestor must exist")
+                        .children;
+                    if !children.contains(&path) {
+                        children.push(path.clone());
+                    }
+                } else if !self.roots.contains(&path) {
+                    self.roots.push(path.clone());
+                }
+                parent = Some(path.clone());
+            }
+        }
+        let roots = self.roots.clone();
+        for root in &roots {
+            update_best_score(root, &mut self.nodes);
+        }
+        sort_search_paths(&mut self.roots, &self.nodes);
+        for root in roots {
+            sort_search_branch(&root, &mut self.nodes);
+        }
+        self.rebuild_rows();
+    }
+
+    fn rows(&self) -> &[SearchTreeRow] {
+        &self.rows
+    }
+
+    fn toggle(&mut self, path: &str) -> bool {
+        if !self
+            .nodes
+            .get(path)
+            .is_some_and(|node| !node.children.is_empty())
+        {
+            return false;
+        }
+        if !self.collapsed.remove(path) {
+            self.collapsed.insert(path.to_string());
+        }
+        self.rebuild_rows();
+        true
+    }
+
+    fn is_expanded(&self, path: &str) -> bool {
+        !self.collapsed.contains(path)
+    }
+
+    fn rebuild_rows(&mut self) {
+        let mut rows = Vec::new();
+        for root in self.roots.clone() {
+            append_search_rows(&root, 0, &self.nodes, &self.collapsed, &mut rows);
+        }
+        self.rows = rows;
+    }
+}
+
+fn update_best_score(path: &str, nodes: &mut HashMap<String, SearchTreeNode>) -> i64 {
+    let Some(node) = nodes.get(path) else {
+        return i64::MIN;
+    };
+    let children = node.children.clone();
+    let mut best_score = node.score.unwrap_or(i64::MIN);
+    for child in children {
+        best_score = best_score.max(update_best_score(&child, nodes));
+    }
+    if let Some(node) = nodes.get_mut(path) {
+        node.best_score = best_score;
+    }
+    best_score
+}
+
+fn sort_search_branch(path: &str, nodes: &mut HashMap<String, SearchTreeNode>) {
+    let children = nodes
+        .get(path)
+        .map(|node| node.children.clone())
+        .unwrap_or_default();
+    for child in &children {
+        sort_search_branch(child, nodes);
+    }
+    let mut children = children;
+    sort_search_paths(&mut children, nodes);
+    if let Some(node) = nodes.get_mut(path) {
+        node.children = children;
+    }
+}
+
+fn sort_search_paths(paths: &mut [String], nodes: &HashMap<String, SearchTreeNode>) {
+    paths.sort_by(|left, right| {
+        let left = nodes.get(left).expect("search node must exist");
+        let right = nodes.get(right).expect("search node must exist");
+        right
+            .best_score
+            .cmp(&left.best_score)
+            .then_with(|| {
+                let left_directory = left.kind == WorkspaceEntryKind::Directory;
+                let right_directory = right.kind == WorkspaceEntryKind::Directory;
+                right_directory.cmp(&left_directory)
+            })
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+}
+
+fn append_search_rows(
+    path: &str,
+    depth: usize,
+    nodes: &HashMap<String, SearchTreeNode>,
+    collapsed: &HashSet<String>,
+    rows: &mut Vec<SearchTreeRow>,
+) {
+    let Some(node) = nodes.get(path) else {
+        return;
+    };
+    let has_children = !node.children.is_empty();
+    rows.push(SearchTreeRow {
+        path: node.path.clone(),
+        name: node.name.clone(),
+        kind: node.kind,
+        depth,
+        has_children,
+        score: node.score.unwrap_or(node.best_score),
+    });
+    if has_children && !collapsed.contains(path) {
+        for child in &node.children {
+            append_search_rows(child, depth + 1, nodes, collapsed, rows);
+        }
+    }
+}
 
 #[derive(Default)]
 pub(super) struct FileSearchState {
@@ -29,11 +252,16 @@ pub(super) struct FileSearchState {
     pub active: usize,
     pub task: Option<Task<()>>,
     pub reveal_task: Option<Task<()>>,
+    tree: SearchTreeModel,
 }
 
 impl FileSearchState {
     fn accepts(&self, generation: u64, query: &str) -> bool {
         self.generation == generation && self.query == query
+    }
+
+    pub(super) fn visible_len(&self) -> usize {
+        self.tree.rows().len()
     }
 }
 
@@ -51,6 +279,7 @@ impl FilesSurface {
         if query.is_empty() {
             self.search_state.loading = false;
             self.search_state.results.clear();
+            self.search_state.tree.clear();
             self.search_list.reset(0);
             self.search.update(cx, |search, cx| {
                 search.set_mention_controls(false, false, cx)
@@ -79,7 +308,7 @@ impl FilesSurface {
             target: context.target.clone(),
             query: query.clone(),
             include_ignored: self.tree.include_ignored(),
-            limit: Some(200),
+            limit: Some(SEARCH_RESULT_LIMIT as u16),
         };
         let client = WorkspaceFilesClient::new(engine, context);
         self.search_state.task = Some(cx.spawn(async move |this, cx| {
@@ -96,6 +325,10 @@ impl FilesSurface {
                     Ok(results) => {
                         surface.search_state.error = None;
                         surface.search_state.results = results;
+                        surface
+                            .search_state
+                            .tree
+                            .rebuild(&surface.search_state.results);
                         surface.search_state.active = 0;
                     }
                     Err(error) => {
@@ -103,10 +336,10 @@ impl FilesSurface {
                     }
                 }
                 surface.search_list.reset_with_uniform_height(
-                    surface.search_state.results.len(),
+                    surface.search_state.tree.rows().len(),
                     px(SEARCH_ROW_HEIGHT),
                 );
-                let has_results = !surface.search_state.results.is_empty();
+                let has_results = !surface.search_state.tree.rows().is_empty();
                 surface.search.update(cx, |search, cx| {
                     search.set_mention_controls(true, has_results, cx)
                 });
@@ -121,15 +354,36 @@ impl FilesSurface {
     }
 
     pub(super) fn activate_search_result(&mut self, cx: &mut Context<Self>) {
-        let Some(result) = self
+        let Some(row) = self
             .search_state
-            .results
+            .tree
+            .rows()
             .get(self.search_state.active)
             .cloned()
         else {
             return;
         };
-        self.reveal_search_result(result, cx);
+        if row.kind == WorkspaceEntryKind::Directory
+            && row.has_children
+            && self.search_state.tree.toggle(&row.path)
+        {
+            self.search_list.reset_with_uniform_height(
+                self.search_state.tree.rows().len(),
+                px(SEARCH_ROW_HEIGHT),
+            );
+            self.search_state.active = self
+                .search_state
+                .tree
+                .rows()
+                .iter()
+                .position(|candidate| candidate.path == row.path)
+                .unwrap_or(0);
+            self.search_list
+                .scroll_to_reveal_item(self.search_state.active);
+            cx.notify();
+            return;
+        }
+        self.reveal_search_result(row.as_match(), cx);
     }
 
     pub(super) fn reveal_search_result(
@@ -222,10 +476,30 @@ impl FilesSurface {
             return centered_search_message(label.into(), theme.text_faint);
         }
         div()
+            .id("files-search-results")
+            .role(gpui::Role::Tree)
+            .aria_label("Fuzzy workspace file results")
             .flex_1()
             .min_h_0()
             .flex()
             .flex_col()
+            .when(
+                self.search_state.results.len() >= SEARCH_RESULT_LIMIT,
+                |element| {
+                    element.child(
+                        div()
+                            .h(px(24.0))
+                            .flex_none()
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .font_family(theme.font_sans.clone())
+                            .text_size(px(10.0))
+                            .text_color(theme.text_faint)
+                            .child("Showing the first 200 matches"),
+                    )
+                },
+            )
             .child(
                 list(
                     self.search_list.clone(),
@@ -244,25 +518,29 @@ impl FilesSurface {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let Some(result) = self.search_state.results.get(index).cloned() else {
+        let Some(row) = self.search_state.tree.rows().get(index).cloned() else {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
         let selected = self.search_state.active == index;
-        let parent = parent_path(&result.path).unwrap_or_default();
-        let drag_payload = WorkspacePathDrag::new(
-            result.path.clone(),
-            result.kind == WorkspaceEntryKind::Directory,
-        );
+        let expanded = row.has_children && self.search_state.tree.is_expanded(&row.path);
+        let is_directory = row.kind == WorkspaceEntryKind::Directory;
+        let padding = 8.0 + row.depth as f32 * SEARCH_TREE_INDENT;
+        let drag_payload = WorkspacePathDrag::new(row.path.clone(), is_directory);
         div()
             .id(("files-search-result", index))
+            .role(gpui::Role::TreeItem)
+            .aria_label(row.name.clone())
+            .aria_selected(selected)
+            .when(row.has_children, |element| element.aria_expanded(expanded))
             .h(px(SEARCH_ROW_HEIGHT))
             .w_full()
             .flex_none()
-            .px(px(10.0))
+            .pl(px(padding))
+            .pr(px(8.0))
             .flex()
             .items_center()
-            .gap(px(7.0))
+            .gap(px(4.0))
             .cursor_pointer()
             .when(selected, |element| element.bg(crate::theme::wash(0.1)))
             .when(!selected, |element| {
@@ -277,7 +555,26 @@ impl FilesSurface {
                 workspace_path_drag_ghost(payload, cx)
             })
             .child(
-                icon(if result.kind == WorkspaceEntryKind::Directory {
+                div()
+                    .size(px(14.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(row.has_children, |element| {
+                        element.child(
+                            icon(if expanded {
+                                icons::ALT_ARROW_DOWN
+                            } else {
+                                icons::ALT_ARROW_RIGHT
+                            })
+                            .size(px(11.0))
+                            .text_color(theme.text_faint),
+                        )
+                    }),
+            )
+            .child(
+                icon(if is_directory {
                     icons::FOLDER
                 } else {
                     icons::DOCUMENT
@@ -289,24 +586,15 @@ impl FilesSurface {
             .child(
                 div()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .truncate()
-                            .font_family(theme.font_sans.clone())
-                            .text_size(px(11.5))
-                            .text_color(theme.text)
-                            .child(result.name),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .font_family(theme.font_sans.clone())
-                            .text_size(px(9.5))
-                            .text_color(theme.text_faint)
-                            .child(parent),
-                    ),
+                    .truncate()
+                    .font_family(theme.font_sans.clone())
+                    .text_size(px(11.5))
+                    .text_color(if is_directory {
+                        theme.text_muted
+                    } else {
+                        theme.text
+                    })
+                    .child(row.name),
             )
             .into_any_element()
     }
@@ -330,6 +618,15 @@ fn centered_search_message(message: SharedString, color: gpui::Hsla) -> AnyEleme
 mod tests {
     use super::*;
 
+    fn search_match(path: &str, kind: WorkspaceEntryKind, score: i64) -> WorkspaceFileSearchMatch {
+        WorkspaceFileSearchMatch {
+            path: path.to_string(),
+            name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            kind,
+            score,
+        }
+    }
+
     #[test]
     fn search_state_rejects_stale_queries() {
         let state = FileSearchState {
@@ -340,5 +637,77 @@ mod tests {
         assert!(state.accepts(4, "shell"));
         assert!(!state.accepts(3, "shell"));
         assert!(!state.accepts(4, "other"));
+    }
+
+    #[test]
+    fn search_tree_groups_matches_under_real_ancestors() {
+        let mut tree = SearchTreeModel::default();
+        tree.rebuild(&[
+            search_match(
+                "archive-renamed/docs/docs-1.txt",
+                WorkspaceEntryKind::File,
+                100,
+            ),
+            search_match(
+                "archive-renamed/logs/file-2.txt",
+                WorkspaceEntryKind::File,
+                90,
+            ),
+            search_match("README.md", WorkspaceEntryKind::File, 80),
+        ]);
+
+        let rows = tree.rows();
+        assert_eq!(
+            rows.iter().map(|row| row.path.as_str()).collect::<Vec<_>>(),
+            vec![
+                "archive-renamed",
+                "archive-renamed/docs",
+                "archive-renamed/docs/docs-1.txt",
+                "archive-renamed/logs",
+                "archive-renamed/logs/file-2.txt",
+                "README.md",
+            ]
+        );
+        assert_eq!(
+            rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
+            vec![0, 1, 2, 1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn search_tree_uses_path_components_instead_of_name_prefixes() {
+        let mut tree = SearchTreeModel::default();
+        tree.rebuild(&[search_match(
+            "THIRD_PARTY_NOTICES/THIRD_PARTY_NOTICES.md",
+            WorkspaceEntryKind::File,
+            100,
+        )]);
+
+        assert_eq!(
+            tree.rows()
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "THIRD_PARTY_NOTICES",
+                "THIRD_PARTY_NOTICES/THIRD_PARTY_NOTICES.md"
+            ]
+        );
+    }
+
+    #[test]
+    fn search_tree_collapses_and_restores_matching_branches() {
+        let mut tree = SearchTreeModel::default();
+        tree.rebuild(&[
+            search_match("src/main.rs", WorkspaceEntryKind::File, 100),
+            search_match("src/lib.rs", WorkspaceEntryKind::File, 90),
+        ]);
+
+        assert!(tree.toggle("src"));
+        assert_eq!(tree.rows().len(), 1);
+        assert!(!tree.is_expanded("src"));
+        assert!(tree.toggle("src"));
+        assert_eq!(tree.rows().len(), 3);
+        assert!(tree.is_expanded("src"));
     }
 }

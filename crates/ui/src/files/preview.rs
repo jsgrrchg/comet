@@ -245,6 +245,14 @@ fn document_blocks_lifecycle(document: &FileDocument) -> bool {
         )
 }
 
+fn document_finishes_review_comment_flush(document: &FileDocument) -> bool {
+    (!document.is_dirty() && matches!(document.phase, DocumentPhase::Ready))
+        || matches!(
+            document.phase,
+            DocumentPhase::SaveFailed(_) | DocumentPhase::Conflict { .. }
+        )
+}
+
 fn comment_anchor_range(
     text: &gpui_base::input::Rope,
     line: u32,
@@ -434,10 +442,35 @@ impl FilesSurface {
         }
         document.review_comment_flush_pending = true;
         let key = self.chat_id.clone();
+        let source = self.review_comment_flush_source;
         self.state.update(cx, |state, cx| {
-            state.begin_review_comment_flush(&key);
+            state.begin_review_comment_flush(&key, source);
             cx.notify();
         });
+    }
+
+    fn finish_review_comment_flush_if_idle(&mut self, cx: &mut Context<Self>) {
+        if self
+            .preview
+            .documents
+            .values()
+            .any(|document| document.review_comment_flush_pending)
+        {
+            return;
+        }
+        let key = self.chat_id.clone();
+        let source = self.review_comment_flush_source;
+        self.state.update(cx, |state, cx| {
+            state.finish_review_comment_flush(&key, source);
+            cx.notify();
+        });
+    }
+
+    pub(super) fn cancel_review_comment_flush(&mut self, cx: &mut Context<Self>) {
+        for document in self.preview.documents.values_mut() {
+            document.review_comment_flush_pending = false;
+        }
+        self.finish_review_comment_flush_if_idle(cx);
     }
 
     fn sync_editor_comment_anchors(
@@ -617,17 +650,7 @@ impl FilesSurface {
         {
             document.review_comment_flush_pending = false;
         }
-        if !self
-            .preview
-            .documents
-            .values()
-            .any(|document| document.review_comment_flush_pending)
-        {
-            self.state.update(cx, |state, cx| {
-                state.finish_review_comment_flush(&key);
-                cx.notify();
-            });
-        }
+        self.finish_review_comment_flush_if_idle(cx);
         cx.notify();
     }
 
@@ -1058,8 +1081,7 @@ impl FilesSurface {
                 let reconcile = document.reconcile_after_save;
                 document.reconcile_after_save = false;
                 if document.review_comment_flush_pending
-                    && !document.is_dirty()
-                    && matches!(document.phase, DocumentPhase::Ready)
+                    && document_finishes_review_comment_flush(document)
                 {
                     document.review_comment_flush_pending = false;
                 }
@@ -1073,18 +1095,7 @@ impl FilesSurface {
                 if reconcile {
                     surface.reconcile_document(task_path.clone(), cx);
                 }
-                if !surface
-                    .preview
-                    .documents
-                    .values()
-                    .any(|document| document.review_comment_flush_pending)
-                {
-                    let key = surface.chat_id.clone();
-                    surface.state.update(cx, |state, cx| {
-                        state.finish_review_comment_flush(&key);
-                        cx.notify();
-                    });
-                }
+                surface.finish_review_comment_flush_if_idle(cx);
                 surface.finish_pending_lifecycle(cx);
                 cx.emit(FilesEvent::TitleChanged);
                 cx.notify();
@@ -1157,6 +1168,7 @@ impl FilesSurface {
         for document in self.preview.documents.values_mut() {
             document.discard_changes();
         }
+        self.cancel_review_comment_flush(cx);
         self.preview.close_requested = false;
         if closing {
             cx.emit(FilesEvent::CloseReady);
@@ -2590,6 +2602,32 @@ mod tests {
 
         document.phase = DocumentPhase::Ready;
         assert!(!document_blocks_lifecycle(&document));
+    }
+
+    #[test]
+    fn terminal_save_outcomes_release_review_comment_flushes() {
+        let mut document = FileDocument::loading(DocumentKey {
+            chat_id: "chat-1".into(),
+            checkout_id: Some("checkout-1".into()),
+            path: "src/lib.rs".into(),
+        });
+        document.revision = 1;
+        document.review_comment_flush_pending = true;
+
+        document.phase = DocumentPhase::Saving;
+        assert!(!document_finishes_review_comment_flush(&document));
+
+        document.phase = DocumentPhase::SaveFailed("offline".into());
+        assert!(document_finishes_review_comment_flush(&document));
+
+        document.phase = DocumentPhase::Conflict { disk_hash: None };
+        assert!(document_finishes_review_comment_flush(&document));
+
+        document.phase = DocumentPhase::Ready;
+        assert!(!document_finishes_review_comment_flush(&document));
+
+        document.saved_revision = document.revision;
+        assert!(document_finishes_review_comment_flush(&document));
     }
 
     #[test]

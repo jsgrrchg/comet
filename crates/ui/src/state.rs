@@ -609,10 +609,10 @@ pub struct AppState {
     pending_sends: HashMap<String, PendingSend>,
     /// Written by the changes pane, read by the composer.
     review_comments: HashMap<String, Vec<ReviewComment>>,
-    /// Chats whose editor-backed comments currently cite a buffer revision
-    /// that has not reached disk yet. Their composer send is held until the
-    /// workspace write succeeds.
-    review_comment_flushes: HashSet<String>,
+    /// File surfaces whose editor-backed comments currently cite a buffer
+    /// revision that has not reached disk yet. A chat remains blocked until
+    /// every surface waiting on a workspace write has finished or cancelled.
+    review_comment_flushes: HashMap<String, HashSet<u64>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -650,7 +650,7 @@ impl AppState {
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             review_comments: HashMap::new(),
-            review_comment_flushes: HashSet::new(),
+            review_comment_flushes: HashMap::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
@@ -725,16 +725,28 @@ impl AppState {
         self.review_comments.remove(key);
     }
 
-    pub fn begin_review_comment_flush(&mut self, key: &str) {
-        self.review_comment_flushes.insert(key.to_string());
+    pub fn begin_review_comment_flush(&mut self, key: &str, source: u64) {
+        self.review_comment_flushes
+            .entry(key.to_string())
+            .or_default()
+            .insert(source);
     }
 
-    pub fn finish_review_comment_flush(&mut self, key: &str) {
-        self.review_comment_flushes.remove(key);
+    pub fn finish_review_comment_flush(&mut self, key: &str, source: u64) {
+        let remove_key = self
+            .review_comment_flushes
+            .get_mut(key)
+            .is_some_and(|sources| {
+                sources.remove(&source);
+                sources.is_empty()
+            });
+        if remove_key {
+            self.review_comment_flushes.remove(key);
+        }
     }
 
     pub fn review_comment_flush_pending(&self, key: &str) -> bool {
-        self.review_comment_flushes.contains(key)
+        self.review_comment_flushes.contains_key(key)
     }
 
     // ---- reducers (pure) ----
@@ -2766,5 +2778,20 @@ mod tests {
             1
         );
         assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+    }
+
+    #[test]
+    fn review_comment_flush_waits_for_every_file_surface() {
+        let mut state = AppState::new();
+
+        state.begin_review_comment_flush("chat-1", 1);
+        state.begin_review_comment_flush("chat-1", 2);
+        assert!(state.review_comment_flush_pending("chat-1"));
+
+        state.finish_review_comment_flush("chat-1", 1);
+        assert!(state.review_comment_flush_pending("chat-1"));
+
+        state.finish_review_comment_flush("chat-1", 2);
+        assert!(!state.review_comment_flush_pending("chat-1"));
     }
 }

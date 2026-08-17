@@ -1,6 +1,10 @@
 //! Workspace file browsing surface.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use gpui::{
     Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Pixels, Point, Render,
@@ -27,6 +31,8 @@ use client::{FilesRequestContext, WorkspaceFilesClient};
 use model::{DirectoryLoadState, FileTreeModel};
 use preview::FilePreviewState;
 use search::FileSearchState;
+
+static NEXT_REVIEW_COMMENT_FLUSH_SOURCE: AtomicU64 = AtomicU64::new(1);
 
 /// A workspace-relative file or directory dragged out of a Files surface.
 ///
@@ -141,6 +147,7 @@ struct EditorContextMenu {
 pub struct FilesSurface {
     state: Entity<AppState>,
     chat_id: String,
+    review_comment_flush_source: u64,
     presentation: FilesPresentation,
     editor_path: Option<String>,
     request_context: Option<FilesRequestContext>,
@@ -445,6 +452,8 @@ impl FilesSurface {
         let mut surface = Self {
             state,
             chat_id,
+            review_comment_flush_source: NEXT_REVIEW_COMMENT_FLUSH_SOURCE
+                .fetch_add(1, Ordering::Relaxed),
             presentation,
             editor_path: editor_path.clone(),
             request_context: None,
@@ -787,7 +796,7 @@ impl FilesSurface {
             cx.notify();
             return false;
         }
-        self.apply_target(next);
+        self.apply_target(next, cx);
         true
     }
 
@@ -797,12 +806,13 @@ impl FilesSurface {
         }
         let next = self.pending_request_context.take();
         self.target_change_pending = false;
-        self.apply_target(next);
+        self.apply_target(next, cx);
         self.ensure_loaded(cx);
         cx.notify();
     }
 
-    fn apply_target(&mut self, next: Option<FilesRequestContext>) {
+    fn apply_target(&mut self, next: Option<FilesRequestContext>, cx: &mut Context<Self>) {
+        self.cancel_review_comment_flush(cx);
         self.loads.clear();
         self.watch_task = None;
         self.watch_sequence = None;

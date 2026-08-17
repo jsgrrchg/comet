@@ -5721,16 +5721,7 @@ impl Shell {
                             theme.text_muted
                         })
                         .child(title),
-                )
-                .when(dirty, |chip| {
-                    chip.child(
-                        div()
-                            .flex_none()
-                            .size(px(5.0))
-                            .rounded_full()
-                            .bg(theme.warning_muted),
-                    )
-                });
+                );
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the

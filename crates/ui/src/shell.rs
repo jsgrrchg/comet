@@ -1679,6 +1679,26 @@ impl Shell {
         cx.notify();
     }
 
+    fn set_files_show_all(&mut self, show_all_files: bool, cx: &mut Context<Self>) {
+        self.settings.files_show_all = show_all_files;
+        if let Some(page) = self.files_settings_page.clone() {
+            page.update(cx, |page, cx| page.set_show_all_files(show_all_files, cx));
+        }
+        let surfaces = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        for surface in surfaces {
+            surface.update(cx, |surface, cx| {
+                surface.set_show_all_files(show_all_files, cx)
+            });
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     /// The picker's Git card / the `+` menu's Diff row: every click opens a
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
@@ -1698,12 +1718,14 @@ impl Shell {
         if !self.files.contains_key(&key) {
             let delay = self.settings.files_autosave_delay_ms;
             let word_wrap = self.settings.files_word_wrap;
+            let show_all_files = self.settings.files_show_all;
             let files = cx.new(|cx| {
                 FilesSurface::new(
                     self.state.clone(),
                     self.active_chat.clone(),
                     delay,
                     word_wrap,
+                    show_all_files,
                     cx,
                 )
             });
@@ -1717,6 +1739,9 @@ impl Shell {
                     FilesEvent::FileRenamed { .. } => cx.notify(),
                     FilesEvent::WordWrapChanged(word_wrap) => {
                         this.set_files_word_wrap(*word_wrap, window, cx)
+                    }
+                    FilesEvent::ShowAllFilesChanged(show_all_files) => {
+                        this.set_files_show_all(*show_all_files, cx)
                     }
                     FilesEvent::CloseReady => {
                         this.on_file_close_ready(RightSurface::Files, &event_key, cx)
@@ -1758,6 +1783,7 @@ impl Shell {
                 path.clone(),
                 self.settings.files_autosave_delay_ms,
                 self.settings.files_word_wrap,
+                self.settings.files_show_all,
                 cx,
             )
         });
@@ -1773,6 +1799,9 @@ impl Shell {
                 }
                 FilesEvent::WordWrapChanged(word_wrap) => {
                     this.set_files_word_wrap(*word_wrap, window, cx)
+                }
+                FilesEvent::ShowAllFilesChanged(show_all_files) => {
+                    this.set_files_show_all(*show_all_files, cx)
                 }
                 FilesEvent::CloseReady => {
                     this.on_file_close_ready(RightSurface::File(id), &event_panel_key, cx)
@@ -2252,6 +2281,7 @@ impl Shell {
                         FilesSettingsPage::new(
                             self.settings.files_autosave_delay_ms,
                             self.settings.files_word_wrap,
+                            self.settings.files_show_all,
                             cx,
                         )
                     });
@@ -2273,6 +2303,9 @@ impl Shell {
                             }
                             FilesSettingsEvent::WordWrapChanged(word_wrap) => {
                                 this.set_files_word_wrap(word_wrap, window, cx);
+                            }
+                            FilesSettingsEvent::ShowAllFilesChanged(show_all_files) => {
+                                this.set_files_show_all(show_all_files, cx);
                             }
                         },
                     ));

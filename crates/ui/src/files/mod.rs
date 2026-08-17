@@ -34,6 +34,7 @@ pub enum FilesEvent {
     TitleChanged,
     FileRenamed { old_path: String, new_path: String },
     WordWrapChanged(bool),
+    ShowAllFilesChanged(bool),
     CloseReady,
     CloseCancelled,
 }
@@ -277,6 +278,7 @@ impl FilesSurface {
         chat_id: String,
         autosave_delay_ms: u64,
         word_wrap: bool,
+        show_all_files: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_with_presentation(
@@ -286,6 +288,7 @@ impl FilesSurface {
             None,
             autosave_delay_ms,
             word_wrap,
+            show_all_files,
             cx,
         )
     }
@@ -296,6 +299,7 @@ impl FilesSurface {
         path: String,
         autosave_delay_ms: u64,
         word_wrap: bool,
+        show_all_files: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::new_with_presentation(
@@ -305,6 +309,7 @@ impl FilesSurface {
             Some(path),
             autosave_delay_ms,
             word_wrap,
+            show_all_files,
             cx,
         )
     }
@@ -316,6 +321,7 @@ impl FilesSurface {
         editor_path: Option<String>,
         autosave_delay_ms: u64,
         word_wrap: bool,
+        show_all_files: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         let search =
@@ -357,7 +363,7 @@ impl FilesSurface {
             request_context: None,
             target_change_pending: false,
             pending_request_context: None,
-            tree: FileTreeModel::new(),
+            tree: FileTreeModel::with_include_ignored(show_all_files),
             tree_list: ListState::new(0, ListAlignment::Top, px(560.0)),
             tree_focus: cx.focus_handle(),
             search,
@@ -392,6 +398,10 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) {
         self.apply_word_wrap(word_wrap, window, cx);
+    }
+
+    pub fn set_show_all_files(&mut self, show_all_files: bool, cx: &mut Context<Self>) {
+        self.apply_show_all_files(show_all_files, cx);
     }
 
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
@@ -449,8 +459,13 @@ impl FilesSurface {
     }
 
     fn toggle_ignored(&mut self, cx: &mut Context<Self>) {
-        let include = !self.tree.include_ignored();
-        if self.tree.set_include_ignored(include) {
+        cx.emit(FilesEvent::ShowAllFilesChanged(
+            !self.tree.include_ignored(),
+        ));
+    }
+
+    fn apply_show_all_files(&mut self, show_all_files: bool, cx: &mut Context<Self>) {
+        if self.tree.set_include_ignored(show_all_files) {
             self.loads.clear();
             self.error = None;
             self.sync_tree_list();
@@ -662,9 +677,9 @@ impl FilesSurface {
                 icon_button("files-toggle-ignored")
                     .role(gpui::Role::Button)
                     .aria_label(if include_ignored {
-                        "Hide ignored files"
+                        "Hide hidden and ignored files"
                     } else {
-                        "Show ignored files"
+                        "Show all files (even hidden)"
                     })
                     .when(include_ignored, |element| {
                         element.bg(crate::theme::wash(0.1))

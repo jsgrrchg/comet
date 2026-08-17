@@ -103,6 +103,8 @@ pub struct UiSettings {
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
     pub files_word_wrap: bool,
+    /// Include hidden and ignored entries in workspace file trees.
+    pub files_show_all: bool,
 }
 
 impl Default for UiSettings {
@@ -127,6 +129,7 @@ impl Default for UiSettings {
             appearance: crate::appearance::AppearanceMode::default(),
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
+            files_show_all: false,
         }
     }
 }
@@ -403,6 +406,7 @@ mod tests {
             appearance: crate::appearance::AppearanceMode::Light,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
+            files_show_all: true,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -428,6 +432,7 @@ mod tests {
             FILES_AUTOSAVE_DELAY_DEFAULT_MS
         );
         assert!(!loaded.files_word_wrap);
+        assert!(!loaded.files_show_all);
         assert!(
             loaded.notifications_enabled,
             "pre-banner files default banners on"

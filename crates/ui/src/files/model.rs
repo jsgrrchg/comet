@@ -86,6 +86,10 @@ impl Default for FileTreeModel {
 
 impl FileTreeModel {
     pub fn new() -> Self {
+        Self::with_include_ignored(false)
+    }
+
+    pub fn with_include_ignored(include_ignored: bool) -> Self {
         let mut nodes = HashMap::new();
         nodes.insert(String::new(), TreeNode::new(root_entry()));
         Self {
@@ -93,7 +97,7 @@ impl FileTreeModel {
             expanded: HashSet::from([String::new()]),
             visible_rows: Vec::new(),
             selected: None,
-            include_ignored: false,
+            include_ignored,
             generation: 0,
         }
     }

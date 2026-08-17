@@ -11,20 +11,28 @@ const DELAY_OPTIONS: [u64; 5] = [300, 600, 900, 1_500, 3_000];
 pub enum FilesSettingsEvent {
     AutosaveDelayChanged(u64),
     WordWrapChanged(bool),
+    ShowAllFilesChanged(bool),
 }
 
 pub struct FilesSettingsPage {
     autosave_delay_ms: u64,
     word_wrap: bool,
+    show_all_files: bool,
 }
 
 impl EventEmitter<FilesSettingsEvent> for FilesSettingsPage {}
 
 impl FilesSettingsPage {
-    pub fn new(autosave_delay_ms: u64, word_wrap: bool, _cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        autosave_delay_ms: u64,
+        word_wrap: bool,
+        show_all_files: bool,
+        _cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             autosave_delay_ms,
             word_wrap,
+            show_all_files,
         }
     }
 
@@ -35,6 +43,14 @@ impl FilesSettingsPage {
         self.word_wrap = word_wrap;
         cx.notify();
     }
+
+    pub fn set_show_all_files(&mut self, show_all_files: bool, cx: &mut Context<Self>) {
+        if self.show_all_files == show_all_files {
+            return;
+        }
+        self.show_all_files = show_all_files;
+        cx.notify();
+    }
 }
 
 impl Render for FilesSettingsPage {
@@ -42,6 +58,7 @@ impl Render for FilesSettingsPage {
         let theme = Theme::of(cx).clone();
         let selected = self.autosave_delay_ms;
         let word_wrap = self.word_wrap;
+        let show_all_files = self.show_all_files;
         let options = DELAY_OPTIONS.into_iter().map(|delay| {
             let active = delay == selected;
             div()
@@ -78,67 +95,102 @@ impl Render for FilesSettingsPage {
                 })
         });
 
-        let card =
-            widgets::section_card(&theme)
-                .child(
-                    widgets::card_row(&theme, true)
-                        .items_start()
-                        .child(widgets::row_tile(&theme, icons::FOLDER))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .child(widgets::row_title(&theme, "Autosave delay"))
-                                .child(widgets::meta_line(
-                                    &theme,
-                                    vec![
-                                div()
-                                    .child("Save files after editing has been idle for this long.")
-                                    .into_any_element(),
-                            ],
-                                ))
-                                .child(
+        let card = widgets::section_card(&theme)
+            .child(
+                widgets::card_row(&theme, true)
+                    .items_start()
+                    .child(widgets::row_tile(&theme, icons::FOLDER))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(&theme, "Autosave delay"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![
                                     div()
-                                        .mt(px(12.0))
-                                        .flex()
-                                        .flex_wrap()
-                                        .gap(px(7.0))
-                                        .children(options),
-                                ),
-                        ),
-                )
-                .child(
-                    widgets::card_row(&theme, false)
-                        .child(widgets::row_tile(&theme, icons::LIST))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .child(widgets::row_title(&theme, "Word wrap"))
-                                .child(widgets::meta_line(
-                                    &theme,
-                                    vec![
-                                        div()
-                                            .child("Wrap long lines in every workspace file.")
-                                            .into_any_element(),
-                                    ],
-                                )),
-                        )
-                        .child(
-                            widgets::toggle_switch(&theme, word_wrap)
-                                .id("files-word-wrap-toggle")
-                                .cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.word_wrap = !this.word_wrap;
-                                    cx.emit(FilesSettingsEvent::WordWrapChanged(this.word_wrap));
-                                    cx.notify();
-                                })),
-                        ),
-                );
+                                        .child(
+                                            "Save files after editing has been idle for this long.",
+                                        )
+                                        .into_any_element(),
+                                ],
+                            ))
+                            .child(
+                                div()
+                                    .mt(px(12.0))
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(7.0))
+                                    .children(options),
+                            ),
+                    ),
+            )
+            .child(
+                widgets::card_row(&theme, true)
+                    .child(widgets::row_tile(&theme, icons::LIST))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(&theme, "Word wrap"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![
+                                    div()
+                                        .child("Wrap long lines in every workspace file.")
+                                        .into_any_element(),
+                                ],
+                            )),
+                    )
+                    .child(
+                        widgets::toggle_switch(&theme, word_wrap)
+                            .id("files-word-wrap-toggle")
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.word_wrap = !this.word_wrap;
+                                cx.emit(FilesSettingsEvent::WordWrapChanged(this.word_wrap));
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                widgets::card_row(&theme, false)
+                    .child(widgets::row_tile(&theme, icons::EYE))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(&theme, "Show all files"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![
+                                    div()
+                                        .child(
+                                            "Include hidden and ignored files in every file tree.",
+                                        )
+                                        .into_any_element(),
+                                ],
+                            )),
+                    )
+                    .child(
+                        widgets::toggle_switch(&theme, show_all_files)
+                            .id("files-show-all-toggle")
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.show_all_files = !this.show_all_files;
+                                cx.emit(FilesSettingsEvent::ShowAllFilesChanged(
+                                    this.show_all_files,
+                                ));
+                                cx.notify();
+                            })),
+                    ),
+            );
 
         div()
             .id("files-settings-page")

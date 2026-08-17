@@ -253,6 +253,14 @@ impl FilesSurface {
         };
         let key = DocumentHighlightKey::new(language, &source);
         if let Some(document) = self.preview.syntax_cache.get(&key) {
+            if let Some(editor) = self
+                .preview
+                .documents
+                .get(&path)
+                .and_then(|file| file.editor.clone())
+            {
+                super::editor_adapter::install_highlighter(&editor, source, document.clone(), cx);
+            }
             self.preview.highlights.insert(
                 path,
                 HighlightedFile {
@@ -265,6 +273,7 @@ impl FilesSurface {
         }
         let highlight_path = path.clone();
         let task_document_key = document_key.clone();
+        let source_for_install = source.clone();
         let task = cx.spawn(async move |this, cx| {
             let request_path = highlight_path.clone();
             let highlighted = cx
@@ -294,6 +303,19 @@ impl FilesSurface {
                 }
                 if let Some(document) = highlighted {
                     surface.preview.syntax_cache.insert(key, document.clone());
+                    if let Some(editor) = surface
+                        .preview
+                        .documents
+                        .get(&highlight_path)
+                        .and_then(|file| file.editor.clone())
+                    {
+                        super::editor_adapter::install_highlighter(
+                            &editor,
+                            source_for_install,
+                            document.clone(),
+                            cx,
+                        );
+                    }
                     surface.preview.highlights.insert(
                         highlight_path.clone(),
                         HighlightedFile {
@@ -667,10 +689,23 @@ impl FilesSurface {
         }
         let text = document.file.as_ref()?.text.clone()?;
         let editor =
-            super::editor::new_file_editor(text, self.preview.word_wrap, theme, window, cx);
+            super::editor::new_file_editor(text, path, self.preview.word_wrap, theme, window, cx);
         let focus = editor.focus_handle(cx);
         window.defer(cx, move |window, cx| focus.focus(window, cx));
         self.preview.documents.get_mut(path)?.editor = Some(editor.clone());
+        let syntax = self.preview.highlights.get(path).and_then(|highlight| {
+            let document = self.preview.documents.get(path)?;
+            if document.content_hash() != Some(highlight.content_hash.as_str()) {
+                return None;
+            }
+            Some((
+                document.file.as_ref()?.text.clone()?,
+                highlight.document.clone(),
+            ))
+        });
+        if let Some((source, highlighted)) = syntax {
+            super::editor_adapter::install_highlighter(&editor, source, highlighted, cx);
+        }
         Some(editor)
     }
 

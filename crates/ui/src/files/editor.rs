@@ -10,6 +10,7 @@ pub(super) type FileEditorState = EditorState;
 /// Creates a stable editor entity for an open workspace document.
 pub(super) fn new_file_editor(
     text: impl Into<SharedString>,
+    path: &str,
     soft_wrap: bool,
     theme: &Theme,
     window: &mut Window,
@@ -17,7 +18,7 @@ pub(super) fn new_file_editor(
 ) -> Entity<EditorState> {
     let editor = cx.new(|cx| {
         EditorState::new(window, cx)
-            .language("text")
+            .language(path.to_string())
             .line_number(true)
             .soft_wrap(soft_wrap)
             .default_value(text)

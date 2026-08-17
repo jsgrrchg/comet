@@ -120,6 +120,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         }
     }
     cx.clear_key_bindings();
+    // `clear_key_bindings` also removes the contextual editing actions that
+    // gpui-base installed at startup. Reinitialize the component layer before
+    // rebuilding Zeron's bindings so Backspace, navigation, selection, undo,
+    // and the rest of the editor keymap continue to reach focused inputs.
+    gpui_base::init(cx);
     crate::composer::init(cx);
     // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
     // these back the native menu key equivalents and must survive keymap

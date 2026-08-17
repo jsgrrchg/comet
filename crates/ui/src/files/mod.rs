@@ -14,6 +14,8 @@ use crate::{
 };
 
 pub mod client;
+pub mod editor;
+pub mod editor_adapter;
 pub mod model;
 pub mod preview;
 pub mod search;

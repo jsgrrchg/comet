@@ -17,6 +17,7 @@ zeron-syntax.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true
+gpui-base.workspace = true
 tokio.workspace = true
 futures.workspace = true
 async-trait.workspace = true

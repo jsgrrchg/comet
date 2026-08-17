@@ -48,6 +48,7 @@ pub(super) struct FileDocument {
     pub lines: Arc<Vec<SharedString>>,
     pub editor: Option<Entity<EditorState>>,
     pub editor_events: Option<Subscription>,
+    pub editor_observer: Option<Subscription>,
     pub loaded_hash: Option<String>,
     pub saved_hash: Option<String>,
     pub revision: u64,
@@ -62,6 +63,7 @@ pub(super) struct FileDocument {
     pub pending_save: Option<PendingSave>,
     pub pending_external_reload: Option<WorkspaceFileText>,
     pub reconcile_after_save: bool,
+    pub review_comment_flush_pending: bool,
 }
 
 #[allow(dead_code)]
@@ -75,6 +77,7 @@ impl FileDocument {
             lines: Arc::new(Vec::new()),
             editor: None,
             editor_events: None,
+            editor_observer: None,
             loaded_hash: None,
             saved_hash: None,
             revision: 0,
@@ -89,6 +92,7 @@ impl FileDocument {
             pending_save: None,
             pending_external_reload: None,
             reconcile_after_save: false,
+            review_comment_flush_pending: false,
         }
     }
 
@@ -103,6 +107,7 @@ impl FileDocument {
         self.pending_save = None;
         self.pending_external_reload = None;
         self.reconcile_after_save = false;
+        self.review_comment_flush_pending = false;
         self.generation
     }
 
@@ -114,6 +119,7 @@ impl FileDocument {
         let hash = file.content_hash.clone();
         self.editor = None;
         self.editor_events = None;
+        self.editor_observer = None;
         self.encoding = writable_encoding(file.encoding);
         self.line_ending = writable_line_ending(file.line_ending);
         self.lines = Arc::new(
@@ -134,6 +140,7 @@ impl FileDocument {
         self.pending_save = None;
         self.pending_external_reload = None;
         self.reconcile_after_save = false;
+        self.review_comment_flush_pending = false;
         self.file = Some(file);
     }
 

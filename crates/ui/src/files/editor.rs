@@ -24,6 +24,7 @@ pub(super) fn new_file_editor(
         EditorState::new(window, cx)
             .language(path.to_string())
             .line_number(true)
+            .folding(false)
             .soft_wrap(soft_wrap)
             .default_value(text)
     });

@@ -3584,15 +3584,15 @@ impl Composer {
     pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
         self.state.update(cx, |state, _| {
-            state.purge_diff_comments(chat_id);
+            state.purge_review_comments(chat_id);
         });
     }
 
     /// Staged in `AppState` because the changes pane writes them.
-    fn staged_comments(&self, cx: &App) -> Vec<crate::comments::DiffComment> {
+    fn staged_comments(&self, cx: &App) -> Vec<crate::comments::ReviewComment> {
         self.state
             .read(cx)
-            .diff_comments(&self.current_key)
+            .review_comments(&self.current_key)
             .to_vec()
     }
 
@@ -4420,7 +4420,8 @@ impl Composer {
     /// Existing chats carry their own project, so they always send.
     fn send_blocked(&self, cx: &App) -> bool {
         let state = self.state.read(cx);
-        state.selected_chat.is_none() && state.selected_space_row().is_none()
+        state.review_comment_flush_pending(&self.current_key)
+            || (state.selected_chat.is_none() && state.selected_space_row().is_none())
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
@@ -4530,7 +4531,7 @@ impl Composer {
         // input as literal text.
         let key = self.current_key.clone();
         let comments = self.state.update(cx, |state, cx| {
-            let taken = state.take_diff_comments(&key);
+            let taken = state.take_review_comments(&key);
             if !taken.is_empty() {
                 cx.notify();
             }
@@ -4823,7 +4824,7 @@ impl Composer {
                         // already re-keyed the composer to the minted id by
                         // now, exactly like the staged files below.
                         for comment in &comments {
-                            s.add_diff_comment(&err_chat_id, comment.clone());
+                            s.add_review_comment(&err_chat_id, comment.clone());
                         }
                         cx.notify();
                     });

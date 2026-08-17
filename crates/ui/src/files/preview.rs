@@ -1,8 +1,8 @@
 use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
 
 use gpui::{
-    AnyElement, Context, ListAlignment, ListSizingBehavior, ListState, Point, Render, ScrollHandle,
-    SharedString, Window, div, font, list, prelude::*, px,
+    AnyElement, Context, Focusable as _, ListAlignment, ListSizingBehavior, ListState, Point,
+    Render, ScrollHandle, SharedString, Window, div, font, list, prelude::*, px,
 };
 use zeron_proto::{ReadWorkspaceFileRequest, WorkspaceFileSearchMatch, WorkspaceReadOnlyReason};
 
@@ -127,9 +127,19 @@ impl FilesSurface {
         cx.notify();
     }
 
-    fn toggle_word_wrap(&mut self, cx: &mut Context<Self>) {
+    fn toggle_word_wrap(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preview.word_wrap = !self.preview.word_wrap;
         self.preview.list.remeasure();
+        if let Some(editor) = self
+            .preview
+            .active
+            .as_deref()
+            .and_then(|path| self.preview.documents.get(path))
+            .and_then(|document| document.editor.clone())
+        {
+            let word_wrap = self.preview.word_wrap;
+            editor.update(cx, |state, cx| state.set_soft_wrap(word_wrap, window, cx));
+        }
         cx.notify();
     }
 
@@ -324,6 +334,7 @@ impl FilesSurface {
     pub(super) fn render_preview(
         &mut self,
         show_sidebar_toggle: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -337,7 +348,7 @@ impl FilesSurface {
                 DocumentPhase::ExternallyModified { .. } | DocumentPhase::Conflict { .. }
             )
         });
-        let body = self.render_document_body(&active, &theme, cx);
+        let body = self.render_document_body(&active, &theme, window, cx);
         div()
             .size_full()
             .min_w_0()
@@ -496,7 +507,7 @@ impl FilesSurface {
                     } else {
                         "Enable word wrap"
                     })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_word_wrap(cx)))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_word_wrap(window, cx)))
                     .child(icon(icons::LIST).size(px(11.0)).text_color(
                         if self.preview.word_wrap() {
                             theme.text
@@ -538,8 +549,10 @@ impl FilesSurface {
         &mut self,
         path: &str,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let editor = self.ensure_editor(path, theme, window, cx);
         let Some(document) = self.preview.documents.get(path) else {
             return gpui::Empty.into_any_element();
         };
@@ -548,6 +561,21 @@ impl FilesSurface {
         }
         if let DocumentPhase::Error(error) | DocumentPhase::SaveFailed(error) = &document.phase {
             return centered_state(error.clone(), theme.danger_muted);
+        }
+        if let Some(editor) = editor {
+            editor.update(cx, |state, _| {
+                state.set_editor_style(super::editor_adapter::editor_style(theme));
+            });
+            return div()
+                .id("files-editor-body")
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.5))
+                .line_height(px(PREVIEW_LINE_HEIGHT))
+                .child(super::editor::editor_element(&editor))
+                .into_any_element();
         }
         let Some(file) = document.file.as_ref() else {
             return centered_state("This file cannot be previewed.", theme.text_muted);
@@ -621,6 +649,29 @@ impl FilesSurface {
             })
             .child(code_scroll)
             .into_any_element()
+    }
+
+    fn ensure_editor(
+        &mut self,
+        path: &str,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Entity<super::editor::FileEditorState>> {
+        let document = self.preview.documents.get(path)?;
+        if !matches!(document.phase, DocumentPhase::Ready) {
+            return None;
+        }
+        if let Some(editor) = document.editor.clone() {
+            return Some(editor);
+        }
+        let text = document.file.as_ref()?.text.clone()?;
+        let editor =
+            super::editor::new_file_editor(text, self.preview.word_wrap, theme, window, cx);
+        let focus = editor.focus_handle(cx);
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+        self.preview.documents.get_mut(path)?.editor = Some(editor.clone());
+        Some(editor)
     }
 
     fn render_preview_line(

@@ -86,6 +86,7 @@ impl FileDocument {
 
     pub fn set_loaded(&mut self, file: WorkspaceFileText) {
         let hash = file.content_hash.clone();
+        self.editor = None;
         self.encoding = writable_encoding(file.encoding);
         self.line_ending = writable_line_ending(file.line_ending);
         self.lines = Arc::new(

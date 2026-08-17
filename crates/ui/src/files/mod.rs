@@ -72,7 +72,7 @@ pub struct FilesSurface {
 }
 
 impl Render for FilesSurface {
-    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = crate::theme::Theme::of(cx).clone();
         let phase = self.tree.node("").map(|root| root.load.clone());
         let content = if !self.search_state.query.is_empty() {
@@ -186,7 +186,7 @@ impl Render for FilesSurface {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(self.render_preview(false, cx)),
+                        .child(self.render_preview(false, window, cx)),
                 )
                 .child(self.preview_split_handle(cx))
                 .child(
@@ -200,7 +200,7 @@ impl Render for FilesSurface {
                 )
                 .into_any_element()
         } else if is_editor && self.preview.has_active() {
-            let preview = self.render_preview(true, cx);
+            let preview = self.render_preview(true, window, cx);
             if self.preview.tree_sidebar_visible() {
                 div()
                     .size_full()

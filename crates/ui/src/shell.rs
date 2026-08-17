@@ -1665,7 +1665,7 @@ impl Shell {
     /// Files is single-instance per chat: both the picker and the `+` menu
     /// focus the existing surface instead of creating duplicate trees and
     /// duplicate workspace subscriptions.
-    fn add_files_surface(&mut self, cx: &mut Context<Self>) {
+    fn add_files_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_chat.is_empty() {
             return;
         }
@@ -1676,34 +1676,41 @@ impl Shell {
                 FilesSurface::new(self.state.clone(), self.active_chat.clone(), delay, cx)
             });
             let event_key = key.clone();
-            let sub = cx.subscribe(&files, move |this: &mut Self, _, event, cx| match event {
-                FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
-                FilesEvent::TitleChanged => cx.notify(),
-                FilesEvent::FileRenamed { .. } => cx.notify(),
-                FilesEvent::CloseReady => {
-                    this.on_file_close_ready(RightSurface::Files, &event_key, cx)
-                }
-                FilesEvent::CloseCancelled => this.cancel_file_close(RightSurface::Files, cx),
-            });
+            let sub = cx.subscribe_in(
+                &files,
+                window,
+                move |this: &mut Self, _, event, window, cx| match event {
+                    FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
+                    FilesEvent::TitleChanged => cx.notify(),
+                    FilesEvent::FileRenamed { .. } => cx.notify(),
+                    FilesEvent::CloseReady => {
+                        this.on_file_close_ready(RightSurface::Files, &event_key, cx)
+                    }
+                    FilesEvent::CloseCancelled => this.cancel_file_close(RightSurface::Files, cx),
+                },
+            );
             self.files.insert(key.clone(), files);
             self.files_subs.insert(key.clone(), sub);
         }
         let tabs = self.right_tabs.entry(key).or_default();
         push_unique_right_surface(tabs, RightSurface::Files);
         self.set_right_active(RightSurface::Files, cx);
+        self.focus_right_file_editor(RightSurface::Files, window, cx);
     }
 
     /// Open a workspace file as a first-class right-pane tab. Every editor is
     /// a separate FilesSurface so its tree, search, watcher and split layout
     /// stay stable while users move among open files.
-    fn add_file_surface(&mut self, path: String, cx: &mut Context<Self>) {
+    fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_chat.is_empty() {
             return;
         }
         let panel_key = self.panel_key(cx);
         let lookup = (panel_key.clone(), path.clone());
         if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
-            self.set_right_active(RightSurface::File(id), cx);
+            let surface = RightSurface::File(id);
+            self.set_right_active(surface, cx);
+            self.focus_right_file_editor(surface, window, cx);
             return;
         }
 
@@ -1719,17 +1726,21 @@ impl Shell {
             )
         });
         let event_panel_key = panel_key.clone();
-        let sub = cx.subscribe(&file, move |this: &mut Self, _, event, cx| match event {
-            FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
-            FilesEvent::TitleChanged => cx.notify(),
-            FilesEvent::FileRenamed { old_path, new_path } => {
-                this.rename_file_surface(id, &event_panel_key, old_path, new_path, cx)
-            }
-            FilesEvent::CloseReady => {
-                this.on_file_close_ready(RightSurface::File(id), &event_panel_key, cx)
-            }
-            FilesEvent::CloseCancelled => this.cancel_file_close(RightSurface::File(id), cx),
-        });
+        let sub = cx.subscribe_in(
+            &file,
+            window,
+            move |this: &mut Self, _, event, window, cx| match event {
+                FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
+                FilesEvent::TitleChanged => cx.notify(),
+                FilesEvent::FileRenamed { old_path, new_path } => {
+                    this.rename_file_surface(id, &event_panel_key, old_path, new_path, cx)
+                }
+                FilesEvent::CloseReady => {
+                    this.on_file_close_ready(RightSurface::File(id), &event_panel_key, cx)
+                }
+                FilesEvent::CloseCancelled => this.cancel_file_close(RightSurface::File(id), cx),
+            },
+        );
         self.file_surfaces.insert(id, file);
         self.file_surface_paths.insert(id, path);
         self.file_surface_keys.insert(lookup, id);
@@ -5412,8 +5423,8 @@ impl Shell {
                             .gap(px(8.0))
                             .child(
                                 row("surface-card-files", icons::FOLDER_WITH_FILES, "Files")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_files_surface(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_files_surface(window, cx);
                                     })),
                             )
                             .child(
@@ -5822,8 +5833,8 @@ impl Shell {
                         .child(
                             popover::menu_row(&theme, false, "right-plus-files")
                                 .id("right-plus-files-row")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.add_files_surface(cx);
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_files_surface(window, cx);
                                     this.close_right_plus(cx);
                                 }))
                                 .child(

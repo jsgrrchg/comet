@@ -50,7 +50,9 @@ pub(super) fn replace_file_contents(
     editor.update(cx, |state, cx| {
         let selection = state.selected_range();
         let scroll_offset = state.scroll_offset();
-        state.replace_all(text, window, cx);
+        // Disk reconciliation establishes a new baseline, so it must not be
+        // recorded as a user edit that can later be undone and autosaved.
+        state.set_value(text, window, cx);
         state.set_selected_range(selection, cx);
         state.set_scroll_offset(scroll_offset, cx);
     });

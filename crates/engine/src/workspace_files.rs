@@ -755,6 +755,14 @@ fn normalize_watch_events(
                 old_path: None,
             };
             match changes.get(&path) {
+                // A file removed and recreated inside one debounce window exists
+                // again. Preserve the final state so open documents can recover.
+                Some(existing)
+                    if existing.kind == WorkspaceFileChangeKind::Removed
+                        && kind == WorkspaceFileChangeKind::Created =>
+                {
+                    changes.insert(path, incoming);
+                }
                 Some(existing)
                     if watch_change_priority(existing.kind) > watch_change_priority(kind) => {}
                 _ => {
@@ -2222,6 +2230,35 @@ mod tests {
                 && change.old_path.is_none()
                 && change.kind == WorkspaceFileChangeKind::Modified
         }));
+    }
+
+    #[test]
+    fn watch_preserves_the_final_state_of_remove_and_create_sequences() {
+        use notify::EventKind;
+        use notify::event::{CreateKind, RemoveKind};
+
+        let root = Path::new("/workspace");
+        let recreated = vec![
+            Ok(notify::Event::new(EventKind::Remove(RemoveKind::File))
+                .add_path(root.join("recreated.rs"))),
+            Ok(notify::Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.join("recreated.rs"))),
+        ];
+        let (_, changes) = normalize_watch_events(root, recreated);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "recreated.rs");
+        assert_eq!(changes[0].kind, WorkspaceFileChangeKind::Created);
+
+        let removed = vec![
+            Ok(notify::Event::new(EventKind::Create(CreateKind::File))
+                .add_path(root.join("removed.rs"))),
+            Ok(notify::Event::new(EventKind::Remove(RemoveKind::File))
+                .add_path(root.join("removed.rs"))),
+        ];
+        let (_, changes) = normalize_watch_events(root, removed);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "removed.rs");
+        assert_eq!(changes[0].kind, WorkspaceFileChangeKind::Removed);
     }
 
     #[tokio::test]

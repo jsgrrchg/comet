@@ -45,6 +45,9 @@ pub const SAVE_DEBOUNCE_MS: u64 = 400;
 pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 900;
 pub const FILES_AUTOSAVE_DELAY_MIN_MS: u64 = 100;
 pub const FILES_AUTOSAVE_DELAY_MAX_MS: u64 = 10_000;
+pub const FILES_EDITOR_FONT_SIZE_DEFAULT: f32 = 13.0;
+pub const FILES_EDITOR_FONT_SIZE_MIN: f32 = 9.0;
+pub const FILES_EDITOR_FONT_SIZE_MAX: f32 = 24.0;
 
 const FILE_NAME: &str = "ui-settings.json";
 
@@ -103,6 +106,8 @@ pub struct UiSettings {
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
     pub files_word_wrap: bool,
+    /// Font size used by editable workspace-file buffers.
+    pub files_editor_font_size: f32,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
 }
@@ -129,6 +134,7 @@ impl Default for UiSettings {
             appearance: crate::appearance::AppearanceMode::default(),
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
+            files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
         }
     }
@@ -332,6 +338,12 @@ impl UiSettings {
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
+        self.files_editor_font_size = clamp_or(
+            self.files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_MIN,
+            FILES_EDITOR_FONT_SIZE_MAX,
+            FILES_EDITOR_FONT_SIZE_DEFAULT,
+        );
         self
     }
 
@@ -406,6 +418,7 @@ mod tests {
             appearance: crate::appearance::AppearanceMode::Light,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
+            files_editor_font_size: 15.0,
             files_show_all: true,
         };
         settings.save(dir.path()).unwrap();
@@ -432,6 +445,10 @@ mod tests {
             FILES_AUTOSAVE_DELAY_DEFAULT_MS
         );
         assert!(!loaded.files_word_wrap);
+        assert_eq!(
+            loaded.files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_DEFAULT
+        );
         assert!(!loaded.files_show_all);
         assert!(
             loaded.notifications_enabled,
@@ -470,6 +487,15 @@ mod tests {
             .clamped()
             .files_autosave_delay_ms,
             FILES_AUTOSAVE_DELAY_MIN_MS
+        );
+        assert_eq!(
+            UiSettings {
+                files_editor_font_size: 100.0,
+                ..Default::default()
+            }
+            .clamped()
+            .files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_MAX
         );
     }
 

@@ -1741,6 +1741,23 @@ impl Shell {
         cx.notify();
     }
 
+    fn set_files_editor_font_size(&mut self, editor_font_size: f32, cx: &mut Context<Self>) {
+        self.settings.files_editor_font_size = editor_font_size;
+        let surfaces = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        for surface in surfaces {
+            surface.update(cx, |surface, cx| {
+                surface.set_editor_font_size(editor_font_size, cx)
+            });
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     fn set_files_show_all(&mut self, show_all_files: bool, cx: &mut Context<Self>) {
         self.settings.files_show_all = show_all_files;
         if let Some(page) = self.files_settings_page.clone() {
@@ -1779,6 +1796,7 @@ impl Shell {
         let key = self.panel_key(cx);
         if !self.files.contains_key(&key) {
             let delay = self.settings.files_autosave_delay_ms;
+            let editor_font_size = self.settings.files_editor_font_size;
             let word_wrap = self.settings.files_word_wrap;
             let show_all_files = self.settings.files_show_all;
             let files = cx.new(|cx| {
@@ -1786,6 +1804,7 @@ impl Shell {
                     self.state.clone(),
                     self.active_chat.clone(),
                     delay,
+                    editor_font_size,
                     word_wrap,
                     show_all_files,
                     cx,
@@ -1844,6 +1863,7 @@ impl Shell {
                 self.active_chat.clone(),
                 path.clone(),
                 self.settings.files_autosave_delay_ms,
+                self.settings.files_editor_font_size,
                 self.settings.files_word_wrap,
                 self.settings.files_show_all,
                 cx,
@@ -2375,6 +2395,7 @@ impl Shell {
                     let page = cx.new(|cx| {
                         FilesSettingsPage::new(
                             self.settings.files_autosave_delay_ms,
+                            self.settings.files_editor_font_size,
                             self.settings.files_word_wrap,
                             self.settings.files_show_all,
                             cx,
@@ -2395,6 +2416,9 @@ impl Shell {
                                 }
                                 this.schedule_save(cx);
                                 cx.notify();
+                            }
+                            FilesSettingsEvent::EditorFontSizeChanged(editor_font_size) => {
+                                this.set_files_editor_font_size(editor_font_size, cx);
                             }
                             FilesSettingsEvent::WordWrapChanged(word_wrap) => {
                                 this.set_files_word_wrap(word_wrap, window, cx);

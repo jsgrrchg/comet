@@ -96,6 +96,7 @@ pub(super) struct FilePreviewState {
     horizontal_scroll: ScrollHandle,
     surface_width: Rc<Cell<f32>>,
     word_wrap: bool,
+    editor_font_size: f32,
     autosave_delay_ms: u64,
     reload_confirmation: Option<String>,
     close_requested: bool,
@@ -108,7 +109,7 @@ pub(super) struct FilePreviewState {
 }
 
 impl FilePreviewState {
-    pub(super) fn new(autosave_delay_ms: u64, word_wrap: bool) -> Self {
+    pub(super) fn new(autosave_delay_ms: u64, word_wrap: bool, editor_font_size: f32) -> Self {
         Self {
             documents: HashMap::new(),
             document_recency: VecDeque::new(),
@@ -119,6 +120,7 @@ impl FilePreviewState {
             horizontal_scroll: ScrollHandle::new(),
             surface_width: Rc::new(Cell::new(520.0)),
             word_wrap,
+            editor_font_size,
             autosave_delay_ms,
             reload_confirmation: None,
             close_requested: false,
@@ -279,6 +281,10 @@ impl FilePreviewState {
 
     fn word_wrap(&self) -> bool {
         self.word_wrap
+    }
+
+    pub(super) fn set_editor_font_size(&mut self, editor_font_size: f32) {
+        self.editor_font_size = editor_font_size;
     }
 
     pub(super) fn set_autosave_delay_ms(&mut self, delay_ms: u64) -> Vec<String> {
@@ -2075,8 +2081,10 @@ impl FilesSurface {
                 .relative()
                 .overflow_hidden()
                 .font_family(theme.font_mono.clone())
-                .text_size(px(11.5))
-                .line_height(px(PREVIEW_LINE_HEIGHT))
+                .text_size(px(self.preview.editor_font_size))
+                .line_height(px(
+                    (self.preview.editor_font_size + 8.5).max(PREVIEW_LINE_HEIGHT)
+                ))
                 .child(super::editor::editor_element(&editor))
                 .children(overlays)
                 .into_any_element();
@@ -2675,7 +2683,7 @@ mod tests {
 
     #[test]
     fn reset_drops_documents_and_active_preview_from_the_previous_target() {
-        let mut preview = FilePreviewState::new(900, false);
+        let mut preview = FilePreviewState::new(900, false, 11.5);
         preview.active = Some("private.env".into());
         preview.documents.insert(
             "private.env".into(),
@@ -2701,7 +2709,7 @@ mod tests {
 
     #[test]
     fn document_cache_evicts_the_oldest_safe_entries() {
-        let mut preview = FilePreviewState::new(900, false);
+        let mut preview = FilePreviewState::new(900, false, 11.5);
         for index in 0..18 {
             let path = format!("src/{index}.rs");
             preview
@@ -2732,7 +2740,7 @@ mod tests {
 
     #[test]
     fn document_cache_uses_retained_bytes_not_only_entry_count() {
-        let mut preview = FilePreviewState::new(900, false);
+        let mut preview = FilePreviewState::new(900, false, 11.5);
         for path in ["old.rs", "active.rs"] {
             preview
                 .documents
@@ -2755,7 +2763,7 @@ mod tests {
 
     #[test]
     fn document_eviction_cleans_path_scoped_companion_state() {
-        let mut preview = FilePreviewState::new(900, false);
+        let mut preview = FilePreviewState::new(900, false, 11.5);
         for path in ["old.rs", "active.rs"] {
             preview
                 .documents
@@ -2791,17 +2799,18 @@ mod tests {
     }
 
     #[test]
-    fn reset_preserves_the_global_word_wrap_preference() {
-        let mut preview = FilePreviewState::new(900, true);
+    fn reset_preserves_global_editor_preferences() {
+        let mut preview = FilePreviewState::new(900, true, 15.0);
 
         preview.reset();
 
         assert!(preview.word_wrap());
+        assert_eq!(preview.editor_font_size, 15.0);
     }
 
     #[test]
     fn wide_layout_respects_an_explicitly_hidden_tree_sidebar() {
-        let mut preview = FilePreviewState::new(900, false);
+        let mut preview = FilePreviewState::new(900, false, 11.5);
         preview.surface_width.set(WIDE_BREAKPOINT);
 
         assert!(preview.tree_sidebar_visible());
@@ -2816,7 +2825,7 @@ mod tests {
 
     #[test]
     fn explicitly_showing_tree_sidebar_clears_responsive_dismissal() {
-        let mut preview = FilePreviewState::new(900, false);
+        let mut preview = FilePreviewState::new(900, false, 11.5);
         preview.surface_width.set(WIDE_BREAKPOINT);
         preview.toggle_tree_sidebar();
 
@@ -2830,7 +2839,7 @@ mod tests {
     #[test]
     fn dirty_reload_waits_for_explicit_discard_confirmation() {
         let path = "src/lib.rs";
-        let mut preview = FilePreviewState::new(900, false);
+        let mut preview = FilePreviewState::new(900, false, 11.5);
         let mut document = FileDocument::loading(DocumentKey {
             chat_id: "chat-1".into(),
             checkout_id: Some("checkout-1".into()),
@@ -2856,7 +2865,7 @@ mod tests {
     #[test]
     fn clean_reload_proceeds_without_confirmation() {
         let path = "src/lib.rs";
-        let mut preview = FilePreviewState::new(900, false);
+        let mut preview = FilePreviewState::new(900, false, 11.5);
         preview.documents.insert(
             path.into(),
             FileDocument::loading(DocumentKey {

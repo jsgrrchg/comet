@@ -370,6 +370,7 @@ impl FilesSurface {
         state: Entity<AppState>,
         chat_id: String,
         autosave_delay_ms: u64,
+        editor_font_size: f32,
         word_wrap: bool,
         show_all_files: bool,
         cx: &mut Context<Self>,
@@ -380,6 +381,7 @@ impl FilesSurface {
             FilesPresentation::Browser,
             None,
             autosave_delay_ms,
+            editor_font_size,
             word_wrap,
             show_all_files,
             cx,
@@ -391,6 +393,7 @@ impl FilesSurface {
         chat_id: String,
         path: String,
         autosave_delay_ms: u64,
+        editor_font_size: f32,
         word_wrap: bool,
         show_all_files: bool,
         cx: &mut Context<Self>,
@@ -401,6 +404,7 @@ impl FilesSurface {
             FilesPresentation::Editor,
             Some(path),
             autosave_delay_ms,
+            editor_font_size,
             word_wrap,
             show_all_files,
             cx,
@@ -413,6 +417,7 @@ impl FilesSurface {
         presentation: FilesPresentation,
         editor_path: Option<String>,
         autosave_delay_ms: u64,
+        editor_font_size: f32,
         word_wrap: bool,
         show_all_files: bool,
         cx: &mut Context<Self>,
@@ -470,7 +475,7 @@ impl FilesSurface {
             watch_task: None,
             watch_sequence: None,
             watch_error: None,
-            preview: FilePreviewState::new(autosave_delay_ms, word_wrap),
+            preview: FilePreviewState::new(autosave_delay_ms, word_wrap, editor_font_size),
             editor_context_menu: crate::popover::Popup::default(),
             loads: HashMap::new(),
             error: None,
@@ -614,6 +619,11 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) {
         self.apply_word_wrap(word_wrap, window, cx);
+    }
+
+    pub fn set_editor_font_size(&mut self, editor_font_size: f32, cx: &mut Context<Self>) {
+        self.preview.set_editor_font_size(editor_font_size);
+        cx.notify();
     }
 
     pub fn set_show_all_files(&mut self, show_all_files: bool, cx: &mut Context<Self>) {

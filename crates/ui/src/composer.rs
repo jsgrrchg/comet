@@ -17,7 +17,7 @@ use gpui::{
     AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point, Role,
     ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
     TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
     prelude::*, px, quad, relative, size,
@@ -1296,6 +1296,7 @@ pub struct ComposerInput {
     /// Key context for the binding map ("Composer", or "PaletteSearch" for
     /// palette filters whose navigation keys must bubble).
     key_context: &'static str,
+    accessibility_role: Role,
     focus_handle: FocusHandle,
     content: String,
     placeholder: SharedString,
@@ -1378,6 +1379,7 @@ impl ComposerInput {
     ) -> Self {
         Self {
             key_context,
+            accessibility_role: Role::MultilineTextInput,
             focus_handle: cx.focus_handle(),
             content: String::new(),
             placeholder: placeholder.into(),
@@ -1425,6 +1427,11 @@ impl ComposerInput {
         self.configured_line_height = line_height;
         self.line_height = px(line_height);
         self.content_height = line_height;
+        self
+    }
+
+    pub fn with_accessibility_role(mut self, role: Role) -> Self {
+        self.accessibility_role = role;
         self
     }
 
@@ -3175,6 +3182,10 @@ impl Render for ComposerInput {
             theme.text
         };
         div()
+            .id(("composer-input", cx.entity_id()))
+            .role(self.accessibility_role)
+            .aria_label(self.placeholder.clone())
+            .aria_placeholder(self.placeholder.clone())
             .key_context(self.key_context)
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)

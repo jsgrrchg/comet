@@ -2433,7 +2433,9 @@ impl Shell {
             .find(|c| c.id == chat_id)
             .and_then(|c| c.title.clone())
             .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Session title", cx));
+        let input = cx.new(|cx| {
+            ComposerInput::new("Session title", cx).with_accessibility_role(gpui::Role::TextInput)
+        });
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -2937,7 +2939,9 @@ impl Shell {
         if self.org.is_some() {
             return;
         }
-        let name_input = cx.new(|cx| ComposerInput::new("Workspace name", cx));
+        let name_input = cx.new(|cx| {
+            ComposerInput::new("Workspace name", cx).with_accessibility_role(gpui::Role::TextInput)
+        });
         let events = cx.subscribe(&name_input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.create_org(cx);

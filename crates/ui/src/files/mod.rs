@@ -399,8 +399,11 @@ impl FilesSurface {
         show_all_files: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        let search =
-            cx.new(|cx| ComposerInput::new("Search files", cx).with_text_metrics(11.0, 16.0));
+        let search = cx.new(|cx| {
+            ComposerInput::new("Search files", cx)
+                .with_accessibility_role(gpui::Role::SearchInput)
+                .with_text_metrics(11.0, 16.0)
+        });
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => this.on_search_edited(cx),
             ComposerInputEvent::Submitted | ComposerInputEvent::MentionAccept => {

@@ -232,6 +232,9 @@ impl FileTreeModel {
             .map(|node| node.children.iter().cloned().collect::<HashSet<_>>())
             .unwrap_or_default();
         for mut entry in page.entries {
+            if !is_direct_child(&entry.path, &directory) {
+                continue;
+            }
             entry.ignored |= parent_ignored;
             let path = entry.path.clone();
             self.nodes
@@ -415,7 +418,8 @@ impl FileTreeModel {
 
     fn rebuild_visible_rows(&mut self) {
         let mut rows = Vec::new();
-        self.append_directory_rows("", 0, &mut rows);
+        let mut visited = HashSet::from([String::new()]);
+        self.append_directory_rows("", 0, &mut rows, &mut visited);
         self.visible_rows = rows;
         if self
             .selected
@@ -426,11 +430,20 @@ impl FileTreeModel {
         }
     }
 
-    fn append_directory_rows(&self, directory: &str, depth: usize, rows: &mut Vec<VisibleTreeRow>) {
+    fn append_directory_rows(
+        &self,
+        directory: &str,
+        depth: usize,
+        rows: &mut Vec<VisibleTreeRow>,
+        visited: &mut HashSet<String>,
+    ) {
         let Some(node) = self.nodes.get(directory) else {
             return;
         };
         for child_path in &node.children {
+            if !visited.insert(child_path.clone()) {
+                continue;
+            }
             let Some(child) = self.nodes.get(child_path) else {
                 continue;
             };
@@ -442,7 +455,7 @@ impl FileTreeModel {
             if child.entry.kind == WorkspaceEntryKind::Directory
                 && self.expanded.contains(child_path)
             {
-                self.append_directory_rows(child_path, depth + 1, rows);
+                self.append_directory_rows(child_path, depth + 1, rows, visited);
             }
         }
 
@@ -533,6 +546,10 @@ fn is_descendant(candidate: &str, ancestor: &str) -> bool {
     candidate
         .strip_prefix(ancestor)
         .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn is_direct_child(candidate: &str, directory: &str) -> bool {
+    parent_path(candidate).as_deref() == Some(directory)
 }
 
 fn synthetic_path(directory: &str, kind: &str) -> String {
@@ -712,6 +729,84 @@ mod tests {
         );
         let root = tree.node("").unwrap();
         assert_eq!(root.children, ["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn directory_pages_reject_self_parents_and_ancestors() {
+        let mut tree = FileTreeModel::new();
+        let generation = tree.generation();
+        tree.begin_load("", None, generation);
+        tree.apply_page(
+            page("", vec![entry("src", WorkspaceEntryKind::Directory)], None),
+            generation,
+        );
+        tree.begin_load("src", None, generation);
+
+        assert!(tree.apply_page(
+            page(
+                "src",
+                vec![
+                    entry("src", WorkspaceEntryKind::Directory),
+                    entry("", WorkspaceEntryKind::Directory),
+                    entry("src/lib.rs", WorkspaceEntryKind::File),
+                ],
+                None,
+            ),
+            generation,
+        ));
+
+        assert_eq!(tree.node("src").unwrap().children, ["src/lib.rs"]);
+        assert_eq!(tree.node("").unwrap().children, ["src"]);
+    }
+
+    #[test]
+    fn directory_pages_reject_non_direct_descendants() {
+        let mut tree = FileTreeModel::new();
+        let generation = tree.generation();
+        tree.begin_load("", None, generation);
+
+        assert!(tree.apply_page(
+            page(
+                "",
+                vec![
+                    entry("src", WorkspaceEntryKind::Directory),
+                    entry("src/nested.rs", WorkspaceEntryKind::File),
+                    entry("README.md", WorkspaceEntryKind::File),
+                ],
+                None,
+            ),
+            generation,
+        ));
+
+        assert_eq!(tree.node("").unwrap().children, ["src", "README.md"]);
+        assert!(tree.node("src/nested.rs").is_none());
+    }
+
+    #[test]
+    fn visible_rows_stop_at_cycles_in_a_corrupted_model() {
+        let mut tree = FileTreeModel::new();
+        tree.nodes.insert(
+            "loop".into(),
+            TreeNode::new(entry("loop", WorkspaceEntryKind::Directory)),
+        );
+        tree.nodes.get_mut("").unwrap().children.push("loop".into());
+        tree.nodes
+            .get_mut("loop")
+            .unwrap()
+            .children
+            .push("loop".into());
+        tree.expanded.insert("loop".into());
+
+        tree.rebuild_visible_rows();
+
+        assert_eq!(
+            tree.visible_rows()
+                .iter()
+                .filter(|row| matches!(row.kind, VisibleRowKind::Entry))
+                .map(|row| row.path.as_str())
+                .collect::<Vec<_>>(),
+            ["loop"]
+        );
     }
 
     #[test]

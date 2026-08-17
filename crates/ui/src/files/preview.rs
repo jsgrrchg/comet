@@ -1657,7 +1657,7 @@ impl FilesSurface {
                 .documents
                 .get(path)
                 .and_then(|document| match &document.phase {
-                    DocumentPhase::Saving => Some(("Autosaving…", theme.text_faint, false, None)),
+                    DocumentPhase::Saving => None,
                     DocumentPhase::SaveFailed(error) => Some((
                         "Autosave failed",
                         theme.danger_muted,

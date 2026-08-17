@@ -130,27 +130,7 @@ impl Render for FilesSurface {
             phase.as_ref(),
             Some(DirectoryLoadState::Unloaded | DirectoryLoadState::Loading { .. })
         ) {
-            div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(10.0))
-                .child(crate::loaders::gradient_spinner(
-                    "files-loading-root",
-                    &theme,
-                    3.0,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(theme.text_faint)
-                        .child("Loading workspace…"),
-                )
-                .into_any_element()
+            div().flex_1().into_any_element()
         } else {
             self.render_tree(cx)
         };

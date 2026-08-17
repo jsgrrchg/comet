@@ -49,6 +49,7 @@ pub(super) struct FileDocument {
     pub editor: Option<Entity<EditorState>>,
     pub editor_events: Option<Subscription>,
     pub editor_observer: Option<Subscription>,
+    pending_editor_sync: Option<String>,
     pub loaded_hash: Option<String>,
     pub saved_hash: Option<String>,
     pub revision: u64,
@@ -78,6 +79,7 @@ impl FileDocument {
             editor: None,
             editor_events: None,
             editor_observer: None,
+            pending_editor_sync: None,
             loaded_hash: None,
             saved_hash: None,
             revision: 0,
@@ -106,6 +108,7 @@ impl FileDocument {
         self.reconcile_task = None;
         self.pending_save = None;
         self.pending_external_reload = None;
+        self.pending_editor_sync = None;
         self.reconcile_after_save = false;
         self.review_comment_flush_pending = false;
         self.generation
@@ -120,6 +123,7 @@ impl FileDocument {
         self.editor = None;
         self.editor_events = None;
         self.editor_observer = None;
+        self.pending_editor_sync = None;
         self.encoding = writable_encoding(file.encoding);
         self.line_ending = writable_line_ending(file.line_ending);
         self.lines = Arc::new(
@@ -247,7 +251,16 @@ impl FileDocument {
         self.reconcile_task = None;
         self.pending_save = None;
         self.pending_external_reload = None;
+        self.pending_editor_sync = None;
         self.phase = DocumentPhase::DeletedOnDisk;
+    }
+
+    pub fn expect_editor_sync(&mut self, text: String) {
+        self.pending_editor_sync = Some(text);
+    }
+
+    pub fn consume_editor_sync(&mut self, text: &str) -> bool {
+        self.pending_editor_sync.take().as_deref() == Some(text)
     }
 
     pub fn restore_on_disk(&mut self, file: WorkspaceFileText) {
@@ -519,6 +532,18 @@ mod tests {
         assert!(matches!(dirty.phase, DocumentPhase::Ready));
         assert!(dirty.is_dirty());
         assert!(dirty.can_autosave());
+    }
+
+    #[test]
+    fn programmatic_editor_sync_ignores_only_the_expected_change() {
+        let mut document = FileDocument::loading(key("src/lib.rs"));
+        document.expect_editor_sync("external contents".into());
+        assert!(document.consume_editor_sync("external contents"));
+        assert!(!document.consume_editor_sync("external contents"));
+
+        document.expect_editor_sync("external contents".into());
+        assert!(!document.consume_editor_sync("user contents"));
+        assert!(!document.consume_editor_sync("external contents"));
     }
 
     #[test]

@@ -827,6 +827,9 @@ impl FilesSurface {
             let Some(document) = self.preview.documents.get_mut(path) else {
                 return;
             };
+            if document.consume_editor_sync(&source) {
+                return;
+            }
             document.mark_user_edit();
             document.revision
         };
@@ -1356,7 +1359,10 @@ impl FilesSurface {
             .get(path)
             .and_then(|document| document.editor.clone());
         if let (Some(editor), Some(text)) = (editor, text.clone()) {
-            editor.update(cx, |state, cx| state.set_value(text, window, cx));
+            if let Some(document) = self.preview.documents.get_mut(path) {
+                document.expect_editor_sync(text.clone());
+            }
+            super::editor::replace_file_contents(&editor, text, window, cx);
         }
         if let Some(document) = self.preview.documents.get_mut(path) {
             document.apply_external_reload(file);

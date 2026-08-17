@@ -39,6 +39,23 @@ pub(super) fn editor_element(editor: &Entity<FileEditorState>) -> AnyElement {
     gpui_base::input::Editor::new(editor).into_any_element()
 }
 
+/// Applies a clean disk update without discarding the user's editor context.
+pub(super) fn replace_file_contents(
+    editor: &Entity<FileEditorState>,
+    text: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut Context<FilesSurface>,
+) {
+    let text = text.into();
+    editor.update(cx, |state, cx| {
+        let selection = state.selected_range();
+        let scroll_offset = state.scroll_offset();
+        state.replace_all(text, window, cx);
+        state.set_selected_range(selection, cx);
+        state.set_scroll_offset(scroll_offset, cx);
+    });
+}
+
 pub(super) fn subscribe_to_changes(
     editor: &Entity<FileEditorState>,
     path: String,

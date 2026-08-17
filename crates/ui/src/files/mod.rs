@@ -259,17 +259,37 @@ impl Render for FilesSurface {
 }
 
 impl FilesSurface {
-    pub fn new(state: Entity<AppState>, chat_id: String, cx: &mut Context<Self>) -> Self {
-        Self::new_with_presentation(state, chat_id, FilesPresentation::Browser, None, cx)
+    pub fn new(
+        state: Entity<AppState>,
+        chat_id: String,
+        autosave_delay_ms: u64,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with_presentation(
+            state,
+            chat_id,
+            FilesPresentation::Browser,
+            None,
+            autosave_delay_ms,
+            cx,
+        )
     }
 
     pub fn new_editor(
         state: Entity<AppState>,
         chat_id: String,
         path: String,
+        autosave_delay_ms: u64,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_presentation(state, chat_id, FilesPresentation::Editor, Some(path), cx)
+        Self::new_with_presentation(
+            state,
+            chat_id,
+            FilesPresentation::Editor,
+            Some(path),
+            autosave_delay_ms,
+            cx,
+        )
     }
 
     fn new_with_presentation(
@@ -277,6 +297,7 @@ impl FilesSurface {
         chat_id: String,
         presentation: FilesPresentation,
         editor_path: Option<String>,
+        autosave_delay_ms: u64,
         cx: &mut Context<Self>,
     ) -> Self {
         let search =
@@ -325,7 +346,7 @@ impl FilesSurface {
             watch_task: None,
             watch_sequence: None,
             watch_error: None,
-            preview: FilePreviewState::new(),
+            preview: FilePreviewState::new(autosave_delay_ms),
             loads: HashMap::new(),
             error: None,
             started: false,
@@ -334,6 +355,11 @@ impl FilesSurface {
         };
         surface.sync_target(cx);
         surface
+    }
+
+    pub fn set_autosave_delay_ms(&mut self, delay_ms: u64, cx: &mut Context<Self>) {
+        self.preview.set_autosave_delay_ms(delay_ms);
+        cx.notify();
     }
 
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {

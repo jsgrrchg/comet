@@ -38,6 +38,7 @@ use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::files::{FilesSettingsEvent, FilesSettingsPage};
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
@@ -160,17 +161,19 @@ pub enum SettingsSection {
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
+    Files,
     Notifications,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 7] = [
+    pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
+        SettingsSection::Files,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
@@ -184,6 +187,7 @@ impl SettingsSection {
             SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
+            SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
@@ -821,12 +825,14 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
+    files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
+    files_settings_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
@@ -1063,12 +1069,14 @@ impl Shell {
             devices_page: None,
             archived_page: None,
             appearance_page: None,
+            files_settings_page: None,
             notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
+            files_settings_sub: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
@@ -1602,8 +1610,10 @@ impl Shell {
         }
         let key = self.panel_key(cx);
         if !self.files.contains_key(&key) {
-            let files =
-                cx.new(|cx| FilesSurface::new(self.state.clone(), self.active_chat.clone(), cx));
+            let delay = self.settings.files_autosave_delay_ms;
+            let files = cx.new(|cx| {
+                FilesSurface::new(self.state.clone(), self.active_chat.clone(), delay, cx)
+            });
             let sub = cx.subscribe(&files, |this: &mut Self, _, event, cx| match event {
                 FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
                 FilesEvent::TitleChanged => cx.notify(),
@@ -1637,6 +1647,7 @@ impl Shell {
                 self.state.clone(),
                 self.active_chat.clone(),
                 path.clone(),
+                self.settings.files_autosave_delay_ms,
                 cx,
             )
         });
@@ -1990,6 +2001,32 @@ impl Shell {
                     self.appearance_page = Some(cx.new(AppearancePage::new));
                 }
                 match &self.appearance_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Files => {
+                if self.files_settings_page.is_none() {
+                    let page = cx.new(|cx| {
+                        FilesSettingsPage::new(self.settings.files_autosave_delay_ms, cx)
+                    });
+                    self.files_settings_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &FilesSettingsEvent, cx| {
+                            let FilesSettingsEvent::Changed { autosave_delay_ms } = *event;
+                            this.settings.files_autosave_delay_ms = autosave_delay_ms;
+                            for surface in this.files.values().chain(this.file_surfaces.values()) {
+                                surface.update(cx, |surface, cx| {
+                                    surface.set_autosave_delay_ms(autosave_delay_ms, cx)
+                                });
+                            }
+                            this.schedule_save(cx);
+                            cx.notify();
+                        },
+                    ));
+                    self.files_settings_page = Some(page);
+                }
+                match &self.files_settings_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -3015,6 +3052,7 @@ impl Shell {
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Files => icons::FOLDER,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,

@@ -15,6 +15,7 @@ pub mod appearance;
 pub mod archived;
 pub mod composer;
 pub mod devices;
+pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
@@ -40,6 +41,10 @@ pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
 
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
+
+pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 900;
+pub const FILES_AUTOSAVE_DELAY_MIN_MS: u64 = 100;
+pub const FILES_AUTOSAVE_DELAY_MAX_MS: u64 = 10_000;
 
 const FILE_NAME: &str = "ui-settings.json";
 
@@ -94,6 +99,8 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Idle time before an edited workspace file is saved automatically.
+    pub files_autosave_delay_ms: u64,
 }
 
 impl Default for UiSettings {
@@ -116,6 +123,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
         }
     }
 }
@@ -315,6 +323,9 @@ impl UiSettings {
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        self.files_autosave_delay_ms = self
+            .files_autosave_delay_ms
+            .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
         self
     }
 
@@ -387,6 +398,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            files_autosave_delay_ms: 1_500,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -407,6 +419,10 @@ mod tests {
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
+        assert_eq!(
+            loaded.files_autosave_delay_ms,
+            FILES_AUTOSAVE_DELAY_DEFAULT_MS
+        );
         assert!(
             loaded.notifications_enabled,
             "pre-banner files default banners on"
@@ -436,6 +452,15 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.sidebar_width, SIDEBAR_MAX);
         assert_eq!(loaded.right_pane_width, RIGHT_PANE_MIN);
+        assert_eq!(
+            UiSettings {
+                files_autosave_delay_ms: 1,
+                ..Default::default()
+            }
+            .clamped()
+            .files_autosave_delay_ms,
+            FILES_AUTOSAVE_DELAY_MIN_MS
+        );
     }
 
     #[test]

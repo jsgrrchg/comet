@@ -35,12 +35,13 @@ pub(super) struct FilePreviewState {
     horizontal_scroll: ScrollHandle,
     surface_width: Rc<Cell<f32>>,
     word_wrap: bool,
+    autosave_delay_ms: u64,
     tree_sidebar_visible: bool,
     tree_width: f32,
 }
 
 impl FilePreviewState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(autosave_delay_ms: u64) -> Self {
         Self {
             documents: HashMap::new(),
             active: None,
@@ -50,6 +51,7 @@ impl FilePreviewState {
             horizontal_scroll: ScrollHandle::new(),
             surface_width: Rc::new(Cell::new(520.0)),
             word_wrap: false,
+            autosave_delay_ms,
             tree_sidebar_visible: false,
             tree_width: TREE_SPLIT_DEFAULT,
         }
@@ -81,6 +83,13 @@ impl FilePreviewState {
 
     fn word_wrap(&self) -> bool {
         self.word_wrap
+    }
+
+    pub(super) fn set_autosave_delay_ms(&mut self, delay_ms: u64) {
+        self.autosave_delay_ms = delay_ms;
+        for document in self.documents.values_mut() {
+            document.autosave_task = None;
+        }
     }
 
     pub(super) fn tree_width(&self) -> f32 {
@@ -866,7 +875,7 @@ mod tests {
 
     #[test]
     fn reset_drops_documents_and_active_preview_from_the_previous_target() {
-        let mut preview = FilePreviewState::new();
+        let mut preview = FilePreviewState::new(900);
         preview.active = Some("private.env".into());
         preview.documents.insert(
             "private.env".into(),

@@ -1917,6 +1917,7 @@ impl FilesSurface {
             .h(px(31.0))
             .flex_none()
             .px(px(10.0))
+            .border_t_1()
             .border_b_1()
             .border_color(theme.border)
             .flex()

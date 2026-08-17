@@ -863,6 +863,7 @@ impl FilesSurface {
             .flex()
             .items_center()
             .gap(px(5.0))
+            .border_t_1()
             .border_b_1()
             .border_color(theme.border)
             .bg(background)

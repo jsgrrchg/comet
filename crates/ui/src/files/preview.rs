@@ -69,6 +69,12 @@ struct EditorOverlayLayout {
     rows: Vec<EditorOverlayRow>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadDecision {
+    ReloadNow,
+    AwaitDiscardConfirmation,
+}
+
 pub(super) struct FilePreviewState {
     documents: HashMap<String, FileDocument>,
     active: Option<String>,
@@ -177,6 +183,26 @@ impl FilePreviewState {
             .filter(|(_, document)| document.can_autosave())
             .map(|(path, _)| path.clone())
             .collect()
+    }
+
+    fn request_reload(&mut self, path: &str) -> ReloadDecision {
+        let Some(document) = self.documents.get_mut(path) else {
+            return ReloadDecision::ReloadNow;
+        };
+        if !document.is_dirty() {
+            self.reload_confirmation = None;
+            return ReloadDecision::ReloadNow;
+        }
+
+        // A destructive reload must remain pending until the user explicitly
+        // confirms it. Pause delayed autosave so it cannot race the choice.
+        document.autosave_task = None;
+        self.reload_confirmation = Some(path.to_string());
+        ReloadDecision::AwaitDiscardConfirmation
+    }
+
+    fn autosave_paused_for_reload(&self, path: &str) -> bool {
+        self.reload_confirmation.as_deref() == Some(path)
     }
 
     pub(super) fn narrow_tree_width(&self) -> f32 {
@@ -558,6 +584,14 @@ impl FilesSurface {
     }
 
     pub(super) fn open_file(&mut self, path: String, cx: &mut Context<Self>) {
+        let leaving_reload_confirmation = self
+            .preview
+            .reload_confirmation
+            .as_deref()
+            .is_some_and(|pending| pending != path);
+        if leaving_reload_confirmation {
+            self.cancel_reload_confirmation(cx);
+        }
         self.preview.active = Some(path.clone());
         self.preview.tree_sidebar_visible = false;
         if !self.preview.documents.contains_key(&path) {
@@ -845,6 +879,9 @@ impl FilesSurface {
     }
 
     pub(super) fn schedule_autosave(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.preview.autosave_paused_for_reload(&path) {
+            return;
+        }
         let delay = Duration::from_millis(self.preview.autosave_delay_ms);
         let Some((key, generation, revision)) = self
             .preview
@@ -859,8 +896,8 @@ impl FilesSurface {
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |surface, cx| {
-                let still_current =
-                    surface
+                let still_current = !surface.preview.autosave_paused_for_reload(&task_path)
+                    && surface
                         .preview
                         .documents
                         .get(&task_path)
@@ -1293,32 +1330,38 @@ impl FilesSurface {
             .reset_with_uniform_height(count, px(PREVIEW_LINE_HEIGHT));
     }
 
-    fn reload_active_document(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.preview.active.clone() {
-            self.read_file(path, cx);
-        }
-    }
-
-    fn reload_external_document(&mut self, cx: &mut Context<Self>) {
+    fn request_reload_active_document(&mut self, cx: &mut Context<Self>) {
         let Some(path) = self.preview.active.clone() else {
             return;
         };
-        let dirty = self
-            .preview
-            .documents
-            .get(&path)
-            .is_some_and(FileDocument::is_dirty);
-        if dirty && self.preview.reload_confirmation.as_deref() != Some(path.as_str()) {
-            self.preview.reload_confirmation = Some(path);
-            cx.notify();
+        match self.preview.request_reload(&path) {
+            ReloadDecision::ReloadNow => self.read_file(path, cx),
+            ReloadDecision::AwaitDiscardConfirmation => cx.notify(),
+        }
+    }
+
+    fn confirm_reload_active_document(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.preview.active.clone() else {
+            return;
+        };
+        if self.preview.reload_confirmation.as_deref() != Some(path.as_str()) {
             return;
         }
         self.preview.reload_confirmation = None;
         self.read_file(path, cx);
     }
 
-    fn cancel_external_reload(&mut self, cx: &mut Context<Self>) {
-        self.preview.reload_confirmation = None;
+    fn cancel_reload_confirmation(&mut self, cx: &mut Context<Self>) {
+        let pending = self.preview.reload_confirmation.take();
+        if let Some(path) = pending
+            && self
+                .preview
+                .documents
+                .get(&path)
+                .is_some_and(FileDocument::can_autosave)
+        {
+            self.schedule_autosave(path, cx);
+        }
         cx.notify();
     }
 
@@ -1447,80 +1490,83 @@ impl FilesSurface {
                         }),
                 )
             })
-            .when(external && !lifecycle_pending, |element| {
-                element.child(
-                    div()
-                        .h(px(30.0))
-                        .flex_none()
-                        .px(px(10.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .border_b_1()
-                        .border_color(theme.warning.opacity(0.25))
-                        .bg(theme.warning.opacity(0.055))
-                        .text_size(px(10.5))
-                        .text_color(theme.warning_muted)
-                        .child(if confirming_reload {
-                            "Discard unsaved changes?"
-                        } else {
-                            "This file changed outside Zeron."
-                        })
-                        .child(
-                            div()
-                                .ml_auto()
-                                .flex()
-                                .items_center()
-                                .gap(px(10.0))
-                                .when(!confirming_reload, |actions| {
-                                    actions
-                                        .child(
-                                            div()
-                                                .id("files-keep-external-edits")
-                                                .cursor_pointer()
-                                                .text_color(theme.text_muted)
-                                                .child("Keep Editing")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.keep_external_edits(cx)
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("files-reload-external")
-                                                .cursor_pointer()
-                                                .text_color(theme.text)
-                                                .child("Reload from Disk")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.reload_external_document(cx)
-                                                })),
-                                        )
-                                })
-                                .when(confirming_reload, |actions| {
-                                    actions
-                                        .child(
-                                            div()
-                                                .id("files-cancel-external-reload")
-                                                .cursor_pointer()
-                                                .text_color(theme.text_muted)
-                                                .child("Cancel")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.cancel_external_reload(cx)
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("files-confirm-external-reload")
-                                                .cursor_pointer()
-                                                .text_color(theme.text)
-                                                .child("Discard & Reload")
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.reload_external_document(cx)
-                                                })),
-                                        )
-                                }),
-                        ),
-                )
-            })
+            .when(
+                (external || confirming_reload) && !lifecycle_pending,
+                |element| {
+                    element.child(
+                        div()
+                            .h(px(30.0))
+                            .flex_none()
+                            .px(px(10.0))
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .border_b_1()
+                            .border_color(theme.warning.opacity(0.25))
+                            .bg(theme.warning.opacity(0.055))
+                            .text_size(px(10.5))
+                            .text_color(theme.warning_muted)
+                            .child(if confirming_reload {
+                                "Discard unsaved changes?"
+                            } else {
+                                "This file changed outside Zeron."
+                            })
+                            .child(
+                                div()
+                                    .ml_auto()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .when(!confirming_reload, |actions| {
+                                        actions
+                                            .child(
+                                                div()
+                                                    .id("files-keep-external-edits")
+                                                    .cursor_pointer()
+                                                    .text_color(theme.text_muted)
+                                                    .child("Keep Editing")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.keep_external_edits(cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("files-reload-external")
+                                                    .cursor_pointer()
+                                                    .text_color(theme.text)
+                                                    .child("Reload from Disk")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.request_reload_active_document(cx)
+                                                    })),
+                                            )
+                                    })
+                                    .when(confirming_reload, |actions| {
+                                        actions
+                                            .child(
+                                                div()
+                                                    .id("files-cancel-reload")
+                                                    .cursor_pointer()
+                                                    .text_color(theme.text_muted)
+                                                    .child("Cancel")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.cancel_reload_confirmation(cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("files-confirm-reload")
+                                                    .cursor_pointer()
+                                                    .text_color(theme.text)
+                                                    .child("Discard & Reload")
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.confirm_reload_active_document(cx)
+                                                    })),
+                                            )
+                                    }),
+                            ),
+                    )
+                },
+            )
             .child(body)
             .into_any_element()
     }
@@ -1690,7 +1736,7 @@ impl FilesSurface {
                     .role(gpui::Role::Button)
                     .aria_label("Reload file")
                     .hover(|style| style.bg(crate::theme::wash(0.07)))
-                    .on_click(cx.listener(|this, _, _, cx| this.reload_active_document(cx)))
+                    .on_click(cx.listener(|this, _, _, cx| this.request_reload_active_document(cx)))
                     .child(
                         icon(icons::REFRESH)
                             .size(px(11.5))
@@ -2398,6 +2444,50 @@ mod tests {
         assert!(preview.documents.is_empty());
         assert!(preview.active.is_none());
         assert!(!preview.tree_sidebar_visible);
+    }
+
+    #[test]
+    fn dirty_reload_waits_for_explicit_discard_confirmation() {
+        let path = "src/lib.rs";
+        let mut preview = FilePreviewState::new(900);
+        let mut document = FileDocument::loading(DocumentKey {
+            chat_id: "chat-1".into(),
+            checkout_id: Some("checkout-1".into()),
+            path: path.into(),
+        });
+        document.revision = 1;
+        preview.documents.insert(path.into(), document);
+
+        assert_eq!(
+            preview.request_reload(path),
+            ReloadDecision::AwaitDiscardConfirmation
+        );
+        assert_eq!(preview.reload_confirmation.as_deref(), Some(path));
+        assert!(preview.documents[path].is_dirty());
+
+        // Repeated toolbar clicks must not bypass the explicit confirmation.
+        assert_eq!(
+            preview.request_reload(path),
+            ReloadDecision::AwaitDiscardConfirmation
+        );
+    }
+
+    #[test]
+    fn clean_reload_proceeds_without_confirmation() {
+        let path = "src/lib.rs";
+        let mut preview = FilePreviewState::new(900);
+        preview.documents.insert(
+            path.into(),
+            FileDocument::loading(DocumentKey {
+                chat_id: "chat-1".into(),
+                checkout_id: Some("checkout-1".into()),
+                path: path.into(),
+            }),
+        );
+        preview.reload_confirmation = Some("stale.rs".into());
+
+        assert_eq!(preview.request_reload(path), ReloadDecision::ReloadNow);
+        assert!(preview.reload_confirmation.is_none());
     }
 
     #[test]

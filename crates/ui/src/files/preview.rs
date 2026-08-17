@@ -218,6 +218,17 @@ fn document_key(context: &FilesRequestContext, path: String) -> DocumentKey {
     }
 }
 
+fn document_blocks_lifecycle(document: &FileDocument) -> bool {
+    document.is_dirty()
+        && matches!(
+            document.phase,
+            DocumentPhase::SaveFailed(_)
+                | DocumentPhase::Conflict { .. }
+                | DocumentPhase::ExternallyModified { .. }
+                | DocumentPhase::DeletedOnDisk
+        )
+}
+
 fn comment_anchor_range(
     text: &gpui_base::input::Rope,
     line: u32,
@@ -1051,14 +1062,10 @@ impl FilesSurface {
         }
         self.preview.close_requested = true;
         let blocked = dirty_paths.iter().any(|path| {
-            self.preview.documents.get(path).is_some_and(|document| {
-                matches!(
-                    document.phase,
-                    DocumentPhase::Conflict { .. }
-                        | DocumentPhase::ExternallyModified { .. }
-                        | DocumentPhase::DeletedOnDisk
-                )
-            })
+            self.preview
+                .documents
+                .get(path)
+                .is_some_and(document_blocks_lifecycle)
         });
         for path in dirty_paths {
             if self
@@ -1085,7 +1092,7 @@ impl FilesSurface {
                 .preview
                 .documents
                 .get(&path)
-                .is_some_and(FileDocument::can_autosave)
+                .is_some_and(FileDocument::can_save)
             {
                 self.save_document(path, cx);
             }
@@ -1414,16 +1421,11 @@ impl FilesSurface {
         let confirming_reload = self.preview.reload_confirmation.as_deref() == Some(&active);
         let lifecycle_pending = self.preview.close_requested || self.target_change_pending;
         let lifecycle_blocked = lifecycle_pending
-            && self.preview.documents.values().any(|document| {
-                document.is_dirty()
-                    && matches!(
-                        document.phase,
-                        DocumentPhase::SaveFailed(_)
-                            | DocumentPhase::Conflict { .. }
-                            | DocumentPhase::ExternallyModified { .. }
-                            | DocumentPhase::DeletedOnDisk
-                    )
-            });
+            && self
+                .preview
+                .documents
+                .values()
+                .any(document_blocks_lifecycle);
         let body = self.render_document_body(&active, &theme, window, cx);
         div()
             .size_full()
@@ -2488,6 +2490,22 @@ mod tests {
 
         assert_eq!(preview.request_reload(path), ReloadDecision::ReloadNow);
         assert!(preview.reload_confirmation.is_none());
+    }
+
+    #[test]
+    fn failed_save_blocks_lifecycle_until_explicit_recovery() {
+        let mut document = FileDocument::loading(DocumentKey {
+            chat_id: "chat-1".into(),
+            checkout_id: Some("checkout-1".into()),
+            path: "src/lib.rs".into(),
+        });
+        document.revision = 1;
+        document.phase = DocumentPhase::SaveFailed("offline".into());
+
+        assert!(document_blocks_lifecycle(&document));
+
+        document.phase = DocumentPhase::Ready;
+        assert!(!document_blocks_lifecycle(&document));
     }
 
     #[test]

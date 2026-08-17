@@ -162,7 +162,7 @@ impl FileDocument {
             && self.line_ending.is_some()
     }
 
-    pub fn can_autosave(&self) -> bool {
+    pub fn can_save(&self) -> bool {
         self.is_editable()
             && self.is_dirty()
             && self.pending_save.is_none()
@@ -170,6 +170,10 @@ impl FileDocument {
                 self.phase,
                 DocumentPhase::Ready | DocumentPhase::SaveFailed(_)
             )
+    }
+
+    pub fn can_autosave(&self) -> bool {
+        self.can_save() && matches!(self.phase, DocumentPhase::Ready)
     }
 
     pub fn mark_user_edit(&mut self) {
@@ -182,7 +186,7 @@ impl FileDocument {
     }
 
     pub fn begin_save(&mut self, text: String) -> Option<PendingSave> {
-        if !self.can_autosave() {
+        if !self.can_save() {
             return None;
         }
         let pending = PendingSave {
@@ -413,8 +417,17 @@ mod tests {
         assert!(document.fail_save(revision, "offline"));
         assert!(document.is_dirty());
         assert!(matches!(document.phase, DocumentPhase::SaveFailed(_)));
+        assert!(document.can_save());
+        assert!(!document.can_autosave());
+
+        let retry_revision = document.begin_save("retry".into()).unwrap().revision;
+        assert!(matches!(document.phase, DocumentPhase::Saving));
+        assert!(document.fail_save(retry_revision, "still offline"));
+        assert!(!document.can_autosave());
 
         document.mark_user_edit();
+        assert!(matches!(document.phase, DocumentPhase::Ready));
+        assert!(document.can_autosave());
         let revision = document
             .begin_save("changed again".into())
             .unwrap()

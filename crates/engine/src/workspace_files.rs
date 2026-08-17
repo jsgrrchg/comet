@@ -345,11 +345,7 @@ impl WorkspaceFiles {
         &self,
         request: SearchWorkspaceFilesRequest,
     ) -> Result<Vec<WorkspaceFileSearchMatch>, WorkspaceFilesError> {
-        if request.query.chars().count() > MAX_SEARCH_QUERY_CHARS {
-            return Err(WorkspaceFilesError::BadParams(format!(
-                "query must not exceed {MAX_SEARCH_QUERY_CHARS} characters"
-            )));
-        }
+        validate_workspace_search_query(&request.query)?;
         let workspace = self.resolve_target(&request.target).await?;
         let limit =
             usize::from(request.limit.unwrap_or(MAX_SEARCH_RESULTS as u16)).min(MAX_SEARCH_RESULTS);
@@ -1006,6 +1002,7 @@ fn search_workspace_blocking(
     limit: usize,
     cancel: &AtomicBool,
 ) -> Result<Vec<WorkspaceFileSearchMatch>, WorkspaceFilesError> {
+    validate_workspace_search_query(query)?;
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -1061,16 +1058,38 @@ fn search_workspace_blocking(
             kind,
             score,
         });
+        if matches.len() > limit {
+            matches.sort_by(compare_workspace_search_matches);
+            matches.truncate(limit);
+        }
     }
-    matches.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    matches.truncate(limit);
+    matches.sort_by(compare_workspace_search_matches);
     Ok(matches)
+}
+
+fn validate_workspace_search_query(query: &str) -> Result<(), WorkspaceFilesError> {
+    if query.trim().is_empty() {
+        return Err(WorkspaceFilesError::BadParams(
+            "query must not be empty".into(),
+        ));
+    }
+    if query.chars().count() > MAX_SEARCH_QUERY_CHARS {
+        return Err(WorkspaceFilesError::BadParams(format!(
+            "query must not exceed {MAX_SEARCH_QUERY_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn compare_workspace_search_matches(
+    left: &WorkspaceFileSearchMatch,
+    right: &WorkspaceFileSearchMatch,
+) -> std::cmp::Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
+        .then_with(|| left.path.cmp(&right.path))
 }
 
 fn read_file_blocking(
@@ -1911,6 +1930,39 @@ mod tests {
                 .any(|entry| entry.path == "src/configuration.rs")
         );
         assert!(matches.len() <= MAX_SEARCH_RESULTS);
+    }
+
+    #[test]
+    fn search_rejects_empty_and_whitespace_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+
+        for query in ["", "   ", "\n\t"] {
+            let error =
+                search_workspace_blocking(&root, query, false, 200, &no_cancel()).unwrap_err();
+            assert!(error.to_string().contains("query must not be empty"));
+        }
+    }
+
+    #[test]
+    fn search_keeps_only_the_best_matches_while_walking() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "aaa-query-notes.txt",
+            "bbb-query-notes.txt",
+            "ccc-query-notes.txt",
+            "query",
+            "query-reference.txt",
+        ] {
+            std::fs::write(root.path().join(name), b"").unwrap();
+        }
+        let root = std::fs::canonicalize(root.path()).unwrap();
+
+        let matches = search_workspace_blocking(&root, "query", false, 2, &no_cancel()).unwrap();
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].path, "query");
+        assert_eq!(matches[1].path, "query-reference.txt");
     }
 
     fn read_fixture(bytes: &[u8]) -> WorkspaceFileText {

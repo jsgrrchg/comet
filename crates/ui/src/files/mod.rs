@@ -3,8 +3,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Render, SharedString,
-    Subscription, Task, div, prelude::*, px,
+    Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Pixels, Point, Render,
+    SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use zeron_proto::ListWorkspaceDirectoryRequest;
 
@@ -132,6 +132,12 @@ impl FilesPresentation {
 
 impl EventEmitter<FilesEvent> for FilesSurface {}
 
+struct EditorContextMenu {
+    editor: Entity<editor::FileEditorState>,
+    position: Point<Pixels>,
+    availability: editor::EditorMenuAvailability,
+}
+
 pub struct FilesSurface {
     state: Entity<AppState>,
     chat_id: String,
@@ -150,6 +156,7 @@ pub struct FilesSurface {
     watch_sequence: Option<u64>,
     watch_error: Option<SharedString>,
     preview: FilePreviewState,
+    editor_context_menu: crate::popover::Popup<EditorContextMenu>,
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
     started: bool,
@@ -314,6 +321,7 @@ impl Render for FilesSurface {
         };
         let measured_width = self.preview.width_cell();
         let entity = cx.entity();
+        let editor_context_menu = self.render_editor_context_menu(&theme, cx);
         div()
             .id(SharedString::from(format!(
                 "files-surface-{}",
@@ -344,6 +352,7 @@ impl Render for FilesSurface {
                     )
             })
             .child(body)
+            .children(editor_context_menu)
     }
 }
 
@@ -451,6 +460,7 @@ impl FilesSurface {
             watch_sequence: None,
             watch_error: None,
             preview: FilePreviewState::new(autosave_delay_ms, word_wrap),
+            editor_context_menu: crate::popover::Popup::default(),
             loads: HashMap::new(),
             error: None,
             started: false,
@@ -459,6 +469,123 @@ impl FilesSurface {
         };
         surface.sync_target(cx);
         surface
+    }
+
+    pub(in crate::files) fn open_editor_context_menu(
+        &mut self,
+        editor: Entity<editor::FileEditorState>,
+        availability: editor::EditorMenuAvailability,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_context_menu.open(EditorContextMenu {
+            editor,
+            position,
+            availability,
+        });
+        cx.notify();
+    }
+
+    fn close_editor_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.editor_context_menu.begin_close() {
+            crate::popover::reap_popup(cx, |surface: &mut Self| &mut surface.editor_context_menu);
+            cx.notify();
+        }
+    }
+
+    fn dispatch_editor_context_action(
+        &mut self,
+        editor: Entity<editor::FileEditorState>,
+        action: editor::EditorContextAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_editor_context_menu(cx);
+        editor::dispatch_context_action(&editor, action, window, cx);
+    }
+
+    fn editor_context_menu_row(
+        theme: &crate::theme::Theme,
+        id: &'static str,
+        label: &'static str,
+        enabled: bool,
+        editor: Entity<editor::FileEditorState>,
+        action: editor::EditorContextAction,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        crate::popover::menu_row(theme, false, id)
+            .id(id)
+            .when(!enabled, |row| row.opacity(0.38).cursor_default())
+            .when(enabled, |row| {
+                row.on_click(cx.listener(move |this, _, window, cx| {
+                    this.dispatch_editor_context_action(editor.clone(), action, window, cx)
+                }))
+            })
+            .child(label)
+            .into_any_element()
+    }
+
+    fn render_editor_context_menu(
+        &mut self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let menu = self.editor_context_menu.get()?;
+        let editor = menu.editor.clone();
+        let position = menu.position;
+        let availability = menu.availability;
+        let closing = self.editor_context_menu.closing_since();
+
+        let card = crate::popover::popover_card(theme)
+            .w(px(170.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_editor_context_menu(cx)))
+            .flex()
+            .flex_col()
+            .child(Self::editor_context_menu_row(
+                theme,
+                "files-editor-context-cut",
+                "Cut",
+                availability.cut,
+                editor.clone(),
+                editor::EditorContextAction::Cut,
+                cx,
+            ))
+            .child(Self::editor_context_menu_row(
+                theme,
+                "files-editor-context-copy",
+                "Copy",
+                availability.copy,
+                editor.clone(),
+                editor::EditorContextAction::Copy,
+                cx,
+            ))
+            .child(Self::editor_context_menu_row(
+                theme,
+                "files-editor-context-paste",
+                "Paste",
+                availability.paste,
+                editor.clone(),
+                editor::EditorContextAction::Paste,
+                cx,
+            ))
+            .child(crate::popover::menu_separator())
+            .child(Self::editor_context_menu_row(
+                theme,
+                "files-editor-context-select-all",
+                "Select All",
+                true,
+                editor,
+                editor::EditorContextAction::SelectAll,
+                cx,
+            ))
+            .into_any_element();
+
+        Some(crate::popover::menu_at(
+            "files-editor-context-menu",
+            position,
+            card,
+            closing,
+        ))
     }
 
     pub fn set_autosave_delay_ms(&mut self, delay_ms: u64, cx: &mut Context<Self>) {
@@ -680,6 +807,7 @@ impl FilesSurface {
         self.watch_task = None;
         self.watch_sequence = None;
         self.watch_error = None;
+        self.editor_context_menu = crate::popover::Popup::default();
         self.preview.reset();
         self.tree.reset();
         self.sync_tree_list();

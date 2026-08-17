@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui::{Entity, SharedString, Task};
+use gpui::{Entity, SharedString, Subscription, Task};
 use gpui_base::input::EditorState;
 use zeron_proto::{
     WorkspaceFileText, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTextEncoding,
@@ -30,6 +30,15 @@ pub(super) enum DocumentPhase {
     Error(SharedString),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PendingSave {
+    pub revision: u64,
+    pub text: String,
+    pub expected_content_hash: String,
+    pub encoding: WorkspaceWritableEncoding,
+    pub line_ending: WorkspaceWritableLineEnding,
+}
+
 #[allow(dead_code)]
 pub(super) struct FileDocument {
     pub key: DocumentKey,
@@ -38,6 +47,7 @@ pub(super) struct FileDocument {
     pub file: Option<WorkspaceFileText>,
     pub lines: Arc<Vec<SharedString>>,
     pub editor: Option<Entity<EditorState>>,
+    pub editor_events: Option<Subscription>,
     pub loaded_hash: Option<String>,
     pub saved_hash: Option<String>,
     pub revision: u64,
@@ -47,6 +57,8 @@ pub(super) struct FileDocument {
     pub read_task: Option<Task<()>>,
     pub highlight_task: Option<Task<()>>,
     pub autosave_task: Option<Task<()>>,
+    pub save_task: Option<Task<()>>,
+    pub pending_save: Option<PendingSave>,
 }
 
 #[allow(dead_code)]
@@ -59,6 +71,7 @@ impl FileDocument {
             file: None,
             lines: Arc::new(Vec::new()),
             editor: None,
+            editor_events: None,
             loaded_hash: None,
             saved_hash: None,
             revision: 0,
@@ -68,6 +81,8 @@ impl FileDocument {
             read_task: None,
             highlight_task: None,
             autosave_task: None,
+            save_task: None,
+            pending_save: None,
         }
     }
 
@@ -77,6 +92,8 @@ impl FileDocument {
         self.read_task = None;
         self.highlight_task = None;
         self.autosave_task = None;
+        self.save_task = None;
+        self.pending_save = None;
         self.generation
     }
 
@@ -87,6 +104,7 @@ impl FileDocument {
     pub fn set_loaded(&mut self, file: WorkspaceFileText) {
         let hash = file.content_hash.clone();
         self.editor = None;
+        self.editor_events = None;
         self.encoding = writable_encoding(file.encoding);
         self.line_ending = writable_line_ending(file.line_ending);
         self.lines = Arc::new(
@@ -104,6 +122,7 @@ impl FileDocument {
         self.saved_hash = hash;
         self.revision = 0;
         self.saved_revision = 0;
+        self.pending_save = None;
         self.file = Some(file);
     }
 
@@ -116,21 +135,80 @@ impl FileDocument {
     }
 
     pub fn is_editable(&self) -> bool {
-        matches!(self.phase, DocumentPhase::Ready | DocumentPhase::Saving)
-            && self.file.as_ref().is_some_and(|file| file.text.is_some())
+        matches!(
+            self.phase,
+            DocumentPhase::Ready | DocumentPhase::Saving | DocumentPhase::SaveFailed(_)
+        ) && self.file.as_ref().is_some_and(|file| file.text.is_some())
             && self.saved_hash.is_some()
             && self.encoding.is_some()
             && self.line_ending.is_some()
     }
 
     pub fn can_autosave(&self) -> bool {
-        self.is_editable() && self.is_dirty() && !matches!(self.phase, DocumentPhase::Saving)
+        self.is_editable()
+            && self.is_dirty()
+            && self.pending_save.is_none()
+            && !matches!(self.phase, DocumentPhase::Saving)
     }
 
     pub fn mark_user_edit(&mut self) {
         if self.is_editable() {
             self.revision = self.revision.wrapping_add(1);
+            if matches!(self.phase, DocumentPhase::SaveFailed(_)) {
+                self.phase = DocumentPhase::Ready;
+            }
         }
+    }
+
+    pub fn begin_save(&mut self, text: String) -> Option<PendingSave> {
+        if !self.can_autosave() {
+            return None;
+        }
+        let pending = PendingSave {
+            revision: self.revision,
+            text,
+            expected_content_hash: self.saved_hash.clone()?,
+            encoding: self.encoding?,
+            line_ending: self.line_ending?,
+        };
+        self.phase = DocumentPhase::Saving;
+        self.autosave_task = None;
+        self.pending_save = Some(pending.clone());
+        Some(pending)
+    }
+
+    pub fn finish_save(&mut self, revision: u64, content_hash: String) -> bool {
+        if self.pending_save.as_ref().map(|save| save.revision) != Some(revision) {
+            return false;
+        }
+        self.saved_hash = Some(content_hash.clone());
+        self.loaded_hash = Some(content_hash);
+        self.saved_revision = revision;
+        self.pending_save = None;
+        self.save_task = None;
+        self.phase = DocumentPhase::Ready;
+        true
+    }
+
+    pub fn fail_save(&mut self, revision: u64, error: impl Into<SharedString>) -> bool {
+        if self.pending_save.as_ref().map(|save| save.revision) != Some(revision) {
+            return false;
+        }
+        self.pending_save = None;
+        self.save_task = None;
+        self.phase = DocumentPhase::SaveFailed(error.into());
+        true
+    }
+
+    pub fn conflict_save(&mut self, revision: u64, disk_hash: Option<String>) -> bool {
+        if self.pending_save.as_ref().map(|save| save.revision) != Some(revision) {
+            return false;
+        }
+        self.pending_save = None;
+        self.save_task = None;
+        self.autosave_task = None;
+        self.phase = DocumentPhase::Conflict { disk_hash };
+        true
     }
 
     pub fn content_hash(&self) -> Option<&str> {
@@ -235,5 +313,60 @@ mod tests {
         truncated.truncated = true;
         document.set_loaded(truncated);
         assert!(matches!(document.phase, DocumentPhase::ReadOnly(_)));
+    }
+
+    #[test]
+    fn save_snapshot_only_cleans_the_revision_it_captured() {
+        let mut document = FileDocument::loading(key("src/lib.rs"));
+        document.set_loaded(text_file());
+        document.mark_user_edit();
+        let pending = document.begin_save("fn first() {}".into()).unwrap();
+        assert_eq!(pending.revision, 1);
+        assert_eq!(pending.expected_content_hash, "hash-1");
+        assert!(matches!(document.phase, DocumentPhase::Saving));
+
+        document.mark_user_edit();
+        assert!(document.finish_save(pending.revision, "hash-2".into()));
+        assert!(document.is_dirty());
+        assert_eq!(document.saved_revision, 1);
+        assert_eq!(document.revision, 2);
+        assert!(document.can_autosave());
+    }
+
+    #[test]
+    fn failed_and_conflicting_saves_preserve_dirty_content() {
+        let mut document = FileDocument::loading(key("src/lib.rs"));
+        document.set_loaded(text_file());
+        document.mark_user_edit();
+        let revision = document.begin_save("changed".into()).unwrap().revision;
+        assert!(document.fail_save(revision, "offline"));
+        assert!(document.is_dirty());
+        assert!(matches!(document.phase, DocumentPhase::SaveFailed(_)));
+
+        document.mark_user_edit();
+        let revision = document
+            .begin_save("changed again".into())
+            .unwrap()
+            .revision;
+        assert!(document.conflict_save(revision, Some("disk-hash".into())));
+        assert!(document.is_dirty());
+        assert!(matches!(
+            document.phase,
+            DocumentPhase::Conflict {
+                disk_hash: Some(ref hash)
+            } if hash == "disk-hash"
+        ));
+        assert!(!document.can_autosave());
+    }
+
+    #[test]
+    fn stale_save_result_cannot_clean_a_new_request() {
+        let mut document = FileDocument::loading(key("src/lib.rs"));
+        document.set_loaded(text_file());
+        document.mark_user_edit();
+        let revision = document.begin_save("changed".into()).unwrap().revision;
+        assert!(!document.finish_save(revision.wrapping_add(1), "wrong-hash".into()));
+        assert!(document.is_dirty());
+        assert!(matches!(document.phase, DocumentPhase::Saving));
     }
 }

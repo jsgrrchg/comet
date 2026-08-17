@@ -25,7 +25,7 @@ pub(super) fn new_file_editor(
     });
     editor.update(cx, |state, cx| {
         state.set_editor_style(super::editor_adapter::editor_style(theme));
-        state.set_readonly(true, cx);
+        state.set_readonly(false, cx);
     });
     editor
 }

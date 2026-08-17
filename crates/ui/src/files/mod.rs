@@ -358,7 +358,10 @@ impl FilesSurface {
     }
 
     pub fn set_autosave_delay_ms(&mut self, delay_ms: u64, cx: &mut Context<Self>) {
-        self.preview.set_autosave_delay_ms(delay_ms);
+        let pending = self.preview.set_autosave_delay_ms(delay_ms);
+        for path in pending {
+            self.schedule_autosave(path, cx);
+        }
         cx.notify();
     }
 

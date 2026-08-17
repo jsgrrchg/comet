@@ -1,10 +1,14 @@
-use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
 
 use gpui::{
     AnyElement, Context, Focusable as _, ListAlignment, ListSizingBehavior, ListState, Point,
     Render, ScrollHandle, SharedString, Window, div, font, list, prelude::*, px,
 };
-use zeron_proto::{ReadWorkspaceFileRequest, WorkspaceFileSearchMatch, WorkspaceReadOnlyReason};
+use gpui_base::input::InputEvent;
+use zeron_proto::{
+    ReadWorkspaceFileRequest, WorkspaceFileSearchMatch, WorkspaceReadOnlyReason,
+    WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
+};
 
 use super::{
     FilesSurface,
@@ -85,11 +89,16 @@ impl FilePreviewState {
         self.word_wrap
     }
 
-    pub(super) fn set_autosave_delay_ms(&mut self, delay_ms: u64) {
+    pub(super) fn set_autosave_delay_ms(&mut self, delay_ms: u64) -> Vec<String> {
         self.autosave_delay_ms = delay_ms;
-        for document in self.documents.values_mut() {
+        let mut pending = Vec::new();
+        for (path, document) in &mut self.documents {
             document.autosave_task = None;
+            if document.can_autosave() {
+                pending.push(path.clone());
+            }
         }
+        pending
     }
 
     pub(super) fn tree_width(&self) -> f32 {
@@ -343,6 +352,224 @@ impl FilesSurface {
         }
     }
 
+    fn on_editor_change(&mut self, path: &str, cx: &mut Context<Self>) {
+        let Some(editor) = self
+            .preview
+            .documents
+            .get(path)
+            .and_then(|document| document.editor.clone())
+        else {
+            return;
+        };
+        let source = editor.read(cx).value().to_string();
+        let revision = {
+            let Some(document) = self.preview.documents.get_mut(path) else {
+                return;
+            };
+            document.mark_user_edit();
+            document.revision
+        };
+        self.request_editor_highlight(path.to_string(), source, revision, cx);
+        self.schedule_autosave(path.to_string(), cx);
+        cx.notify();
+    }
+
+    fn request_editor_highlight(
+        &mut self,
+        path: String,
+        source: String,
+        revision: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(language) = zeron_syntax::language_for_path(&path) else {
+            return;
+        };
+        let Some((document_key, generation)) = self
+            .preview
+            .documents
+            .get(&path)
+            .map(|document| (document.key.clone(), document.generation))
+        else {
+            return;
+        };
+        let cache_key = DocumentHighlightKey::new(language, &source);
+        let task_path = path.clone();
+        let task_document_key = document_key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            let request_path = task_path.clone();
+            let source_for_parse = source.clone();
+            let highlighted = cx
+                .background_executor()
+                .spawn(async move {
+                    zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                        source: &source_for_parse,
+                        path: Some(&request_path),
+                        fence_tag: None,
+                    })
+                    .ok()
+                    .map(Arc::new)
+                })
+                .await;
+            let _ = this.update(cx, |surface, cx| {
+                let Some(document) = surface.preview.documents.get(&task_path) else {
+                    return;
+                };
+                if !document.accepts(&task_document_key, generation)
+                    || document.revision != revision
+                {
+                    return;
+                }
+                let Some(highlighted) = highlighted else {
+                    return;
+                };
+                surface
+                    .preview
+                    .syntax_cache
+                    .insert(cache_key, highlighted.clone());
+                if let Some(editor) = document.editor.clone() {
+                    super::editor_adapter::install_highlighter(&editor, source, highlighted, cx);
+                }
+                cx.notify();
+            });
+        });
+        if let Some(document) = self.preview.documents.get_mut(&path)
+            && document.accepts(&document_key, generation)
+        {
+            document.highlight_task = Some(task);
+        }
+    }
+
+    pub(super) fn schedule_autosave(&mut self, path: String, cx: &mut Context<Self>) {
+        let delay = Duration::from_millis(self.preview.autosave_delay_ms);
+        let Some((key, generation, revision)) = self
+            .preview
+            .documents
+            .get(&path)
+            .filter(|document| document.can_autosave())
+            .map(|document| (document.key.clone(), document.generation, document.revision))
+        else {
+            return;
+        };
+        let task_path = path.clone();
+        let task = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(delay).await;
+            let _ = this.update(cx, |surface, cx| {
+                let still_current =
+                    surface
+                        .preview
+                        .documents
+                        .get(&task_path)
+                        .is_some_and(|document| {
+                            document.accepts(&key, generation)
+                                && document.revision == revision
+                                && document.can_autosave()
+                        });
+                if still_current {
+                    surface.save_document(task_path, cx);
+                }
+            });
+        });
+        if let Some(document) = self.preview.documents.get_mut(&path) {
+            document.autosave_task = Some(task);
+        }
+    }
+
+    fn save_document(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(context) = self.request_context.clone() else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            if let Some(document) = self.preview.documents.get_mut(&path) {
+                document.autosave_task = None;
+                document.phase =
+                    DocumentPhase::SaveFailed("Workspace service is unavailable.".into());
+            }
+            cx.notify();
+            return;
+        };
+        let Some(editor) = self
+            .preview
+            .documents
+            .get(&path)
+            .and_then(|document| document.editor.clone())
+        else {
+            return;
+        };
+        let text = editor.read(cx).value().to_string();
+        let Some((key, generation, pending)) =
+            self.preview.documents.get_mut(&path).and_then(|document| {
+                let key = document.key.clone();
+                let generation = document.generation;
+                document
+                    .begin_save(text)
+                    .map(|pending| (key, generation, pending))
+            })
+        else {
+            return;
+        };
+        let request = WriteWorkspaceFileRequest {
+            target: context.target.clone(),
+            path: path.clone(),
+            text: pending.text.clone(),
+            expected_content_hash: pending.expected_content_hash.clone(),
+            encoding: pending.encoding,
+            line_ending: pending.line_ending,
+        };
+        let revision = pending.revision;
+        let task_path = path.clone();
+        let task_key = key.clone();
+        let client = WorkspaceFilesClient::new(engine, context.clone());
+        let task = cx.spawn(async move |this, cx| {
+            let result = client.write_file(request).await;
+            let _ = this.update(cx, |surface, cx| {
+                if surface.request_context.as_ref() != Some(&context) {
+                    return;
+                }
+                let Some(document) = surface.preview.documents.get_mut(&task_path) else {
+                    return;
+                };
+                if !document.accepts(&task_key, generation) {
+                    return;
+                }
+                match result {
+                    Ok(WriteWorkspaceFileOutcome::Written { file }) => {
+                        let hash = file.content_hash.clone();
+                        if document.finish_save(revision, hash.clone()) {
+                            if let Some(loaded) = document.file.as_mut() {
+                                loaded.content_hash = Some(hash);
+                                loaded.size = file.size;
+                                loaded.modified_at = file.modified_at;
+                            }
+                        }
+                    }
+                    Ok(WriteWorkspaceFileOutcome::Conflict {
+                        current_content_hash,
+                        ..
+                    }) => {
+                        document.conflict_save(revision, current_content_hash);
+                    }
+                    Err(error) => {
+                        document.fail_save(revision, error.to_string());
+                    }
+                }
+                let save_again = document.can_autosave();
+                if save_again {
+                    surface.schedule_autosave(task_path.clone(), cx);
+                }
+                cx.notify();
+            });
+        });
+        if let Some(document) = self.preview.documents.get_mut(&path)
+            && document.accepts(&key, generation)
+        {
+            document.save_task = Some(task);
+        }
+        cx.notify();
+    }
+
     fn sync_preview_list(&self) {
         let count = self
             .preview
@@ -359,6 +586,20 @@ impl FilesSurface {
     fn reload_active_document(&mut self, cx: &mut Context<Self>) {
         if let Some(path) = self.preview.active.clone() {
             self.read_file(path, cx);
+        }
+    }
+
+    fn retry_active_save(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.preview.active.clone() else {
+            return;
+        };
+        if self
+            .preview
+            .documents
+            .get(&path)
+            .is_some_and(|document| matches!(document.phase, DocumentPhase::SaveFailed(_)))
+        {
+            self.save_document(path, cx);
         }
     }
 
@@ -427,6 +668,24 @@ impl FilesSurface {
     ) -> AnyElement {
         let parts = path.split('/').collect::<Vec<_>>();
         let reveal_path = path.to_string();
+        let save_status =
+            self.preview
+                .documents
+                .get(path)
+                .and_then(|document| match &document.phase {
+                    DocumentPhase::Saving => Some(("Autosaving…", theme.text_faint, false)),
+                    DocumentPhase::SaveFailed(_) => {
+                        Some(("Autosave failed", theme.danger_muted, true))
+                    }
+                    DocumentPhase::Conflict { .. } => {
+                        Some(("Save conflict", theme.warning_muted, false))
+                    }
+                    DocumentPhase::DeletedOnDisk => {
+                        Some(("Deleted on disk", theme.warning_muted, false))
+                    }
+                    _ if document.is_dirty() => Some(("Unsaved", theme.text_faint, false)),
+                    _ => None,
+                });
         let mut crumbs = div()
             .min_w_0()
             .flex_1()
@@ -467,6 +726,24 @@ impl FilesSurface {
             .items_center()
             .gap(px(6.0))
             .child(crumbs)
+            .when_some(save_status, |element, (label, color, retry)| {
+                element.child(
+                    div()
+                        .id("files-save-status")
+                        .flex_none()
+                        .font_family(theme.font_sans.clone())
+                        .text_size(px(9.5))
+                        .text_color(color)
+                        .when(retry, |element| {
+                            element
+                                .cursor_pointer()
+                                .role(gpui::Role::Button)
+                                .aria_label("Retry autosave")
+                                .on_click(cx.listener(|this, _, _, cx| this.retry_active_save(cx)))
+                        })
+                        .child(label),
+                )
+            })
             .child(
                 div()
                     .id("files-reveal-active")
@@ -590,7 +867,7 @@ impl FilesSurface {
         if matches!(document.phase, DocumentPhase::Loading) {
             return centered_state("Loading file…", theme.text_faint);
         }
-        if let DocumentPhase::Error(error) | DocumentPhase::SaveFailed(error) = &document.phase {
+        if let DocumentPhase::Error(error) = &document.phase {
             return centered_state(error.clone(), theme.danger_muted);
         }
         if let Some(editor) = editor {
@@ -690,18 +967,26 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) -> Option<gpui::Entity<super::editor::FileEditorState>> {
         let document = self.preview.documents.get(path)?;
-        if !matches!(document.phase, DocumentPhase::Ready) {
-            return None;
-        }
         if let Some(editor) = document.editor.clone() {
             return Some(editor);
+        }
+        if !document.is_editable() {
+            return None;
         }
         let text = document.file.as_ref()?.text.clone()?;
         let editor =
             super::editor::new_file_editor(text, path, self.preview.word_wrap, theme, window, cx);
+        let event_path = path.to_string();
+        let editor_events = cx.subscribe(&editor, move |surface, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                surface.on_editor_change(&event_path, cx);
+            }
+        });
         let focus = editor.focus_handle(cx);
         window.defer(cx, move |window, cx| focus.focus(window, cx));
-        self.preview.documents.get_mut(path)?.editor = Some(editor.clone());
+        let document = self.preview.documents.get_mut(path)?;
+        document.editor = Some(editor.clone());
+        document.editor_events = Some(editor_events);
         let syntax = self.preview.highlights.get(path).and_then(|highlight| {
             let document = self.preview.documents.get(path)?;
             if document.content_hash() != Some(highlight.content_hash.as_str()) {

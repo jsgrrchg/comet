@@ -27,6 +27,10 @@ use crate::{
 const PREVIEW_LINE_HEIGHT: f32 = 20.0;
 const WIDE_BREAKPOINT: f32 = 680.0;
 const TREE_SPLIT_DEFAULT: f32 = 286.0;
+const EDITOR_COMMENT_CARD_WIDTH: f32 = 320.0;
+const EDITOR_COMMENT_CARD_MARGIN: f32 = 8.0;
+const EDITOR_COMMENT_CARD_MIN_ANCHORED_WIDTH: f32 = 220.0;
+const EDITOR_COMMENT_DRAFT_HEIGHT: f32 = 92.0;
 
 struct HighlightedFile {
     content_hash: String,
@@ -60,6 +64,7 @@ struct EditorOverlayRow {
 struct EditorOverlayLayout {
     gutter_width: f32,
     line_height: f32,
+    viewport_width: f32,
     viewport_height: f32,
     rows: Vec<EditorOverlayRow>,
 }
@@ -252,6 +257,7 @@ fn editor_overlay_layout(editor: &super::editor::FileEditorState) -> Option<Edit
     Some(EditorOverlayLayout {
         gutter_width: gutter_width.unwrap_or(36.0),
         line_height,
+        viewport_width: f32::from(input_bounds.size.width),
         viewport_height: f32::from(input_bounds.size.height),
         rows,
     })
@@ -435,7 +441,10 @@ impl FilesSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let input = cx.new(|cx| ComposerInput::new("Request a change…", cx));
+        let input = cx.new(|cx| {
+            ComposerInput::new("Add a comment…", cx)
+                .with_text_metrics(12.0, crate::composer::INPUT_LINE_HEIGHT)
+        });
         let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.commit_editor_comment(cx),
             ComposerInputEvent::Edited => cx.notify(),
@@ -469,7 +478,6 @@ impl FilesSurface {
             return;
         }
         let comment = ReviewComment::file(draft.path.clone(), draft.line, body);
-        let id = comment.id.clone();
         self.state.update(cx, |state, cx| {
             state.add_review_comment(&draft.key, comment);
             cx.notify();
@@ -482,7 +490,7 @@ impl FilesSurface {
         {
             self.sync_editor_comment_anchors(&draft.path, &editor, cx);
         }
-        self.preview.active_comment = Some(id);
+        self.preview.active_comment = None;
         self.require_review_comment_flush(&draft.path, cx);
         if self
             .preview
@@ -1874,6 +1882,7 @@ impl FilesSurface {
             .iter()
             .map(|comment| (comment.line, comment.clone()))
             .collect::<HashMap<_, _>>();
+        let (card_left, card_width) = editor_comment_overlay_horizontal(&layout);
         let mut overlays = Vec::with_capacity(layout.rows.len() + 1);
         for row in &layout.rows {
             let group: SharedString = format!("file-comment-gutter-{}-{}", path, row.line).into();
@@ -1947,26 +1956,21 @@ impl FilesSurface {
                 comments::card_height(&comment.body),
             )
         {
-            overlays.push(self.render_editor_comment_card(
-                comment,
-                layout.gutter_width,
-                top,
-                theme,
-                cx,
-            ));
+            overlays.push(
+                self.render_editor_comment_card(comment, card_left, card_width, top, theme, cx),
+            );
         } else if let Some(draft) = self
             .preview
             .comment_draft
             .as_ref()
             .filter(|draft| draft.path == path)
             && let Some(top) =
-                editor_comment_overlay_top(&layout, draft.line, comments::DRAFT_CARD_HEIGHT)
+                editor_comment_overlay_top(&layout, draft.line, EDITOR_COMMENT_DRAFT_HEIGHT)
         {
             overlays.push(self.render_editor_comment_draft(
-                draft.path.clone(),
-                draft.line,
                 draft.input.clone(),
-                layout.gutter_width,
+                card_left,
+                card_width,
                 top,
                 theme,
                 cx,
@@ -1979,184 +1983,138 @@ impl FilesSurface {
         &self,
         comment: ReviewComment,
         left: f32,
+        width: f32,
         top: f32,
         theme: &Theme,
         cx: &Context<Self>,
     ) -> AnyElement {
         let group: SharedString = format!("file-comment-card-{}", comment.id).into();
         let id = comment.id.clone();
-        div()
+        let card = crate::popover::popover_card_flush(theme)
             .group(group.clone())
             .absolute()
             .left(px(left))
-            .right(px(0.0))
             .top(px(top))
+            .w(px(width))
             .h(px(comments::card_height(&comment.body)))
             .flex()
-            .flex_row()
-            .bg(crate::theme::ink(0.05))
-            .child(editor_comment_accent_bar(theme.solid.opacity(0.35)))
+            .flex_col()
+            .font_family(theme.font_sans.clone())
+            .px(px(Theme::SPACE_LG))
+            .py(px(comments::CARD_PAD_V / 2.0))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
+                    .h(px(comments::CARD_HEADER_HEIGHT))
+                    .flex_none()
                     .flex()
-                    .flex_col()
-                    .px(px(Theme::SPACE_LG))
-                    .py(px(comments::CARD_PAD_V / 2.0))
+                    .items_center()
+                    .gap(px(6.0))
                     .child(
-                        div()
-                            .h(px(comments::CARD_HEADER_HEIGHT))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                icon(icons::CHAT_ROUND_LINE)
-                                    .size(px(12.0))
-                                    .text_color(theme.text_faint),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(theme.font_mono.clone())
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from(comment.location())),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "file-comment-remove-{}",
-                                        comment.id
-                                    )))
-                                    .size(px(16.0))
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(4.0))
-                                    .cursor_pointer()
-                                    .opacity(0.0)
-                                    .group_hover(group, |style| style.opacity(1.0))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.remove_editor_comment(&id, cx)
-                                    }))
-                                    .child(
-                                        icon(icons::CLOSE_CIRCLE)
-                                            .size(px(12.0))
-                                            .text_color(theme.text_muted),
-                                    ),
-                            ),
+                        icon(icons::CHAT_ROUND_LINE)
+                            .size(px(12.0))
+                            .text_color(theme.text_faint),
                     )
                     .child(
                         div()
                             .flex_1()
-                            .min_h_0()
-                            .overflow_hidden()
-                            .text_size(px(12.0))
-                            .line_height(px(comments::CARD_LINE_HEIGHT))
-                            .text_color(theme.text_dim)
-                            .child(SharedString::from(comment.body)),
+                            .min_w_0()
+                            .truncate()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(comment.location())),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "file-comment-remove-{}",
+                                comment.id
+                            )))
+                            .size(px(16.0))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(4.0))
+                            .cursor_pointer()
+                            .opacity(0.0)
+                            .group_hover(group, |style| style.opacity(1.0))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_editor_comment(&id, cx)
+                            }))
+                            .child(
+                                icon(icons::CLOSE_CIRCLE)
+                                    .size(px(12.0))
+                                    .text_color(theme.text_muted),
+                            ),
                     ),
             )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .text_size(px(12.0))
+                    .line_height(px(comments::CARD_LINE_HEIGHT))
+                    .text_color(theme.text_dim)
+                    .child(SharedString::from(comment.body)),
+            );
+        crate::frost::frosted(crate::popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_editor_comment_draft(
         &self,
-        path: String,
-        line: u32,
         input: Entity<ComposerInput>,
         left: f32,
+        width: f32,
         top: f32,
         theme: &Theme,
         cx: &Context<Self>,
     ) -> AnyElement {
-        div()
+        let card = crate::popover::popover_card_flush(theme)
             .absolute()
             .left(px(left))
-            .right(px(0.0))
             .top(px(top))
-            .h(px(comments::DRAFT_CARD_HEIGHT))
+            .w(px(width))
+            .h(px(EDITOR_COMMENT_DRAFT_HEIGHT))
             .flex()
-            .flex_row()
-            .bg(crate::theme::ink(0.08))
-            .child(editor_comment_accent_bar(theme.solid.opacity(0.7)))
+            .flex_col()
+            .font_family(theme.font_sans.clone())
+            .px(px(Theme::SPACE_LG))
+            .py(px(8.0))
             .child(
                 div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .px(px(Theme::SPACE_LG))
-                    .py(px(10.0))
-                    .child(
-                        div()
-                            .h(px(comments::CARD_HEADER_HEIGHT))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                icon(icons::CHAT_ROUND_LINE)
-                                    .size(px(12.0))
-                                    .text_color(theme.text_faint),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .font_family(theme.font_mono.clone())
-                                    .text_size(px(11.0))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from(format!("{path}:{line}"))),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .h(px(46.0))
-                            .flex_none()
-                            .overflow_hidden()
-                            .text_size(px(12.0))
-                            .child(input.into_any_element()),
-                    )
-                    .child(
-                        div()
-                            .h(px(28.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap(px(6.0))
-                            .child(
-                                editor_comment_action(
-                                    "file-comment-cancel",
-                                    "Cancel",
-                                    false,
-                                    theme,
-                                )
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.cancel_editor_comment(cx)),
-                                ),
-                            )
-                            .child(
-                                editor_comment_action(
-                                    "file-comment-commit",
-                                    "Comment",
-                                    true,
-                                    theme,
-                                )
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.commit_editor_comment(cx)),
-                                ),
-                            ),
-                    ),
+                    .h(px(48.0))
+                    .flex_none()
+                    .overflow_hidden()
+                    .rounded(px(7.0))
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.input_glass_bg())
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .text_size(px(12.0))
+                    .child(input.into_any_element()),
             )
+            .child(
+                div()
+                    .h(px(28.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(6.0))
+                    .child(
+                        editor_comment_action("file-comment-cancel", "Cancel", false, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_editor_comment(cx))),
+                    )
+                    .child(
+                        editor_comment_action("file-comment-commit", "Comment", true, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.commit_editor_comment(cx))),
+                    ),
+            );
+        crate::frost::frosted(crate::popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
             .into_any_element()
     }
 
@@ -2324,8 +2282,20 @@ fn editor_comment_overlay_top(
     Some(preferred.clamp(0.0, (layout.viewport_height - card_height).max(0.0)))
 }
 
-fn editor_comment_accent_bar(color: gpui::Hsla) -> gpui::Div {
-    div().w(px(3.0)).h_full().flex_none().bg(color)
+fn editor_comment_overlay_horizontal(layout: &EditorOverlayLayout) -> (f32, f32) {
+    let anchored_left =
+        (layout.gutter_width - EDITOR_COMMENT_CARD_MARGIN).max(EDITOR_COMMENT_CARD_MARGIN);
+    let anchored_width = (layout.viewport_width - anchored_left - EDITOR_COMMENT_CARD_MARGIN)
+        .min(EDITOR_COMMENT_CARD_WIDTH)
+        .max(0.0);
+    if anchored_width >= EDITOR_COMMENT_CARD_MIN_ANCHORED_WIDTH {
+        (anchored_left, anchored_width)
+    } else {
+        (
+            EDITOR_COMMENT_CARD_MARGIN,
+            (layout.viewport_width - EDITOR_COMMENT_CARD_MARGIN * 2.0).max(0.0),
+        )
+    }
 }
 
 fn editor_comment_action(
@@ -2461,10 +2431,26 @@ mod tests {
         let layout = EditorOverlayLayout {
             gutter_width: 32.0,
             line_height: 20.0,
+            viewport_width: 420.0,
             viewport_height: 100.0,
             rows: vec![EditorOverlayRow { line: 5, top: 80.0 }],
         };
         assert_eq!(editor_comment_overlay_top(&layout, 5, 60.0), Some(40.0));
         assert_eq!(editor_comment_overlay_top(&layout, 6, 60.0), None);
+    }
+
+    #[test]
+    fn comment_overlay_is_compact_when_space_allows_and_inset_when_narrow() {
+        let mut layout = EditorOverlayLayout {
+            gutter_width: 40.0,
+            line_height: 20.0,
+            viewport_width: 480.0,
+            viewport_height: 300.0,
+            rows: Vec::new(),
+        };
+        assert_eq!(editor_comment_overlay_horizontal(&layout), (32.0, 320.0));
+
+        layout.viewport_width = 210.0;
+        assert_eq!(editor_comment_overlay_horizontal(&layout), (8.0, 194.0));
     }
 }

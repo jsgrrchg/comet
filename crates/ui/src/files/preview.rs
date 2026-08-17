@@ -342,6 +342,21 @@ impl Render for FileEditorTooltip {
 }
 
 impl FilesSurface {
+    pub(crate) fn focus_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self
+            .preview
+            .active
+            .as_deref()
+            .and_then(|path| self.preview.documents.get(path))
+            .and_then(|document| document.editor.clone())
+        else {
+            return;
+        };
+        let focus = editor.focus_handle(cx);
+        // Tab activation remounts this surface after the click handler returns.
+        window.defer(cx, move |window, cx| focus.focus(window, cx));
+    }
+
     pub(super) fn show_tree_sidebar(&mut self, cx: &mut Context<Self>) {
         self.preview.tree_sidebar_visible = true;
         cx.notify();

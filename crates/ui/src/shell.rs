@@ -1635,6 +1635,25 @@ impl Shell {
         cx.notify();
     }
 
+    fn focus_right_file_editor(
+        &mut self,
+        surface: RightSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self.panel_key(cx);
+        let files = match surface {
+            RightSurface::Files => self.files.get(&key).cloned(),
+            RightSurface::File(id) => self.file_surfaces.get(&id).cloned(),
+            _ => None,
+        };
+        if let Some(files) = files {
+            files.update(cx, |files, cx| {
+                files.focus_editor(window, cx);
+            });
+        }
+    }
+
     /// The picker's Git card / the `+` menu's Diff row: every click opens a
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
@@ -5643,9 +5662,10 @@ impl Shell {
                 .when(!is_active, |el| {
                     el.hover(|s| s.bg(crate::theme::wash(0.06)))
                 })
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.set_right_active(surface, cx);
+                    this.focus_right_file_editor(surface, window, cx);
                 }))
                 // Middle-click closes, like every tab strip.
                 .on_mouse_down(

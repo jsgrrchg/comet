@@ -42,6 +42,7 @@ pub mod terminal;
 pub mod theme;
 pub mod transcript;
 pub mod typography;
+mod workspace_links;
 
 use std::path::PathBuf;
 

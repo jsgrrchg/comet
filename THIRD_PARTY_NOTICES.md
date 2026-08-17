@@ -17,7 +17,7 @@ Zeron also uses the following editor foundations from the pinned `jsgrrchg/gpui-
 
 | Component | Version | License | Source |
 | --- | --- | --- | --- |
-| gpui-base | 0.5.2 (`1fc58bb`) | Apache-2.0 | https://github.com/jsgrrchg/gpui-component |
+| gpui-base | 0.5.2 (`8194877`) | Apache-2.0 | https://github.com/jsgrrchg/gpui-component |
 | Ropey | 2.0.0-beta.1 | MIT | https://github.com/cessen/ropey |
 
 The full Zeron distribution remains licensed under the terms in `LICENSE`.

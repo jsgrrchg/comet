@@ -1,4 +1,10 @@
-use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc, time::Duration};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet, VecDeque},
+    rc::Rc,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     AnyElement, App, Context, Entity, Focusable as _, HighlightStyle, ListAlignment,
@@ -12,7 +18,7 @@ use zeron_proto::{
 };
 
 use super::{
-    FilesCloseDisposition, FilesEvent, FilesSurface,
+    FilesCloseDisposition, FilesEvent, FilesSurface, TOOLBAR_BUTTON_RADIUS, TOOLBAR_BUTTON_SIZE,
     client::{FilesRequestContext, WorkspaceFilesClient},
     document::{DocumentKey, DocumentPhase, FileDocument},
 };
@@ -31,6 +37,11 @@ const EDITOR_COMMENT_CARD_WIDTH: f32 = 320.0;
 const EDITOR_COMMENT_CARD_MARGIN: f32 = 8.0;
 const EDITOR_COMMENT_CARD_MIN_ANCHORED_WIDTH: f32 = 220.0;
 const EDITOR_COMMENT_DRAFT_HEIGHT: f32 = 92.0;
+// A read response is capped at 8 MiB and editable files at 1 MiB. The byte
+// budget bounds large previews while the entry cap bounds many tiny editors.
+// Protected documents may exceed either limit rather than risk losing work.
+const MAX_RETAINED_DOCUMENTS: usize = 16;
+const MAX_RETAINED_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
 
 struct HighlightedFile {
     content_hash: String,
@@ -77,6 +88,7 @@ enum ReloadDecision {
 
 pub(super) struct FilePreviewState {
     documents: HashMap<String, FileDocument>,
+    document_recency: VecDeque<String>,
     active: Option<String>,
     highlights: HashMap<String, HighlightedFile>,
     syntax_cache: SyntaxHighlightCache,
@@ -99,6 +111,7 @@ impl FilePreviewState {
     pub(super) fn new(autosave_delay_ms: u64, word_wrap: bool) -> Self {
         Self {
             documents: HashMap::new(),
+            document_recency: VecDeque::new(),
             active: None,
             highlights: HashMap::new(),
             syntax_cache: SyntaxHighlightCache::default(),
@@ -120,6 +133,7 @@ impl FilePreviewState {
 
     pub(super) fn reset(&mut self) {
         self.documents.clear();
+        self.document_recency.clear();
         self.active = None;
         self.highlights.clear();
         self.list.reset(0);
@@ -133,6 +147,108 @@ impl FilePreviewState {
 
     pub(super) fn has_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    fn touch_document(&mut self, path: &str) {
+        self.document_recency.retain(|candidate| candidate != path);
+        self.document_recency.push_back(path.to_string());
+    }
+
+    fn retained_document_bytes(&self) -> usize {
+        let documents = self.documents.values().fold(0usize, |total, document| {
+            total.saturating_add(document.estimated_retained_bytes())
+        });
+        self.highlights
+            .values()
+            .fold(documents, |total, highlight| {
+                total.saturating_add(estimated_highlighted_file_bytes(highlight))
+            })
+    }
+
+    fn document_is_evictable(&self, path: &str, protected_paths: &HashSet<String>) -> bool {
+        if self.active.as_deref() == Some(path)
+            || self.reload_confirmation.as_deref() == Some(path)
+            || self
+                .comment_draft
+                .as_ref()
+                .is_some_and(|draft| draft.path == path)
+            || protected_paths.contains(path)
+        {
+            return false;
+        }
+        self.documents.get(path).is_some_and(|document| {
+            !document.is_dirty()
+                && matches!(
+                    document.phase,
+                    DocumentPhase::Ready
+                        | DocumentPhase::ReadOnly(_)
+                        | DocumentPhase::Error(_)
+                        | DocumentPhase::DeletedOnDisk
+                )
+                && document.read_task.is_none()
+                && document.highlight_task.is_none()
+                && document.autosave_task.is_none()
+                && document.save_task.is_none()
+                && document.reconcile_task.is_none()
+                && document.pending_save.is_none()
+                && document.pending_external_reload.is_none()
+                && !document.reconcile_after_save
+                && !document.review_comment_flush_pending
+        })
+    }
+
+    fn evict_document(&mut self, path: &str) -> bool {
+        if self.documents.remove(path).is_none() {
+            return false;
+        }
+        self.document_recency.retain(|candidate| candidate != path);
+        self.highlights.remove(path);
+        if let Some(anchors) = self.comment_anchors.remove(path)
+            && self
+                .active_comment
+                .as_ref()
+                .is_some_and(|id| anchors.contains_key(id))
+        {
+            self.active_comment = None;
+        }
+        true
+    }
+
+    fn trim_document_cache(&mut self, protected_paths: &HashSet<String>) -> Vec<String> {
+        self.trim_document_cache_to(
+            protected_paths,
+            MAX_RETAINED_DOCUMENTS,
+            MAX_RETAINED_DOCUMENT_BYTES,
+        )
+    }
+
+    fn trim_document_cache_to(
+        &mut self,
+        protected_paths: &HashSet<String>,
+        max_documents: usize,
+        max_bytes: usize,
+    ) -> Vec<String> {
+        let mut evicted = Vec::new();
+        while self.documents.len() > max_documents || self.retained_document_bytes() > max_bytes {
+            let candidate = self
+                .document_recency
+                .iter()
+                .find(|path| self.document_is_evictable(path, protected_paths))
+                .cloned()
+                .or_else(|| {
+                    self.documents
+                        .keys()
+                        .find(|path| self.document_is_evictable(path, protected_paths))
+                        .cloned()
+                });
+            let Some(candidate) = candidate else {
+                break;
+            };
+            if self.evict_document(&candidate) {
+                evicted.push(candidate);
+            }
+        }
+        evicted
     }
 
     pub(super) fn is_wide(&self) -> bool {
@@ -226,6 +342,24 @@ impl FilePreviewState {
     }
 }
 
+fn estimated_highlighted_file_bytes(highlight: &HighlightedFile) -> usize {
+    let document = &highlight.document;
+    std::mem::size_of::<HighlightedFile>()
+        .saturating_add(highlight.content_hash.capacity())
+        .saturating_add(
+            document
+                .lines
+                .capacity()
+                .saturating_mul(std::mem::size_of::<Vec<zeron_syntax::HighlightSpan>>()),
+        )
+        .saturating_add(document.lines.iter().fold(0usize, |total, line| {
+            total.saturating_add(
+                line.capacity()
+                    .saturating_mul(std::mem::size_of::<zeron_syntax::HighlightSpan>()),
+            )
+        }))
+}
+
 fn document_key(context: &FilesRequestContext, path: String) -> DocumentKey {
     DocumentKey {
         chat_id: context.target.chat_id.clone().unwrap_or_default(),
@@ -242,6 +376,14 @@ fn document_blocks_lifecycle(document: &FileDocument) -> bool {
                 | DocumentPhase::Conflict { .. }
                 | DocumentPhase::ExternallyModified { .. }
                 | DocumentPhase::DeletedOnDisk
+        )
+}
+
+fn document_finishes_review_comment_flush(document: &FileDocument) -> bool {
+    (!document.is_dirty() && matches!(document.phase, DocumentPhase::Ready))
+        || matches!(
+            document.phase,
+            DocumentPhase::SaveFailed(_) | DocumentPhase::Conflict { .. }
         )
 }
 
@@ -425,6 +567,23 @@ impl FilesSurface {
             .collect()
     }
 
+    fn trim_document_cache(&mut self, cx: &App) {
+        let mut protected_paths = self
+            .state
+            .read(cx)
+            .review_comments(&self.chat_id)
+            .iter()
+            .filter(|comment| comment.is_file())
+            .map(|comment| comment.path.clone())
+            .collect::<HashSet<_>>();
+        if let Some(path) = self.editor_path.as_ref() {
+            protected_paths.insert(path.clone());
+        }
+        for path in self.preview.trim_document_cache(&protected_paths) {
+            tracing::debug!(path = %path, "evicted inactive workspace document");
+        }
+    }
+
     fn require_review_comment_flush(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(document) = self.preview.documents.get_mut(path) else {
             return;
@@ -434,10 +593,35 @@ impl FilesSurface {
         }
         document.review_comment_flush_pending = true;
         let key = self.chat_id.clone();
+        let source = self.review_comment_flush_source;
         self.state.update(cx, |state, cx| {
-            state.begin_review_comment_flush(&key);
+            state.begin_review_comment_flush(&key, source);
             cx.notify();
         });
+    }
+
+    fn finish_review_comment_flush_if_idle(&mut self, cx: &mut Context<Self>) {
+        if self
+            .preview
+            .documents
+            .values()
+            .any(|document| document.review_comment_flush_pending)
+        {
+            return;
+        }
+        let key = self.chat_id.clone();
+        let source = self.review_comment_flush_source;
+        self.state.update(cx, |state, cx| {
+            state.finish_review_comment_flush(&key, source);
+            cx.notify();
+        });
+    }
+
+    pub(super) fn cancel_review_comment_flush(&mut self, cx: &mut Context<Self>) {
+        for document in self.preview.documents.values_mut() {
+            document.review_comment_flush_pending = false;
+        }
+        self.finish_review_comment_flush_if_idle(cx);
     }
 
     fn sync_editor_comment_anchors(
@@ -549,6 +733,7 @@ impl FilesSurface {
 
     fn cancel_editor_comment(&mut self, cx: &mut Context<Self>) {
         self.preview.comment_draft = None;
+        self.trim_document_cache(cx);
         cx.notify();
     }
 
@@ -617,17 +802,8 @@ impl FilesSurface {
         {
             document.review_comment_flush_pending = false;
         }
-        if !self
-            .preview
-            .documents
-            .values()
-            .any(|document| document.review_comment_flush_pending)
-        {
-            self.state.update(cx, |state, cx| {
-                state.finish_review_comment_flush(&key);
-                cx.notify();
-            });
-        }
+        self.finish_review_comment_flush_if_idle(cx);
+        self.trim_document_cache(cx);
         cx.notify();
     }
 
@@ -651,6 +827,7 @@ impl FilesSurface {
             self.cancel_reload_confirmation(cx);
         }
         self.preview.active = Some(path.clone());
+        self.preview.touch_document(&path);
         self.preview.tree_sidebar_visible = false;
         if !self.preview.documents.contains_key(&path) {
             let Some(context) = self.request_context.as_ref() else {
@@ -664,6 +841,7 @@ impl FilesSurface {
         } else {
             self.sync_preview_list();
         }
+        self.trim_document_cache(cx);
         cx.notify();
     }
 
@@ -709,6 +887,7 @@ impl FilesSurface {
                 if !document.accepts(&task_key, generation) {
                     return;
                 }
+                document.read_task = None;
                 match result {
                     Ok(file) => {
                         let highlight = file
@@ -728,6 +907,7 @@ impl FilesSurface {
                         surface.sync_preview_list();
                     }
                 }
+                surface.trim_document_cache(cx);
                 cx.notify();
             });
         });
@@ -796,15 +976,18 @@ impl FilesSurface {
                 })
                 .await;
             let _ = this.update(cx, |surface, cx| {
-                let still_current =
-                    surface
-                        .preview
-                        .documents
-                        .get(&highlight_path)
-                        .is_some_and(|document| {
-                            document.accepts(&task_document_key, generation)
-                                && document.content_hash() == Some(content_hash.as_str())
-                        });
+                let still_current = surface
+                    .preview
+                    .documents
+                    .get_mut(&highlight_path)
+                    .is_some_and(|document| {
+                        let current = document.accepts(&task_document_key, generation)
+                            && document.content_hash() == Some(content_hash.as_str());
+                        if current {
+                            document.highlight_task = None;
+                        }
+                        current
+                    });
                 if !still_current {
                     return;
                 }
@@ -832,6 +1015,7 @@ impl FilesSurface {
                     );
                     cx.notify();
                 }
+                surface.trim_document_cache(cx);
             });
         });
         if let Some(document) = self.preview.documents.get_mut(&path)
@@ -908,7 +1092,7 @@ impl FilesSurface {
                 })
                 .await;
             let _ = this.update(cx, |surface, cx| {
-                let Some(document) = surface.preview.documents.get(&task_path) else {
+                let Some(document) = surface.preview.documents.get_mut(&task_path) else {
                     return;
                 };
                 if !document.accepts(&task_document_key, generation)
@@ -916,16 +1100,20 @@ impl FilesSurface {
                 {
                     return;
                 }
+                document.highlight_task = None;
                 let Some(highlighted) = highlighted else {
+                    surface.trim_document_cache(cx);
                     return;
                 };
+                let editor = document.editor.clone();
                 surface
                     .preview
                     .syntax_cache
                     .insert(cache_key, highlighted.clone());
-                if let Some(editor) = document.editor.clone() {
+                if let Some(editor) = editor {
                     super::editor_adapter::install_highlighter(&editor, source, highlighted, cx);
                 }
+                surface.trim_document_cache(cx);
                 cx.notify();
             });
         });
@@ -1058,8 +1246,7 @@ impl FilesSurface {
                 let reconcile = document.reconcile_after_save;
                 document.reconcile_after_save = false;
                 if document.review_comment_flush_pending
-                    && !document.is_dirty()
-                    && matches!(document.phase, DocumentPhase::Ready)
+                    && document_finishes_review_comment_flush(document)
                 {
                     document.review_comment_flush_pending = false;
                 }
@@ -1073,19 +1260,9 @@ impl FilesSurface {
                 if reconcile {
                     surface.reconcile_document(task_path.clone(), cx);
                 }
-                if !surface
-                    .preview
-                    .documents
-                    .values()
-                    .any(|document| document.review_comment_flush_pending)
-                {
-                    let key = surface.chat_id.clone();
-                    surface.state.update(cx, |state, cx| {
-                        state.finish_review_comment_flush(&key);
-                        cx.notify();
-                    });
-                }
+                surface.finish_review_comment_flush_if_idle(cx);
                 surface.finish_pending_lifecycle(cx);
+                surface.trim_document_cache(cx);
                 cx.emit(FilesEvent::TitleChanged);
                 cx.notify();
             });
@@ -1157,6 +1334,7 @@ impl FilesSurface {
         for document in self.preview.documents.values_mut() {
             document.discard_changes();
         }
+        self.cancel_review_comment_flush(cx);
         self.preview.close_requested = false;
         if closing {
             cx.emit(FilesEvent::CloseReady);
@@ -1203,7 +1381,15 @@ impl FilesSurface {
         let task_path = path.clone();
         let task_key = key.clone();
         let task = cx.spawn(async move |this, cx| {
+            let started_at = Instant::now();
             let result = client.read_file(request).await;
+            tracing::trace!(
+                path = %task_path,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                success = result.is_ok(),
+                error = ?result.as_ref().err(),
+                "workspace document reconciliation read completed"
+            );
             let _ = this.update(cx, |surface, cx| {
                 if surface.request_context.as_ref() != Some(&context) {
                     return;
@@ -1348,6 +1534,12 @@ impl FilesSurface {
             {
                 draft.path = new_document_path.clone();
             }
+            self.preview.document_recency.retain(|recent_path| {
+                recent_path != old_document_path && recent_path != new_document_path
+            });
+            self.preview
+                .document_recency
+                .push_back(new_document_path.clone());
             let key = self.chat_id.clone();
             self.state.update(cx, |state, _| {
                 state.rename_review_comment_path(&key, old_document_path, new_document_path);
@@ -1762,9 +1954,9 @@ impl FilesSurface {
             .child(
                 div()
                     .id("files-reveal-active")
-                    .size(px(22.0))
+                    .size(px(TOOLBAR_BUTTON_SIZE))
                     .flex_none()
-                    .rounded(px(5.0))
+                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1797,9 +1989,9 @@ impl FilesSurface {
             .child(
                 div()
                     .id("files-toggle-word-wrap")
-                    .size(px(22.0))
+                    .size(px(TOOLBAR_BUTTON_SIZE))
                     .flex_none()
-                    .rounded(px(5.0))
+                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1826,9 +2018,9 @@ impl FilesSurface {
             .child(
                 div()
                     .id("files-toggle-tree-sidebar")
-                    .size(px(22.0))
+                    .size(px(TOOLBAR_BUTTON_SIZE))
                     .flex_none()
-                    .rounded(px(5.0))
+                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -2460,6 +2652,17 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
 mod tests {
     use super::*;
 
+    fn cached_document(path: &str, text: &str) -> FileDocument {
+        let mut document = FileDocument::loading(DocumentKey {
+            chat_id: "chat-1".into(),
+            checkout_id: Some("checkout-1".into()),
+            path: path.into(),
+        });
+        document.phase = DocumentPhase::Ready;
+        document.lines = Arc::new(vec![SharedString::from(text.to_string())]);
+        document
+    }
+
     #[test]
     fn read_only_reasons_have_specific_messages() {
         assert!(read_only_message(Some(WorkspaceReadOnlyReason::Binary)).contains("Binary"));
@@ -2493,6 +2696,97 @@ mod tests {
         assert!(preview.documents.is_empty());
         assert!(preview.active.is_none());
         assert!(!preview.tree_sidebar_visible);
+    }
+
+    #[test]
+    fn document_cache_evicts_the_oldest_safe_entries() {
+        let mut preview = FilePreviewState::new(900, false);
+        for index in 0..18 {
+            let path = format!("src/{index}.rs");
+            preview
+                .documents
+                .insert(path.clone(), cached_document(&path, "fn main() {}"));
+            preview.touch_document(&path);
+        }
+        preview.active = Some("src/0.rs".into());
+        preview.documents.get_mut("src/1.rs").unwrap().revision = 1;
+        preview.documents.get_mut("src/2.rs").unwrap().phase =
+            DocumentPhase::Conflict { disk_hash: None };
+        preview
+            .documents
+            .get_mut("src/3.rs")
+            .unwrap()
+            .review_comment_flush_pending = true;
+        preview.documents.get_mut("src/7.rs").unwrap().phase = DocumentPhase::Loading;
+        let protected = HashSet::from(["src/4.rs".to_string()]);
+
+        let evicted = preview.trim_document_cache_to(&protected, 15, usize::MAX);
+
+        assert_eq!(evicted, vec!["src/5.rs", "src/6.rs", "src/8.rs"]);
+        for retained in ["src/0.rs", "src/1.rs", "src/2.rs", "src/3.rs", "src/4.rs"] {
+            assert!(preview.documents.contains_key(retained));
+        }
+        assert!(preview.documents.contains_key("src/7.rs"));
+    }
+
+    #[test]
+    fn document_cache_uses_retained_bytes_not_only_entry_count() {
+        let mut preview = FilePreviewState::new(900, false);
+        for path in ["old.rs", "active.rs"] {
+            preview
+                .documents
+                .insert(path.into(), cached_document(path, &"x".repeat(4 * 1024)));
+            preview.touch_document(path);
+        }
+        preview.active = Some("active.rs".into());
+        let active_bytes = preview.documents["active.rs"].estimated_retained_bytes();
+        let total_bytes = preview.retained_document_bytes();
+
+        let evicted = preview.trim_document_cache_to(
+            &HashSet::new(),
+            usize::MAX,
+            total_bytes.saturating_sub(1),
+        );
+
+        assert_eq!(evicted, vec!["old.rs"]);
+        assert!(preview.retained_document_bytes() <= active_bytes);
+    }
+
+    #[test]
+    fn document_eviction_cleans_path_scoped_companion_state() {
+        let mut preview = FilePreviewState::new(900, false);
+        for path in ["old.rs", "active.rs"] {
+            preview
+                .documents
+                .insert(path.into(), cached_document(path, "fn main() {}"));
+            preview.touch_document(path);
+        }
+        preview.active = Some("active.rs".into());
+        preview
+            .comment_anchors
+            .insert("old.rs".into(), HashMap::new());
+        let highlighted = Arc::new(
+            zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                source: "fn main() {}",
+                path: Some("old.rs"),
+                fence_tag: None,
+            })
+            .unwrap(),
+        );
+        preview.highlights.insert(
+            "old.rs".into(),
+            HighlightedFile {
+                content_hash: "hash".into(),
+                document: highlighted,
+            },
+        );
+
+        let evicted = preview.trim_document_cache_to(&HashSet::new(), 1, usize::MAX);
+
+        assert_eq!(evicted, vec!["old.rs"]);
+        assert!(!preview.highlights.contains_key("old.rs"));
+        assert!(!preview.comment_anchors.contains_key("old.rs"));
+        assert!(!preview.document_recency.iter().any(|path| path == "old.rs"));
     }
 
     #[test]
@@ -2590,6 +2884,32 @@ mod tests {
 
         document.phase = DocumentPhase::Ready;
         assert!(!document_blocks_lifecycle(&document));
+    }
+
+    #[test]
+    fn terminal_save_outcomes_release_review_comment_flushes() {
+        let mut document = FileDocument::loading(DocumentKey {
+            chat_id: "chat-1".into(),
+            checkout_id: Some("checkout-1".into()),
+            path: "src/lib.rs".into(),
+        });
+        document.revision = 1;
+        document.review_comment_flush_pending = true;
+
+        document.phase = DocumentPhase::Saving;
+        assert!(!document_finishes_review_comment_flush(&document));
+
+        document.phase = DocumentPhase::SaveFailed("offline".into());
+        assert!(document_finishes_review_comment_flush(&document));
+
+        document.phase = DocumentPhase::Conflict { disk_hash: None };
+        assert!(document_finishes_review_comment_flush(&document));
+
+        document.phase = DocumentPhase::Ready;
+        assert!(!document_finishes_review_comment_flush(&document));
+
+        document.saved_revision = document.revision;
+        assert!(document_finishes_review_comment_flush(&document));
     }
 
     #[test]

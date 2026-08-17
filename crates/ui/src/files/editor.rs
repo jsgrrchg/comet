@@ -1,15 +1,44 @@
 //! Boundary between the Files surface and the `gpui-base` editor.
 
+use std::rc::Rc;
+
 use gpui::{
-    AnyElement, AppContext as _, Context, Entity, IntoElement as _, SharedString, Subscription,
-    Window,
+    AnyElement, AppContext as _, Context, Entity, Focusable as _, IntoElement as _, SharedString,
+    Subscription, Window,
 };
-use gpui_base::input::{EditorState, InputEvent};
+use gpui_base::input::{EditorState, InputContextMenuCapabilities, InputEvent};
 
 use super::FilesSurface;
 use crate::theme::Theme;
 
 pub(super) type FileEditorState = EditorState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct EditorMenuAvailability {
+    pub(super) cut: bool,
+    pub(super) copy: bool,
+    pub(super) paste: bool,
+}
+
+impl EditorMenuAvailability {
+    fn new(capabilities: InputContextMenuCapabilities, clipboard_has_text: bool) -> Self {
+        let editable = capabilities.is_editable();
+        let selection = capabilities.has_selection();
+        Self {
+            cut: editable && selection,
+            copy: selection,
+            paste: editable && clipboard_has_text,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EditorContextAction {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
 
 /// Creates a stable editor entity for an open workspace document.
 pub(super) fn new_file_editor(
@@ -18,7 +47,7 @@ pub(super) fn new_file_editor(
     soft_wrap: bool,
     theme: &Theme,
     window: &mut Window,
-    cx: &mut Context<impl gpui::Render>,
+    cx: &mut Context<FilesSurface>,
 ) -> Entity<EditorState> {
     let editor = cx.new(|cx| {
         EditorState::new(window, cx)
@@ -28,11 +57,46 @@ pub(super) fn new_file_editor(
             .soft_wrap(soft_wrap)
             .default_value(text)
     });
+    let surface = cx.weak_entity();
+    let menu_editor = editor.clone();
     editor.update(cx, |state, cx| {
         state.set_editor_style(super::editor_adapter::editor_style(theme));
         state.set_readonly(false, cx);
+        state.on_context_menu(Rc::new(move |_, capabilities, position, _, cx| {
+            let clipboard_has_text = cx
+                .read_from_clipboard()
+                .and_then(|item| item.text())
+                .is_some();
+            surface
+                .update(cx, |surface, cx| {
+                    surface.open_editor_context_menu(
+                        menu_editor.clone(),
+                        EditorMenuAvailability::new(capabilities, clipboard_has_text),
+                        position,
+                        cx,
+                    );
+                })
+                .ok();
+        }));
     });
     editor
+}
+
+pub(super) fn dispatch_context_action(
+    editor: &Entity<FileEditorState>,
+    action: EditorContextAction,
+    window: &mut Window,
+    cx: &mut Context<FilesSurface>,
+) {
+    let focus = editor.focus_handle(cx);
+    window.focus(&focus, cx);
+    let action: Box<dyn gpui::Action> = match action {
+        EditorContextAction::Cut => Box::new(gpui_base::input::Cut),
+        EditorContextAction::Copy => Box::new(gpui_base::input::Copy),
+        EditorContextAction::Paste => Box::new(gpui_base::input::Paste),
+        EditorContextAction::SelectAll => Box::new(gpui_base::input::SelectAll),
+    };
+    window.dispatch_action(action, cx);
 }
 
 pub(super) fn editor_element(editor: &Entity<FileEditorState>) -> AnyElement {
@@ -68,4 +132,45 @@ pub(super) fn subscribe_to_changes(
             surface.on_editor_change(&path, cx);
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn menu_availability_tracks_selection_editability_and_clipboard() {
+        let editable_selection = InputContextMenuCapabilities::new().selection(true);
+        assert_eq!(
+            EditorMenuAvailability::new(editable_selection, true),
+            EditorMenuAvailability {
+                cut: true,
+                copy: true,
+                paste: true,
+            }
+        );
+
+        let without_selection = InputContextMenuCapabilities::new();
+        assert_eq!(
+            EditorMenuAvailability::new(without_selection, true),
+            EditorMenuAvailability {
+                cut: false,
+                copy: false,
+                paste: true,
+            }
+        );
+        assert!(!EditorMenuAvailability::new(without_selection, false).paste);
+
+        let readonly_selection = InputContextMenuCapabilities::new()
+            .selection(true)
+            .readonly(true);
+        assert_eq!(
+            EditorMenuAvailability::new(readonly_selection, true),
+            EditorMenuAvailability {
+                cut: false,
+                copy: true,
+                paste: false,
+            }
+        );
+    }
 }

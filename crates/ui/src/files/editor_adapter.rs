@@ -126,7 +126,7 @@ pub(super) fn editor_style(theme: &Theme) -> InputEditorStyle {
         background: gpui::transparent_black(),
         border: theme.border,
         selection: theme.accent.opacity(0.22),
-        caret: theme.text,
+        caret: theme.caret,
         highlight_styles: Arc::new(ZeronHighlightStyleResolver {
             palette: theme.syntax.clone(),
         }),
@@ -293,5 +293,12 @@ mod tests {
         assert_eq!(runs.first().unwrap().0.start, 0);
         assert_eq!(runs.last().unwrap().0.end, source.len());
         assert!(runs.windows(2).all(|pair| pair[0].0.end == pair[1].0.start));
+    }
+
+    #[test]
+    fn editor_caret_uses_the_same_theme_token_as_other_inputs() {
+        for theme in [Theme::dark(), Theme::light()] {
+            assert_eq!(editor_style(&theme).caret, theme.caret);
+        }
     }
 }

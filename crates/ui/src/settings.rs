@@ -303,6 +303,19 @@ pub enum ComposerSendBehavior {
     ModEnter,
 }
 
+/// What Enter does with a message while the selected agent has a live turn.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActiveTurnSendBehavior {
+    /// Preserve the historical behavior: steer immediately when the harness
+    /// supports it, otherwise leave the message queued for the next turn.
+    #[default]
+    Steer,
+    /// Keep the message visible and editable in the queue until the turn ends
+    /// or the user explicitly chooses Steer now / Send now.
+    Queue,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -359,6 +372,10 @@ pub struct UiSettings {
     /// Whether the message composer sends with Enter or the platform modifier
     /// plus Enter. Device-local and opt-in.
     pub composer_send_behavior: ComposerSendBehavior,
+    /// Whether messages submitted during a live turn steer immediately or
+    /// remain in the visible pending-message queue. Device-local preference;
+    /// the selected intent is copied onto each synchronized queue row.
+    pub active_turn_send_behavior: ActiveTurnSendBehavior,
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
@@ -406,6 +423,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
+            active_turn_send_behavior: ActiveTurnSendBehavior::default(),
             escape_stops_active_agent: false,
             appearance: crate::appearance::AppearanceMode::default(),
             ui_font_family: crate::typography::UiFontFamily::default(),
@@ -763,6 +781,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             composer_send_behavior: ComposerSendBehavior::ModEnter,
+            active_turn_send_behavior: ActiveTurnSendBehavior::Queue,
             escape_stops_active_agent: true,
             appearance: crate::appearance::AppearanceMode::Light,
             ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
@@ -1111,6 +1130,7 @@ mod tests {
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
         assert_eq!(d.composer_send_behavior, ComposerSendBehavior::Enter);
+        assert_eq!(d.active_turn_send_behavior, ActiveTurnSendBehavior::Steer);
         assert!(!d.escape_stops_active_agent);
     }
 
@@ -1231,6 +1251,22 @@ mod tests {
         assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
+    }
+
+    #[test]
+    fn active_turn_send_behavior_preserves_automatic_steering_for_old_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.active_turn_send_behavior,
+            ActiveTurnSendBehavior::Steer
+        );
     }
 
     #[test]

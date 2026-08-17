@@ -44,7 +44,7 @@ pub mod methods {
     /// Messages typed while the agent was busy, held on the chat doc so every
     /// device sees the same queue. `{ chatId }` → `{ items: QueuedMessage[] }`.
     pub const WATCH_QUEUE: &str = "WatchQueue";
-    /// Append to the queue. `{ chatId, text, attachments? }` → `{ id }`.
+    /// Append to the queue. `{ chatId, text, attachments?, holdForTurnEnd? }` → `{ id }`.
     pub const QUEUE_MESSAGE: &str = "QueueMessage";
     /// Retype a queued message; empty text deletes it.
     /// `{ chatId, id, text }` → `{ changed }`.
@@ -54,6 +54,9 @@ pub mod methods {
     pub const REMOVE_QUEUED_MESSAGE: &str = "RemoveQueuedMessage";
     /// Interrupt whatever is running and send this one. `{ chatId, id }` → `{ sent }`.
     pub const SEND_QUEUED_MESSAGE_NOW: &str = "SendQueuedMessageNow";
+    /// Steer this row into the live turn without interrupting it.
+    /// `{ chatId, id }` → `{ sent }`.
+    pub const STEER_QUEUED_MESSAGE_NOW: &str = "SteerQueuedMessageNow";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.

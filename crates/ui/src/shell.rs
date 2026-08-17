@@ -2555,12 +2555,14 @@ impl Shell {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
                     let composer_send_behavior = self.settings.composer_send_behavior;
+                    let active_turn_send_behavior = self.settings.active_turn_send_behavior;
                     let escape_stops_active_agent = self.settings.escape_stops_active_agent;
                     let page = cx.new(|cx| {
                         ShortcutsPage::new(
                             state,
                             keymap,
                             composer_send_behavior,
+                            active_turn_send_behavior,
                             escape_stops_active_agent,
                             cx,
                         )
@@ -2575,6 +2577,9 @@ impl Shell {
                                 }
                                 ShortcutsEvent::ComposerSendBehaviorChanged(behavior) => {
                                     this.settings.composer_send_behavior = *behavior;
+                                }
+                                ShortcutsEvent::ActiveTurnSendBehaviorChanged(behavior) => {
+                                    this.settings.active_turn_send_behavior = *behavior;
                                 }
                                 ShortcutsEvent::EscapeStopsActiveAgentChanged(enabled) => {
                                     this.settings.escape_stops_active_agent = *enabled;

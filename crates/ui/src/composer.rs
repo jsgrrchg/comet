@@ -34,7 +34,7 @@ use zeron_rpc::{RpcError, methods};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::Pickers;
-use crate::settings::{ComposerSendBehavior, platform_combo};
+use crate::settings::{ActiveTurnSendBehavior, ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
 use crate::theme::Theme;
 
@@ -4691,7 +4691,7 @@ impl Composer {
         cx.notify();
     }
 
-    fn run_live(&self, cx: &App) -> bool {
+    pub(crate) fn run_live(&self, cx: &App) -> bool {
         let s = self.state.read(cx);
         let Some(chat_id) = s.selected_chat.as_deref() else {
             return false;
@@ -4891,6 +4891,9 @@ impl Composer {
         // A queued message is not in the transcript yet — the queue panel is
         // its echo, and it gets a real bubble when the host sends it.
         let queue = queue && !is_new;
+        let hold_for_turn_end = queue
+            && crate::settings::current(cx).active_turn_send_behavior
+                == ActiveTurnSendBehavior::Queue;
         self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
@@ -5099,6 +5102,7 @@ impl Composer {
                         "chatId": chat_id,
                         "text": content,
                         "attachments": attachment_paths,
+                        "holdForTurnEnd": hold_for_turn_end,
                     });
                     engine
                         .client()

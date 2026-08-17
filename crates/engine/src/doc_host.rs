@@ -232,6 +232,10 @@ pub struct ChatDocHandle {
     /// the turn and starting its own the chat reads Idle, and an idle chat with
     /// a queue is exactly what the flush drains.
     drain_lock: tokio::sync::Mutex<()>,
+    /// An explicit user interrupt freezes automatic queue delivery. The next
+    /// explicit prompt or queue send resumes it; incidental doc/status changes
+    /// must not turn Cancel into "send the next row".
+    queue_paused: AtomicBool,
     /// True when the doc changed while nobody watched: the mirror rebuild is
     /// deferred to the next `watch_messages` attach instead of paid per commit.
     mirror_dirty: AtomicBool,
@@ -896,6 +900,7 @@ impl DocHost {
             messages_tx,
             queue_tx,
             drain_lock: tokio::sync::Mutex::new(()),
+            queue_paused: AtomicBool::new(false),
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
@@ -1815,12 +1820,26 @@ impl DocHost {
         text: &str,
         attachments: Vec<String>,
     ) -> Result<String, EngineError> {
+        self.queue_message_with_behavior(chat_id, text, attachments, false)
+    }
+
+    /// Append a message while preserving the submitter's active-turn policy
+    /// on the synchronized row. This matters when another device hosts the
+    /// chat: the host, not the submitting UI, decides when to drain it.
+    pub fn queue_message_with_behavior(
+        &self,
+        chat_id: &str,
+        text: &str,
+        attachments: Vec<String>,
+        hold_for_turn_end: bool,
+    ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
         let id = new_id();
         handle.doc.push_queued(&QueuedMessage {
             id: id.clone(),
             text: text.to_string(),
             attachments,
+            hold_for_turn_end,
             issued_by: self.inner.config.device_id.clone(),
             issued_at: now_ms(),
             edited_at: None,
@@ -1884,13 +1903,62 @@ impl DocHost {
         let Some(item) = handle.doc.take_queued(id)? else {
             return Ok(false);
         };
+        let was_paused = handle.queue_paused.swap(false, Ordering::AcqRel);
         handle.publish_queue();
         if let Err(err) = self
             .dispatch_queued(&handle, &item, QueueSend::Interrupt)
             .await
         {
+            if was_paused {
+                handle.queue_paused.store(true, Ordering::Release);
+            }
             // Put it back rather than swallowing what the user typed — at the
             // head, because the user just said this one was the urgent one.
+            let _ = handle.doc.insert_queued(0, &item);
+            handle.publish_queue();
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    /// Inject one held row into the current turn without interrupting it.
+    /// Unsupported harnesses leave the row untouched. If the turn ends in the
+    /// narrow window after the capability check, normal steering fallback
+    /// starts the next turn instead of losing or duplicating the message.
+    pub async fn steer_queued_now(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
+        let handle = self.open(chat_id)?;
+        let _drain = handle.drain_lock.lock().await;
+        let Some(sessions) = self.sessions() else {
+            return Err(EngineError::Other("sessions engine not wired".into()));
+        };
+        if !sessions.turn_in_flight(chat_id) || !sessions.steers_mid_turn(self.harness_for(chat_id))
+        {
+            return Err(EngineError::Other(
+                "the active agent cannot accept steering right now".into(),
+            ));
+        }
+        let Some(candidate) = handle
+            .doc
+            .read_queue()?
+            .into_iter()
+            .find(|item| item.id == id)
+        else {
+            return Ok(false);
+        };
+        if !candidate.attachments.is_empty() {
+            return Err(EngineError::Other(
+                "messages with attachments cannot be steered mid-turn".into(),
+            ));
+        }
+        let Some(item) = handle.doc.take_queued(id)? else {
+            return Ok(false);
+        };
+        let was_paused = handle.queue_paused.swap(false, Ordering::AcqRel);
+        handle.publish_queue();
+        if let Err(err) = self.dispatch_queued(&handle, &item, QueueSend::Steer).await {
+            if was_paused {
+                handle.queue_paused.store(true, Ordering::Release);
+            }
             let _ = handle.doc.insert_queued(0, &item);
             handle.publish_queue();
             return Err(err);
@@ -1917,6 +1985,9 @@ impl DocHost {
         // lock next re-reads the queue and the status, so a drain that became
         // unnecessary while it waited simply finds nothing to do.
         let _drain = handle.drain_lock.lock().await;
+        if handle.queue_paused.load(Ordering::Acquire) {
+            return;
+        }
         loop {
             let Ok(Some(head)) = handle.doc.read_queue().map(|q| q.into_iter().next()) else {
                 return;
@@ -1930,7 +2001,8 @@ impl DocHost {
                 // Attachments never steer: the steer path carries a prompt and
                 // nothing else, so a message with files must wait for a turn
                 // that can inline them rather than lose them.
-                let steer_now = head.attachments.is_empty()
+                let steer_now = !head.hold_for_turn_end
+                    && head.attachments.is_empty()
                     && sessions.steers_mid_turn(self.harness_for(&handle.chat_id));
                 if !steer_now {
                     return; // held until the turn ends
@@ -1955,6 +2027,32 @@ impl DocHost {
             }
             if busy {
                 return; // steered into a live turn; the rest waits for its end
+            }
+        }
+    }
+
+    /// Stop the active turn without treating the resulting Idle transition as
+    /// permission to release the next queued message. The same lock used by
+    /// drains closes the race between clicking Cancel and the status watcher.
+    async fn interrupt_and_pause_queue(
+        &self,
+        sessions: &SessionsEngine,
+        handle: &Arc<ChatDocHandle>,
+    ) -> Result<bool, EngineError> {
+        let _drain = handle.drain_lock.lock().await;
+        if !sessions.turn_in_flight(&handle.chat_id) {
+            return Ok(false);
+        }
+        handle.queue_paused.store(true, Ordering::Release);
+        match sessions.interrupt(&handle.chat_id).await {
+            Ok(true) => Ok(true),
+            Ok(false) => {
+                handle.queue_paused.store(false, Ordering::Release);
+                Ok(false)
+            }
+            Err(err) => {
+                handle.queue_paused.store(false, Ordering::Release);
+                Err(err)
             }
         }
     }
@@ -2329,14 +2427,18 @@ impl DocHost {
                 sessions
                     .dispatch(chat_id, harness, request.clone(), Some(message_id.clone()))
                     .await?;
+                // A fresh user-authored turn is the deliberate action that
+                // thaws a queue frozen by Cancel. Clear only after dispatch
+                // succeeds so a failed send cannot silently unfreeze it.
+                handle.queue_paused.store(false, Ordering::Release);
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
-                self.deliver_prompt(sessions, chat_id, prompt, message_id.clone())
+                self.deliver_prompt(sessions, handle, prompt, message_id.clone())
                     .await
             }
             SessionCommandPayload::Interrupt {} => {
-                sessions.interrupt(chat_id).await?;
+                self.interrupt_and_pause_queue(sessions, handle).await?;
                 Ok((SessionCommandStatus::Applied, None))
             }
             SessionCommandPayload::RespondInput {
@@ -2420,10 +2522,11 @@ impl DocHost {
     async fn deliver_prompt(
         &self,
         sessions: &SessionsEngine,
-        chat_id: &str,
+        handle: &Arc<ChatDocHandle>,
         prompt: &str,
         message_id: Option<String>,
     ) -> Result<(SessionCommandStatus, Option<String>), EngineError> {
+        let chat_id = &handle.chat_id;
         if self.held_until_turn_end(sessions, chat_id, prompt, message_id.as_deref())? {
             return Ok((
                 SessionCommandStatus::Applied,
@@ -2431,7 +2534,10 @@ impl DocHost {
             ));
         }
         match sessions.steer(chat_id, prompt, message_id.clone()).await? {
-            SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
+            SteerOutcome::Accepted => {
+                handle.queue_paused.store(false, Ordering::Release);
+                Ok((SessionCommandStatus::Applied, None))
+            }
             SteerOutcome::NotSteerable => {
                 let request = sessions
                     .last_request(chat_id)
@@ -2451,6 +2557,7 @@ impl DocHost {
                 sessions
                     .dispatch(chat_id, harness, request, message_id)
                     .await?;
+                handle.queue_paused.store(false, Ordering::Release);
                 Ok((
                     SessionCommandStatus::Applied,
                     Some("queued as new turn".into()),
@@ -2494,6 +2601,7 @@ impl DocHost {
             id: message_id.map(str::to_string).unwrap_or_else(new_id),
             text: prompt.to_string(),
             attachments: Vec::new(),
+            hold_for_turn_end: false,
             issued_by: self.inner.config.device_id.clone(),
             issued_at: now_ms(),
             edited_at: None,

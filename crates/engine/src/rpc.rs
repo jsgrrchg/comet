@@ -111,6 +111,10 @@ struct QueueMessageParams {
     text: String,
     #[serde(default)]
     attachments: Vec<String>,
+    /// Keep this row visible during the current turn even when the harness
+    /// supports mid-turn steering.
+    #[serde(default)]
+    hold_for_turn_end: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -830,6 +834,7 @@ fn forwardable(method: &str) -> bool {
             | methods::MOVE_QUEUED_MESSAGE
             | methods::REMOVE_QUEUED_MESSAGE
             | methods::SEND_QUEUED_MESSAGE_NOW
+            | methods::STEER_QUEUED_MESSAGE_NOW
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -1146,7 +1151,12 @@ impl RpcService for EngineRpc {
                 let p: QueueMessageParams = parse_params(params)?;
                 let id = self
                     .doc_host
-                    .queue_message(&p.chat_id, &p.text, p.attachments)
+                    .queue_message_with_behavior(
+                        &p.chat_id,
+                        &p.text,
+                        p.attachments,
+                        p.hold_for_turn_end,
+                    )
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "id": id }))
             }
@@ -1179,6 +1189,15 @@ impl RpcService for EngineRpc {
                 let sent = self
                     .doc_host
                     .send_queued_now(&p.chat_id, &p.id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "sent": sent }))
+            }
+            methods::STEER_QUEUED_MESSAGE_NOW => {
+                let p: QueuedMessageParams = parse_params(params)?;
+                let sent = self
+                    .doc_host
+                    .steer_queued_now(&p.chat_id, &p.id)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "sent": sent }))

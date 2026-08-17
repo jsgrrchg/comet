@@ -83,13 +83,13 @@ impl Harness for HeldHarness {
     async fn run(
         &self,
         request: RunRequest,
-        _controls: RunControls,
+        controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.prompts.lock().unwrap().push(request.prompt.clone());
         if self.asks {
             // Only the engine can mint a request id it will honour, so the
             // question has to go through controls rather than the stream.
-            let _answer = (_controls.request_input)(vec![UserInputQuestion {
+            let _answer = (controls.request_input)(vec![UserInputQuestion {
                 id: "q1".into(),
                 header: "Choose".into(),
                 question: "which one?".into(),
@@ -98,6 +98,7 @@ impl Harness for HeldHarness {
             }]);
         }
         let mut finish = self.finish.subscribe();
+        let mut steering = controls.steering;
         let started = futures::stream::iter(vec![Ok(AgentEvent::SessionStarted {
             harness: HarnessId::Mock,
             model: "mock-1".into(),
@@ -107,13 +108,28 @@ impl Harness for HeldHarness {
             assistant_message_id: format!("a-{}", request.prompt),
         })]);
         let done = futures::stream::once(async move {
-            let _ = finish.recv().await;
-            Ok(AgentEvent::Done {
-                status: DoneStatus::Completed,
-                result: None,
-                error: None,
-                session_id: Some("sess-queue".into()),
-            })
+            loop {
+                tokio::select! {
+                    _ = finish.recv() => {
+                        return Ok(AgentEvent::Done {
+                            status: DoneStatus::Completed,
+                            result: None,
+                            error: None,
+                            session_id: Some("sess-queue".into()),
+                        });
+                    }
+                    steer = steering.recv() => {
+                        if steer.is_none() {
+                            return Ok(AgentEvent::Done {
+                                status: DoneStatus::Completed,
+                                result: None,
+                                error: None,
+                                session_id: Some("sess-queue".into()),
+                            });
+                        }
+                    }
+                }
+            }
         });
         Ok(started.chain(done).boxed())
     }
@@ -298,6 +314,77 @@ async fn queue_holds_during_a_turn_and_flushes_in_order_at_its_end() {
     core.shutdown().await;
 }
 
+/// Cancel is not a normal turn boundary: it freezes the visible queue instead
+/// of immediately promoting its head into a new inference. The freeze survives
+/// incidental queue edits and is lifted by an explicit send action.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_a_turn_freezes_the_queue_until_an_explicit_send() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "the first turn to start",
+    )
+    .await;
+
+    for text in ["second", "third"] {
+        core.doc_host
+            .queue_message(CHAT, text, Vec::new())
+            .expect("queue follow-up");
+    }
+    let second_id = core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .read_queue()
+        .unwrap()[0]
+        .id
+        .clone();
+
+    core.doc_host
+        .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+        .expect("queue interrupt");
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "the interrupted turn to settle",
+    )
+    .await;
+
+    core.doc_host
+        .update_queued_message(CHAT, &second_id, "second edited")
+        .expect("edit frozen row");
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(queue_texts(&core), vec!["second edited", "third"]);
+    assert!(
+        !prompts.lock().unwrap().iter().any(|p| p == "second edited"),
+        "Cancel must not turn a queued row into a new inference"
+    );
+
+    core.doc_host
+        .send_queued_now(CHAT, &second_id)
+        .await
+        .expect("explicit queue send");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "second edited"),
+        "the explicitly selected row to start",
+    )
+    .await;
+    assert_eq!(queue_texts(&core), vec!["third"]);
+
+    let _ = harness.finish.send(());
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "third"),
+        "normal draining to resume after the explicit send",
+    )
+    .await;
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
 /// A `Steer` command asks for the running turn directly — a client that decided
 /// for itself, and the path a question's follow-up prompt takes. It obeys the
 /// same rule as a typed message: a turn-boundary agent's mailbox is not read
@@ -377,6 +464,81 @@ async fn steer_sends_into_a_live_turn_when_the_agent_takes_mid_turn_input() {
     )
     .await;
     assert!(queue_texts(&core).is_empty());
+
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+/// The user can opt out of automatic steering even for a step-boundary agent,
+/// then explicitly steer a selected row without interrupting the turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn held_policy_keeps_a_steerable_message_visible_until_steer_now() {
+    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "the first turn to start",
+    )
+    .await;
+
+    let reply = client
+        .call(
+            zeron_rpc::methods::QUEUE_MESSAGE,
+            serde_json::json!({
+                "chatId": CHAT,
+                "text": "hold this",
+                "holdForTurnEnd": true,
+            }),
+        )
+        .await
+        .expect("queue held message");
+    let id = reply["id"].as_str().expect("queue id").to_string();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(queue_texts(&core), vec!["hold this"]);
+    assert!(!user_messages(&core).iter().any(|m| m == "hold this"));
+
+    let reply = client
+        .call(
+            zeron_rpc::methods::STEER_QUEUED_MESSAGE_NOW,
+            serde_json::json!({ "chatId": CHAT, "id": id }),
+        )
+        .await
+        .expect("steer now");
+    assert_eq!(reply["sent"], true);
+    wait_for(
+        || user_messages(&core).iter().any(|m| m == "hold this"),
+        "the held message to steer",
+    )
+    .await;
+    assert!(queue_texts(&core).is_empty());
+
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_now_leaves_the_row_when_the_agent_cannot_steer_mid_turn() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "the first turn to start",
+    )
+    .await;
+    let id = core
+        .doc_host
+        .queue_message(CHAT, "still queued", Vec::new())
+        .expect("queue held message");
+
+    assert!(core.doc_host.steer_queued_now(CHAT, &id).await.is_err());
+    assert_eq!(queue_texts(&core), vec!["still queued"]);
 
     let _ = harness.finish.send(());
     core.shutdown().await;

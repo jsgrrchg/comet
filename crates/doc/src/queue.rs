@@ -31,6 +31,10 @@ pub struct QueuedMessage {
     /// files that only exist on the device that typed it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// Do not automatically steer this row into a live turn. The row remains
+    /// visible until turn end or an explicit Steer now / Send now action.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hold_for_turn_end: bool,
     /// Device that queued it.
     pub issued_by: String,
     /// Epoch millis.
@@ -38,6 +42,10 @@ pub struct QueuedMessage {
     /// Epoch millis of the last text edit, when there has been one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<i64>,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl QueuedMessage {
@@ -50,6 +58,7 @@ impl QueuedMessage {
             id: id.into(),
             text: text.into(),
             attachments: Vec::new(),
+            hold_for_turn_end: false,
             issued_by: issued_by.into(),
             issued_at: 0,
             edited_at: None,
@@ -208,6 +217,9 @@ fn write_queued_map(map: &loro::LoroMap, item: &QueuedMessage) -> Result<(), Doc
             crate::schema::loro_value_from_json(&serde_json::to_value(&item.attachments)?),
         )?;
     }
+    if item.hold_for_turn_end {
+        map.insert("holdForTurnEnd", true)?;
+    }
     if let Some(edited_at) = item.edited_at {
         map.insert("editedAt", edited_at)?;
     }
@@ -230,6 +242,10 @@ fn queued_from_json(v: serde_json::Value) -> Option<QueuedMessage> {
             .get("attachments")
             .and_then(|a| serde_json::from_value(a.clone()).ok())
             .unwrap_or_default(),
+        hold_for_turn_end: v
+            .get("holdForTurnEnd")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
         issued_by: v
             .get("issuedBy")
             .and_then(|d| d.as_str())
@@ -253,6 +269,7 @@ mod tests {
             id: id.into(),
             text: text.into(),
             attachments: Vec::new(),
+            hold_for_turn_end: false,
             issued_by: "device-a".into(),
             issued_at: 1_000,
             edited_at: None,
@@ -299,6 +316,19 @@ mod tests {
         doc.push_queued(&first).unwrap();
         doc.push_queued(&item("q2", "second")).unwrap();
         assert_eq!(doc.read_queue().unwrap(), vec![first, item("q2", "second")]);
+    }
+
+    #[test]
+    fn hold_policy_round_trips_and_old_rows_default_to_automatic_steering() {
+        let doc = doc();
+        let mut held = item("q1", "hold this");
+        held.hold_for_turn_end = true;
+        doc.push_queued(&held).unwrap();
+        doc.push_queued(&item("q2", "legacy behavior")).unwrap();
+
+        let rows = doc.read_queue().unwrap();
+        assert!(rows[0].hold_for_turn_end);
+        assert!(!rows[1].hold_for_turn_end);
     }
 
     #[test]

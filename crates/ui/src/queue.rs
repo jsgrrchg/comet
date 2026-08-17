@@ -6,7 +6,7 @@
 //!
 //! What a row can do is deliberately the whole set: move it (drag, or the
 //! arrows for people who don't drag), retype it, send it now — which stops the
-//! turn and hands it over — or drop it. Editing a row to nothing IS dropping
+//! turn and hands it over — steer it without stopping, or drop it. Editing a row to nothing IS dropping
 //! it: emptying the box you just filled is a clear enough statement that
 //! "delete" would only be a second way to say it.
 
@@ -22,6 +22,26 @@ use crate::composer::Composer;
 use crate::icons::{self, icon};
 use crate::terminal::panel::drop_index;
 use crate::theme::Theme;
+
+struct QueueActionTooltip {
+    label: SharedString,
+}
+
+impl Render for QueueActionTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(5.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_overlay)
+            .text_size(px(10.5))
+            .text_color(theme.text_muted)
+            .child(self.label.clone())
+    }
+}
 
 /// One row's slot: a line of 12.5px copy with the breathing room a hover plate
 /// needs to read as a plate, and no more. These rows sit between the transcript
@@ -135,43 +155,42 @@ impl Composer {
                 self.queue_row(&chat_id, ix, item, count, drag_from, &editing, &theme, cx)
             }));
 
-        Some(
-            div()
-                .rounded(px(18.0))
-                .bg(theme.input_glass_bg())
-                .border_1()
-                .border_color(theme.border)
-                .when(!theme.is_glass(), |el| el.shadow_lg())
-                .px(px(8.0))
-                .pt(px(6.0))
-                .pb(px(8.0))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .h(px(20.0))
-                        .px(px(ROW_PAD_X))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .text_color(theme.text_muted.opacity(0.6))
-                                .child(SharedString::from(crate::popover::tracked_upper("Queued"))),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(theme.text_muted.opacity(0.45))
-                                .child(SharedString::from(label)),
-                        ),
-                )
-                .child(rows)
-                .into_any_element(),
-        )
+        let panel = div()
+            .rounded(px(18.0))
+            .overflow_hidden()
+            .bg(theme.input_glass_bg())
+            .border_1()
+            .border_color(theme.border)
+            .when(!theme.is_glass(), |el| el.shadow_lg())
+            .px(px(8.0))
+            .pt(px(6.0))
+            .pb(px(8.0))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(px(20.0))
+                    .px(px(ROW_PAD_X))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child(SharedString::from(crate::popover::tracked_upper("Queued"))),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_muted.opacity(0.45))
+                            .child(SharedString::from(label)),
+                    ),
+            )
+            .child(rows);
+        Some(crate::frost::frosted(18.0, 16.0, panel).into_any_element())
     }
 
     /// One queued message: its place in line, the text, and — on hover — the
@@ -202,6 +221,7 @@ impl Composer {
             self.queue_action(
                 &key,
                 "up",
+                "Move up",
                 icons::ARROW_UP,
                 &group,
                 theme,
@@ -214,6 +234,7 @@ impl Composer {
             self.queue_action(
                 &key,
                 "down",
+                "Move down",
                 icons::ARROW_DOWN,
                 &group,
                 theme,
@@ -226,6 +247,7 @@ impl Composer {
         let edit = self.queue_action(
             &key,
             "edit",
+            "Edit",
             icons::PEN,
             &group,
             theme,
@@ -234,9 +256,28 @@ impl Composer {
             }),
         );
         let now_id = item.id.clone();
+        let steer_now = (item.attachments.is_empty()
+            && self.run_live(cx)
+            && self.pickers().read(cx).resolved_steering_mode(cx)
+                == Some(zeron_proto::SteeringMode::StepBoundary))
+        .then(|| {
+            let steer_id = item.id.clone();
+            self.queue_action(
+                &key,
+                "steer",
+                "Steer now",
+                icons::RETURN,
+                &group,
+                theme,
+                cx.listener(move |this, _, _, cx| {
+                    this.steer_queued_now(steer_id.clone(), cx);
+                }),
+            )
+        });
         let send_now = self.queue_action(
             &key,
             "now",
+            "Send now (interrupt)",
             icons::ARROW_RIGHT,
             &group,
             theme,
@@ -248,6 +289,7 @@ impl Composer {
         let discard = self.queue_action(
             &key,
             "drop",
+            "Remove",
             icons::CLOSE,
             &group,
             theme,
@@ -344,6 +386,7 @@ impl Composer {
                         .children(up)
                         .children(down)
                         .child(edit)
+                        .children(steer_now)
                         .child(send_now)
                         .child(discard),
                 )
@@ -357,6 +400,7 @@ impl Composer {
         &self,
         key: &SharedString,
         slot: &str,
+        label: &'static str,
         glyph: &'static str,
         group: &SharedString,
         theme: &Theme,
@@ -380,6 +424,13 @@ impl Composer {
             .group_hover(group.clone(), |s| s.opacity(1.0))
             .hover(|s| s.bg(crate::theme::ink(0.07)))
             .on_click(on_click)
+            .tooltip(move |_, cx| {
+                cx.new(|_| QueueActionTooltip {
+                    label: label.into(),
+                })
+                .into()
+            })
+            .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(glyph)
                     .size(px(11.0))
@@ -464,6 +515,20 @@ impl Composer {
             methods::SEND_QUEUED_MESSAGE_NOW,
             serde_json::json!({ "id": id }),
             "Couldn't send that message",
+            cx,
+        );
+    }
+
+    /// Steer one row into the current turn without stopping it. If the turn
+    /// ends during the click, the engine sends it as the next turn instead.
+    pub(crate) fn steer_queued_now(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.editing_queued.as_deref() == Some(id.as_str()) {
+            self.editing_queued = None;
+        }
+        self.queue_rpc(
+            methods::STEER_QUEUED_MESSAGE_NOW,
+            serde_json::json!({ "id": id }),
+            "Couldn't steer that message",
             cx,
         );
     }

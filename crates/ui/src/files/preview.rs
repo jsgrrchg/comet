@@ -88,6 +88,7 @@ pub(super) struct FilePreviewState {
     reload_confirmation: Option<String>,
     close_requested: bool,
     tree_sidebar_visible: bool,
+    tree_sidebar_dismissed: bool,
     tree_width: f32,
     comment_anchors: HashMap<String, HashMap<String, EditorCommentAnchor>>,
     comment_draft: Option<EditorCommentDraft>,
@@ -109,6 +110,7 @@ impl FilePreviewState {
             reload_confirmation: None,
             close_requested: false,
             tree_sidebar_visible: false,
+            tree_sidebar_dismissed: false,
             tree_width: TREE_SPLIT_DEFAULT,
             comment_anchors: HashMap::new(),
             comment_draft: None,
@@ -142,7 +144,21 @@ impl FilePreviewState {
     }
 
     pub(super) fn tree_sidebar_visible(&self) -> bool {
-        self.tree_sidebar_visible
+        self.tree_sidebar_visible || (self.is_wide() && !self.tree_sidebar_dismissed)
+    }
+
+    fn show_tree_sidebar(&mut self) {
+        self.tree_sidebar_visible = true;
+        self.tree_sidebar_dismissed = false;
+    }
+
+    fn toggle_tree_sidebar(&mut self) {
+        if self.tree_sidebar_visible() {
+            self.tree_sidebar_visible = false;
+            self.tree_sidebar_dismissed = true;
+        } else {
+            self.show_tree_sidebar();
+        }
     }
 
     fn word_wrap(&self) -> bool {
@@ -362,12 +378,12 @@ impl FilesSurface {
     }
 
     pub(super) fn show_tree_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.preview.tree_sidebar_visible = true;
+        self.preview.show_tree_sidebar();
         cx.notify();
     }
 
     fn toggle_tree_sidebar(&mut self, cx: &mut Context<Self>) {
-        self.preview.tree_sidebar_visible = !self.preview.tree_sidebar_visible;
+        self.preview.toggle_tree_sidebar();
         cx.notify();
     }
 
@@ -1458,7 +1474,6 @@ impl FilesSurface {
 
     pub(super) fn render_preview(
         &mut self,
-        show_sidebar_toggle: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1466,7 +1481,7 @@ impl FilesSurface {
         let Some(active) = self.preview.active.clone() else {
             return gpui::Empty.into_any_element();
         };
-        let breadcrumb = self.render_breadcrumb(&active, show_sidebar_toggle, &theme, cx);
+        let breadcrumb = self.render_breadcrumb(&active, &theme, cx);
         let external = self.preview.documents.get(&active).is_some_and(|document| {
             matches!(
                 document.phase,
@@ -1631,7 +1646,6 @@ impl FilesSurface {
     fn render_breadcrumb(
         &mut self,
         path: &str,
-        show_sidebar_toggle: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1829,32 +1843,30 @@ impl FilesSurface {
                         },
                     )),
             )
-            .when(show_sidebar_toggle, |element| {
-                element.child(
-                    div()
-                        .id("files-toggle-tree-sidebar")
-                        .size(px(22.0))
-                        .flex_none()
-                        .rounded(px(5.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .cursor_pointer()
-                        .hover(|style| style.bg(crate::theme::wash(0.07)))
-                        .role(gpui::Role::Button)
-                        .aria_label(if self.preview.tree_sidebar_visible {
-                            "Hide files sidebar"
-                        } else {
-                            "Show files sidebar"
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_tree_sidebar(cx)))
-                        .child(
-                            icon(icons::SIDEBAR_MINIMALISTIC)
-                                .size(px(11.0))
-                                .text_color(theme.text_muted),
-                        ),
-                )
-            })
+            .child(
+                div()
+                    .id("files-toggle-tree-sidebar")
+                    .size(px(22.0))
+                    .flex_none()
+                    .rounded(px(5.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|style| style.bg(crate::theme::wash(0.07)))
+                    .role(gpui::Role::Button)
+                    .aria_label(if self.preview.tree_sidebar_visible() {
+                        "Hide files sidebar"
+                    } else {
+                        "Show files sidebar"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_tree_sidebar(cx)))
+                    .child(
+                        icon(icons::SIDEBAR_MINIMALISTIC)
+                            .size(px(11.0))
+                            .text_color(theme.text_muted),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2510,6 +2522,34 @@ mod tests {
         preview.reset();
 
         assert!(preview.word_wrap());
+    }
+
+    #[test]
+    fn wide_layout_respects_an_explicitly_hidden_tree_sidebar() {
+        let mut preview = FilePreviewState::new(900, false);
+        preview.surface_width.set(WIDE_BREAKPOINT);
+
+        assert!(preview.tree_sidebar_visible());
+
+        preview.toggle_tree_sidebar();
+        assert!(!preview.tree_sidebar_visible());
+
+        preview.surface_width.set(WIDE_BREAKPOINT - 1.0);
+        preview.surface_width.set(WIDE_BREAKPOINT);
+        assert!(!preview.tree_sidebar_visible());
+    }
+
+    #[test]
+    fn explicitly_showing_tree_sidebar_clears_responsive_dismissal() {
+        let mut preview = FilePreviewState::new(900, false);
+        preview.surface_width.set(WIDE_BREAKPOINT);
+        preview.toggle_tree_sidebar();
+
+        preview.show_tree_sidebar();
+
+        assert!(preview.tree_sidebar_visible());
+        preview.tree_sidebar_visible = false;
+        assert!(preview.tree_sidebar_visible());
     }
 
     #[test]

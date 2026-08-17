@@ -190,7 +190,10 @@ impl Render for FilesSurface {
             })
             .child(content);
         let is_editor = self.presentation.is_editor();
-        let wide = is_editor && self.preview.has_active() && self.preview.is_wide();
+        let wide = is_editor
+            && self.preview.has_active()
+            && self.preview.is_wide()
+            && self.preview.tree_sidebar_visible();
         let body = if wide {
             div()
                 .size_full()
@@ -200,7 +203,7 @@ impl Render for FilesSurface {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(self.render_preview(false, window, cx)),
+                        .child(self.render_preview(window, cx)),
                 )
                 .child(self.preview_split_handle(cx))
                 .child(
@@ -214,7 +217,7 @@ impl Render for FilesSurface {
                 )
                 .into_any_element()
         } else if is_editor && self.preview.has_active() {
-            let preview = self.render_preview(true, window, cx);
+            let preview = self.render_preview(window, cx);
             if self.preview.tree_sidebar_visible() {
                 div()
                     .size_full()

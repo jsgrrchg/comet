@@ -1,8 +1,12 @@
 //! Boundary between the Files surface and the `gpui-base` editor.
 
-use gpui::{AnyElement, AppContext as _, Context, Entity, IntoElement as _, SharedString, Window};
-use gpui_base::input::EditorState;
+use gpui::{
+    AnyElement, AppContext as _, Context, Entity, IntoElement as _, SharedString, Subscription,
+    Window,
+};
+use gpui_base::input::{EditorState, InputEvent};
 
+use super::FilesSurface;
 use crate::theme::Theme;
 
 pub(super) type FileEditorState = EditorState;
@@ -32,4 +36,16 @@ pub(super) fn new_file_editor(
 
 pub(super) fn editor_element(editor: &Entity<FileEditorState>) -> AnyElement {
     gpui_base::input::Editor::new(editor).into_any_element()
+}
+
+pub(super) fn subscribe_to_changes(
+    editor: &Entity<FileEditorState>,
+    path: String,
+    cx: &mut Context<FilesSurface>,
+) -> Subscription {
+    cx.subscribe(editor, move |surface, _, event, cx| {
+        if matches!(event, InputEvent::Change) {
+            surface.on_editor_change(&path, cx);
+        }
+    })
 }

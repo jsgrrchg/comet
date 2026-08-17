@@ -4,7 +4,6 @@ use gpui::{
     AnyElement, Context, Focusable as _, ListAlignment, ListSizingBehavior, ListState, Point,
     Render, ScrollHandle, SharedString, Window, div, font, list, prelude::*, px,
 };
-use gpui_base::input::InputEvent;
 use zeron_proto::{
     ReadWorkspaceFileRequest, WorkspaceFileSearchMatch, WorkspaceReadOnlyReason,
     WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
@@ -163,6 +162,28 @@ impl Render for PreviewDragGhost {
     }
 }
 
+struct FileEditorTooltip {
+    text: SharedString,
+}
+
+impl Render for FileEditorTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .max_w(px(360.0))
+            .px(px(9.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_overlay)
+            .font_family(theme.font_sans.clone())
+            .text_size(px(10.5))
+            .text_color(theme.text_muted)
+            .child(self.text.clone())
+    }
+}
+
 impl FilesSurface {
     pub(super) fn show_tree_sidebar(&mut self, cx: &mut Context<Self>) {
         self.preview.tree_sidebar_visible = true;
@@ -264,6 +285,7 @@ impl FilesSurface {
                         }
                     }
                     Err(error) => {
+                        tracing::warn!(path = %task_path, error = %error, "workspace file load failed");
                         document.set_error(error.to_string());
                         surface.sync_preview_list();
                     }
@@ -381,7 +403,7 @@ impl FilesSurface {
         }
     }
 
-    fn on_editor_change(&mut self, path: &str, cx: &mut Context<Self>) {
+    pub(super) fn on_editor_change(&mut self, path: &str, cx: &mut Context<Self>) {
         let Some(editor) = self
             .preview
             .documents
@@ -400,6 +422,7 @@ impl FilesSurface {
         };
         self.request_editor_highlight(path.to_string(), source, revision, cx);
         self.schedule_autosave(path.to_string(), cx);
+        cx.emit(FilesEvent::TitleChanged);
         cx.notify();
     }
 
@@ -566,21 +589,23 @@ impl FilesSurface {
                 match result {
                     Ok(WriteWorkspaceFileOutcome::Written { file }) => {
                         let hash = file.content_hash.clone();
-                        if document.finish_save(revision, hash.clone()) {
-                            if let Some(loaded) = document.file.as_mut() {
-                                loaded.content_hash = Some(hash);
-                                loaded.size = file.size;
-                                loaded.modified_at = file.modified_at;
-                            }
+                        if document.finish_save(revision, hash.clone())
+                            && let Some(loaded) = document.file.as_mut()
+                        {
+                            loaded.content_hash = Some(hash);
+                            loaded.size = file.size;
+                            loaded.modified_at = file.modified_at;
                         }
                     }
                     Ok(WriteWorkspaceFileOutcome::Conflict {
                         current_content_hash,
                         ..
                     }) => {
+                        tracing::warn!(path = %task_path, "workspace file autosave conflicted");
                         document.conflict_save(revision, current_content_hash);
                     }
                     Err(error) => {
+                        tracing::warn!(path = %task_path, error = %error, "workspace file autosave failed");
                         document.fail_save(revision, error.to_string());
                     }
                 }
@@ -598,6 +623,7 @@ impl FilesSurface {
                     surface.reconcile_document(task_path.clone(), cx);
                 }
                 surface.finish_pending_lifecycle(cx);
+                cx.emit(FilesEvent::TitleChanged);
                 cx.notify();
             });
         });
@@ -680,6 +706,7 @@ impl FilesSurface {
         } else {
             cx.emit(FilesEvent::CloseReady);
         }
+        cx.emit(FilesEvent::TitleChanged);
         cx.notify();
     }
 
@@ -812,11 +839,7 @@ impl FilesSurface {
             if let Some(editor) = document.editor.clone() {
                 let event_path = new_document_path.clone();
                 document.editor_events =
-                    Some(cx.subscribe(&editor, move |surface, _, event, cx| {
-                        if matches!(event, InputEvent::Change) {
-                            surface.on_editor_change(&event_path, cx);
-                        }
-                    }));
+                    Some(super::editor::subscribe_to_changes(&editor, event_path, cx));
             }
             if needs_review {
                 document.mark_external(None);
@@ -1129,25 +1152,40 @@ impl FilesSurface {
     ) -> AnyElement {
         let parts = path.split('/').collect::<Vec<_>>();
         let reveal_path = path.to_string();
+        let tooltip_path: SharedString = path.to_string().into();
         let save_status =
             self.preview
                 .documents
                 .get(path)
                 .and_then(|document| match &document.phase {
-                    DocumentPhase::Saving => Some(("Autosaving…", theme.text_faint, false)),
-                    DocumentPhase::SaveFailed(_) => {
-                        Some(("Autosave failed", theme.danger_muted, true))
-                    }
-                    DocumentPhase::Conflict { .. } => {
-                        Some(("Save conflict", theme.warning_muted, false))
-                    }
-                    DocumentPhase::DeletedOnDisk => {
-                        Some(("Deleted on disk", theme.warning_muted, false))
-                    }
-                    _ if document.is_dirty() => Some(("Unsaved", theme.text_faint, false)),
+                    DocumentPhase::Saving => Some(("Autosaving…", theme.text_faint, false, None)),
+                    DocumentPhase::SaveFailed(error) => Some((
+                        "Autosave failed",
+                        theme.danger_muted,
+                        true,
+                        Some(error.clone()),
+                    )),
+                    DocumentPhase::Conflict { .. } => Some((
+                        "Save conflict",
+                        theme.warning_muted,
+                        false,
+                        Some(SharedString::from(
+                            "The file changed on disk. Your editor buffer was preserved.",
+                        )),
+                    )),
+                    DocumentPhase::DeletedOnDisk => Some((
+                        "Deleted on disk",
+                        theme.warning_muted,
+                        false,
+                        Some(SharedString::from(
+                            "The file was removed on disk. Your editor buffer was preserved.",
+                        )),
+                    )),
+                    _ if document.is_dirty() => Some(("Unsaved", theme.text_faint, false, None)),
                     _ => None,
                 });
         let mut crumbs = div()
+            .id("files-breadcrumb-path")
             .min_w_0()
             .flex_1()
             .flex()
@@ -1177,6 +1215,14 @@ impl FilesSurface {
                     .child((*part).to_string()),
             );
         }
+        crumbs = crumbs
+            .tooltip(move |_, cx| {
+                cx.new(|_| FileEditorTooltip {
+                    text: tooltip_path.clone(),
+                })
+                .into()
+            })
+            .tooltip_show_delay(Duration::from_millis(350));
         div()
             .h(px(31.0))
             .flex_none()
@@ -1187,7 +1233,7 @@ impl FilesSurface {
             .items_center()
             .gap(px(6.0))
             .child(crumbs)
-            .when_some(save_status, |element, (label, color, retry)| {
+            .when_some(save_status, |element, (label, color, retry, detail)| {
                 element.child(
                     div()
                         .id("files-save-status")
@@ -1202,6 +1248,16 @@ impl FilesSurface {
                                 .aria_label("Retry autosave")
                                 .on_click(cx.listener(|this, _, _, cx| this.retry_active_save(cx)))
                         })
+                        .when_some(detail, |element, detail| {
+                            element
+                                .tooltip(move |_, cx| {
+                                    cx.new(|_| FileEditorTooltip {
+                                        text: detail.clone(),
+                                    })
+                                    .into()
+                                })
+                                .tooltip_show_delay(Duration::from_millis(350))
+                        })
                         .child(label),
                 )
             })
@@ -1215,6 +1271,8 @@ impl FilesSurface {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label("Reveal file in tree")
                     .hover(|style| style.bg(crate::theme::wash(0.07)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let name = reveal_path
@@ -1248,6 +1306,8 @@ impl FilesSurface {
                     .items_center()
                     .justify_center()
                     .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label("Reload file")
                     .hover(|style| style.bg(crate::theme::wash(0.07)))
                     .on_click(cx.listener(|this, _, _, cx| this.reload_active_document(cx)))
                     .child(
@@ -1439,11 +1499,7 @@ impl FilesSurface {
         let editor =
             super::editor::new_file_editor(text, path, self.preview.word_wrap, theme, window, cx);
         let event_path = path.to_string();
-        let editor_events = cx.subscribe(&editor, move |surface, _, event, cx| {
-            if matches!(event, InputEvent::Change) {
-                surface.on_editor_change(&event_path, cx);
-            }
-        });
+        let editor_events = super::editor::subscribe_to_changes(&editor, event_path, cx);
         let focus = editor.focus_handle(cx);
         window.defer(cx, move |window, cx| focus.focus(window, cx));
         let document = self.preview.documents.get_mut(path)?;

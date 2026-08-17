@@ -452,6 +452,27 @@ impl Render for SurfaceTabGhost {
             .child(div().truncate().child(self.title.clone()))
     }
 }
+
+struct SurfaceTabTooltip {
+    text: SharedString,
+}
+
+impl Render for SurfaceTabTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .max_w(px(380.0))
+            .px(px(9.0))
+            .py(px(6.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_overlay)
+            .text_size(px(10.5))
+            .text_color(theme.text_muted)
+            .child(self.text.clone())
+    }
+}
 /// Drag marker for the terminal-panel height handle.
 struct TerminalResize;
 
@@ -1471,7 +1492,10 @@ impl Shell {
     /// The right pane's surface tabs in the STORED (drag-reorderable) order —
     /// `(surface, title)`; entries whose backing tab/entity is gone are
     /// skipped.
-    fn right_surface_rows(&self, cx: &App) -> Vec<(RightSurface, SharedString)> {
+    fn right_surface_rows(
+        &self,
+        cx: &App,
+    ) -> Vec<(RightSurface, SharedString, bool, Option<SharedString>)> {
         let key = self.panel_key(cx);
         let stored: &[RightSurface] = self
             .right_tabs
@@ -1486,28 +1510,37 @@ impl Shell {
         stored
             .iter()
             .filter_map(|surface| match surface {
-                RightSurface::Files => self
-                    .files
-                    .get(&key)
-                    .map(|files| (*surface, files.read(cx).tab_title())),
-                RightSurface::File(id) => self.file_surfaces.get(id).map(|_| {
-                    let title = self
-                        .file_surface_paths
-                        .get(id)
+                RightSurface::Files => self.files.get(&key).map(|files| {
+                    let files = files.read(cx);
+                    (
+                        *surface,
+                        files.tab_title(),
+                        files.has_unsaved_changes(),
+                        None,
+                    )
+                }),
+                RightSurface::File(id) => self.file_surfaces.get(id).map(|file| {
+                    let path = self.file_surface_paths.get(id);
+                    let title = path
                         .map(|path| workspace_file_title(path))
                         .unwrap_or_else(|| SharedString::from("File"));
-                    (*surface, title)
+                    (
+                        *surface,
+                        title,
+                        file.read(cx).has_unsaved_changes(),
+                        path.cloned().map(Into::into),
+                    )
                 }),
                 RightSurface::Diff(id) => self
                     .diffs
                     .get(id)
                     // Contextual title (user request): the pane's scope
                     // label, or the pinned commit's subject.
-                    .map(|changes| (*surface, changes.read(cx).tab_title())),
+                    .map(|changes| (*surface, changes.read(cx).tab_title(), false, None)),
                 RightSurface::Terminal(tab) => terminals
                     .iter()
                     .find(|(k, _, _)| k == tab)
-                    .map(|(_, title, _)| (*surface, title.clone())),
+                    .map(|(_, title, _)| (*surface, title.clone(), false, None)),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -1558,13 +1591,13 @@ impl Shell {
         let rows = self.right_surface_rows(cx);
         let exists = match picked {
             RightSurface::Picker => false,
-            surface => rows.iter().any(|(s, _)| *s == surface),
+            surface => rows.iter().any(|(s, _, _, _)| *s == surface),
         };
         if exists {
             picked
         } else {
             rows.first()
-                .map(|(s, _)| *s)
+                .map(|(s, _, _, _)| *s)
                 .unwrap_or(RightSurface::Picker)
         }
     }
@@ -5545,7 +5578,7 @@ impl Shell {
                 this.right_tab_drag = None;
                 this.reorder_right_tabs(payload.from, to, cx);
             }));
-        for (ix, (surface, title)) in rows.into_iter().enumerate() {
+        for (ix, (surface, title, dirty, detail)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
             let icon_path = match surface {
                 RightSurface::Files => icons::FOLDER_WITH_FILES,
@@ -5559,6 +5592,12 @@ impl Shell {
             // hovered (user request).
             let group: SharedString = format!("right-surface-tab-{ix}").into();
             let ghost_title = title.clone();
+            let accessible_name = detail.as_ref().unwrap_or(&title);
+            let accessible_label = if dirty {
+                format!("{accessible_name}, unsaved changes")
+            } else {
+                accessible_name.to_string()
+            };
             let chip = div()
                 .id(("right-surface-tab", ix))
                 .group(group.clone())
@@ -5573,6 +5612,17 @@ impl Shell {
                 .items_center()
                 .gap(px(3.0))
                 .cursor_pointer()
+                .role(gpui::Role::Button)
+                .aria_label(accessible_label)
+                .when_some(detail, |chip, detail| {
+                    chip.tooltip(move |_, cx| {
+                        cx.new(|_| SurfaceTabTooltip {
+                            text: detail.clone(),
+                        })
+                        .into()
+                    })
+                    .tooltip_show_delay(Duration::from_millis(350))
+                })
                 // The old session-tab strip's solved carve-out: NOT
                 // `.occlude()` — a BlockMouse hitbox ends the hit test,
                 // so the scroll container behind the tabs never saw
@@ -5666,7 +5716,16 @@ impl Shell {
                             theme.text_muted
                         })
                         .child(title),
-                );
+                )
+                .when(dirty, |chip| {
+                    chip.child(
+                        div()
+                            .flex_none()
+                            .size(px(5.0))
+                            .rounded_full()
+                            .bg(theme.warning_muted),
+                    )
+                });
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the

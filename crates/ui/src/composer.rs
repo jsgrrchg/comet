@@ -725,6 +725,46 @@ fn local_file_link(path: &str, is_dir: bool) -> String {
     )
 }
 
+/// Build the text inserted when a workspace item is dropped at an arbitrary
+/// selection. Unlike completion, a drop does not necessarily happen at a
+/// token boundary, so it supplies its own leading separator when needed.
+fn dropped_file_mention(
+    content: &str,
+    range: Range<usize>,
+    path: &str,
+    is_dir: bool,
+) -> Option<(String, usize)> {
+    if range.start > range.end
+        || !local_path_is_safe(path)
+        || !content.is_char_boundary(range.start)
+    {
+        return None;
+    }
+    let suffix = content.get(range.end..)?;
+    let prefix = if range.start > 0
+        && content[..range.start]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| !ch.is_whitespace())
+    {
+        " "
+    } else {
+        ""
+    };
+    let existing_separator = suffix
+        .chars()
+        .next()
+        .filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
+    let trailing = if existing_separator.is_some() {
+        ""
+    } else {
+        " "
+    };
+    let inserted = format!("{prefix}{}{trailing}", local_file_link(path, is_dir));
+    let cursor_advance = inserted.len() + existing_separator.map(char::len_utf8).unwrap_or(0);
+    Some((inserted, cursor_advance))
+}
+
 fn local_path_is_safe(path: &str) -> bool {
     !path.is_empty()
         && !path.starts_with('/')
@@ -1481,6 +1521,31 @@ impl ComposerInput {
         self.reset_blink();
         cx.emit(ComposerInputEvent::Edited);
         cx.notify();
+    }
+
+    /// Insert a workspace reference at the current selection. Drag-and-drop
+    /// uses the same strict local Markdown transport and projected chip as an
+    /// `@` mention selected from completion.
+    fn insert_dropped_mention(&mut self, path: &str, is_dir: bool, cx: &mut Context<Self>) -> bool {
+        let range = self.selected_range.clone();
+        let Some((inserted, cursor_advance)) =
+            dropped_file_mention(&self.content, range.clone(), path, is_dir)
+        else {
+            return false;
+        };
+        self.invalidate_mention_tooltip();
+        self.record_edit(&range, &inserted);
+        self.content =
+            self.content[..range.start].to_owned() + &inserted + &self.content[range.end..];
+        self.refresh_projection();
+        let cursor = range.start + cursor_advance;
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.follow_cursor = true;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+        true
     }
 
     /// Replace a completed plain-text token (slash commands) as one
@@ -3567,6 +3632,28 @@ impl Composer {
             }
         }
         self.add_staged(staged, cx);
+    }
+
+    /// Add a file-tree or file-tab drop through the existing file-mention
+    /// pipeline. This keeps the reference workspace-relative and therefore
+    /// valid for local and remote sessions alike.
+    pub(crate) fn add_workspace_path(
+        &mut self,
+        path: &str,
+        is_directory: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let inserted = self.input.update(cx, |input, cx| {
+            input.insert_dropped_mention(path, is_directory, cx)
+        });
+        if inserted {
+            self.reset_mention(None, cx);
+            self.reset_slash(None, cx);
+            let focus = self.input.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+            cx.notify();
+        }
     }
 
     fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -5897,6 +5984,25 @@ mod tests {
         let links = file_mention_links(&folder);
         assert_eq!(links[0].path, "src/components");
         assert!(links[0].is_dir);
+    }
+
+    #[test]
+    fn dropped_mentions_are_separated_from_surrounding_text() {
+        let (inserted, cursor_advance) =
+            dropped_file_mention("fixnow", 3..3, "src/lib.rs", false).expect("valid drop");
+        assert_eq!(inserted, " [lib.rs](zeron-file:src/lib.rs) ");
+        assert_eq!(cursor_advance, inserted.len());
+
+        let (inserted, cursor_advance) =
+            dropped_file_mention("fix now", 3..3, "src/components", true).expect("valid drop");
+        assert_eq!(inserted, " [components](zeron-file:src/components/)");
+        assert_eq!(cursor_advance, inserted.len() + 1);
+    }
+
+    #[test]
+    fn dropped_mentions_reject_paths_outside_the_workspace() {
+        assert!(dropped_file_mention("", 0..0, "/tmp/file.rs", false).is_none());
+        assert!(dropped_file_mention("", 0..0, "../file.rs", false).is_none());
     }
 
     #[test]

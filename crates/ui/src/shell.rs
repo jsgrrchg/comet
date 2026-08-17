@@ -28,7 +28,7 @@ use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
-use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface};
+use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -421,6 +421,7 @@ struct RightTabDrag {
     panel_key: String,
     from: usize,
     title: SharedString,
+    workspace_path: Option<WorkspacePathDrag>,
 }
 
 /// Live drag-over state for the surface-tab strip — the terminal drawer's
@@ -792,9 +793,8 @@ pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
-    /// External file drag hovering the conversation column — shows the
-    /// "Drop images to attach" veil over the whole chat area; a drop stages
-    /// the files in the composer.
+    /// External image or workspace-path drag hovering the conversation
+    /// column; a drop stages an image or inserts a file-mention chip.
     file_drag_active: bool,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under — written by a
@@ -1549,6 +1549,24 @@ impl Shell {
                 RightSurface::Picker => None,
             })
             .collect()
+    }
+
+    fn workspace_path_for_surface(
+        &self,
+        surface: RightSurface,
+        cx: &App,
+    ) -> Option<WorkspacePathDrag> {
+        let path = match surface {
+            RightSurface::Files => self
+                .files
+                .get(&self.panel_key(cx))
+                .and_then(|files| files.read(cx).attachment_path().map(str::to_string))?,
+            RightSurface::File(id) => self.file_surface_paths.get(&id)?.clone(),
+            RightSurface::Picker | RightSurface::Diff(_) | RightSurface::Terminal(_) => {
+                return None;
+            }
+        };
+        Some(WorkspacePathDrag::new(path, false))
     }
 
     /// Drag-reorder a surface tab within this chat's strip.
@@ -4973,11 +4991,12 @@ impl Shell {
         };
 
         let status = self.render_status_strip(cx);
-        // File dropzone over the ENTIRE conversation column (transcript +
-        // composer, not just the pill): dragging OS files anywhere across the
-        // chat area shows the "Drop images to attach" veil; a drop stages the
-        // files in the composer. `has_active_drag` gates the veil so a drag
-        // that left the window (FileDrop Exited) can't strand it.
+        // Attachment dropzone over the ENTIRE conversation column (transcript
+        // + composer, not just the pill). OS images keep using the upload
+        // pipeline; workspace files/directories and file tabs become the same
+        // projected file-mention chips the composer already understands.
+        // `has_active_drag` gates the veil so a drag that left the window
+        // cannot strand it.
         let file_drag_active = self.file_drag_active && cx.has_active_drag();
         div()
             .id("chat-dropzone")
@@ -5001,6 +5020,43 @@ impl Shell {
                 let paths = paths.paths().to_vec();
                 this.composer
                     .update(cx, |composer, cx| composer.add_paths(paths, cx));
+                cx.notify();
+            }))
+            .on_drag_move::<WorkspacePathDrag>(cx.listener(
+                |this, e: &gpui::DragMoveEvent<WorkspacePathDrag>, _, cx| {
+                    let inside = e.bounds.contains(&e.event.position);
+                    if this.file_drag_active != inside {
+                        this.file_drag_active = inside;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop::<WorkspacePathDrag>(cx.listener(
+                |this, payload: &WorkspacePathDrag, window, cx| {
+                    this.file_drag_active = false;
+                    this.composer.update(cx, |composer, cx| {
+                        composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
+                    });
+                    cx.notify();
+                },
+            ))
+            .on_drag_move::<RightTabDrag>(cx.listener(
+                |this, e: &gpui::DragMoveEvent<RightTabDrag>, _, cx| {
+                    let inside =
+                        e.bounds.contains(&e.event.position) && e.drag(cx).workspace_path.is_some();
+                    if this.file_drag_active != inside {
+                        this.file_drag_active = inside;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop::<RightTabDrag>(cx.listener(|this, payload: &RightTabDrag, window, cx| {
+                this.file_drag_active = false;
+                if let Some(path) = &payload.workspace_path {
+                    this.composer.update(cx, |composer, cx| {
+                        composer.add_workspace_path(&path.path, path.is_directory, window, cx)
+                    });
+                }
                 cx.notify();
             }))
             .child(
@@ -5088,7 +5144,7 @@ impl Shell {
                         .justify_center()
                         .text_size(px(13.0))
                         .text_color(theme.text)
-                        .child("Drop images to attach"),
+                        .child("Drop to attach"),
                 )
             })
             .into_any_element()
@@ -5715,6 +5771,7 @@ impl Shell {
             // hovered (user request).
             let group: SharedString = format!("right-surface-tab-{ix}").into();
             let ghost_title = title.clone();
+            let workspace_path = self.workspace_path_for_surface(surface, cx);
             let accessible_name = detail.as_ref().unwrap_or(&title);
             let accessible_label = if dirty {
                 format!("{accessible_name}, unsaved changes")
@@ -5778,6 +5835,7 @@ impl Shell {
                         panel_key: self.panel_key(cx),
                         from: ix,
                         title: ghost_title,
+                        workspace_path,
                     },
                     |payload, _point, _, cx| {
                         let title = payload.title.clone();

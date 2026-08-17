@@ -8,7 +8,10 @@ use zeron_proto::{
     WorkspaceFileSearchMatch,
 };
 
-use super::{FilesSurface, client::WorkspaceFilesClient, model::parent_path};
+use super::{
+    FilesSurface, WorkspacePathDrag, client::WorkspaceFilesClient, model::parent_path,
+    workspace_path_drag_ghost,
+};
 use crate::{
     icons::{self, icon},
     theme::Theme,
@@ -247,6 +250,10 @@ impl FilesSurface {
         let theme = Theme::of(cx).clone();
         let selected = self.search_state.active == index;
         let parent = parent_path(&result.path).unwrap_or_default();
+        let drag_payload = WorkspacePathDrag::new(
+            result.path.clone(),
+            result.kind == WorkspaceEntryKind::Directory,
+        );
         div()
             .id(("files-search-result", index))
             .h(px(SEARCH_ROW_HEIGHT))
@@ -265,6 +272,10 @@ impl FilesSurface {
                 this.search_state.active = index;
                 this.activate_search_result(cx);
             }))
+            .on_drag(drag_payload, |payload, _, _, cx| {
+                cx.stop_propagation();
+                workspace_path_drag_ghost(payload, cx)
+            })
             .child(
                 icon(if result.kind == WorkspaceEntryKind::Directory {
                     icons::FOLDER

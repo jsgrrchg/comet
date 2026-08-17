@@ -28,6 +28,78 @@ use model::{DirectoryLoadState, FileTreeModel};
 use preview::FilePreviewState;
 use search::FileSearchState;
 
+/// A workspace-relative file or directory dragged out of a Files surface.
+///
+/// Keeping the payload relative is important: the composer may target a
+/// remote device, and its existing file-mention transport resolves paths in
+/// that workspace instead of leaking a path from the UI machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspacePathDrag {
+    pub path: String,
+    pub is_directory: bool,
+}
+
+impl WorkspacePathDrag {
+    pub(crate) fn new(path: String, is_directory: bool) -> Self {
+        Self { path, is_directory }
+    }
+
+    fn title(&self) -> SharedString {
+        self.path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(&self.path)
+            .to_string()
+            .into()
+    }
+}
+
+/// Compact drag preview shared by tree and search rows. It deliberately uses
+/// the same raised surface, hairline, type scale, and opacity as surface tabs.
+pub(crate) struct WorkspacePathDragGhost {
+    payload: WorkspacePathDrag,
+}
+
+impl Render for WorkspacePathDragGhost {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = crate::theme::Theme::of(cx);
+        div()
+            .h(px(24.0))
+            .max_w(px(220.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(5.0))
+            .rounded(px(6.0))
+            .bg(theme.surface_raised)
+            .border_1()
+            .border_color(theme.border_strong)
+            .text_size(px(11.5))
+            .text_color(theme.text)
+            .opacity(0.85)
+            .child(
+                crate::icons::icon(if self.payload.is_directory {
+                    crate::icons::FOLDER
+                } else {
+                    crate::icons::DOCUMENT
+                })
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.text_muted),
+            )
+            .child(div().min_w_0().truncate().child(self.payload.title()))
+    }
+}
+
+pub(crate) fn workspace_path_drag_ghost(
+    payload: &WorkspacePathDrag,
+    cx: &mut gpui::App,
+) -> gpui::Entity<WorkspacePathDragGhost> {
+    let payload = payload.clone();
+    cx.new(|_| WorkspacePathDragGhost { payload })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesEvent {
     OpenFile(String),
@@ -427,6 +499,12 @@ impl FilesSurface {
             .and_then(|path| path.rsplit('/').next())
             .unwrap_or("Files")
             .into()
+    }
+
+    /// The file represented by this surface tab, when the browser has already
+    /// promoted itself to an editor.
+    pub fn attachment_path(&self) -> Option<&str> {
+        self.editor_path.as_deref()
     }
 
     pub(super) fn open_tree_file(&mut self, path: String, cx: &mut Context<Self>) {

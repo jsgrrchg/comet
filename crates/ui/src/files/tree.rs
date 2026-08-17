@@ -4,7 +4,10 @@ use gpui::{
 };
 use zeron_proto::WorkspaceEntryKind;
 
-use super::{FilesSurface, model::DirectoryLoadState, model::VisibleRowKind};
+use super::{
+    FilesSurface, WorkspacePathDrag, model::DirectoryLoadState, model::VisibleRowKind,
+    workspace_path_drag_ghost,
+};
 use crate::{
     icons::{self, icon},
     theme::Theme,
@@ -61,6 +64,7 @@ impl FilesSurface {
                 let selected = self.tree.selected() == Some(path.as_str());
                 let focused = self.tree_focus.is_focused(window);
                 let is_directory = node.entry.kind == WorkspaceEntryKind::Directory;
+                let drag_payload = WorkspacePathDrag::new(path.clone(), is_directory);
                 let expanded = is_directory && self.tree.is_expanded(&path);
                 let text_color = if selected {
                     theme.text
@@ -97,6 +101,10 @@ impl FilesSurface {
                         this.tree_focus.focus(window, cx);
                         this.activate_tree_path(path.clone(), cx);
                     }))
+                    .on_drag(drag_payload, |payload, _, _, cx| {
+                        cx.stop_propagation();
+                        workspace_path_drag_ghost(payload, cx)
+                    })
                     .child(
                         div()
                             .size(px(14.0))

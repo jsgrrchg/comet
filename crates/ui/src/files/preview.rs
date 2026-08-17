@@ -11,7 +11,7 @@ use zeron_proto::{
 };
 
 use super::{
-    FilesSurface,
+    FilesCloseDisposition, FilesEvent, FilesSurface,
     client::{FilesRequestContext, WorkspaceFilesClient},
     document::{DocumentKey, DocumentPhase, FileDocument},
 };
@@ -41,6 +41,7 @@ pub(super) struct FilePreviewState {
     word_wrap: bool,
     autosave_delay_ms: u64,
     reload_confirmation: Option<String>,
+    close_requested: bool,
     tree_sidebar_visible: bool,
     tree_width: f32,
 }
@@ -58,6 +59,7 @@ impl FilePreviewState {
             word_wrap: false,
             autosave_delay_ms,
             reload_confirmation: None,
+            close_requested: false,
             tree_sidebar_visible: false,
             tree_width: TREE_SPLIT_DEFAULT,
         }
@@ -69,6 +71,7 @@ impl FilePreviewState {
         self.highlights.clear();
         self.list.reset(0);
         self.reload_confirmation = None;
+        self.close_requested = false;
         self.tree_sidebar_visible = false;
     }
 
@@ -106,6 +109,26 @@ impl FilePreviewState {
 
     pub(super) fn tree_width(&self) -> f32 {
         self.tree_width
+    }
+
+    pub(super) fn has_unsaved_changes(&self) -> bool {
+        self.documents.values().any(FileDocument::is_dirty)
+    }
+
+    pub(super) fn dirty_paths(&self) -> Vec<String> {
+        self.documents
+            .iter()
+            .filter(|(_, document)| document.is_dirty())
+            .map(|(path, _)| path.clone())
+            .collect()
+    }
+
+    pub(super) fn autosavable_dirty_paths(&self) -> Vec<String> {
+        self.documents
+            .iter()
+            .filter(|(_, document)| document.can_autosave())
+            .map(|(path, _)| path.clone())
+            .collect()
     }
 
     pub(super) fn narrow_tree_width(&self) -> f32 {
@@ -483,7 +506,7 @@ impl FilesSurface {
         }
     }
 
-    fn save_document(&mut self, path: String, cx: &mut Context<Self>) {
+    pub(super) fn save_document(&mut self, path: String, cx: &mut Context<Self>) {
         let Some(context) = self.request_context.clone() else {
             return;
         };
@@ -565,11 +588,16 @@ impl FilesSurface {
                 let reconcile = document.reconcile_after_save;
                 document.reconcile_after_save = false;
                 if save_again {
-                    surface.schedule_autosave(task_path.clone(), cx);
+                    if surface.preview.close_requested || surface.target_change_pending {
+                        surface.save_document(task_path.clone(), cx);
+                    } else {
+                        surface.schedule_autosave(task_path.clone(), cx);
+                    }
                 }
                 if reconcile {
                     surface.reconcile_document(task_path.clone(), cx);
                 }
+                surface.finish_pending_lifecycle(cx);
                 cx.notify();
             });
         });
@@ -579,6 +607,90 @@ impl FilesSurface {
             document.save_task = Some(task);
         }
         cx.notify();
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.preview.has_unsaved_changes()
+    }
+
+    pub fn prepare_close(&mut self, cx: &mut Context<Self>) -> FilesCloseDisposition {
+        let dirty_paths = self.preview.dirty_paths();
+        if dirty_paths.is_empty() {
+            return FilesCloseDisposition::Allow;
+        }
+        self.preview.close_requested = true;
+        let blocked = dirty_paths.iter().any(|path| {
+            self.preview.documents.get(path).is_some_and(|document| {
+                matches!(
+                    document.phase,
+                    DocumentPhase::Conflict { .. }
+                        | DocumentPhase::ExternallyModified { .. }
+                        | DocumentPhase::DeletedOnDisk
+                )
+            })
+        });
+        for path in dirty_paths {
+            if self
+                .preview
+                .documents
+                .get(&path)
+                .is_some_and(FileDocument::can_autosave)
+            {
+                self.save_document(path, cx);
+            }
+        }
+        cx.notify();
+        if blocked {
+            FilesCloseDisposition::Blocked
+        } else {
+            FilesCloseDisposition::Pending
+        }
+    }
+
+    fn retry_pending_close(&mut self, cx: &mut Context<Self>) {
+        let paths = self.preview.dirty_paths();
+        for path in paths {
+            if self
+                .preview
+                .documents
+                .get(&path)
+                .is_some_and(FileDocument::can_autosave)
+            {
+                self.save_document(path, cx);
+            }
+        }
+    }
+
+    fn keep_open(&mut self, cx: &mut Context<Self>) {
+        self.preview.close_requested = false;
+        cx.emit(FilesEvent::CloseCancelled);
+        cx.notify();
+    }
+
+    fn discard_changes_and_close(&mut self, cx: &mut Context<Self>) {
+        let closing = self.preview.close_requested;
+        for document in self.preview.documents.values_mut() {
+            document.discard_changes();
+        }
+        self.preview.close_requested = false;
+        if closing {
+            cx.emit(FilesEvent::CloseReady);
+        } else if self.target_change_pending {
+            self.apply_pending_target(cx);
+        } else {
+            cx.emit(FilesEvent::CloseReady);
+        }
+        cx.notify();
+    }
+
+    fn finish_pending_lifecycle(&mut self, cx: &mut Context<Self>) {
+        if self.preview.close_requested && !self.preview.has_unsaved_changes() {
+            self.preview.close_requested = false;
+            cx.emit(FilesEvent::CloseReady);
+        }
+        if self.target_change_pending && !self.preview.has_unsaved_changes() {
+            self.apply_pending_target(cx);
+        }
     }
 
     pub(super) fn reconcile_document(&mut self, path: String, cx: &mut Context<Self>) {
@@ -852,6 +964,18 @@ impl FilesSurface {
             )
         });
         let confirming_reload = self.preview.reload_confirmation.as_deref() == Some(&active);
+        let lifecycle_pending = self.preview.close_requested || self.target_change_pending;
+        let lifecycle_blocked = lifecycle_pending
+            && self.preview.documents.values().any(|document| {
+                document.is_dirty()
+                    && matches!(
+                        document.phase,
+                        DocumentPhase::SaveFailed(_)
+                            | DocumentPhase::Conflict { .. }
+                            | DocumentPhase::ExternallyModified { .. }
+                            | DocumentPhase::DeletedOnDisk
+                    )
+            });
         let body = self.render_document_body(&active, &theme, window, cx);
         div()
             .size_full()
@@ -859,7 +983,66 @@ impl FilesSurface {
             .flex()
             .flex_col()
             .child(breadcrumb)
-            .when(external, |element| {
+            .when(lifecycle_pending, |element| {
+                element.child(
+                    div()
+                        .h(px(30.0))
+                        .flex_none()
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(10.0))
+                        .border_b_1()
+                        .border_color(theme.warning.opacity(0.25))
+                        .bg(theme.warning.opacity(0.055))
+                        .text_size(px(10.5))
+                        .text_color(theme.warning_muted)
+                        .child(if lifecycle_blocked {
+                            "Changes could not be saved safely."
+                        } else if self.target_change_pending {
+                            "Saving changes before switching workspace…"
+                        } else {
+                            "Saving changes before closing…"
+                        })
+                        .when(lifecycle_blocked, |banner| {
+                            banner
+                                .child(
+                                    div()
+                                        .id("files-retry-close-save")
+                                        .ml_auto()
+                                        .cursor_pointer()
+                                        .text_color(theme.text)
+                                        .child("Retry")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.retry_pending_close(cx)
+                                        })),
+                                )
+                                .when(!self.target_change_pending, |banner| {
+                                    banner.child(
+                                        div()
+                                            .id("files-keep-open")
+                                            .cursor_pointer()
+                                            .text_color(theme.text_muted)
+                                            .child("Keep Open")
+                                            .on_click(
+                                                cx.listener(|this, _, _, cx| this.keep_open(cx)),
+                                            ),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id("files-discard-close-changes")
+                                        .cursor_pointer()
+                                        .text_color(theme.danger_muted)
+                                        .child("Discard Changes")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.discard_changes_and_close(cx)
+                                        })),
+                                )
+                        }),
+                )
+            })
+            .when(external && !lifecycle_pending, |element| {
                 element.child(
                     div()
                         .h(px(30.0))

@@ -28,7 +28,7 @@ use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
-use crate::files::{FilesEvent, FilesSurface};
+use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -205,7 +205,7 @@ pub enum Route {
 /// One right-pane surface tab: a workspace browser, an individual workspace
 /// file editor, a git-diff page, or one embedded terminal. `Picker` is the
 /// empty state.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RightSurface {
     #[default]
     Picker,
@@ -807,6 +807,8 @@ pub struct Shell {
     file_surface_keys: std::collections::HashMap<(String, String), u64>,
     file_surface_subs: std::collections::HashMap<u64, Subscription>,
     file_surface_seq: u64,
+    pending_file_closes: std::collections::HashSet<RightSurface>,
+    window_close_pending: bool,
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
@@ -1059,6 +1061,8 @@ impl Shell {
             file_surface_keys: std::collections::HashMap::new(),
             file_surface_subs: std::collections::HashMap::new(),
             file_surface_seq: 0,
+            pending_file_closes: std::collections::HashSet::new(),
+            window_close_pending: false,
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
             right_tabs: std::collections::HashMap::new(),
@@ -1614,10 +1618,15 @@ impl Shell {
             let files = cx.new(|cx| {
                 FilesSurface::new(self.state.clone(), self.active_chat.clone(), delay, cx)
             });
-            let sub = cx.subscribe(&files, |this: &mut Self, _, event, cx| match event {
+            let event_key = key.clone();
+            let sub = cx.subscribe(&files, move |this: &mut Self, _, event, cx| match event {
                 FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
                 FilesEvent::TitleChanged => cx.notify(),
                 FilesEvent::FileRenamed { .. } => cx.notify(),
+                FilesEvent::CloseReady => {
+                    this.on_file_close_ready(RightSurface::Files, &event_key, cx)
+                }
+                FilesEvent::CloseCancelled => this.cancel_file_close(RightSurface::Files, cx),
             });
             self.files.insert(key.clone(), files);
             self.files_subs.insert(key.clone(), sub);
@@ -1659,6 +1668,10 @@ impl Shell {
             FilesEvent::FileRenamed { old_path, new_path } => {
                 this.rename_file_surface(id, &event_panel_key, old_path, new_path, cx)
             }
+            FilesEvent::CloseReady => {
+                this.on_file_close_ready(RightSurface::File(id), &event_panel_key, cx)
+            }
+            FilesEvent::CloseCancelled => this.cancel_file_close(RightSurface::File(id), cx),
         });
         self.file_surfaces.insert(id, file);
         self.file_surface_paths.insert(id, path);
@@ -1747,20 +1760,28 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let key = self.panel_key(cx);
+        let files = match surface {
+            RightSurface::Files => self.files.get(&key).cloned(),
+            RightSurface::File(id) => self.file_surfaces.get(&id).cloned(),
+            _ => None,
+        };
+        if let Some(files) = files {
+            match files.update(cx, |files, cx| files.prepare_close(cx)) {
+                FilesCloseDisposition::Allow => {
+                    self.complete_file_close(surface, &key, cx);
+                }
+                FilesCloseDisposition::Pending | FilesCloseDisposition::Blocked => {
+                    self.pending_file_closes.insert(surface);
+                    self.set_right_active(surface, cx);
+                }
+            }
+            return;
+        }
         if let Some(tabs) = self.right_tabs.get_mut(&key) {
             tabs.retain(|s| *s != surface);
         }
         match surface {
-            RightSurface::Files => {
-                self.files.remove(&key);
-                self.files_subs.remove(&key);
-            }
-            RightSurface::File(id) => {
-                self.file_surfaces.remove(&id);
-                self.file_surface_paths.remove(&id);
-                self.file_surface_subs.remove(&id);
-                self.file_surface_keys.retain(|_, value| *value != id);
-            }
+            RightSurface::Files | RightSurface::File(_) => {}
             RightSurface::Diff(id) => {
                 // Dropping the entity tears down its diff watch.
                 self.diffs.remove(&id);
@@ -1775,6 +1796,89 @@ impl Shell {
         self.panels.update(&key, |p| {
             if p.right_active == surface {
                 p.right_active = RightSurface::Picker;
+            }
+        });
+        cx.notify();
+    }
+
+    fn on_file_close_ready(
+        &mut self,
+        surface: RightSurface,
+        panel_key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_file_closes.contains(&surface) {
+            self.complete_file_close(surface, panel_key, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn cancel_file_close(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
+        self.pending_file_closes.remove(&surface);
+        self.window_close_pending = false;
+        cx.notify();
+    }
+
+    pub fn prepare_window_close(&mut self, cx: &mut Context<Self>) -> bool {
+        let surfaces = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        if surfaces
+            .iter()
+            .all(|surface| !surface.read(cx).has_unsaved_changes())
+        {
+            self.window_close_pending = false;
+            return true;
+        }
+        self.window_close_pending = true;
+        let mut all_ready = true;
+        for surface in surfaces {
+            let disposition = surface.update(cx, |surface, cx| surface.prepare_close(cx));
+            all_ready &= disposition == FilesCloseDisposition::Allow;
+        }
+        if all_ready {
+            self.window_close_pending = false;
+        }
+        all_ready
+    }
+
+    fn all_file_edits_flushed(&self, cx: &App) -> bool {
+        self.files
+            .values()
+            .chain(self.file_surfaces.values())
+            .all(|surface| !surface.read(cx).has_unsaved_changes())
+    }
+
+    fn complete_file_close(
+        &mut self,
+        surface: RightSurface,
+        panel_key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tabs) = self.right_tabs.get_mut(panel_key) {
+            tabs.retain(|candidate| *candidate != surface);
+        }
+        match surface {
+            RightSurface::Files => {
+                self.files.remove(panel_key);
+                self.files_subs.remove(panel_key);
+            }
+            RightSurface::File(id) => {
+                self.file_surfaces.remove(&id);
+                self.file_surface_paths.remove(&id);
+                self.file_surface_subs.remove(&id);
+                self.file_surface_keys.retain(|_, value| *value != id);
+            }
+            _ => return,
+        }
+        self.pending_file_closes.remove(&surface);
+        self.panels.update(panel_key, |panel| {
+            if panel.right_active == surface {
+                panel.right_active = RightSurface::Picker;
             }
         });
         cx.notify();
@@ -6362,6 +6466,10 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.window_close_pending && self.all_file_edits_flushed(cx) {
+            self.window_close_pending = false;
+            window.defer(cx, |window, _| window.remove_window());
+        }
         let theme = Theme::of(cx);
         // The shell tone (zeron `.frost`): the surface the sidebar sits on and
         // the main panel floats over as an inset rounded card. On macOS the

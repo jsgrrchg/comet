@@ -266,6 +266,15 @@ impl FileDocument {
         self.file = Some(file);
     }
 
+    pub fn discard_changes(&mut self) {
+        self.autosave_task = None;
+        self.save_task = None;
+        self.reconcile_task = None;
+        self.pending_save = None;
+        self.pending_external_reload = None;
+        self.saved_revision = self.revision;
+    }
+
     pub fn content_hash(&self) -> Option<&str> {
         self.file.as_ref()?.content_hash.as_deref()
     }
@@ -459,5 +468,16 @@ mod tests {
         assert!(document.is_editable());
         assert!(!document.can_autosave());
         assert!(matches!(document.phase, DocumentPhase::DeletedOnDisk));
+    }
+
+    #[test]
+    fn explicit_discard_resolves_dirty_state_for_lifecycle_exit() {
+        let mut document = FileDocument::loading(key("src/lib.rs"));
+        document.set_loaded(text_file());
+        document.mark_user_edit();
+        assert!(document.is_dirty());
+        document.discard_changes();
+        assert!(!document.is_dirty());
+        assert!(document.pending_save.is_none());
     }
 }

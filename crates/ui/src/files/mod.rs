@@ -3,8 +3,8 @@
 use std::{collections::HashMap, time::Duration};
 
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Render,
-    SharedString, Subscription, Task, div, prelude::*, px,
+    Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Render, SharedString,
+    Subscription, Task, div, prelude::*, px,
 };
 use zeron_proto::ListWorkspaceDirectoryRequest;
 
@@ -33,6 +33,15 @@ pub enum FilesEvent {
     OpenFile(String),
     TitleChanged,
     FileRenamed { old_path: String, new_path: String },
+    CloseReady,
+    CloseCancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesCloseDisposition {
+    Allow,
+    Pending,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +64,8 @@ pub struct FilesSurface {
     presentation: FilesPresentation,
     editor_path: Option<String>,
     request_context: Option<FilesRequestContext>,
+    target_change_pending: bool,
+    pending_request_context: Option<FilesRequestContext>,
     tree: FileTreeModel,
     tree_list: ListState,
     tree_focus: FocusHandle,
@@ -338,6 +349,8 @@ impl FilesSurface {
             presentation,
             editor_path: editor_path.clone(),
             request_context: None,
+            target_change_pending: false,
+            pending_request_context: None,
             tree: FileTreeModel::new(),
             tree_list: ListState::new(0, ListAlignment::Top, px(560.0)),
             tree_focus: cx.focus_handle(),
@@ -517,11 +530,38 @@ impl FilesSurface {
         &self.chat_id
     }
 
-    fn sync_target(&mut self, cx: &App) -> bool {
+    fn sync_target(&mut self, cx: &mut Context<Self>) -> bool {
         let next = FilesRequestContext::for_chat(self.state.read(cx), &self.chat_id);
         if self.request_context == next {
+            self.target_change_pending = false;
+            self.pending_request_context = None;
             return false;
         }
+        if self.preview.has_unsaved_changes() {
+            self.target_change_pending = true;
+            self.pending_request_context = next;
+            for path in self.preview.autosavable_dirty_paths() {
+                self.save_document(path, cx);
+            }
+            cx.notify();
+            return false;
+        }
+        self.apply_target(next);
+        true
+    }
+
+    pub(super) fn apply_pending_target(&mut self, cx: &mut Context<Self>) {
+        if !self.target_change_pending {
+            return;
+        }
+        let next = self.pending_request_context.take();
+        self.target_change_pending = false;
+        self.apply_target(next);
+        self.ensure_loaded(cx);
+        cx.notify();
+    }
+
+    fn apply_target(&mut self, next: Option<FilesRequestContext>) {
         self.loads.clear();
         self.watch_task = None;
         self.watch_sequence = None;
@@ -536,7 +576,6 @@ impl FilesSurface {
         };
         self.request_context = next;
         self.started = false;
-        true
     }
 
     fn sync_tree_list(&self) {

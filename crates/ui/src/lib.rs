@@ -243,7 +243,14 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // the subscription lives as long as the window does, and the window
             // owns nothing that would drop it early.
             appearance::observe_window(window, cx).detach();
-            cx.new(|cx| shell::Shell::new(state, boot, cx))
+            let shell = cx.new(|cx| shell::Shell::new(state, boot, cx));
+            let weak_shell = shell.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                weak_shell
+                    .update(cx, |shell, cx| shell.prepare_window_close(cx))
+                    .unwrap_or(true)
+            });
+            shell
         },
     )
     .expect("failed to open window");

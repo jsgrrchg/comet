@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use zeron_proto::{
     ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
     WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceFileSearchMatch,
-    WorkspaceFileText, WorkspaceTarget,
+    WorkspaceFileText, WorkspaceTarget, WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
 };
 use zeron_rpc::{RpcError, methods};
 
@@ -136,6 +136,13 @@ impl WorkspaceFilesClient {
         request: ReadWorkspaceFileRequest,
     ) -> Result<WorkspaceFileText, FilesClientError> {
         self.call(methods::READ_WORKSPACE_FILE, &request).await
+    }
+
+    pub async fn write_file(
+        &self,
+        request: WriteWorkspaceFileRequest,
+    ) -> Result<WriteWorkspaceFileOutcome, FilesClientError> {
+        self.call(methods::WRITE_WORKSPACE_FILE, &request).await
     }
 
     pub async fn watch(&self) -> Result<mpsc::Receiver<serde_json::Value>, FilesClientError> {
@@ -338,6 +345,18 @@ mod tests {
                         "truncated": false
                     }),
                 ),
+                (
+                    methods::WRITE_WORKSPACE_FILE.into(),
+                    serde_json::json!({
+                        "status": "written",
+                        "file": {
+                            "path": "src/lib.rs",
+                            "contentHash": "hash-2",
+                            "size": 12,
+                            "modifiedAt": null
+                        }
+                    }),
+                ),
             ]),
             watch_values: vec![serde_json::json!({ "sequence": 1, "changes": [] })],
             ..Default::default()
@@ -375,16 +394,78 @@ mod tests {
             })
             .await
             .unwrap();
+        let outcome = client
+            .write_file(WriteWorkspaceFileRequest {
+                target: target(),
+                path: "src/lib.rs".into(),
+                text: "fn main() {}".into(),
+                expected_content_hash: "hash".into(),
+                encoding: zeron_proto::WorkspaceWritableEncoding::Utf8,
+                line_ending: zeron_proto::WorkspaceWritableLineEnding::Lf,
+            })
+            .await
+            .unwrap();
         let mut watch = client.watch().await.unwrap();
 
         assert!(page.entries.is_empty());
         assert_eq!(search[0].path, "src/lib.rs");
         assert_eq!(file.text.as_deref(), Some("fn lib() {}"));
+        assert!(matches!(
+            outcome,
+            WriteWorkspaceFileOutcome::Written { file } if file.content_hash == "hash-2"
+        ));
         assert_eq!(watch.recv().await.unwrap()["sequence"], 1);
         let calls = transport.calls.lock().unwrap();
-        assert_eq!(calls.len(), 4);
+        assert_eq!(calls.len(), 5);
         assert!(calls.iter().all(|(_, params)| {
             params["chatId"] == "chat-1" && params["targetDeviceId"] == "remote-device"
         }));
+    }
+
+    #[tokio::test]
+    async fn write_decodes_conflicts_without_changing_request_shape() {
+        let transport = Arc::new(DeterministicTransport {
+            responses: HashMap::from([(
+                methods::WRITE_WORKSPACE_FILE.into(),
+                serde_json::json!({
+                    "status": "conflict",
+                    "reason": "changed",
+                    "currentContentHash": "disk-hash",
+                    "currentModifiedAt": null
+                }),
+            )]),
+            ..Default::default()
+        });
+        let context = FilesRequestContext {
+            target: target(),
+            target_device_id: None,
+            cwd: "/workspace".into(),
+            checkout_id: Some("checkout-1".into()),
+        };
+        let client = WorkspaceFilesClient::with_transport(transport.clone(), context);
+        let outcome = client
+            .write_file(WriteWorkspaceFileRequest {
+                target: target(),
+                path: "src/lib.rs".into(),
+                text: "changed".into(),
+                expected_content_hash: "hash".into(),
+                encoding: zeron_proto::WorkspaceWritableEncoding::Utf8,
+                line_ending: zeron_proto::WorkspaceWritableLineEnding::Lf,
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            outcome,
+            WriteWorkspaceFileOutcome::Conflict {
+                current_content_hash: Some(hash),
+                ..
+            } if hash == "disk-hash"
+        ));
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls[0].1["expectedContentHash"], "hash");
+        assert_eq!(calls[0].1["encoding"], "utf8");
+        assert_eq!(calls[0].1["lineEnding"], "lf");
+        assert!(calls[0].1.get("targetDeviceId").is_none());
     }
 }

@@ -2,13 +2,15 @@ use std::{cell::Cell, collections::HashMap, rc::Rc, sync::Arc};
 
 use gpui::{
     AnyElement, Context, ListAlignment, ListSizingBehavior, ListState, Point, Render, ScrollHandle,
-    SharedString, Task, Window, div, font, list, prelude::*, px,
+    SharedString, Window, div, font, list, prelude::*, px,
 };
-use zeron_proto::{
-    ReadWorkspaceFileRequest, WorkspaceFileSearchMatch, WorkspaceFileText, WorkspaceReadOnlyReason,
-};
+use zeron_proto::{ReadWorkspaceFileRequest, WorkspaceFileSearchMatch, WorkspaceReadOnlyReason};
 
-use super::{FilesSurface, client::WorkspaceFilesClient};
+use super::{
+    FilesSurface,
+    client::{FilesRequestContext, WorkspaceFilesClient},
+    document::{DocumentKey, DocumentPhase, FileDocument},
+};
 use crate::{
     icons::{self, icon},
     syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache},
@@ -19,22 +21,6 @@ const PREVIEW_LINE_HEIGHT: f32 = 20.0;
 const WIDE_BREAKPOINT: f32 = 680.0;
 const TREE_SPLIT_DEFAULT: f32 = 286.0;
 
-enum DocumentPhase {
-    Loading,
-    Ready(ReadyDocument),
-    Error(SharedString),
-}
-
-struct ReadyDocument {
-    file: WorkspaceFileText,
-    lines: Arc<Vec<SharedString>>,
-}
-
-struct FileDocument {
-    phase: DocumentPhase,
-    externally_modified: bool,
-}
-
 struct HighlightedFile {
     content_hash: String,
     document: Arc<zeron_syntax::HighlightedDocument>,
@@ -43,8 +29,6 @@ struct HighlightedFile {
 pub(super) struct FilePreviewState {
     documents: HashMap<String, FileDocument>,
     active: Option<String>,
-    reads: HashMap<String, Task<()>>,
-    highlight_tasks: HashMap<String, Task<()>>,
     highlights: HashMap<String, HighlightedFile>,
     syntax_cache: SyntaxHighlightCache,
     list: ListState,
@@ -60,8 +44,6 @@ impl FilePreviewState {
         Self {
             documents: HashMap::new(),
             active: None,
-            reads: HashMap::new(),
-            highlight_tasks: HashMap::new(),
             highlights: HashMap::new(),
             syntax_cache: SyntaxHighlightCache::default(),
             list: ListState::new(0, ListAlignment::Top, px(520.0)),
@@ -76,8 +58,6 @@ impl FilePreviewState {
     pub(super) fn reset(&mut self) {
         self.documents.clear();
         self.active = None;
-        self.reads.clear();
-        self.highlight_tasks.clear();
         self.highlights.clear();
         self.list.reset(0);
         self.tree_sidebar_visible = false;
@@ -113,8 +93,16 @@ impl FilePreviewState {
 
     pub(super) fn mark_external(&mut self, path: &str) {
         if let Some(document) = self.documents.get_mut(path) {
-            document.externally_modified = true;
+            document.phase = DocumentPhase::ExternallyModified { disk_hash: None };
         }
+    }
+}
+
+fn document_key(context: &FilesRequestContext, path: String) -> DocumentKey {
+    DocumentKey {
+        chat_id: context.target.chat_id.clone().unwrap_or_default(),
+        checkout_id: context.checkout_id.clone(),
+        path,
     }
 }
 
@@ -149,12 +137,12 @@ impl FilesSurface {
         self.preview.active = Some(path.clone());
         self.preview.tree_sidebar_visible = false;
         if !self.preview.documents.contains_key(&path) {
+            let Some(context) = self.request_context.as_ref() else {
+                return;
+            };
             self.preview.documents.insert(
                 path.clone(),
-                FileDocument {
-                    phase: DocumentPhase::Loading,
-                    externally_modified: false,
-                },
+                FileDocument::loading(document_key(context, path.clone())),
             );
             self.read_file(path, cx);
         } else {
@@ -174,16 +162,19 @@ impl FilesSurface {
             }
             return;
         };
-        if let Some(document) = self.preview.documents.get_mut(&path) {
-            document.phase = DocumentPhase::Loading;
-            document.externally_modified = false;
-        }
+        let Some(document) = self.preview.documents.get_mut(&path) else {
+            return;
+        };
+        let key = document_key(&context, path.clone());
+        document.key = key.clone();
+        let generation = document.begin_load();
         let request = ReadWorkspaceFileRequest {
             target: context.target.clone(),
             path: path.clone(),
         };
         let client = WorkspaceFilesClient::new(engine, context.clone());
         let task_path = path.clone();
+        let task_key = key.clone();
         let task = cx.spawn(async move |this, cx| {
             let mut result = client.read_file(request.clone()).await;
             if result.as_ref().is_err_and(|error| error.retryable()) {
@@ -199,37 +190,35 @@ impl FilesSurface {
                 let Some(document) = surface.preview.documents.get_mut(&task_path) else {
                     return;
                 };
+                if !document.accepts(&task_key, generation) {
+                    return;
+                }
                 match result {
                     Ok(file) => {
-                        let lines = Arc::new(
-                            file.text
-                                .as_deref()
-                                .unwrap_or_default()
-                                .split('\n')
-                                .map(|line| SharedString::from(line.to_string()))
-                                .collect::<Vec<_>>(),
-                        );
                         let highlight = file
                             .text
                             .as_ref()
                             .zip(file.content_hash.as_ref())
                             .map(|(source, hash)| (source.clone(), hash.clone()));
-                        document.phase = DocumentPhase::Ready(ReadyDocument { file, lines });
-                        document.externally_modified = false;
+                        document.set_loaded(file);
                         surface.sync_preview_list();
                         if let Some((source, hash)) = highlight {
                             surface.request_file_highlight(task_path.clone(), source, hash, cx);
                         }
                     }
                     Err(error) => {
-                        document.phase = DocumentPhase::Error(error.to_string().into());
+                        document.set_error(error.to_string());
                         surface.sync_preview_list();
                     }
                 }
                 cx.notify();
             });
         });
-        self.preview.reads.insert(path, task);
+        if let Some(document) = self.preview.documents.get_mut(&path)
+            && document.accepts(&key, generation)
+        {
+            document.read_task = Some(task);
+        }
         self.sync_preview_list();
         cx.notify();
     }
@@ -242,6 +231,14 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) {
         let Some(language) = zeron_syntax::language_for_path(&path) else {
+            return;
+        };
+        let Some((document_key, generation)) = self
+            .preview
+            .documents
+            .get(&path)
+            .map(|document| (document.key.clone(), document.generation))
+        else {
             return;
         };
         let key = DocumentHighlightKey::new(language, &source);
@@ -257,6 +254,7 @@ impl FilesSurface {
             return;
         }
         let highlight_path = path.clone();
+        let task_document_key = document_key.clone();
         let task = cx.spawn(async move |this, cx| {
             let request_path = highlight_path.clone();
             let highlighted = cx
@@ -277,11 +275,10 @@ impl FilesSurface {
                         .preview
                         .documents
                         .get(&highlight_path)
-                        .and_then(|document| match &document.phase {
-                            DocumentPhase::Ready(ready) => ready.file.content_hash.as_deref(),
-                            _ => None,
-                        })
-                        == Some(content_hash.as_str());
+                        .is_some_and(|document| {
+                            document.accepts(&task_document_key, generation)
+                                && document.content_hash() == Some(content_hash.as_str())
+                        });
                 if !still_current {
                     return;
                 }
@@ -298,7 +295,11 @@ impl FilesSurface {
                 }
             });
         });
-        self.preview.highlight_tasks.insert(path, task);
+        if let Some(document) = self.preview.documents.get_mut(&path)
+            && document.accepts(&document_key, generation)
+        {
+            document.highlight_task = Some(task);
+        }
     }
 
     fn sync_preview_list(&self) {
@@ -307,10 +308,7 @@ impl FilesSurface {
             .active
             .as_deref()
             .and_then(|path| self.preview.documents.get(path))
-            .and_then(|document| match &document.phase {
-                DocumentPhase::Ready(ready) => Some(ready.lines.len()),
-                _ => None,
-            })
+            .map(|document| document.lines.len())
             .unwrap_or(0);
         self.preview
             .list
@@ -333,11 +331,12 @@ impl FilesSurface {
             return gpui::Empty.into_any_element();
         };
         let breadcrumb = self.render_breadcrumb(&active, show_sidebar_toggle, &theme, cx);
-        let external = self
-            .preview
-            .documents
-            .get(&active)
-            .is_some_and(|document| document.externally_modified);
+        let external = self.preview.documents.get(&active).is_some_and(|document| {
+            matches!(
+                document.phase,
+                DocumentPhase::ExternallyModified { .. } | DocumentPhase::Conflict { .. }
+            )
+        });
         let body = self.render_document_body(&active, &theme, cx);
         div()
             .size_full()
@@ -544,84 +543,84 @@ impl FilesSurface {
         let Some(document) = self.preview.documents.get(path) else {
             return gpui::Empty.into_any_element();
         };
-        match &document.phase {
-            DocumentPhase::Loading => centered_state("Loading file…", theme.text_faint),
-            DocumentPhase::Error(error) => centered_state(error.clone(), theme.danger_muted),
-            DocumentPhase::Ready(ready) => {
-                if ready.file.text.is_none() {
-                    return centered_state(
-                        read_only_message(ready.file.read_only_reason),
-                        theme.text_muted,
-                    );
-                }
-                let truncated = ready.file.truncated;
-                let word_wrap = self.preview.word_wrap();
-                let code_scroll = if word_wrap {
-                    div()
-                        .id("files-preview-code-scroll")
-                        .flex_1()
-                        .min_w_0()
-                        .min_h_0()
-                        .flex()
-                        .child(
-                            list(
-                                self.preview.list.clone(),
-                                cx.processor(Self::render_preview_line),
-                            )
-                            .flex_1()
-                            .min_h_0()
-                            .with_sizing_behavior(ListSizingBehavior::Auto),
-                        )
-                } else {
-                    let mut scroll = div()
-                        .id("files-preview-code-scroll")
-                        .flex_1()
-                        .min_w_0()
-                        .min_h_0()
-                        .flex()
-                        .overflow_x_scroll()
-                        .track_scroll(&self.preview.horizontal_scroll)
-                        .child(
-                            div().flex_none().min_w_full().h_full().child(
-                                list(
-                                    self.preview.list.clone(),
-                                    cx.processor(Self::render_preview_line),
-                                )
-                                .h_full()
-                                .with_sizing_behavior(ListSizingBehavior::Infer),
-                            ),
-                        );
-                    // GPUI otherwise maps a vertical wheel gesture to X for an
-                    // x-only scroller, preventing the list from receiving it.
-                    scroll.style().restrict_scroll_to_axis = Some(true);
-                    scroll
-                };
-
-                div()
+        if matches!(document.phase, DocumentPhase::Loading) {
+            return centered_state("Loading file…", theme.text_faint);
+        }
+        if let DocumentPhase::Error(error) | DocumentPhase::SaveFailed(error) = &document.phase {
+            return centered_state(error.clone(), theme.danger_muted);
+        }
+        let Some(file) = document.file.as_ref() else {
+            return centered_state("This file cannot be previewed.", theme.text_muted);
+        };
+        if file.text.is_none() {
+            return centered_state(read_only_message(file.read_only_reason), theme.text_muted);
+        }
+        let truncated = file.truncated;
+        let word_wrap = self.preview.word_wrap();
+        let code_scroll = if word_wrap {
+            div()
+                .id("files-preview-code-scroll")
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .child(
+                    list(
+                        self.preview.list.clone(),
+                        cx.processor(Self::render_preview_line),
+                    )
                     .flex_1()
                     .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .when(truncated, |element| {
-                        element.child(
-                            div()
-                                .h(px(28.0))
-                                .flex_none()
-                                .px(px(10.0))
-                                .border_b_1()
-                                .border_color(theme.border)
-                                .bg(theme.warning.opacity(0.045))
-                                .flex()
-                                .items_center()
-                                .text_size(px(10.0))
-                                .text_color(theme.warning_muted)
-                                .child("Large file preview is truncated and read-only."),
+                    .with_sizing_behavior(ListSizingBehavior::Auto),
+                )
+        } else {
+            let mut scroll = div()
+                .id("files-preview-code-scroll")
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .overflow_x_scroll()
+                .track_scroll(&self.preview.horizontal_scroll)
+                .child(
+                    div().flex_none().min_w_full().h_full().child(
+                        list(
+                            self.preview.list.clone(),
+                            cx.processor(Self::render_preview_line),
                         )
-                    })
-                    .child(code_scroll)
-                    .into_any_element()
-            }
-        }
+                        .h_full()
+                        .with_sizing_behavior(ListSizingBehavior::Infer),
+                    ),
+                );
+            // GPUI otherwise maps a vertical wheel gesture to X for an x-only
+            // scroller, preventing the list from receiving it.
+            scroll.style().restrict_scroll_to_axis = Some(true);
+            scroll
+        };
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when(truncated, |element| {
+                element.child(
+                    div()
+                        .h(px(28.0))
+                        .flex_none()
+                        .px(px(10.0))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .bg(theme.warning.opacity(0.045))
+                        .flex()
+                        .items_center()
+                        .text_size(px(10.0))
+                        .text_color(theme.warning_muted)
+                        .child("Large file preview is truncated and read-only."),
+                )
+            })
+            .child(code_scroll)
+            .into_any_element()
     }
 
     fn render_preview_line(
@@ -636,10 +635,10 @@ impl FilesSurface {
         let Some(document) = self.preview.documents.get(path) else {
             return gpui::Empty.into_any_element();
         };
-        let DocumentPhase::Ready(ready) = &document.phase else {
+        let Some(file) = document.file.as_ref() else {
             return gpui::Empty.into_any_element();
         };
-        let Some(line) = ready.lines.get(index) else {
+        let Some(line) = document.lines.get(index) else {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
@@ -649,7 +648,7 @@ impl FilesSurface {
             .highlights
             .get(path)
             .filter(|highlight| {
-                ready.file.content_hash.as_deref() == Some(highlight.content_hash.as_str())
+                file.content_hash.as_deref() == Some(highlight.content_hash.as_str())
             })
             .and_then(|highlight| highlight.document.lines.get(index))
             .map(Vec::as_slice)
@@ -785,11 +784,13 @@ mod tests {
         preview.active = Some("private.env".into());
         preview.documents.insert(
             "private.env".into(),
-            FileDocument {
-                phase: DocumentPhase::Loading,
-                externally_modified: true,
-            },
+            FileDocument::loading(DocumentKey {
+                chat_id: "chat-1".into(),
+                checkout_id: Some("checkout-1".into()),
+                path: "private.env".into(),
+            }),
         );
+        preview.mark_external("private.env");
         preview.tree_sidebar_visible = true;
 
         preview.reset();

@@ -14,6 +14,7 @@ use crate::{
 };
 
 pub mod client;
+pub mod document;
 pub mod editor;
 pub mod editor_adapter;
 pub mod model;

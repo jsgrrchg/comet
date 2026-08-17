@@ -3,7 +3,7 @@ use std::{collections::HashSet, time::Duration};
 use gpui::Context;
 use zeron_proto::{WorkspaceFileChangeKind, WorkspaceFileChanges};
 
-use super::{FilesSurface, client::WorkspaceFilesClient, model::parent_path};
+use super::{FilesEvent, FilesSurface, client::WorkspaceFilesClient, model::parent_path};
 
 impl FilesSurface {
     pub(super) fn ensure_watch(&mut self, cx: &mut Context<Self>) {
@@ -76,6 +76,7 @@ impl FilesSurface {
         self.watch_sequence = Some(frame.sequence);
         if frame.resync_required || gap {
             self.refresh(cx);
+            self.reconcile_open_documents(cx);
             return;
         }
 
@@ -88,10 +89,11 @@ impl FilesSurface {
                     }
                 }
                 WorkspaceFileChangeKind::Modified => {
-                    self.preview.mark_external(&change.path);
+                    self.reconcile_document(change.path, cx);
                 }
                 WorkspaceFileChangeKind::Removed => {
                     self.tree.remove(&change.path);
+                    self.mark_document_deleted(&change.path, cx);
                     if let Some(parent) = parent_path(&change.path) {
                         parents.insert(parent);
                     }
@@ -99,6 +101,11 @@ impl FilesSurface {
                 WorkspaceFileChangeKind::Renamed => {
                     if let Some(old_path) = change.old_path {
                         self.tree.remove(&old_path);
+                        for (old_path, new_path) in
+                            self.rename_documents(&old_path, change.path.clone(), cx)
+                        {
+                            cx.emit(FilesEvent::FileRenamed { old_path, new_path });
+                        }
                         if let Some(parent) = parent_path(&old_path) {
                             parents.insert(parent);
                         }

@@ -58,7 +58,10 @@ pub(super) struct FileDocument {
     pub highlight_task: Option<Task<()>>,
     pub autosave_task: Option<Task<()>>,
     pub save_task: Option<Task<()>>,
+    pub reconcile_task: Option<Task<()>>,
     pub pending_save: Option<PendingSave>,
+    pub pending_external_reload: Option<WorkspaceFileText>,
+    pub reconcile_after_save: bool,
 }
 
 #[allow(dead_code)]
@@ -82,7 +85,10 @@ impl FileDocument {
             highlight_task: None,
             autosave_task: None,
             save_task: None,
+            reconcile_task: None,
             pending_save: None,
+            pending_external_reload: None,
+            reconcile_after_save: false,
         }
     }
 
@@ -93,7 +99,10 @@ impl FileDocument {
         self.highlight_task = None;
         self.autosave_task = None;
         self.save_task = None;
+        self.reconcile_task = None;
         self.pending_save = None;
+        self.pending_external_reload = None;
+        self.reconcile_after_save = false;
         self.generation
     }
 
@@ -123,6 +132,8 @@ impl FileDocument {
         self.revision = 0;
         self.saved_revision = 0;
         self.pending_save = None;
+        self.pending_external_reload = None;
+        self.reconcile_after_save = false;
         self.file = Some(file);
     }
 
@@ -135,9 +146,9 @@ impl FileDocument {
     }
 
     pub fn is_editable(&self) -> bool {
-        matches!(
+        !matches!(
             self.phase,
-            DocumentPhase::Ready | DocumentPhase::Saving | DocumentPhase::SaveFailed(_)
+            DocumentPhase::Loading | DocumentPhase::ReadOnly(_) | DocumentPhase::Error(_)
         ) && self.file.as_ref().is_some_and(|file| file.text.is_some())
             && self.saved_hash.is_some()
             && self.encoding.is_some()
@@ -148,7 +159,10 @@ impl FileDocument {
         self.is_editable()
             && self.is_dirty()
             && self.pending_save.is_none()
-            && !matches!(self.phase, DocumentPhase::Saving)
+            && matches!(
+                self.phase,
+                DocumentPhase::Ready | DocumentPhase::SaveFailed(_)
+            )
     }
 
     pub fn mark_user_edit(&mut self) {
@@ -209,6 +223,47 @@ impl FileDocument {
         self.autosave_task = None;
         self.phase = DocumentPhase::Conflict { disk_hash };
         true
+    }
+
+    pub fn mark_external(&mut self, disk_hash: Option<String>) {
+        self.autosave_task = None;
+        self.phase = DocumentPhase::ExternallyModified { disk_hash };
+    }
+
+    pub fn mark_deleted(&mut self) {
+        self.autosave_task = None;
+        self.save_task = None;
+        self.reconcile_task = None;
+        self.pending_save = None;
+        self.pending_external_reload = None;
+        self.phase = DocumentPhase::DeletedOnDisk;
+    }
+
+    pub fn queue_external_reload(&mut self, file: WorkspaceFileText) {
+        self.pending_external_reload = Some(file);
+        self.reconcile_task = None;
+    }
+
+    pub fn apply_external_reload(&mut self, file: WorkspaceFileText) {
+        let hash = file.content_hash.clone();
+        self.encoding = writable_encoding(file.encoding);
+        self.line_ending = writable_line_ending(file.line_ending);
+        self.lines = Arc::new(
+            file.text
+                .as_deref()
+                .unwrap_or_default()
+                .split('\n')
+                .map(|line| SharedString::from(line.to_string()))
+                .collect(),
+        );
+        self.loaded_hash = hash.clone();
+        self.saved_hash = hash;
+        self.saved_revision = self.revision;
+        self.phase = read_only_reason(&file)
+            .map(DocumentPhase::ReadOnly)
+            .unwrap_or(DocumentPhase::Ready);
+        self.pending_external_reload = None;
+        self.file = Some(file);
     }
 
     pub fn content_hash(&self) -> Option<&str> {
@@ -368,5 +423,41 @@ mod tests {
         assert!(!document.finish_save(revision.wrapping_add(1), "wrong-hash".into()));
         assert!(document.is_dirty());
         assert!(matches!(document.phase, DocumentPhase::Saving));
+    }
+
+    #[test]
+    fn external_reload_is_clean_but_external_dirty_state_blocks_autosave() {
+        let mut document = FileDocument::loading(key("src/lib.rs"));
+        document.set_loaded(text_file());
+        let mut reloaded = text_file();
+        reloaded.text = Some("fn external() {}".into());
+        reloaded.content_hash = Some("hash-2".into());
+        document.apply_external_reload(reloaded);
+        assert_eq!(document.saved_hash.as_deref(), Some("hash-2"));
+        assert!(!document.is_dirty());
+
+        document.mark_user_edit();
+        document.mark_external(Some("hash-3".into()));
+        document.mark_user_edit();
+        assert_eq!(document.revision, 2);
+        assert!(!document.can_autosave());
+        assert!(matches!(
+            document.phase,
+            DocumentPhase::ExternallyModified {
+                disk_hash: Some(ref hash)
+            } if hash == "hash-3"
+        ));
+    }
+
+    #[test]
+    fn deletion_preserves_dirty_revision_and_stops_autosave() {
+        let mut document = FileDocument::loading(key("src/lib.rs"));
+        document.set_loaded(text_file());
+        document.mark_user_edit();
+        document.mark_deleted();
+        assert!(document.is_dirty());
+        assert!(document.is_editable());
+        assert!(!document.can_autosave());
+        assert!(matches!(document.phase, DocumentPhase::DeletedOnDisk));
     }
 }

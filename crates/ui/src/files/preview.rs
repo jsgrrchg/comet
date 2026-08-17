@@ -40,6 +40,7 @@ pub(super) struct FilePreviewState {
     surface_width: Rc<Cell<f32>>,
     word_wrap: bool,
     autosave_delay_ms: u64,
+    reload_confirmation: Option<String>,
     tree_sidebar_visible: bool,
     tree_width: f32,
 }
@@ -56,6 +57,7 @@ impl FilePreviewState {
             surface_width: Rc::new(Cell::new(520.0)),
             word_wrap: false,
             autosave_delay_ms,
+            reload_confirmation: None,
             tree_sidebar_visible: false,
             tree_width: TREE_SPLIT_DEFAULT,
         }
@@ -66,6 +68,7 @@ impl FilePreviewState {
         self.active = None;
         self.highlights.clear();
         self.list.reset(0);
+        self.reload_confirmation = None;
         self.tree_sidebar_visible = false;
     }
 
@@ -108,12 +111,6 @@ impl FilePreviewState {
     pub(super) fn narrow_tree_width(&self) -> f32 {
         (self.surface_width.get() * 0.44).clamp(152.0, self.tree_width)
     }
-
-    pub(super) fn mark_external(&mut self, path: &str) {
-        if let Some(document) = self.documents.get_mut(path) {
-            document.phase = DocumentPhase::ExternallyModified { disk_hash: None };
-        }
-    }
 }
 
 fn document_key(context: &FilesRequestContext, path: String) -> DocumentKey {
@@ -121,6 +118,15 @@ fn document_key(context: &FilesRequestContext, path: String) -> DocumentKey {
         chat_id: context.target.chat_id.clone().unwrap_or_default(),
         checkout_id: context.checkout_id.clone(),
         path,
+    }
+}
+
+fn renamed_document_path(path: &str, old_path: &str, new_path: &str) -> Option<String> {
+    if path == old_path {
+        Some(new_path.to_string())
+    } else {
+        path.strip_prefix(&format!("{old_path}/"))
+            .map(|suffix| format!("{new_path}/{suffix}"))
     }
 }
 
@@ -556,8 +562,13 @@ impl FilesSurface {
                     }
                 }
                 let save_again = document.can_autosave();
+                let reconcile = document.reconcile_after_save;
+                document.reconcile_after_save = false;
                 if save_again {
                     surface.schedule_autosave(task_path.clone(), cx);
+                }
+                if reconcile {
+                    surface.reconcile_document(task_path.clone(), cx);
                 }
                 cx.notify();
             });
@@ -568,6 +579,188 @@ impl FilesSurface {
             document.save_task = Some(task);
         }
         cx.notify();
+    }
+
+    pub(super) fn reconcile_document(&mut self, path: String, cx: &mut Context<Self>) {
+        let Some(context) = self.request_context.clone() else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(document) = self.preview.documents.get_mut(&path) else {
+            return;
+        };
+        if matches!(document.phase, DocumentPhase::Saving) {
+            document.reconcile_after_save = true;
+            return;
+        }
+        let key = document.key.clone();
+        let generation = document.generation;
+        let request = ReadWorkspaceFileRequest {
+            target: context.target.clone(),
+            path: path.clone(),
+        };
+        let client = WorkspaceFilesClient::new(engine, context.clone());
+        let task_path = path.clone();
+        let task_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let result = client.read_file(request).await;
+            let _ = this.update(cx, |surface, cx| {
+                if surface.request_context.as_ref() != Some(&context) {
+                    return;
+                }
+                let Some(document) = surface.preview.documents.get_mut(&task_path) else {
+                    return;
+                };
+                if !document.accepts(&task_key, generation) {
+                    return;
+                }
+                if matches!(document.phase, DocumentPhase::Saving) {
+                    document.reconcile_after_save = true;
+                    return;
+                }
+                document.reconcile_task = None;
+                let Ok(file) = result else {
+                    return;
+                };
+                if file.content_hash == document.saved_hash {
+                    if matches!(document.phase, DocumentPhase::ExternallyModified { .. }) {
+                        document.phase = DocumentPhase::Ready;
+                    }
+                    return;
+                }
+                if document.is_dirty() {
+                    document.mark_external(file.content_hash);
+                } else {
+                    document.queue_external_reload(file);
+                }
+                cx.notify();
+            });
+        });
+        if let Some(document) = self.preview.documents.get_mut(&path)
+            && document.accepts(&key, generation)
+        {
+            document.reconcile_task = Some(task);
+        }
+    }
+
+    pub(super) fn reconcile_open_documents(&mut self, cx: &mut Context<Self>) {
+        let paths = self.preview.documents.keys().cloned().collect::<Vec<_>>();
+        for path in paths {
+            self.reconcile_document(path, cx);
+        }
+    }
+
+    pub(super) fn mark_document_deleted(&mut self, path: &str, cx: &mut Context<Self>) {
+        let prefix = format!("{path}/");
+        let mut changed = false;
+        for (document_path, document) in &mut self.preview.documents {
+            if document_path == path || document_path.starts_with(&prefix) {
+                document.mark_deleted();
+                changed = true;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub(super) fn rename_documents(
+        &mut self,
+        old_path: &str,
+        new_path: String,
+        cx: &mut Context<Self>,
+    ) -> Vec<(String, String)> {
+        let renames = self
+            .preview
+            .documents
+            .keys()
+            .filter_map(|path| {
+                renamed_document_path(path, old_path, &new_path)
+                    .map(|renamed| (path.clone(), renamed))
+            })
+            .collect::<Vec<_>>();
+        for (old_document_path, new_document_path) in &renames {
+            let Some(mut document) = self.preview.documents.remove(old_document_path) else {
+                continue;
+            };
+            let needs_review =
+                document.is_dirty() || matches!(document.phase, DocumentPhase::Saving);
+            document.read_task = None;
+            document.highlight_task = None;
+            document.autosave_task = None;
+            document.save_task = None;
+            document.reconcile_task = None;
+            document.pending_save = None;
+            document.key.path = new_document_path.clone();
+            if let Some(file) = document.file.as_mut() {
+                file.path = new_document_path.clone();
+            }
+            if let Some(editor) = document.editor.clone() {
+                let event_path = new_document_path.clone();
+                document.editor_events =
+                    Some(cx.subscribe(&editor, move |surface, _, event, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            surface.on_editor_change(&event_path, cx);
+                        }
+                    }));
+            }
+            if needs_review {
+                document.mark_external(None);
+            }
+            if self.preview.active.as_deref() == Some(old_document_path) {
+                self.preview.active = Some(new_document_path.clone());
+            }
+            if self.editor_path.as_deref() == Some(old_document_path) {
+                self.editor_path = Some(new_document_path.clone());
+            }
+            if let Some(highlight) = self.preview.highlights.remove(old_document_path) {
+                self.preview
+                    .highlights
+                    .insert(new_document_path.clone(), highlight);
+            }
+            self.preview
+                .documents
+                .insert(new_document_path.clone(), document);
+        }
+        if !renames.is_empty() {
+            cx.notify();
+        }
+        renames
+    }
+
+    fn apply_pending_external_reload(
+        &mut self,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file) = self
+            .preview
+            .documents
+            .get_mut(path)
+            .and_then(|document| document.pending_external_reload.take())
+        else {
+            return;
+        };
+        let text = file.text.clone();
+        let hash = file.content_hash.clone();
+        let editor = self
+            .preview
+            .documents
+            .get(path)
+            .and_then(|document| document.editor.clone());
+        if let (Some(editor), Some(text)) = (editor, text.clone()) {
+            editor.update(cx, |state, cx| state.set_value(text, window, cx));
+        }
+        if let Some(document) = self.preview.documents.get_mut(path) {
+            document.apply_external_reload(file);
+        }
+        self.sync_preview_list();
+        if let (Some(text), Some(hash)) = (text, hash) {
+            self.request_file_highlight(path.to_string(), text, hash, cx);
+        }
     }
 
     fn sync_preview_list(&self) {
@@ -587,6 +780,44 @@ impl FilesSurface {
         if let Some(path) = self.preview.active.clone() {
             self.read_file(path, cx);
         }
+    }
+
+    fn reload_external_document(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.preview.active.clone() else {
+            return;
+        };
+        let dirty = self
+            .preview
+            .documents
+            .get(&path)
+            .is_some_and(FileDocument::is_dirty);
+        if dirty && self.preview.reload_confirmation.as_deref() != Some(path.as_str()) {
+            self.preview.reload_confirmation = Some(path);
+            cx.notify();
+            return;
+        }
+        self.preview.reload_confirmation = None;
+        self.read_file(path, cx);
+    }
+
+    fn cancel_external_reload(&mut self, cx: &mut Context<Self>) {
+        self.preview.reload_confirmation = None;
+        cx.notify();
+    }
+
+    fn keep_external_edits(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.preview.active.clone() else {
+            return;
+        };
+        if let Some(document) = self.preview.documents.get_mut(&path)
+            && let DocumentPhase::ExternallyModified { disk_hash } = &document.phase
+        {
+            document.phase = DocumentPhase::Conflict {
+                disk_hash: disk_hash.clone(),
+            };
+        }
+        self.preview.reload_confirmation = None;
+        cx.notify();
     }
 
     fn retry_active_save(&mut self, cx: &mut Context<Self>) {
@@ -620,6 +851,7 @@ impl FilesSurface {
                 DocumentPhase::ExternallyModified { .. } | DocumentPhase::Conflict { .. }
             )
         });
+        let confirming_reload = self.preview.reload_confirmation.as_deref() == Some(&active);
         let body = self.render_document_body(&active, &theme, window, cx);
         div()
             .size_full()
@@ -641,17 +873,63 @@ impl FilesSurface {
                         .bg(theme.warning.opacity(0.055))
                         .text_size(px(10.5))
                         .text_color(theme.warning_muted)
-                        .child("This file changed outside Zeron.")
+                        .child(if confirming_reload {
+                            "Discard unsaved changes?"
+                        } else {
+                            "This file changed outside Zeron."
+                        })
                         .child(
                             div()
-                                .id("files-reload-external")
                                 .ml_auto()
-                                .cursor_pointer()
-                                .text_color(theme.text)
-                                .child("Reload")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.reload_active_document(cx)),
-                                ),
+                                .flex()
+                                .items_center()
+                                .gap(px(10.0))
+                                .when(!confirming_reload, |actions| {
+                                    actions
+                                        .child(
+                                            div()
+                                                .id("files-keep-external-edits")
+                                                .cursor_pointer()
+                                                .text_color(theme.text_muted)
+                                                .child("Keep Editing")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.keep_external_edits(cx)
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("files-reload-external")
+                                                .cursor_pointer()
+                                                .text_color(theme.text)
+                                                .child("Reload from Disk")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.reload_external_document(cx)
+                                                })),
+                                        )
+                                })
+                                .when(confirming_reload, |actions| {
+                                    actions
+                                        .child(
+                                            div()
+                                                .id("files-cancel-external-reload")
+                                                .cursor_pointer()
+                                                .text_color(theme.text_muted)
+                                                .child("Cancel")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.cancel_external_reload(cx)
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("files-confirm-external-reload")
+                                                .cursor_pointer()
+                                                .text_color(theme.text)
+                                                .child("Discard & Reload")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.reload_external_document(cx)
+                                                })),
+                                        )
+                                }),
                         ),
                 )
             })
@@ -860,6 +1138,7 @@ impl FilesSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.apply_pending_external_reload(path, window, cx);
         let editor = self.ensure_editor(path, theme, window, cx);
         let Some(document) = self.preview.documents.get(path) else {
             return gpui::Empty.into_any_element();
@@ -1170,7 +1449,11 @@ mod tests {
                 path: "private.env".into(),
             }),
         );
-        preview.mark_external("private.env");
+        preview
+            .documents
+            .get_mut("private.env")
+            .unwrap()
+            .mark_external(None);
         preview.tree_sidebar_visible = true;
 
         preview.reset();
@@ -1178,5 +1461,17 @@ mod tests {
         assert!(preview.documents.is_empty());
         assert!(preview.active.is_none());
         assert!(!preview.tree_sidebar_visible);
+    }
+
+    #[test]
+    fn directory_rename_updates_open_descendant_paths() {
+        assert_eq!(
+            renamed_document_path("src/files/mod.rs", "src", "crates/ui/src"),
+            Some("crates/ui/src/files/mod.rs".into())
+        );
+        assert_eq!(
+            renamed_document_path("src-old/lib.rs", "src", "crates/ui/src"),
+            None
+        );
     }
 }

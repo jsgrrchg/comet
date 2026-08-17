@@ -32,6 +32,7 @@ use search::FileSearchState;
 pub enum FilesEvent {
     OpenFile(String),
     TitleChanged,
+    FileRenamed { old_path: String, new_path: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

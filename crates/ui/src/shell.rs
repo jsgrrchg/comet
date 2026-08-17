@@ -1617,6 +1617,7 @@ impl Shell {
             let sub = cx.subscribe(&files, |this: &mut Self, _, event, cx| match event {
                 FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
                 FilesEvent::TitleChanged => cx.notify(),
+                FilesEvent::FileRenamed { .. } => cx.notify(),
             });
             self.files.insert(key.clone(), files);
             self.files_subs.insert(key.clone(), sub);
@@ -1651,9 +1652,13 @@ impl Shell {
                 cx,
             )
         });
-        let sub = cx.subscribe(&file, |this: &mut Self, _, event, cx| match event {
+        let event_panel_key = panel_key.clone();
+        let sub = cx.subscribe(&file, move |this: &mut Self, _, event, cx| match event {
             FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), cx),
             FilesEvent::TitleChanged => cx.notify(),
+            FilesEvent::FileRenamed { old_path, new_path } => {
+                this.rename_file_surface(id, &event_panel_key, old_path, new_path, cx)
+            }
         });
         self.file_surfaces.insert(id, file);
         self.file_surface_paths.insert(id, path);
@@ -1664,6 +1669,26 @@ impl Shell {
             .or_default()
             .push(RightSurface::File(id));
         self.set_right_active(RightSurface::File(id), cx);
+    }
+
+    fn rename_file_surface(
+        &mut self,
+        id: u64,
+        panel_key: &str,
+        old_path: &str,
+        new_path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.file_surface_paths.get(&id).map(String::as_str) != Some(old_path) {
+            return;
+        }
+        self.file_surface_paths.insert(id, new_path.to_string());
+        self.file_surface_keys
+            .remove(&(panel_key.to_string(), old_path.to_string()));
+        self.file_surface_keys
+            .entry((panel_key.to_string(), new_path.to_string()))
+            .or_insert(id);
+        cx.notify();
     }
 
     /// A History row click: the commit opens as its own pinned diff tab

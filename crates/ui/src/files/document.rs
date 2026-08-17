@@ -250,6 +250,18 @@ impl FileDocument {
         self.phase = DocumentPhase::DeletedOnDisk;
     }
 
+    pub fn restore_on_disk(&mut self, file: WorkspaceFileText) {
+        let hash = file.content_hash.clone();
+        self.encoding = writable_encoding(file.encoding);
+        self.line_ending = writable_line_ending(file.line_ending);
+        self.loaded_hash = hash.clone();
+        self.saved_hash = hash;
+        self.phase = read_only_reason(&file)
+            .map(DocumentPhase::ReadOnly)
+            .unwrap_or(DocumentPhase::Ready);
+        self.file = Some(file);
+    }
+
     pub fn queue_external_reload(&mut self, file: WorkspaceFileText) {
         self.pending_external_reload = Some(file);
         self.reconcile_task = None;
@@ -488,6 +500,25 @@ mod tests {
         assert!(document.is_editable());
         assert!(!document.can_autosave());
         assert!(matches!(document.phase, DocumentPhase::DeletedOnDisk));
+    }
+
+    #[test]
+    fn same_content_recreation_restores_disk_state_without_losing_dirty_edits() {
+        let mut clean = FileDocument::loading(key("src/lib.rs"));
+        clean.set_loaded(text_file());
+        clean.mark_deleted();
+        clean.restore_on_disk(text_file());
+        assert!(matches!(clean.phase, DocumentPhase::Ready));
+        assert!(!clean.is_dirty());
+
+        let mut dirty = FileDocument::loading(key("src/lib.rs"));
+        dirty.set_loaded(text_file());
+        dirty.mark_user_edit();
+        dirty.mark_deleted();
+        dirty.restore_on_disk(text_file());
+        assert!(matches!(dirty.phase, DocumentPhase::Ready));
+        assert!(dirty.is_dirty());
+        assert!(dirty.can_autosave());
     }
 
     #[test]

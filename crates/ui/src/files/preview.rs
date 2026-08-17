@@ -309,6 +309,10 @@ fn renamed_document_path(path: &str, old_path: &str, new_path: &str) -> Option<S
     }
 }
 
+fn path_is_same_or_descendant(path: &str, ancestor: &str) -> bool {
+    path == ancestor || path.starts_with(&format!("{ancestor}/"))
+}
+
 pub(super) struct PreviewSplitResize;
 
 struct PreviewDragGhost;
@@ -1191,8 +1195,20 @@ impl FilesSurface {
                     return;
                 };
                 if file.content_hash == document.saved_hash {
-                    if matches!(document.phase, DocumentPhase::ExternallyModified { .. }) {
+                    let recovered = if matches!(document.phase, DocumentPhase::DeletedOnDisk) {
+                        document.restore_on_disk(file);
+                        true
+                    } else if matches!(document.phase, DocumentPhase::ExternallyModified { .. }) {
                         document.phase = DocumentPhase::Ready;
+                        true
+                    } else {
+                        false
+                    };
+                    if document.can_autosave() {
+                        surface.schedule_autosave(task_path.clone(), cx);
+                    }
+                    if recovered {
+                        cx.notify();
                     }
                     return;
                 }
@@ -1218,11 +1234,23 @@ impl FilesSurface {
         }
     }
 
+    pub(super) fn reconcile_created_documents(&mut self, path: &str, cx: &mut Context<Self>) {
+        let paths = self
+            .preview
+            .documents
+            .keys()
+            .filter(|document_path| path_is_same_or_descendant(document_path, path))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            self.reconcile_document(path, cx);
+        }
+    }
+
     pub(super) fn mark_document_deleted(&mut self, path: &str, cx: &mut Context<Self>) {
-        let prefix = format!("{path}/");
         let mut changed = false;
         for (document_path, document) in &mut self.preview.documents {
-            if document_path == path || document_path.starts_with(&prefix) {
+            if path_is_same_or_descendant(document_path, path) {
                 document.mark_deleted();
                 changed = true;
             }
@@ -2533,6 +2561,13 @@ mod tests {
             renamed_document_path("src-old/lib.rs", "src", "crates/ui/src"),
             None
         );
+    }
+
+    #[test]
+    fn document_paths_match_recreated_files_and_directory_descendants() {
+        assert!(path_is_same_or_descendant("src/lib.rs", "src/lib.rs"));
+        assert!(path_is_same_or_descendant("src/files/mod.rs", "src"));
+        assert!(!path_is_same_or_descendant("src-old/lib.rs", "src"));
     }
 
     #[test]

@@ -84,6 +84,7 @@ impl FilesSurface {
         for change in frame.changes {
             match change.kind {
                 WorkspaceFileChangeKind::Created => {
+                    self.reconcile_created_documents(&change.path, cx);
                     if let Some(parent) = parent_path(&change.path) {
                         parents.insert(parent);
                     }

@@ -39,6 +39,7 @@ pub mod syntax_cache;
 pub mod terminal;
 pub mod theme;
 pub mod transcript;
+mod workspace_links;
 
 use std::borrow::Cow;
 use std::path::PathBuf;

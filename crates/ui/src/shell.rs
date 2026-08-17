@@ -53,6 +53,7 @@ use crate::state::{
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
+use crate::workspace_links::resolve_workspace_file_link;
 
 mod spaces;
 mod tabs;
@@ -1016,6 +1017,18 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let shell = cx.weak_entity();
+        transcript.update(cx, |transcript, _| {
+            transcript.set_workspace_link_handler(crate::markdown::render::LinkUi {
+                handler: std::rc::Rc::new(move |target, window, cx| {
+                    shell
+                        .update(cx, |shell, cx| {
+                            shell.open_workspace_file_link(target, window, cx)
+                        })
+                        .unwrap_or(false)
+                }),
+            });
+        });
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
@@ -1867,6 +1880,39 @@ impl Shell {
             .or_default()
             .push(RightSurface::File(id));
         self.set_right_active(RightSurface::File(id), cx);
+    }
+
+    fn open_workspace_file_link(
+        &mut self,
+        target: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(chat) = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == self.active_chat)
+        else {
+            return false;
+        };
+        let Some(root) = chat.cwd.as_deref() else {
+            return false;
+        };
+        let Some(link) = resolve_workspace_file_link(target, root) else {
+            return false;
+        };
+
+        let key = self.panel_key(cx);
+        let was_open = self.panels.get(&key).changes_open;
+        let from = self.right_target(cx);
+        self.panels.update(&key, |panel| panel.changes_open = true);
+        if !was_open {
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        }
+        self.add_file_surface(link.path, window, cx);
+        true
     }
 
     fn rename_file_surface(

@@ -33,6 +33,8 @@ use preview::FilePreviewState;
 use search::FileSearchState;
 
 static NEXT_REVIEW_COMMENT_FLUSH_SOURCE: AtomicU64 = AtomicU64::new(1);
+pub(super) const TOOLBAR_BUTTON_SIZE: f32 = 22.0;
+pub(super) const TOOLBAR_BUTTON_RADIUS: f32 = 5.0;
 
 /// A workspace-relative file or directory dragged out of a Files surface.
 ///
@@ -845,9 +847,9 @@ impl FilesSurface {
         let icon_button = |id: &'static str| {
             div()
                 .id(id)
-                .size(px(25.0))
+                .size(px(TOOLBAR_BUTTON_SIZE))
                 .flex_none()
-                .rounded(px(6.0))
+                .rounded(px(TOOLBAR_BUTTON_RADIUS))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -866,7 +868,7 @@ impl FilesSurface {
             .bg(background)
             .child(
                 div()
-                    .h(px(26.0))
+                    .h(px(TOOLBAR_BUTTON_SIZE))
                     .min_w_0()
                     .flex_1()
                     .px(px(8.0))

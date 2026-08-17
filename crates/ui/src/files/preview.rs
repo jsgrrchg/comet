@@ -18,7 +18,7 @@ use zeron_proto::{
 };
 
 use super::{
-    FilesCloseDisposition, FilesEvent, FilesSurface,
+    FilesCloseDisposition, FilesEvent, FilesSurface, TOOLBAR_BUTTON_RADIUS, TOOLBAR_BUTTON_SIZE,
     client::{FilesRequestContext, WorkspaceFilesClient},
     document::{DocumentKey, DocumentPhase, FileDocument},
 };
@@ -1954,9 +1954,9 @@ impl FilesSurface {
             .child(
                 div()
                     .id("files-reveal-active")
-                    .size(px(22.0))
+                    .size(px(TOOLBAR_BUTTON_SIZE))
                     .flex_none()
-                    .rounded(px(5.0))
+                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -1989,9 +1989,9 @@ impl FilesSurface {
             .child(
                 div()
                     .id("files-toggle-word-wrap")
-                    .size(px(22.0))
+                    .size(px(TOOLBAR_BUTTON_SIZE))
                     .flex_none()
-                    .rounded(px(5.0))
+                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -2018,9 +2018,9 @@ impl FilesSurface {
             .child(
                 div()
                     .id("files-toggle-tree-sidebar")
-                    .size(px(22.0))
+                    .size(px(TOOLBAR_BUTTON_SIZE))
                     .flex_none()
-                    .rounded(px(5.0))
+                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
                     .flex()
                     .items_center()
                     .justify_center()

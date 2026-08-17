@@ -237,7 +237,27 @@ impl Render for FilesSurface {
                                 .size(px(10.5))
                                 .flex_none(),
                         )
-                        .child(div().min_w_0().truncate().child(error)),
+                        .child(div().min_w_0().flex_1().truncate().child(error))
+                        .child(
+                            div()
+                                .id("files-watch-refresh-now")
+                                .h(px(20.0))
+                                .flex_none()
+                                .px(px(6.0))
+                                .rounded(px(5.0))
+                                .flex()
+                                .items_center()
+                                .cursor_pointer()
+                                .role(gpui::Role::Button)
+                                .aria_label("Refresh workspace files now")
+                                .text_color(theme.text_muted)
+                                .hover(|style| style.bg(crate::theme::wash(0.07)))
+                                .child("Refresh now")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.refresh(cx);
+                                    this.reconcile_open_documents(cx);
+                                })),
+                        ),
                 )
             })
             .child(content);
@@ -722,17 +742,6 @@ impl FilesSurface {
                             .text_color(theme.text_faint),
                     )
                     .child(div().min_w_0().flex_1().child(self.search.clone())),
-            )
-            .child(
-                icon_button("files-refresh")
-                    .role(gpui::Role::Button)
-                    .aria_label("Refresh files")
-                    .on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
-                    .child(
-                        crate::icons::icon(crate::icons::REFRESH)
-                            .size(px(12.5))
-                            .text_color(theme.text_muted),
-                    ),
             )
             .child(
                 icon_button("files-toggle-ignored")

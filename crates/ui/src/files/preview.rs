@@ -1796,26 +1796,6 @@ impl FilesSurface {
             )
             .child(
                 div()
-                    .id("files-refresh-active")
-                    .size(px(22.0))
-                    .flex_none()
-                    .rounded(px(5.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .role(gpui::Role::Button)
-                    .aria_label("Reload file")
-                    .hover(|style| style.bg(crate::theme::wash(0.07)))
-                    .on_click(cx.listener(|this, _, _, cx| this.request_reload_active_document(cx)))
-                    .child(
-                        icon(icons::REFRESH)
-                            .size(px(11.5))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .child(
-                div()
                     .id("files-toggle-word-wrap")
                     .size(px(22.0))
                     .flex_none()

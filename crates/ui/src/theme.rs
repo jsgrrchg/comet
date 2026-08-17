@@ -171,6 +171,12 @@ pub struct SyntaxPalette {
     pub tag: Hsla,
     pub attribute: Hsla,
     pub label: Hsla,
+    pub markup_heading: Hsla,
+    pub markup_raw: Hsla,
+    pub markup_link: Hsla,
+    pub markup_reference: Hsla,
+    pub markup_emphasis: Hsla,
+    pub markup_strong: Hsla,
     pub invalid: Hsla,
 }
 
@@ -200,6 +206,12 @@ impl SyntaxPalette {
             HighlightKind::Tag => self.tag,
             HighlightKind::Attribute => self.attribute,
             HighlightKind::Label => self.label,
+            HighlightKind::MarkupHeading => self.markup_heading,
+            HighlightKind::MarkupRaw => self.markup_raw,
+            HighlightKind::MarkupLink => self.markup_link,
+            HighlightKind::MarkupReference => self.markup_reference,
+            HighlightKind::MarkupEmphasis => self.markup_emphasis,
+            HighlightKind::MarkupStrong => self.markup_strong,
             HighlightKind::Invalid => self.invalid,
         }
     }
@@ -235,6 +247,12 @@ impl SyntaxPalette {
             tag: pink,
             attribute: amber,
             label: amber,
+            markup_heading: indigo,
+            markup_raw: emerald,
+            markup_link: pink,
+            markup_reference: amber,
+            markup_emphasis: pink,
+            markup_strong: indigo,
             invalid: red,
         }
     }
@@ -270,6 +288,12 @@ impl SyntaxPalette {
             tag: pink,
             attribute: amber,
             label: amber,
+            markup_heading: indigo,
+            markup_raw: emerald,
+            markup_link: pink,
+            markup_reference: amber,
+            markup_emphasis: pink,
+            markup_strong: indigo,
             invalid: red,
         }
     }
@@ -1311,6 +1335,12 @@ mod tests {
             HighlightKind::Tag,
             HighlightKind::Attribute,
             HighlightKind::Label,
+            HighlightKind::MarkupHeading,
+            HighlightKind::MarkupRaw,
+            HighlightKind::MarkupLink,
+            HighlightKind::MarkupReference,
+            HighlightKind::MarkupEmphasis,
+            HighlightKind::MarkupStrong,
             HighlightKind::Embedded,
             HighlightKind::Invalid,
         ];

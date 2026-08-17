@@ -209,13 +209,19 @@ fn name_for_kind(kind: HighlightKind) -> &'static str {
         HighlightKind::Tag => "tag",
         HighlightKind::Attribute => "attribute",
         HighlightKind::Label => "label",
+        HighlightKind::MarkupHeading => "markup_heading",
+        HighlightKind::MarkupRaw => "markup_raw",
+        HighlightKind::MarkupLink => "markup_link",
+        HighlightKind::MarkupReference => "markup_reference",
+        HighlightKind::MarkupEmphasis => "markup_emphasis",
+        HighlightKind::MarkupStrong => "markup_strong",
         HighlightKind::Embedded => "embedded",
         HighlightKind::Invalid => "invalid",
     }
 }
 
 fn kind_for_name(name: &str) -> Option<HighlightKind> {
-    const KINDS: [HighlightKind; 25] = [
+    const KINDS: [HighlightKind; 31] = [
         HighlightKind::Comment,
         HighlightKind::Keyword,
         HighlightKind::String,
@@ -239,6 +245,12 @@ fn kind_for_name(name: &str) -> Option<HighlightKind> {
         HighlightKind::Tag,
         HighlightKind::Attribute,
         HighlightKind::Label,
+        HighlightKind::MarkupHeading,
+        HighlightKind::MarkupRaw,
+        HighlightKind::MarkupLink,
+        HighlightKind::MarkupReference,
+        HighlightKind::MarkupEmphasis,
+        HighlightKind::MarkupStrong,
         HighlightKind::Embedded,
         HighlightKind::Invalid,
     ];

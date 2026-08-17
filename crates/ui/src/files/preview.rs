@@ -3,7 +3,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -1381,7 +1381,15 @@ impl FilesSurface {
         let task_path = path.clone();
         let task_key = key.clone();
         let task = cx.spawn(async move |this, cx| {
+            let started_at = Instant::now();
             let result = client.read_file(request).await;
+            tracing::trace!(
+                path = %task_path,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                success = result.is_ok(),
+                error = ?result.as_ref().err(),
+                "workspace document reconciliation read completed"
+            );
             let _ = this.update(cx, |surface, cx| {
                 if surface.request_context.as_ref() != Some(&context) {
                     return;

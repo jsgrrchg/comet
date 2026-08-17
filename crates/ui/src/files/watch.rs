@@ -73,6 +73,14 @@ impl FilesSurface {
 
     fn apply_workspace_changes(&mut self, frame: WorkspaceFileChanges, cx: &mut Context<Self>) {
         let gap = sequence_needs_resync(self.watch_sequence, frame.sequence);
+        tracing::trace!(
+            sequence = frame.sequence,
+            previous_sequence = ?self.watch_sequence,
+            resync_required = frame.resync_required,
+            gap,
+            change_count = frame.changes.len(),
+            "workspace file changes received by UI"
+        );
         self.watch_sequence = Some(frame.sequence);
         if frame.resync_required || gap {
             self.refresh(cx);
@@ -111,6 +119,9 @@ impl FilesSurface {
                             parents.insert(parent);
                         }
                     }
+                    // Atomic replacement tools can report a temporary file being
+                    // renamed over an already-open destination document.
+                    self.reconcile_created_documents(&change.path, cx);
                     if let Some(parent) = parent_path(&change.path) {
                         parents.insert(parent);
                     }

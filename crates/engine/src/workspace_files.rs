@@ -132,11 +132,10 @@ impl WorkspaceRelativePath {
         if path.len() > MAX_RELATIVE_PATH_BYTES {
             return Err(bad_path("path is too long"));
         }
-        if path.contains(['\0', '\\']) {
+        if path.contains(['\0', '\\', ':']) {
             return Err(bad_path("path contains an invalid character"));
         }
-        if path.starts_with('/') || path.starts_with("//") || path.as_bytes().get(1) == Some(&b':')
-        {
+        if path.starts_with('/') || path.starts_with("//") {
             return Err(bad_path("path must be workspace-relative"));
         }
         if path
@@ -1818,6 +1817,27 @@ mod tests {
             assert!(
                 WorkspaceRelativePath::file(path).is_err(),
                 "unsafe path accepted: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn relative_paths_reject_drive_letters_and_ntfs_alternate_data_streams() {
+        for path in [
+            "C:/file.txt",
+            "C:file.txt",
+            "file.txt:stream",
+            "dir/file.txt:stream",
+            "dir:stream/file.txt",
+            ":stream",
+        ] {
+            assert!(
+                WorkspaceRelativePath::file(path).is_err(),
+                "unsafe file path accepted: {path:?}"
+            );
+            assert!(
+                WorkspaceRelativePath::directory(path).is_err(),
+                "unsafe directory path accepted: {path:?}"
             );
         }
     }

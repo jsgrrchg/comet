@@ -93,6 +93,8 @@ icon_assets![
     (RESTART, "restart"),
     (ADD_CIRCLE, "add-circle"),
     (TUNING, "tuning"),
+    (EYE, "eye"),
+    (EYE_CLOSED, "eye-closed"),
     (PAPERCLIP, "paperclip"),
     // Hand-drawn pushpin in the Solar Linear style for local sidebar pins.
     (PIN, "pin"),

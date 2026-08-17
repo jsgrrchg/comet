@@ -21,6 +21,7 @@ pub mod appearance;
 pub mod archived;
 pub mod composer;
 pub mod devices;
+pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
@@ -49,6 +50,10 @@ pub const TERMINAL_DEFAULT_HEIGHT: f32 = 280.0;
 
 /// Debounce for settings writes after a drag/toggle.
 pub const SAVE_DEBOUNCE_MS: u64 = 400;
+
+pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 900;
+pub const FILES_AUTOSAVE_DELAY_MIN_MS: u64 = 100;
+pub const FILES_AUTOSAVE_DELAY_MAX_MS: u64 = 10_000;
 
 const FILE_NAME: &str = "ui-settings.json";
 
@@ -372,6 +377,12 @@ pub struct UiSettings {
     pub git_history_column_order: GitHistoryColumnOrder,
     /// How authors are represented in Git History rows.
     pub git_history_author_display: GitHistoryAuthorDisplay,
+    /// Idle time before an edited workspace file is saved automatically.
+    pub files_autosave_delay_ms: u64,
+    /// Wrap long lines in workspace file editors and previews.
+    pub files_word_wrap: bool,
+    /// Include hidden and ignored entries in workspace file trees.
+    pub files_show_all: bool,
 }
 
 impl Default for UiSettings {
@@ -403,6 +414,9 @@ impl Default for UiSettings {
             git_history_column_widths: GitHistoryColumnWidths::default(),
             git_history_column_order: GitHistoryColumnOrder::default(),
             git_history_author_display: GitHistoryAuthorDisplay::default(),
+            files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
+            files_word_wrap: false,
+            files_show_all: false,
         }
     }
 }
@@ -656,6 +670,9 @@ impl UiSettings {
         self.ui_font_size = self.ui_font_size.normalized();
         self.git_history_column_widths = self.git_history_column_widths.clamped();
         self.git_history_column_order = self.git_history_column_order.normalized();
+        self.files_autosave_delay_ms = self
+            .files_autosave_delay_ms
+            .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
         self
     }
 
@@ -766,6 +783,9 @@ mod tests {
                 GitHistoryColumn::Date,
             ]),
             git_history_author_display: GitHistoryAuthorDisplay::Name,
+            files_autosave_delay_ms: 1_500,
+            files_word_wrap: true,
+            files_show_all: true,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
@@ -818,6 +838,12 @@ mod tests {
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(loaded.sidebar_pinned_session_ids_by_profile.is_empty());
         assert!(!loaded.sound_enabled, "other keys still parse");
+        assert_eq!(
+            loaded.files_autosave_delay_ms,
+            FILES_AUTOSAVE_DELAY_DEFAULT_MS
+        );
+        assert!(!loaded.files_word_wrap);
+        assert!(!loaded.files_show_all);
         assert!(
             loaded.notifications_enabled,
             "pre-banner files default banners on"
@@ -1015,6 +1041,15 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.sidebar_width, SIDEBAR_MAX);
         assert_eq!(loaded.right_pane_width, RIGHT_PANE_MIN);
+        assert_eq!(
+            UiSettings {
+                files_autosave_delay_ms: 1,
+                ..Default::default()
+            }
+            .clamped()
+            .files_autosave_delay_ms,
+            FILES_AUTOSAVE_DELAY_MIN_MS
+        );
     }
 
     #[test]

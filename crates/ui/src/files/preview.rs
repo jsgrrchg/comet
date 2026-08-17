@@ -1181,7 +1181,6 @@ impl FilesSurface {
                             "The file was removed on disk. Your editor buffer was preserved.",
                         )),
                     )),
-                    _ if document.is_dirty() => Some(("Unsaved", theme.text_faint, false, None)),
                     _ => None,
                 });
         let mut crumbs = div()

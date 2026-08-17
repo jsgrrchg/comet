@@ -301,6 +301,44 @@ impl FileDocument {
     pub fn content_hash(&self) -> Option<&str> {
         self.file.as_ref()?.content_hash.as_deref()
     }
+
+    pub fn estimated_retained_bytes(&self) -> usize {
+        let file_text_bytes = self
+            .file
+            .as_ref()
+            .and_then(|file| file.text.as_ref())
+            .map_or(0, String::capacity);
+        let pending_reload_bytes = self
+            .pending_external_reload
+            .as_ref()
+            .and_then(|file| file.text.as_ref())
+            .map_or(0, String::capacity);
+        let line_bytes = self
+            .lines
+            .capacity()
+            .saturating_mul(std::mem::size_of::<SharedString>())
+            .saturating_add(
+                self.lines
+                    .iter()
+                    .fold(0usize, |total, line| total.saturating_add(line.len())),
+            );
+        let pending_save_bytes = self
+            .pending_save
+            .as_ref()
+            .map_or(0, |save| save.text.capacity());
+        let editor_text_bytes = self
+            .editor
+            .is_some()
+            .then_some(file_text_bytes)
+            .unwrap_or(0);
+
+        std::mem::size_of::<Self>()
+            .saturating_add(file_text_bytes)
+            .saturating_add(pending_reload_bytes)
+            .saturating_add(line_bytes)
+            .saturating_add(pending_save_bytes)
+            .saturating_add(editor_text_bytes)
+    }
 }
 
 fn read_only_reason(file: &WorkspaceFileText) -> Option<WorkspaceReadOnlyReason> {

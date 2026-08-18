@@ -713,6 +713,8 @@ impl EngineRpc {
                 });
                 return Ok(RpcReply::Stream(stream.boxed()));
             }
+            // Streams are unbounded by design (a quiet WATCH_* is healthy);
+            // only unary calls below get the reply deadline.
             let rx = match client.subscribe(method, params).await {
                 Ok(rx) => rx,
                 Err(err) => {
@@ -730,13 +732,27 @@ impl EngineRpc {
             });
             return Ok(RpcReply::Stream(stream.boxed()));
         }
-        match client.call(method, params).await {
-            Ok(value) => Ok(RpcReply::Value(value)),
-            Err(err) => {
+        let deadline = forward_deadline(method);
+        match tokio::time::timeout(deadline, client.call(method, params)).await {
+            Ok(Ok(value)) => Ok(RpcReply::Value(value)),
+            Ok(Err(err)) => {
                 if should_invalidate_link(&err) {
                     links.invalidate(target);
                 }
                 Err(err)
+            }
+            Err(_) => {
+                // No reply inside the deadline. The link may be a zombie — the
+                // relay's auto-pong keeps a dead host socket looking alive
+                // (ws3 auto-pong incident) — so drop it; the next call re-dials.
+                // NOTE: the remote may still complete the forwarded work; the
+                // caller sees a retryable failure instead of hanging forever
+                // (the "Sending…" wedge, 2026-08-18).
+                links.invalidate(target);
+                Err(RpcError::Transport(format!(
+                    "no reply from device {target} for {method} within {}s",
+                    deadline.as_secs()
+                )))
             }
         }
     }
@@ -869,6 +885,24 @@ fn should_invalidate_link(error: &RpcError) -> bool {
     matches!(error, RpcError::Closed | RpcError::Transport(_))
 }
 
+/// Reply deadline for a relay-forwarded unary call. The relay is WebSocket
+/// frames through a DO: a dropped frame (host socket replaced mid-call, DO
+/// restart) loses the reply SILENTLY — the DO's auto-pong keeps the client
+/// socket looking healthy — and an unbounded await wedged callers forever
+/// (the composer's permanent "Sending…", 2026-08-18). Network-bound git and
+/// update methods get a long leash; worktree creation checks out a full tree;
+/// everything else is interactive and must fail fast.
+fn forward_deadline(method: &str) -> std::time::Duration {
+    use std::time::Duration;
+    match method {
+        methods::CLONE_REPO | methods::FETCH_ALL | methods::APPLY_UPDATE => {
+            Duration::from_secs(15 * 60)
+        }
+        methods::CREATE_WORKTREE => Duration::from_secs(120),
+        _ => Duration::from_secs(30),
+    }
+}
+
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
@@ -903,6 +937,7 @@ fn forwardable(method: &str) -> bool {
             | methods::FETCH_ALL
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
+            | methods::LIST_DRIVES
             | methods::SEARCH_FILES
             | methods::LIST_WORKSPACE_DIRECTORY
             | methods::SEARCH_WORKSPACE_FILES
@@ -1157,8 +1192,11 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_COMMANDS => {
                 // Same shape as ListModels: forces a lazy resolve, then the
-                // harness's own (cached) discovery. Non-ACP harnesses return
-                // an empty list from the trait default.
+                // harness's own (cached) discovery — ACP agents advertise
+                // availableCommands, claude answers the initialize control
+                // request, codex lists skills; only harnesses whose wire has
+                // no listing (cursor, mock) fall through to the trait's
+                // empty default.
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self
                     .registry
@@ -1883,6 +1921,14 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&listing)
             }
+            methods::LIST_DRIVES => {
+                let drives = self
+                    .repos
+                    .list_drives()
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&zeron_proto::DriveListing { drives })
+            }
             methods::SEARCH_FILES => {
                 let p: FileSearchParams = parse_params(params)?;
                 if p.query.chars().count() > 256 {
@@ -2323,6 +2369,30 @@ mod tests {
         assert!(is_stream_method(methods::WATCH_WORKSPACE_FILES));
         assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+    }
+
+    /// Every forwardable unary method gets a bounded reply deadline —
+    /// interactive calls fail fast, network-bound git/update calls get the
+    /// long leash, and nothing awaits forever (the "Sending…" wedge).
+    #[test]
+    fn forward_deadlines_are_tiered_and_bounded() {
+        use std::time::Duration;
+        assert_eq!(
+            forward_deadline(methods::CREATE_WORKTREE),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            forward_deadline(methods::CLONE_REPO),
+            Duration::from_secs(15 * 60)
+        );
+        assert_eq!(
+            forward_deadline(methods::LIST_BRANCHES),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            forward_deadline(methods::QUEUE_COMMAND),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

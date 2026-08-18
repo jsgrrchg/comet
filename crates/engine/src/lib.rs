@@ -247,8 +247,10 @@ impl EngineCore {
         let workspace_files =
             WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
+        doc_host.set_repos(repos.clone());
         let terminals = Terminals::new();
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
+        doc_host.set_worktree_setup_services(project_actions.clone(), terminals.clone());
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),

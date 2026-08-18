@@ -172,6 +172,11 @@ struct DocHostInner {
     /// graph only drops once this back-edge is severed.
     sessions: Mutex<Option<SessionsEngine>>,
     workspace: OnceLock<WorkspaceHost>,
+    /// Worktree materialization for Run commands (see `set_repos`).
+    repos: OnceLock<crate::repos::Repos>,
+    /// Host-local Actions and PTYs used by durable worktree setup.
+    project_actions: OnceLock<crate::project_actions::ProjectActionsStore>,
+    terminals: OnceLock<crate::terminals::Terminals>,
     /// Cancels every worker spawned through `spawn_worker` — the loops'
     /// own exit conditions (weak handle death, closed channels) don't cover
     /// runtime replacement, where Edge-capable tasks must stop doing
@@ -442,6 +447,9 @@ impl DocHost {
                 config,
                 sessions: Mutex::new(None),
                 workspace: OnceLock::new(),
+                repos: OnceLock::new(),
+                project_actions: OnceLock::new(),
+                terminals: OnceLock::new(),
                 shutdown: CancellationToken::new(),
                 tasks: TaskTracker::new(),
                 handles: Mutex::new(HashMap::new()),
@@ -557,6 +565,23 @@ impl DocHost {
     pub fn retirement_probe(&self) -> Box<dyn Fn() -> bool + Send + Sync> {
         let weak = Arc::downgrade(&self.inner);
         Box::new(move || weak.upgrade().is_none())
+    }
+
+    /// Wire the repos engine (engine assembly) — worktree materialization for
+    /// Run commands carrying a [`zeron_proto::WorktreeSpec`].
+    pub fn set_repos(&self, repos: crate::repos::Repos) {
+        let _ = self.inner.repos.set(repos);
+    }
+
+    /// Wire host-local services used to run a project's optional setup Action
+    /// after a durable Run materializes a fresh worktree.
+    pub fn set_worktree_setup_services(
+        &self,
+        project_actions: crate::project_actions::ProjectActionsStore,
+        terminals: crate::terminals::Terminals,
+    ) {
+        let _ = self.inner.project_actions.set(project_actions);
+        let _ = self.inner.terminals.set(terminals);
     }
 
     /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
@@ -2426,12 +2451,40 @@ impl DocHost {
                 request,
                 message_id,
             } => {
+                let mut request = request.clone();
+                // Worktree directive (WorktreeSpec): materialize on THIS host at
+                // drain time — the durable command plane replaces the sender's
+                // old blocking CreateWorktree relay RPC, whose lost reply wedged
+                // the composer on "Sending…" while the run proceeded anyway.
+                // `take()` resolves the request before dispatch, so the journal
+                // and steer→new-turn fallbacks reuse the created path instead of
+                // minting another checkout.
+                let fresh_worktree = match request.worktree.take() {
+                    Some(spec) => {
+                        let (cwd, fresh) = self.materialize_worktree(chat_id, &spec).await?;
+                        request.cwd = cwd;
+                        fresh
+                    }
+                    None => None,
+                };
                 // Claim-on-first-command: a run for a chat with no workspace row
                 // creates the row under our device id (we are about to host it).
                 if let Some(ws) = self.workspace() {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
+                    // A pre-existing row (the client's createChat raced ahead)
+                    // still carries the repo folder — repoint it at the fresh
+                    // worktree, and stamp the actual `zeron/<name>` branch so
+                    // the footer and the title-rename flow see it.
+                    if let Some(wt) = &fresh_worktree {
+                        if let Err(err) = ws.set_chat_cwd(chat_id, &wt.path) {
+                            tracing::warn!(chat = %chat_id, error = %err, "worktree cwd stamp failed");
+                        }
+                        if let Err(err) = ws.set_chat_branch(chat_id, &wt.branch) {
+                            tracing::warn!(chat = %chat_id, error = %err, "worktree branch stamp failed");
+                        }
+                    }
                 }
-                let harness = self.harness_for_request(chat_id, request);
+                let harness = self.harness_for_request(chat_id, &request);
                 // A row with no config renders no harness glyph (and every
                 // later dispatch falls back to the engine default), so stamp
                 // what this run actually executes with. Claimed rows and
@@ -2452,7 +2505,7 @@ impl DocHost {
                     }
                 }
                 sessions
-                    .dispatch(chat_id, harness, request.clone(), Some(message_id.clone()))
+                    .dispatch(chat_id, harness, request, Some(message_id.clone()))
                     .await?;
                 // A fresh user-authored turn is the deliberate action that
                 // thaws a queue frozen by Cancel. Clear only after dispatch
@@ -2637,6 +2690,118 @@ impl DocHost {
         Ok(true)
     }
 
+    /// Create (or reuse) the isolated worktree a Run's [`zeron_proto::WorktreeSpec`]
+    /// asks for, returning the resolved cwd plus the fresh worktree when one was
+    /// actually created. Reuse guard: a chat whose row already points inside a
+    /// linked worktree of the same repo keeps it — a duplicate Run (client retry
+    /// after a lost ack, ledger reset) must not mint a second checkout.
+    async fn materialize_worktree(
+        &self,
+        chat_id: &str,
+        spec: &zeron_proto::WorktreeSpec,
+    ) -> Result<(String, Option<zeron_proto::Worktree>), EngineError> {
+        if let Some(ws) = self.workspace()
+            && let Ok(Some(chat)) = ws.chat(chat_id)
+            && let Some(cwd) = chat.cwd
+            && cwd != spec.repo_path
+            && crate::workspace_host::linked_worktree_root(std::path::Path::new(&cwd)).as_deref()
+                == Some(spec.repo_path.as_str())
+        {
+            tracing::info!(chat = %chat_id, cwd = %cwd, "worktree spec: reusing the chat's existing worktree");
+            return Ok((cwd, None));
+        }
+        let repos = self
+            .inner
+            .repos
+            .get()
+            .ok_or_else(|| EngineError::Other("repos engine not wired".into()))?;
+        let worktree = repos
+            .create_worktree(std::path::Path::new(&spec.repo_path), &spec.base)
+            .await?;
+        tracing::info!(
+            chat = %chat_id,
+            path = %worktree.path,
+            branch = %worktree.branch,
+            "worktree materialized for run"
+        );
+        self.launch_worktree_setup(spec, &worktree);
+        Ok((worktree.path.clone(), Some(worktree)))
+    }
+
+    /// Setup is best-effort just like the legacy CreateWorktree RPC path: a
+    /// missing or failed Action never prevents the user's actual agent run.
+    /// Unlike that old RPC path, both worktree creation and setup now happen on
+    /// the owning host after the durable Run reaches it.
+    fn launch_worktree_setup(
+        &self,
+        spec: &zeron_proto::WorktreeSpec,
+        worktree: &zeron_proto::Worktree,
+    ) {
+        let Some(space_id) = spec.space_id.as_deref() else {
+            return;
+        };
+        let result = (|| -> Result<Option<zeron_proto::ProjectActionRun>, EngineError> {
+            let workspace = self
+                .workspace()
+                .ok_or_else(|| EngineError::Other("workspace host not wired".into()))?;
+            let space = workspace
+                .space(space_id)?
+                .ok_or_else(|| EngineError::Other("Project space not found".into()))?;
+            if space.device_id != self.inner.config.device_id {
+                return Err(EngineError::Other(
+                    "Project space belongs to another device".into(),
+                ));
+            }
+            let project_root = std::fs::canonicalize(&space.path)?;
+            let requested_root = std::fs::canonicalize(&spec.repo_path)?;
+            if project_root != requested_root {
+                return Err(EngineError::Other(
+                    "Worktree repository does not match project space".into(),
+                ));
+            }
+            let actions = self
+                .inner
+                .project_actions
+                .get()
+                .ok_or_else(|| EngineError::Other("project Actions store not wired".into()))?;
+            let Some(action) = actions.setup_action(space_id, &project_root)? else {
+                return Ok(None);
+            };
+            let terminals = self
+                .inner
+                .terminals
+                .get()
+                .ok_or_else(|| EngineError::Other("terminals engine not wired".into()))?;
+            let worktree_root = std::fs::canonicalize(&worktree.path)
+                .unwrap_or_else(|_| worktree.path.clone().into());
+            crate::project_actions::launch_project_setup_action(
+                terminals,
+                &action,
+                &project_root,
+                &worktree_root,
+                80,
+                24,
+            )
+            .map(Some)
+        })();
+        match result {
+            Ok(Some(run)) => tracing::info!(
+                space_id,
+                worktree = %worktree.path,
+                action = %run.action_name,
+                terminal = %run.terminal.id,
+                "project setup Action started for durable worktree"
+            ),
+            Ok(None) => {}
+            Err(err) => tracing::warn!(
+                space_id,
+                worktree = %worktree.path,
+                error = %err,
+                "failed to start project setup Action"
+            ),
+        }
+    }
+
     /// A steer-turned-run with no in-process `last_request` (engine restarted
     /// since the last turn): rebuild the run config from the chat's workspace
     /// row — cwd from the row, model/reasoning/options/sandbox from its config
@@ -2673,6 +2838,7 @@ impl DocHost {
             auto_approve: false,
             attachments: Vec::new(),
             resume: None,
+            worktree: None,
         })
     }
 

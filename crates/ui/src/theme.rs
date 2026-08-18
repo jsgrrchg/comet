@@ -776,6 +776,11 @@ impl Theme {
         set_current_appearance(appearance);
         let theme = Self::for_appearance(appearance)
             .with_font_sans(crate::typography::effective_family_name(cx));
+        let (normal, hover, active) = scrollbar_thumb_colors(&theme);
+        gpui_base::Theme::global_mut(cx).scrollbar.styles = gpui_base::ScrollbarStyles::default()
+            .thumb(|style| style.bg(normal))
+            .thumb_hover(|style| style.bg(hover))
+            .thumb_active(|style| style.bg(active));
         cx.set_global(theme);
     }
 
@@ -798,6 +803,14 @@ impl Theme {
     pub fn wash(&self, alpha: f32) -> Hsla {
         wash_for(self.appearance, alpha)
     }
+}
+
+fn scrollbar_thumb_colors(theme: &Theme) -> (Hsla, Hsla, Hsla) {
+    (
+        theme.text.opacity(0.30),
+        theme.text.opacity(0.42),
+        theme.text.opacity(0.55),
+    )
 }
 
 impl Default for Theme {
@@ -1171,6 +1184,17 @@ mod tests {
         // oklch(0.145 0 0) is Tailwind neutral-950, zeron's app background.
         let rgb = srgb_u8(oklch_to_srgb(0.145, 0.0, 0.0));
         assert_eq!(rgb, [10, 10, 10]);
+    }
+
+    #[test]
+    fn scrollbar_thumbs_follow_the_active_appearance() {
+        let dark = scrollbar_thumb_colors(&Theme::dark());
+        let light = scrollbar_thumb_colors(&Theme::light());
+
+        assert!(dark.0.l > Theme::dark().bg.l);
+        assert!(light.0.l < Theme::light().bg.l);
+        assert_eq!([dark.0.a, dark.1.a, dark.2.a], [0.30, 0.42, 0.55]);
+        assert_eq!([light.0.a, light.1.a, light.2.a], [0.30, 0.42, 0.55]);
     }
 
     #[test]

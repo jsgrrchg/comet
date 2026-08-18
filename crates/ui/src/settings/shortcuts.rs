@@ -9,7 +9,8 @@ use gpui::{
 };
 
 use crate::settings::{
-    ComposerSendBehavior, KeymapConfig, ShortcutId, combo_from_keystroke, display_combo,
+    ActiveTurnSendBehavior, ComposerSendBehavior, KeymapConfig, ShortcutId, combo_from_keystroke,
+    display_combo,
 };
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -41,6 +42,8 @@ pub enum ShortcutsEvent {
     KeymapChanged(KeymapConfig),
     /// The composer send behavior changed — persist + re-apply.
     ComposerSendBehaviorChanged(ComposerSendBehavior),
+    /// Mid-turn submissions should steer immediately or remain queued.
+    ActiveTurnSendBehaviorChanged(ActiveTurnSendBehavior),
     /// The Escape fallback changed — persist it locally.
     EscapeStopsActiveAgentChanged(bool),
 }
@@ -49,6 +52,7 @@ pub struct ShortcutsPage {
     /// Working copy (kept in sync with the shell via change events).
     keymap: KeymapConfig,
     composer_send_behavior: ComposerSendBehavior,
+    active_turn_send_behavior: ActiveTurnSendBehavior,
     escape_stops_active_agent: bool,
     recording: Option<ShortcutId>,
     /// A rejected record attempt ("{Combo} is already assigned to {label}.") —
@@ -67,17 +71,31 @@ impl ShortcutsPage {
         state: Entity<AppState>,
         keymap: KeymapConfig,
         composer_send_behavior: ComposerSendBehavior,
+        active_turn_send_behavior: ActiveTurnSendBehavior,
         escape_stops_active_agent: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             keymap,
             composer_send_behavior,
+            active_turn_send_behavior,
             escape_stops_active_agent,
             recording: None,
             conflict_notice: None,
             focus: cx.focus_handle(),
             _state: state,
+        }
+    }
+
+    fn set_active_turn_send_behavior(
+        &mut self,
+        behavior: ActiveTurnSendBehavior,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_turn_send_behavior != behavior {
+            self.active_turn_send_behavior = behavior;
+            cx.emit(ShortcutsEvent::ActiveTurnSendBehaviorChanged(behavior));
+            cx.notify();
         }
     }
 
@@ -215,9 +233,11 @@ impl Render for ShortcutsPage {
         let theme = Theme::of(cx).clone();
         let recording = self.recording;
         let send_behavior = self.composer_send_behavior;
+        let active_turn_behavior = self.active_turn_send_behavior;
         let escape_stops_active_agent = self.escape_stops_active_agent;
         let customized = self.keymap != KeymapConfig::default()
             || send_behavior != ComposerSendBehavior::default()
+            || active_turn_behavior != ActiveTurnSendBehavior::default()
             || escape_stops_active_agent;
         let modifier_label = modifier_send_label(cfg!(target_os = "macos"));
 
@@ -324,6 +344,76 @@ impl Render for ShortcutsPage {
                     )
                     .child(send_behavior_control),
             );
+        let active_turn_control = div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .rounded(px(9.0))
+            .p(px(2.0))
+            .bg(crate::theme::ink(0.04))
+            .children(
+                [
+                    (ActiveTurnSendBehavior::Steer, "Steer"),
+                    (ActiveTurnSendBehavior::Queue, "Queue"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(ix, (behavior, label))| {
+                    let selected = active_turn_behavior == behavior;
+                    div()
+                        .id(("active-turn-send-option", ix))
+                        .min_w(px(72.0))
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .rounded(px(7.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(12.0))
+                        .text_color(if selected {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .when(selected, |el| {
+                            el.bg(theme.bg)
+                                .border_1()
+                                .border_color(theme.border.opacity(0.8))
+                        })
+                        .when(!selected, |el| {
+                            el.cursor_pointer()
+                                .hover(|s| s.text_color(theme.text))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_active_turn_send_behavior(behavior, cx)
+                                }))
+                        })
+                        .child(SharedString::from(label))
+                }),
+            );
+        let active_turn_row = widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .min_h(px(84.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(widgets::row_title(&theme, "Messages during an active turn"))
+                        .child(
+                            div()
+                                .mt(px(4.0))
+                                .max_w(px(430.0))
+                                .text_size(px(11.5))
+                                .line_height(px(17.0))
+                                .text_color(theme.text_muted.opacity(0.65))
+                                .child(SharedString::from(
+                                    "Steer sends immediately when supported. Queue keeps messages visible and editable until the turn ends or you choose an action.",
+                                )),
+                        ),
+                )
+                .child(active_turn_control),
+        );
         let escape_behavior_row = widgets::section_card(&theme).child(
             widgets::card_row(&theme, true)
                 .min_h(px(84.0))
@@ -518,6 +608,10 @@ impl Render for ShortcutsPage {
                                                     ComposerSendBehavior::Enter,
                                                     cx,
                                                 );
+                                                this.set_active_turn_send_behavior(
+                                                    ActiveTurnSendBehavior::Steer,
+                                                    cx,
+                                                );
                                                 this.set_escape_stops_active_agent(false, cx);
                                             }),
                                         )
@@ -531,6 +625,7 @@ impl Render for ShortcutsPage {
                             }),
                     )
                     .child(send_behavior_row.mt(px(32.0)))
+                    .child(active_turn_row.mt(px(16.0)))
                     .child(widgets::section_card(&theme).mt(px(16.0)).children(rows))
                     .child(
                         div()

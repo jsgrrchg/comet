@@ -603,6 +603,10 @@ pub struct AppState {
     pub spaces_synced: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
+    /// The selected chat's pending-message queue — what was typed while the
+    /// agent was busy, in the order it will be sent. Device-agnostic: the
+    /// chat's doc holds them (every device sees the same queue).
+    pub queue: Vec<zeron_doc::QueuedMessage>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -611,10 +615,10 @@ pub struct AppState {
     pending_sends: HashMap<String, PendingSend>,
     /// Written by the changes pane, read by the composer.
     review_comments: HashMap<String, Vec<ReviewComment>>,
-    /// Chats whose editor-backed comments currently cite a buffer revision
-    /// that has not reached disk yet. Their composer send is held until the
-    /// workspace write succeeds.
-    review_comment_flushes: HashSet<String>,
+    /// File surfaces whose editor-backed comments currently cite a buffer
+    /// revision that has not reached disk yet. A chat remains blocked until
+    /// every surface waiting on a workspace write has finished or cancelled.
+    review_comment_flushes: HashMap<String, HashSet<u64>>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -628,6 +632,7 @@ pub struct AppState {
     transcript_task: Option<Task<()>>,
     change_requests: ChangeRequestClientState,
     change_request_tasks: HashMap<ChangeRequestWatchKey, Task<()>>,
+    queue_task: Option<Task<()>>,
 }
 
 impl Default for AppState {
@@ -651,10 +656,11 @@ impl AppState {
             selected_device: None,
             selected_chat: None,
             transcript: Vec::new(),
+            queue: Vec::new(),
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             review_comments: HashMap::new(),
-            review_comment_flushes: HashSet::new(),
+            review_comment_flushes: HashMap::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
@@ -663,6 +669,7 @@ impl AppState {
             transcript_task: None,
             change_requests: ChangeRequestClientState::default(),
             change_request_tasks: HashMap::new(),
+            queue_task: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -731,16 +738,28 @@ impl AppState {
         self.review_comments.remove(key);
     }
 
-    pub fn begin_review_comment_flush(&mut self, key: &str) {
-        self.review_comment_flushes.insert(key.to_string());
+    pub fn begin_review_comment_flush(&mut self, key: &str, source: u64) {
+        self.review_comment_flushes
+            .entry(key.to_string())
+            .or_default()
+            .insert(source);
     }
 
-    pub fn finish_review_comment_flush(&mut self, key: &str) {
-        self.review_comment_flushes.remove(key);
+    pub fn finish_review_comment_flush(&mut self, key: &str, source: u64) {
+        let remove_key = self
+            .review_comment_flushes
+            .get_mut(key)
+            .is_some_and(|sources| {
+                sources.remove(&source);
+                sources.is_empty()
+            });
+        if remove_key {
+            self.review_comment_flushes.remove(key);
+        }
     }
 
     pub fn review_comment_flush_pending(&self, key: &str) -> bool {
-        self.review_comment_flushes.contains(key)
+        self.review_comment_flushes.contains_key(key)
     }
 
     // ---- reducers (pure) ----
@@ -756,6 +775,8 @@ impl AppState {
             self.selected_chat = None;
             self.transcript.clear();
             self.transcript_task = None;
+            self.queue.clear();
+            self.queue_task = None;
         }
     }
 
@@ -1260,7 +1281,9 @@ impl AppState {
         self.connection = ConnectionStatus::Ready;
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
         }
         cx.notify();
     }
@@ -1309,6 +1332,8 @@ impl AppState {
         self.auto_selected = true;
         self.transcript.clear();
         self.transcript_task = None;
+        self.queue.clear();
+        self.queue_task = None;
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
             // (the new-session canvas) keeps the current project pick.
@@ -1327,7 +1352,9 @@ impl AppState {
             self.mark_chat_seen(id, cx);
         }
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            self.transcript_task =
+                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
         }
         cx.notify();
     }
@@ -1714,6 +1741,66 @@ fn spawn_transcript_watch(
             // Stream ended: engine restart, RPC drop, or chat purge. Retry;
             // the purge case is cleaned up by apply_chats dropping this task.
             tracing::debug!(%chat_id, "transcript stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
+        }
+    })
+}
+
+/// The selected chat's pending-message queue, straight off its doc. Whole-list
+/// frames (the queue is a handful of rows at most), retried like the transcript
+/// watch — a queue that silently stopped updating would show messages the host
+/// has already sent.
+fn spawn_queue_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+    chat_id: String,
+) -> Task<()> {
+    #[derive(serde::Deserialize)]
+    struct QueueFrame {
+        #[serde(default)]
+        items: Vec<zeron_doc::QueuedMessage>,
+    }
+    cx.spawn(async move |this, cx| {
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_QUEUE, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::debug!(%chat_id, error = %err, "queue watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let frame: QueueFrame = match serde_json::from_value(value) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed queue frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    // Guard against a stale pump racing a newer selection.
+                    if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                        state.queue = frame.items;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
             if this.update(cx, |_, _| {}).is_err() {
                 return;
             }
@@ -2922,5 +3009,20 @@ mod tests {
             1
         );
         assert!(parse_orgs(&serde_json::json!("nope")).is_empty());
+    }
+
+    #[test]
+    fn review_comment_flush_waits_for_every_file_surface() {
+        let mut state = AppState::new();
+
+        state.begin_review_comment_flush("chat-1", 1);
+        state.begin_review_comment_flush("chat-1", 2);
+        assert!(state.review_comment_flush_pending("chat-1"));
+
+        state.finish_review_comment_flush("chat-1", 1);
+        assert!(state.review_comment_flush_pending("chat-1"));
+
+        state.finish_review_comment_flush("chat-1", 2);
+        assert!(!state.review_comment_flush_pending("chat-1"));
     }
 }

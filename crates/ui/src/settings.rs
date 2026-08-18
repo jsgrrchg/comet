@@ -54,6 +54,9 @@ pub const SAVE_DEBOUNCE_MS: u64 = 400;
 pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 900;
 pub const FILES_AUTOSAVE_DELAY_MIN_MS: u64 = 100;
 pub const FILES_AUTOSAVE_DELAY_MAX_MS: u64 = 10_000;
+pub const FILES_EDITOR_FONT_SIZE_DEFAULT: f32 = 13.0;
+pub const FILES_EDITOR_FONT_SIZE_MIN: f32 = 9.0;
+pub const FILES_EDITOR_FONT_SIZE_MAX: f32 = 24.0;
 
 const FILE_NAME: &str = "ui-settings.json";
 
@@ -303,6 +306,19 @@ pub enum ComposerSendBehavior {
     ModEnter,
 }
 
+/// What Enter does with a message while the selected agent has a live turn.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActiveTurnSendBehavior {
+    /// Preserve the historical behavior: steer immediately when the harness
+    /// supports it, otherwise leave the message queued for the next turn.
+    #[default]
+    Steer,
+    /// Keep the message visible and editable in the queue until the turn ends
+    /// or the user explicitly chooses Steer now / Send now.
+    Queue,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
@@ -359,6 +375,10 @@ pub struct UiSettings {
     /// Whether the message composer sends with Enter or the platform modifier
     /// plus Enter. Device-local and opt-in.
     pub composer_send_behavior: ComposerSendBehavior,
+    /// Whether messages submitted during a live turn steer immediately or
+    /// remain in the visible pending-message queue. Device-local preference;
+    /// the selected intent is copied onto each synchronized queue row.
+    pub active_turn_send_behavior: ActiveTurnSendBehavior,
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
@@ -381,6 +401,8 @@ pub struct UiSettings {
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
     pub files_word_wrap: bool,
+    /// Font size used by editable workspace-file buffers.
+    pub files_editor_font_size: f32,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
 }
@@ -406,6 +428,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
+            active_turn_send_behavior: ActiveTurnSendBehavior::default(),
             escape_stops_active_agent: false,
             appearance: crate::appearance::AppearanceMode::default(),
             ui_font_family: crate::typography::UiFontFamily::default(),
@@ -416,6 +439,7 @@ impl Default for UiSettings {
             git_history_author_display: GitHistoryAuthorDisplay::default(),
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
+            files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
         }
     }
@@ -673,6 +697,12 @@ impl UiSettings {
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
+        self.files_editor_font_size = clamp_or(
+            self.files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_MIN,
+            FILES_EDITOR_FONT_SIZE_MAX,
+            FILES_EDITOR_FONT_SIZE_DEFAULT,
+        );
         self
     }
 
@@ -763,6 +793,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             composer_send_behavior: ComposerSendBehavior::ModEnter,
+            active_turn_send_behavior: ActiveTurnSendBehavior::Queue,
             escape_stops_active_agent: true,
             appearance: crate::appearance::AppearanceMode::Light,
             ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
@@ -785,6 +816,7 @@ mod tests {
             git_history_author_display: GitHistoryAuthorDisplay::Name,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
+            files_editor_font_size: 15.0,
             files_show_all: true,
         };
         settings.save(dir.path()).unwrap();
@@ -843,6 +875,10 @@ mod tests {
             FILES_AUTOSAVE_DELAY_DEFAULT_MS
         );
         assert!(!loaded.files_word_wrap);
+        assert_eq!(
+            loaded.files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_DEFAULT
+        );
         assert!(!loaded.files_show_all);
         assert!(
             loaded.notifications_enabled,
@@ -1050,6 +1086,15 @@ mod tests {
             .files_autosave_delay_ms,
             FILES_AUTOSAVE_DELAY_MIN_MS
         );
+        assert_eq!(
+            UiSettings {
+                files_editor_font_size: 100.0,
+                ..Default::default()
+            }
+            .clamped()
+            .files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_MAX
+        );
     }
 
     #[test]
@@ -1111,6 +1156,7 @@ mod tests {
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
         assert_eq!(d.composer_send_behavior, ComposerSendBehavior::Enter);
+        assert_eq!(d.active_turn_send_behavior, ActiveTurnSendBehavior::Steer);
         assert!(!d.escape_stops_active_agent);
     }
 
@@ -1231,6 +1277,22 @@ mod tests {
         assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
+    }
+
+    #[test]
+    fn active_turn_send_behavior_preserves_automatic_steering_for_old_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.active_turn_send_behavior,
+            ActiveTurnSendBehavior::Steer
+        );
     }
 
     #[test]

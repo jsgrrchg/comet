@@ -42,6 +42,10 @@ final class SessionStore {
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
+    /// Messages typed while the agent was busy, in the order they will be sent
+    /// (crates/doc/src/queue.rs). Shared with every other device on the chat:
+    /// what the Mac queued shows up here, and reordering here reorders there.
+    private(set) var queue: [QueuedMessage] = []
 
     let doc = LoroDoc()
     /// The chat2 room cursor — the last server row seq folded into `doc`.
@@ -77,17 +81,25 @@ final class SessionStore {
 
     @ObservationIgnored private var hostRelay: (deviceId: String, client: DeviceRelayClient)?
 
+    /// This device's id — what its own doc writes are stamped with.
+    var deviceId: String { config.deviceId }
+
+    /// The shared relay to the chat's host device (uploads, sending a queued
+    /// message now). Nil while the chat has no host to ask.
+    func hostRelayClient() -> DeviceRelayClient? {
+        guard let hostDeviceId else { return nil }
+        if let hostRelay, hostRelay.deviceId == hostDeviceId {
+            return hostRelay.client
+        }
+        let relay = DeviceRelayClient(deviceId: hostDeviceId, config: config)
+        hostRelay = (hostDeviceId, relay)
+        return relay
+    }
+
     /// Chunked upload of one staged image to the host device; returns the
     /// durable absolute path on that device (what the refs trailer carries).
     func uploadAttachment(name: String, data: Data) async throws -> String {
-        guard let hostDeviceId else { throw RelayError.hostOffline }
-        let relay: DeviceRelayClient
-        if let hostRelay, hostRelay.deviceId == hostDeviceId {
-            relay = hostRelay.client
-        } else {
-            relay = DeviceRelayClient(deviceId: hostDeviceId, config: config)
-            hostRelay = (hostDeviceId, relay)
-        }
+        guard let relay = hostRelayClient() else { throw RelayError.hostOffline }
         return try await uploadAttachmentChunked(relay: relay, name: name, data: data)
     }
 
@@ -148,6 +160,10 @@ final class SessionStore {
         connectIfReady()
     }
 
+    /// Still holding the preload dial (never connected) — the kick sweep
+    /// skips these so a foreground/path flap can't stampede held sockets.
+    var isDialHeld: Bool { holdDial }
+
     /// End a preload dial-hold: an open view (or the stagger timer) wants
     /// live sync now.
     func releaseDial() {
@@ -161,11 +177,22 @@ final class SessionStore {
         let delegate = ChatRoomClient.Delegate(
             cursor: { [weak self] in self?.cursor ?? 0 },
             containsFrontier: { [weak self] frontier in
-                // Empty frontier = a checkpoint of an empty doc — nothing to
-                // fetch (mirror of EngineChatSink::contains_frontier).
-                guard !frontier.isEmpty else { return true }
-                guard let self,
+                // Deliberately NO empty-frontier shortcut (mirror of
+                // EngineChatSink::contains_frontier): an empty payload on a
+                // present checkpoint is unreadable provenance, not proof of
+                // emptiness — skipping made fresh readers park every row that
+                // depends on the chat's founding ops ("Add Tweets" incident,
+                // 2026-08-18). Empty fails the decode: NOT contained, fetch —
+                // always safe, never silently skips history.
+                guard let self, !frontier.isEmpty,
                       let vv = try? VersionVector.decode(bytes: frontier) else { return false }
+                // A decoded-but-EMPTY version vector is a vacuous claim every
+                // doc "includes" — the actual poison, one representation
+                // deeper than zero-length bytes. Fetch.
+                guard !vv.toHashmap().isEmpty else {
+                    roomLog.info("chat2 \(self.chatId, privacy: .public): frontier decodes empty (vacuous); fetching checkpoint")
+                    return false
+                }
                 return self.doc.oplogVv().includesVv(other: vv)
             },
             applyCheckpoint: { [weak self] bytes, seq in
@@ -195,6 +222,20 @@ final class SessionStore {
                 self.cursor = max(self.cursor, seq)
                 self.saver?.poke()
             },
+            clampCursor: { [weak self] seq in
+                guard let self, self.cursor > seq else { return }
+                // Cursor amnesty (see ChatRoomClient): a cursor above the
+                // room's checkpoint is only as trustworthy as the doc under
+                // it — rows imported while their deps were missing PARK
+                // silently, vanish on export, and the cursor lied forever
+                // ("Add Tweets" wedge: cursor 75 over a checkpoint-only doc,
+                // 2026-08-18). Clamping re-fetches rows since the checkpoint
+                // (KB-bounded by trim policy; re-imports are no-ops), which
+                // converts any lying cursor into a true one.
+                roomLog.info("chat2 \(self.chatId, privacy: .public): cursor amnesty \(self.cursor) → \(seq)")
+                self.cursor = seq
+                self.saver?.poke()
+            },
             event: { [weak self] event in self?.handle(event) }
         )
         let client = ChatRoomClient(
@@ -202,6 +243,12 @@ final class SessionStore {
             urlProvider: { [config, chatId] in await config.chat2SocketURL(chatId: chatId) },
             checkpointRequest: { [config, chatId] in
                 await config.chat2CheckpointRequest(chatId: chatId)
+            },
+            rowsRequest: { [config, chatId] after in
+                await config.chat2RowsRequest(chatId: chatId, after: after)
+            },
+            pushRequest: { [config, chatId] batchId in
+                await config.chat2PushRequest(chatId: chatId, batchId: batchId)
             },
             delegate: delegate)
         chatRoom = client
@@ -324,7 +371,7 @@ final class SessionStore {
             guard let self else { return }
             self.projecting = false
             if let decoded {
-                self.apply(decoded)
+                self.apply(decoded.entries, queue: decoded.queue)
             }
             if self.projectPending {
                 self.projectPending = false
@@ -333,8 +380,9 @@ final class SessionStore {
         }
     }
 
-    private func apply(_ decoded: [MessageEntry]) {
+    private func apply(_ decoded: [MessageEntry], queue decodedQueue: [QueuedMessage] = []) {
         entries = decoded
+        if decodedQueue != queue { queue = decodedQueue }
         // Drop echoes the host has materialized.
         let ids = Set(entries.map(\.id))
         pendingSends.removeAll { ids.contains($0.messageId) }
@@ -346,10 +394,13 @@ final class SessionStore {
 
     /// Whole-doc decode. `nil` means the doc has no map root yet — leave the
     /// previous projection standing rather than blanking a live transcript.
-    nonisolated static func decodeEntries(from doc: LoroDoc) -> [MessageEntry]? {
+    nonisolated static func decodeEntries(
+        from doc: LoroDoc
+    ) -> (entries: [MessageEntry], queue: [QueuedMessage])? {
         guard let root = doc.getDeepValue().mapValue else { return nil }
         let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
-        return joinContinuations(raw)
+        let queue = (root["queue"]?.listValue ?? []).compactMap(queuedFrom)
+        return (joinContinuations(raw), queue)
     }
 
     nonisolated private static func entryFrom(_ value: LoroValue) -> MessageEntry? {
@@ -522,11 +573,19 @@ final class SessionStore {
     /// Durable-nudge the host device so a cold host opens the doc and drains
     /// (doc_host.rs nudge_remote_host). Fire-and-forget; the command is
     /// durable in the doc regardless.
-    private func nudgeHost() {
+    func nudgeHost() {
         guard let hostDeviceId else { return }
         Task { [config, chatId] in
             await config.nudge(deviceId: hostDeviceId, chatId: chatId)
         }
+    }
+
+    /// Re-read the queue after a local write, without waiting for the coalesced
+    /// whole-doc projection: dragging a row must move it this frame.
+    func refreshQueue() {
+        let next = (doc.getDeepValue().mapValue?["queue"]?.listValue ?? [])
+            .compactMap(Self.queuedFrom)
+        if next != queue { queue = next }
     }
 }
 

@@ -1,10 +1,14 @@
 //! Workspace file browsing surface.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
 
 use gpui::{
-    Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Render, SharedString,
-    Subscription, Task, div, prelude::*, px,
+    Context, Entity, EventEmitter, FocusHandle, ListAlignment, ListState, Pixels, Point, Render,
+    SharedString, Subscription, Task, Window, div, prelude::*, px,
 };
 use zeron_proto::ListWorkspaceDirectoryRequest;
 
@@ -27,6 +31,10 @@ use client::{FilesRequestContext, WorkspaceFilesClient};
 use model::{DirectoryLoadState, FileTreeModel};
 use preview::FilePreviewState;
 use search::FileSearchState;
+
+static NEXT_REVIEW_COMMENT_FLUSH_SOURCE: AtomicU64 = AtomicU64::new(1);
+pub(super) const TOOLBAR_BUTTON_SIZE: f32 = 22.0;
+pub(super) const TOOLBAR_BUTTON_RADIUS: f32 = 5.0;
 
 /// A workspace-relative file or directory dragged out of a Files surface.
 ///
@@ -132,9 +140,16 @@ impl FilesPresentation {
 
 impl EventEmitter<FilesEvent> for FilesSurface {}
 
+struct EditorContextMenu {
+    editor: Entity<editor::FileEditorState>,
+    position: Point<Pixels>,
+    availability: editor::EditorMenuAvailability,
+}
+
 pub struct FilesSurface {
     state: Entity<AppState>,
     chat_id: String,
+    review_comment_flush_source: u64,
     presentation: FilesPresentation,
     editor_path: Option<String>,
     request_context: Option<FilesRequestContext>,
@@ -150,6 +165,7 @@ pub struct FilesSurface {
     watch_sequence: Option<u64>,
     watch_error: Option<SharedString>,
     preview: FilePreviewState,
+    editor_context_menu: crate::popover::Popup<EditorContextMenu>,
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
     started: bool,
@@ -314,6 +330,7 @@ impl Render for FilesSurface {
         };
         let measured_width = self.preview.width_cell();
         let entity = cx.entity();
+        let editor_context_menu = self.render_editor_context_menu(&theme, cx);
         div()
             .id(SharedString::from(format!(
                 "files-surface-{}",
@@ -344,6 +361,7 @@ impl Render for FilesSurface {
                     )
             })
             .child(body)
+            .children(editor_context_menu)
     }
 }
 
@@ -352,6 +370,7 @@ impl FilesSurface {
         state: Entity<AppState>,
         chat_id: String,
         autosave_delay_ms: u64,
+        editor_font_size: f32,
         word_wrap: bool,
         show_all_files: bool,
         cx: &mut Context<Self>,
@@ -362,6 +381,7 @@ impl FilesSurface {
             FilesPresentation::Browser,
             None,
             autosave_delay_ms,
+            editor_font_size,
             word_wrap,
             show_all_files,
             cx,
@@ -373,6 +393,7 @@ impl FilesSurface {
         chat_id: String,
         path: String,
         autosave_delay_ms: u64,
+        editor_font_size: f32,
         word_wrap: bool,
         show_all_files: bool,
         cx: &mut Context<Self>,
@@ -383,6 +404,7 @@ impl FilesSurface {
             FilesPresentation::Editor,
             Some(path),
             autosave_delay_ms,
+            editor_font_size,
             word_wrap,
             show_all_files,
             cx,
@@ -395,6 +417,7 @@ impl FilesSurface {
         presentation: FilesPresentation,
         editor_path: Option<String>,
         autosave_delay_ms: u64,
+        editor_font_size: f32,
         word_wrap: bool,
         show_all_files: bool,
         cx: &mut Context<Self>,
@@ -437,6 +460,8 @@ impl FilesSurface {
         let mut surface = Self {
             state,
             chat_id,
+            review_comment_flush_source: NEXT_REVIEW_COMMENT_FLUSH_SOURCE
+                .fetch_add(1, Ordering::Relaxed),
             presentation,
             editor_path: editor_path.clone(),
             request_context: None,
@@ -451,7 +476,8 @@ impl FilesSurface {
             watch_task: None,
             watch_sequence: None,
             watch_error: None,
-            preview: FilePreviewState::new(autosave_delay_ms, word_wrap),
+            preview: FilePreviewState::new(autosave_delay_ms, word_wrap, editor_font_size),
+            editor_context_menu: crate::popover::Popup::default(),
             loads: HashMap::new(),
             error: None,
             started: false,
@@ -460,6 +486,123 @@ impl FilesSurface {
         };
         surface.sync_target(cx);
         surface
+    }
+
+    pub(in crate::files) fn open_editor_context_menu(
+        &mut self,
+        editor: Entity<editor::FileEditorState>,
+        availability: editor::EditorMenuAvailability,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor_context_menu.open(EditorContextMenu {
+            editor,
+            position,
+            availability,
+        });
+        cx.notify();
+    }
+
+    fn close_editor_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.editor_context_menu.begin_close() {
+            crate::popover::reap_popup(cx, |surface: &mut Self| &mut surface.editor_context_menu);
+            cx.notify();
+        }
+    }
+
+    fn dispatch_editor_context_action(
+        &mut self,
+        editor: Entity<editor::FileEditorState>,
+        action: editor::EditorContextAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_editor_context_menu(cx);
+        editor::dispatch_context_action(&editor, action, window, cx);
+    }
+
+    fn editor_context_menu_row(
+        theme: &crate::theme::Theme,
+        id: &'static str,
+        label: &'static str,
+        enabled: bool,
+        editor: Entity<editor::FileEditorState>,
+        action: editor::EditorContextAction,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        crate::popover::menu_row(theme, false, id)
+            .id(id)
+            .when(!enabled, |row| row.opacity(0.38).cursor_default())
+            .when(enabled, |row| {
+                row.on_click(cx.listener(move |this, _, window, cx| {
+                    this.dispatch_editor_context_action(editor.clone(), action, window, cx)
+                }))
+            })
+            .child(label)
+            .into_any_element()
+    }
+
+    fn render_editor_context_menu(
+        &mut self,
+        theme: &crate::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let menu = self.editor_context_menu.get()?;
+        let editor = menu.editor.clone();
+        let position = menu.position;
+        let availability = menu.availability;
+        let closing = self.editor_context_menu.closing_since();
+
+        let card = crate::popover::popover_card(theme)
+            .w(px(170.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_editor_context_menu(cx)))
+            .flex()
+            .flex_col()
+            .child(Self::editor_context_menu_row(
+                theme,
+                "files-editor-context-cut",
+                "Cut",
+                availability.cut,
+                editor.clone(),
+                editor::EditorContextAction::Cut,
+                cx,
+            ))
+            .child(Self::editor_context_menu_row(
+                theme,
+                "files-editor-context-copy",
+                "Copy",
+                availability.copy,
+                editor.clone(),
+                editor::EditorContextAction::Copy,
+                cx,
+            ))
+            .child(Self::editor_context_menu_row(
+                theme,
+                "files-editor-context-paste",
+                "Paste",
+                availability.paste,
+                editor.clone(),
+                editor::EditorContextAction::Paste,
+                cx,
+            ))
+            .child(crate::popover::menu_separator())
+            .child(Self::editor_context_menu_row(
+                theme,
+                "files-editor-context-select-all",
+                "Select All",
+                true,
+                editor,
+                editor::EditorContextAction::SelectAll,
+                cx,
+            ))
+            .into_any_element();
+
+        Some(crate::popover::menu_at(
+            "files-editor-context-menu",
+            position,
+            card,
+            closing,
+        ))
     }
 
     pub fn set_autosave_delay_ms(&mut self, delay_ms: u64, cx: &mut Context<Self>) {
@@ -477,6 +620,11 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) {
         self.apply_word_wrap(word_wrap, window, cx);
+    }
+
+    pub fn set_editor_font_size(&mut self, editor_font_size: f32, cx: &mut Context<Self>) {
+        self.preview.set_editor_font_size(editor_font_size);
+        cx.notify();
     }
 
     pub fn set_show_all_files(&mut self, show_all_files: bool, cx: &mut Context<Self>) {
@@ -661,7 +809,7 @@ impl FilesSurface {
             cx.notify();
             return false;
         }
-        self.apply_target(next);
+        self.apply_target(next, cx);
         true
     }
 
@@ -671,16 +819,18 @@ impl FilesSurface {
         }
         let next = self.pending_request_context.take();
         self.target_change_pending = false;
-        self.apply_target(next);
+        self.apply_target(next, cx);
         self.ensure_loaded(cx);
         cx.notify();
     }
 
-    fn apply_target(&mut self, next: Option<FilesRequestContext>) {
+    fn apply_target(&mut self, next: Option<FilesRequestContext>, cx: &mut Context<Self>) {
+        self.cancel_review_comment_flush(cx);
         self.loads.clear();
         self.watch_task = None;
         self.watch_sequence = None;
         self.watch_error = None;
+        self.editor_context_menu = crate::popover::Popup::default();
         self.preview.reset();
         self.tree.reset();
         self.sync_tree_list();
@@ -708,9 +858,9 @@ impl FilesSurface {
         let icon_button = |id: &'static str| {
             div()
                 .id(id)
-                .size(px(25.0))
+                .size(px(TOOLBAR_BUTTON_SIZE))
                 .flex_none()
-                .rounded(px(6.0))
+                .rounded(px(TOOLBAR_BUTTON_RADIUS))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -724,12 +874,13 @@ impl FilesSurface {
             .flex()
             .items_center()
             .gap(px(5.0))
+            .border_t_1()
             .border_b_1()
             .border_color(theme.border)
             .bg(background)
             .child(
                 div()
-                    .h(px(26.0))
+                    .h(px(TOOLBAR_BUTTON_SIZE))
                     .min_w_0()
                     .flex_1()
                     .px(px(8.0))

@@ -34,7 +34,7 @@ use zeron_rpc::{RpcError, methods};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
 use crate::pickers::Pickers;
-use crate::settings::{ComposerSendBehavior, platform_combo};
+use crate::settings::{ActiveTurnSendBehavior, ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
 use crate::theme::Theme;
 
@@ -3532,8 +3532,8 @@ fn slash_error_message(err: &RpcError) -> SharedString {
 }
 
 pub struct Composer {
-    state: Entity<AppState>,
-    input: Entity<ComposerInput>,
+    pub(crate) state: Entity<AppState>,
+    pub(crate) input: Entity<ComposerInput>,
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
     /// Shared with the shell's new-session canvas, which renders the
     /// device/project target selectors ([`Pickers::render_target_selectors`]).
@@ -3562,7 +3562,7 @@ pub struct Composer {
     slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
     current_key: String,
     sending: bool,
-    failure: Option<SharedString>,
+    pub(crate) failure: Option<SharedString>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
     /// Requests already answered locally (suppresses the panel until the doc
@@ -3575,6 +3575,13 @@ pub struct Composer {
     /// another chat's request when the user navigates quickly.
     interrupting: HashSet<String>,
     interrupt_tasks: HashMap<String, Task<()>>,
+    /// The queued message being retyped in the input box (see
+    /// [`Composer::begin_queue_edit`]).
+    pub(crate) editing_queued: Option<String>,
+    /// Whatever was half-typed when that edit started, put back afterwards.
+    pub(crate) queue_edit_stash: Option<String>,
+    /// Live drag over the queue panel: which row, and where it would land.
+    pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -3705,6 +3712,9 @@ impl Composer {
             send_task: None,
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
+            editing_queued: None,
+            queue_edit_stash: None,
+            queue_drag: None,
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,
@@ -4681,7 +4691,7 @@ impl Composer {
         cx.notify();
     }
 
-    fn run_live(&self, cx: &App) -> bool {
+    pub(crate) fn run_live(&self, cx: &App) -> bool {
         let s = self.state.read(cx);
         let Some(chat_id) = s.selected_chat.as_deref() else {
             return false;
@@ -4721,7 +4731,24 @@ impl Composer {
             self.wizard_advance(cx);
             return;
         }
+        // Retyping a queued message: Enter saves the row rather than sending
+        // anything, and saving it to nothing removes it.
+        if self.commit_queue_edit(cx) {
+            return;
+        }
         let text = self.input.read(cx).text().trim().to_string();
+        // Empty box with a queue behind it: Enter sends the top message now,
+        // which stops the turn to do it. This outranks Stop — hitting Enter on
+        // an empty composer while messages wait is asking for the next one,
+        // not just for silence.
+        if text.is_empty()
+            && self.staged().is_empty()
+            && self.staged_comments(cx).is_empty()
+            && !self.state.read(cx).queue.is_empty()
+        {
+            self.queue_pop_head(cx);
+            return;
+        }
         let no_content =
             !composer_has_content(&text, self.staged().len(), self.staged_comments(cx).len());
         match self.button_mode(cx) {
@@ -4729,15 +4756,20 @@ impl Composer {
             _ if no_content => {}
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
+            // Busy: the message joins the queue rather than racing the turn.
+            // Whether it then steers straight into that turn or waits for the
+            // next one is the engine's call (`DocHost::drain_queue`) — the
+            // composer only says "here, take this".
             SendButtonMode::Steer => self.send(text, true, cx),
         }
     }
 
-    /// Queue a Run (or Steer) doc command with an optimistic echo. New chats
+    /// Queue a Run doc command with an optimistic echo — or, with the agent
+    /// busy, park the message on the chat's pending queue instead. New chats
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+    fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
@@ -4856,15 +4888,23 @@ impl Composer {
             status: None,
             continuation_of: None,
         };
+        // A queued message is not in the transcript yet — the queue panel is
+        // its echo, and it gets a real bubble when the host sends it.
+        let queue = queue && !is_new;
+        let hold_for_turn_end = queue
+            && crate::settings::current(cx).active_turn_send_behavior
+                == ActiveTurnSendBehavior::Queue;
         self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
-            s.push_echo(&chat_id, echo);
-            // Working overlay until the host executes the queued command —
-            // without it a remote send flashed Completed (and could ring the
-            // done-chime) in the queue→drain→sync gap.
-            s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
+            if !queue {
+                s.push_echo(&chat_id, echo);
+                // Working overlay until the host executes the queued command —
+                // without it a remote send flashed Completed (and could ring
+                // the done-chime) in the queue→drain→sync gap.
+                s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
+            }
             cx.notify();
         });
 
@@ -4878,7 +4918,6 @@ impl Composer {
         });
         cx.notify();
 
-        let steer_cmd = steer && !is_new;
         let restore_text = typed;
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
@@ -5045,38 +5084,48 @@ impl Composer {
                         status: None,
                         continuation_of: None,
                     };
-                    let echo_chat_id = chat_id.clone();
-                    this.update(cx, |composer, cx| {
-                        composer.state.update(cx, |s, cx| {
-                            s.remove_echo(&echo_chat_id, &message_id);
-                            s.push_echo(&echo_chat_id, refreshed);
-                            cx.notify();
-                        });
-                    })
-                    .ok();
+                    if !queue {
+                        let echo_chat_id = chat_id.clone();
+                        this.update(cx, |composer, cx| {
+                            composer.state.update(cx, |s, cx| {
+                                s.remove_echo(&echo_chat_id, &message_id);
+                                s.push_echo(&echo_chat_id, refreshed);
+                                cx.notify();
+                            });
+                        })
+                        .ok();
+                    }
                 }
 
-                let command = if steer_cmd {
-                    SessionCommandPayload::Steer {
+                if queue {
+                    let params = serde_json::json!({
+                        "chatId": chat_id,
+                        "text": content,
+                        "attachments": attachment_paths,
+                        "holdForTurnEnd": hold_for_turn_end,
+                    });
+                    engine
+                        .client()
+                        .call(methods::QUEUE_MESSAGE, params)
+                        .await
+                        .map_err(|e| format!("Send failed: {e}"))?;
+                    return Ok(());
+                }
+
+                let command = SessionCommandPayload::Run {
+                    request: RunRequest {
                         prompt: content.clone(),
-                        message_id: Some(message_id.clone()),
-                    }
-                } else {
-                    SessionCommandPayload::Run {
-                        request: RunRequest {
-                            prompt: content.clone(),
-                            harness: resolved.harness,
-                            model: resolved.model.clone(),
-                            reasoning: resolved.reasoning,
-                            model_options: resolved.model_options.clone(),
-                            cwd,
-                            sandbox: SandboxLevel::WorkspaceWrite,
-                            auto_approve: false,
-                            resume: None,
-                            attachments: attachment_paths,
-                        },
-                        message_id: message_id.clone(),
-                    }
+                        harness: resolved.harness,
+                        model: resolved.model.clone(),
+                        reasoning: resolved.reasoning,
+                        model_options: resolved.model_options.clone(),
+                        cwd,
+                        sandbox: SandboxLevel::WorkspaceWrite,
+                        auto_approve: false,
+                        resume: None,
+                        attachments: attachment_paths,
+                    },
+                    message_id: message_id.clone(),
                 };
                 let command = serde_json::to_value(&command)
                     .map_err(|e| format!("Send failed: {e}"))?;
@@ -5784,6 +5833,27 @@ impl Render for Composer {
             let wizard = self.render_wizard(cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
         }
+
+        // What is waiting to be sent, stacked directly above the box it was
+        // typed in — the queue is a property of this composer, not a panel
+        // somewhere else.
+        let container = container.when_some(self.render_queue_panel(cx), |el, panel| {
+            el.child(motion::fade_quick("composer-queue", div().child(panel)))
+        });
+        // Escape backs out of a queue-row edit (the row keeps its old text).
+        // Bound here rather than in the input: the input's own Escape belongs
+        // to the mention/slash popups, which outrank this while they're open.
+        let container = container.when(self.editing_queued.is_some(), |el| {
+            el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape"
+                    && this.mention.token.is_none()
+                    && this.slash.token.is_none()
+                    && this.cancel_queue_edit(cx)
+                {
+                    cx.stop_propagation();
+                }
+            }))
+        });
 
         // New chats always use the expanded layout: the repo/branch pickers
         // need the full-width actions row (zeron composer-actions.tsx

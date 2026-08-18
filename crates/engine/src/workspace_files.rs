@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -36,6 +36,7 @@ pub const WORKSPACE_FILE_RPC_TIMEOUT: Duration = Duration::from_secs(6);
 pub const MAX_EDITABLE_FILE_BYTES: u64 = 1024 * 1024;
 pub const MAX_PREVIEW_FILE_BYTES: u64 = 8 * 1024 * 1024;
 pub const WATCH_DEBOUNCE: Duration = Duration::from_millis(100);
+pub const WATCH_MAX_BURST: Duration = Duration::from_secs(1);
 pub const WATCH_REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 pub const MAX_WATCH_DIRS: usize = 8_000;
 const WATCH_EVENT_BUFFER: usize = 256;
@@ -132,11 +133,10 @@ impl WorkspaceRelativePath {
         if path.len() > MAX_RELATIVE_PATH_BYTES {
             return Err(bad_path("path is too long"));
         }
-        if path.contains(['\0', '\\']) {
+        if path.contains(['\0', '\\', ':']) {
             return Err(bad_path("path contains an invalid character"));
         }
-        if path.starts_with('/') || path.starts_with("//") || path.as_bytes().get(1) == Some(&b':')
-        {
+        if path.starts_with('/') || path.starts_with("//") {
             return Err(bad_path("path must be workspace-relative"));
         }
         if path
@@ -345,11 +345,7 @@ impl WorkspaceFiles {
         &self,
         request: SearchWorkspaceFilesRequest,
     ) -> Result<Vec<WorkspaceFileSearchMatch>, WorkspaceFilesError> {
-        if request.query.chars().count() > MAX_SEARCH_QUERY_CHARS {
-            return Err(WorkspaceFilesError::BadParams(format!(
-                "query must not exceed {MAX_SEARCH_QUERY_CHARS} characters"
-            )));
-        }
+        validate_workspace_search_query(&request.query)?;
         let workspace = self.resolve_target(&request.target).await?;
         let limit =
             usize::from(request.limit.unwrap_or(MAX_SEARCH_RESULTS as u16)).min(MAX_SEARCH_RESULTS);
@@ -510,6 +506,16 @@ impl CheckoutWatch {
             let callback_overflow = overflow.clone();
             let callback_notify = overflow_notify.clone();
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+                if event
+                    .as_ref()
+                    .is_ok_and(|event| matches!(event.kind, notify::EventKind::Access(_)))
+                {
+                    return;
+                }
+                let event = TimedWatchEvent {
+                    received_at: Instant::now(),
+                    event,
+                };
                 match event_tx.try_send(event) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -570,8 +576,16 @@ impl CheckoutWatch {
     }
 
     fn publish(&self, resync_required: bool, changes: Vec<WorkspaceFileChange>) {
+        let sequence = self.sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        tracing::trace!(
+            checkout_id = %self.checkout_id,
+            sequence,
+            resync_required,
+            change_count = changes.len(),
+            "workspace file watcher publishing changes"
+        );
         let _ = self.changes_tx.send(WorkspaceFileChanges {
-            sequence: self.sequence.fetch_add(1, Ordering::AcqRel) + 1,
+            sequence,
             resync_required,
             changes,
         });
@@ -624,9 +638,14 @@ impl Drop for WorkspaceFileSubscription {
     }
 }
 
+struct TimedWatchEvent {
+    received_at: Instant,
+    event: Result<notify::Event, notify::Error>,
+}
+
 async fn watch_task(
     watch: Weak<CheckoutWatch>,
-    mut event_rx: mpsc::Receiver<Result<notify::Event, notify::Error>>,
+    mut event_rx: mpsc::Receiver<TimedWatchEvent>,
     overflow: Arc<AtomicBool>,
     overflow_notify: Arc<Notify>,
     repair_only: bool,
@@ -641,7 +660,7 @@ async fn watch_task(
     repair.tick().await;
     loop {
         enum Wake {
-            Event(Result<notify::Event, notify::Error>),
+            Event(TimedWatchEvent),
             Overflow,
             Repair,
         }
@@ -658,22 +677,49 @@ async fn watch_task(
             return;
         };
         match wake {
-            Wake::Overflow | Wake::Repair => {
+            Wake::Overflow => {
                 overflow.store(false, Ordering::Release);
+                tracing::trace!(
+                    checkout_id = %watch.checkout_id,
+                    "workspace file watcher overflow requested resync"
+                );
+                watch.publish(true, Vec::new());
+            }
+            Wake::Repair => {
+                overflow.store(false, Ordering::Release);
+                tracing::trace!(
+                    checkout_id = %watch.checkout_id,
+                    "workspace file watcher repair requested resync"
+                );
                 watch.publish(true, Vec::new());
             }
             Wake::Event(first) => {
-                let mut events = vec![first];
+                let burst_started = first.received_at;
+                let mut events = vec![first.event];
                 loop {
-                    match tokio::time::timeout(WATCH_DEBOUNCE, event_rx.recv()).await {
-                        Ok(Some(event)) => events.push(event),
+                    let remaining = WATCH_MAX_BURST.saturating_sub(burst_started.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(WATCH_DEBOUNCE.min(remaining), event_rx.recv()).await
+                    {
+                        Ok(Some(event)) => events.push(event.event),
                         Ok(None) => return,
                         Err(_) => break,
                     }
                 }
                 let overflowed = overflow.swap(false, Ordering::AcqRel);
+                let event_count = events.len();
                 let (mut resync_required, changes) = normalize_watch_events(&watch.root, events);
                 resync_required |= overflowed;
+                tracing::trace!(
+                    checkout_id = %watch.checkout_id,
+                    event_count,
+                    change_count = changes.len(),
+                    resync_required,
+                    burst_ms = burst_started.elapsed().as_millis(),
+                    "workspace file watcher normalized event burst"
+                );
                 if resync_required || !changes.is_empty() {
                     watch.publish(resync_required, changes);
                 }
@@ -1006,6 +1052,7 @@ fn search_workspace_blocking(
     limit: usize,
     cancel: &AtomicBool,
 ) -> Result<Vec<WorkspaceFileSearchMatch>, WorkspaceFilesError> {
+    validate_workspace_search_query(query)?;
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -1061,16 +1108,38 @@ fn search_workspace_blocking(
             kind,
             score,
         });
+        if matches.len() > limit {
+            matches.sort_by(compare_workspace_search_matches);
+            matches.truncate(limit);
+        }
     }
-    matches.sort_by(|left, right| {
-        right
-            .score
-            .cmp(&left.score)
-            .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
-            .then_with(|| left.path.cmp(&right.path))
-    });
-    matches.truncate(limit);
+    matches.sort_by(compare_workspace_search_matches);
     Ok(matches)
+}
+
+fn validate_workspace_search_query(query: &str) -> Result<(), WorkspaceFilesError> {
+    if query.trim().is_empty() {
+        return Err(WorkspaceFilesError::BadParams(
+            "query must not be empty".into(),
+        ));
+    }
+    if query.chars().count() > MAX_SEARCH_QUERY_CHARS {
+        return Err(WorkspaceFilesError::BadParams(format!(
+            "query must not exceed {MAX_SEARCH_QUERY_CHARS} characters"
+        )));
+    }
+    Ok(())
+}
+
+fn compare_workspace_search_matches(
+    left: &WorkspaceFileSearchMatch,
+    right: &WorkspaceFileSearchMatch,
+) -> std::cmp::Ordering {
+    right
+        .score
+        .cmp(&left.score)
+        .then_with(|| left.path.to_lowercase().cmp(&right.path.to_lowercase()))
+        .then_with(|| left.path.cmp(&right.path))
 }
 
 fn read_file_blocking(
@@ -1804,6 +1873,27 @@ mod tests {
     }
 
     #[test]
+    fn relative_paths_reject_drive_letters_and_ntfs_alternate_data_streams() {
+        for path in [
+            "C:/file.txt",
+            "C:file.txt",
+            "file.txt:stream",
+            "dir/file.txt:stream",
+            "dir:stream/file.txt",
+            ":stream",
+        ] {
+            assert!(
+                WorkspaceRelativePath::file(path).is_err(),
+                "unsafe file path accepted: {path:?}"
+            );
+            assert!(
+                WorkspaceRelativePath::directory(path).is_err(),
+                "unsafe directory path accepted: {path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn list_orders_directories_pages_and_detects_stale_cursors() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("Zoo")).unwrap();
@@ -1911,6 +2001,39 @@ mod tests {
                 .any(|entry| entry.path == "src/configuration.rs")
         );
         assert!(matches.len() <= MAX_SEARCH_RESULTS);
+    }
+
+    #[test]
+    fn search_rejects_empty_and_whitespace_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+
+        for query in ["", "   ", "\n\t"] {
+            let error =
+                search_workspace_blocking(&root, query, false, 200, &no_cancel()).unwrap_err();
+            assert!(error.to_string().contains("query must not be empty"));
+        }
+    }
+
+    #[test]
+    fn search_keeps_only_the_best_matches_while_walking() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "aaa-query-notes.txt",
+            "bbb-query-notes.txt",
+            "ccc-query-notes.txt",
+            "query",
+            "query-reference.txt",
+        ] {
+            std::fs::write(root.path().join(name), b"").unwrap();
+        }
+        let root = std::fs::canonicalize(root.path()).unwrap();
+
+        let matches = search_workspace_blocking(&root, "query", false, 2, &no_cancel()).unwrap();
+
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].path, "query");
+        assert_eq!(matches[1].path, "query-reference.txt");
     }
 
     fn read_fixture(bytes: &[u8]) -> WorkspaceFileText {
@@ -2310,6 +2433,116 @@ mod tests {
         );
         watch.cancel.cancel();
         assert!(subscription.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn watch_reconciles_native_remove_and_recreate_bursts_promptly() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let path = canonical.join("recreated.txt");
+        std::fs::write(&path, b"before").unwrap();
+        let watch = CheckoutWatch::start(
+            "checkout".into(),
+            canonical,
+            false,
+            CancellationToken::new(),
+        );
+        let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
+        subscription.recv().await.unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"after").unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut recovered = false;
+        while tokio::time::Instant::now() < deadline {
+            let batch = tokio::time::timeout_at(deadline, subscription.recv())
+                .await
+                .expect("watch event timeout")
+                .expect("watch closed");
+            if batch.changes.iter().any(|change| {
+                change.path == "recreated.txt"
+                    && matches!(
+                        change.kind,
+                        WorkspaceFileChangeKind::Created | WorkspaceFileChangeKind::Modified
+                    )
+            }) {
+                recovered = true;
+                break;
+            }
+        }
+
+        assert!(recovered, "recreated file never reached its final state");
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+    }
+
+    #[tokio::test]
+    async fn watch_reports_native_atomic_replacements_promptly() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let path = canonical.join("replaced.txt");
+        let replacement = canonical.join("replacement.tmp");
+        std::fs::write(&path, b"before").unwrap();
+        let watch = CheckoutWatch::start(
+            "checkout".into(),
+            canonical,
+            false,
+            CancellationToken::new(),
+        );
+        let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
+        subscription.recv().await.unwrap();
+
+        std::fs::write(&replacement, b"after").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut reported = false;
+        while tokio::time::Instant::now() < deadline {
+            let batch = tokio::time::timeout_at(deadline, subscription.recv())
+                .await
+                .expect("watch event timeout")
+                .expect("watch closed");
+            if batch
+                .changes
+                .iter()
+                .any(|change| change.path == "replaced.txt")
+            {
+                reported = true;
+                break;
+            }
+        }
+
+        assert!(reported, "atomic replacement was not reported");
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
+    }
+
+    #[tokio::test]
+    async fn watch_publishes_before_a_continuous_native_burst_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(root.path()).unwrap();
+        let path = canonical.join("busy.txt");
+        std::fs::write(&path, b"0").unwrap();
+        let watch = CheckoutWatch::start(
+            "checkout".into(),
+            canonical,
+            false,
+            CancellationToken::new(),
+        );
+        let mut subscription = watch.subscribe(Weak::<WorkspaceFilesInner>::new());
+        subscription.recv().await.unwrap();
+
+        let producer = tokio::spawn(async move {
+            for value in 1..=50 {
+                std::fs::write(&path, value.to_string()).unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        });
+        let batch = tokio::time::timeout(Duration::from_millis(1_800), subscription.recv())
+            .await
+            .expect("continuous burst postponed publication")
+            .expect("watch closed");
+
+        assert!(batch.changes.iter().any(|change| change.path == "busy.txt"));
+        assert!(!producer.is_finished());
+        producer.await.unwrap();
     }
 
     #[tokio::test]

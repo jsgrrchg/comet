@@ -6698,14 +6698,14 @@ impl Shell {
                             // itself no longer gates on it (terminals work anywhere).
                             .when(self.space_git_detected(cx), |el| {
                                 el.child(
-                                    row("surface-card-diffs", icons::GIT_BRANCH, "Diffs").on_click(
+                                    row("surface-card-diffs", icons::LIST, "Diffs").on_click(
                                         cx.listener(|this, _, _, cx| {
                                             this.add_diff_surface(cx);
                                         }),
                                     ),
                                 )
                                 .child(
-                                    row("surface-card-history", icons::LIST, "History").on_click(
+                                    row("surface-card-history", icons::GIT_BRANCH, "History").on_click(
                                         cx.listener(|this, _, _, cx| {
                                             this.add_history_surface(cx);
                                         }),
@@ -6890,12 +6890,12 @@ impl Shell {
                     .get(&id)
                     .map(|changes| {
                         if changes.read(cx).is_history() {
-                            icons::LIST
-                        } else {
                             icons::GIT_BRANCH
+                        } else {
+                            icons::LIST
                         }
                     })
-                    .unwrap_or(icons::GIT_BRANCH),
+                    .unwrap_or(icons::LIST),
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Picker => icons::PLUS,
                 RightSurface::Subagent(_) => icons::BOT,
@@ -7175,7 +7175,7 @@ impl Shell {
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
-                                        icon(icons::GIT_BRANCH)
+                                        icon(icons::LIST)
                                             .size(px(13.0))
                                             .text_color(theme.text_muted),
                                     )
@@ -7189,7 +7189,7 @@ impl Shell {
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
-                                        icon(icons::LIST)
+                                        icon(icons::GIT_BRANCH)
                                             .size(px(13.0))
                                             .text_color(theme.text_muted),
                                     )

@@ -127,6 +127,11 @@ pub mod methods {
     pub const WATCH_WORKSPACE_FILES: &str = "WatchWorkspaceFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
+    // Project Actions are private state on the device that owns the project.
+    pub const LIST_PROJECT_ACTIONS: &str = "ListProjectActions";
+    pub const UPSERT_PROJECT_ACTION: &str = "UpsertProjectAction";
+    pub const DELETE_PROJECT_ACTION: &str = "DeleteProjectAction";
+    pub const RUN_PROJECT_ACTION: &str = "RunProjectAction";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";

@@ -15,6 +15,11 @@ use crate::state::AppState;
 use crate::theme::Theme;
 
 const SNAPSHOT_TTL: Duration = Duration::from_secs(60);
+const PR_TABLE_HEADER_HEIGHT: f32 = 24.0;
+const PR_TABLE_ROW_HEIGHT: f32 = 52.0;
+const PR_TABLE_CHANGES_WIDTH: f32 = 92.0;
+const PR_TABLE_UPDATED_WIDTH: f32 = 92.0;
+const PR_TABLE_ACTION_WIDTH: f32 = 22.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PullRequestsPageError {
@@ -442,13 +447,8 @@ fn render_pull_request_table(
     let show_header = layout != PullRequestTableLayout::Narrow;
     div()
         .w_full()
-        .rounded(px(14.0))
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.card_glass_bg())
-        .overflow_hidden()
         .when(show_header, |element| {
-            element.child(render_table_header(layout, theme))
+            element.child(render_table_header(theme))
         })
         .children(
             items
@@ -459,36 +459,42 @@ fn render_pull_request_table(
         .into_any_element()
 }
 
-fn render_table_header(layout: PullRequestTableLayout, theme: &Theme) -> AnyElement {
+fn render_table_header(theme: &Theme) -> AnyElement {
     let label = |copy: &'static str| {
         div()
-            .text_size(px(10.5))
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(theme.text_muted.opacity(0.55))
+            .text_size(px(9.5))
+            .text_color(theme.text_faint)
             .child(copy)
     };
     div()
-        .h(px(38.0))
-        .px(px(16.0))
+        .h(px(PR_TABLE_HEADER_HEIGHT))
+        .px(px(8.0))
+        .flex_none()
         .flex()
         .items_center()
-        .gap(px(14.0))
+        .gap(px(8.0))
         .border_b_1()
-        .border_color(theme.border)
-        .bg(crate::theme::ink(0.018))
+        .border_color(crate::theme::hairline(0.06))
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .pl(px(27.0))
-                .child(label("PULL REQUEST")),
+                .pl(px(23.0))
+                .child(label("Pull request")),
         )
-        .when(layout == PullRequestTableLayout::Wide, |element| {
-            element.child(div().w(px(150.0)).child(label("AUTHOR")))
-        })
-        .child(div().w(px(174.0)).child(label("CHANGES")))
-        .child(div().w(px(108.0)).child(label("UPDATED")))
-        .child(div().w(px(20.0)))
+        .child(
+            div()
+                .w(px(PR_TABLE_CHANGES_WIDTH))
+                .flex_none()
+                .child(label("Changes")),
+        )
+        .child(
+            div()
+                .w(px(PR_TABLE_UPDATED_WIDTH))
+                .flex_none()
+                .child(label("Updated")),
+        )
+        .child(div().w(px(PR_TABLE_ACTION_WIDTH)).flex_none())
         .into_any_element()
 }
 
@@ -499,16 +505,19 @@ fn render_table_row(
     theme: &Theme,
 ) -> AnyElement {
     let url = item.url.clone();
+    let group: SharedString = format!("pull-request-row-hover-{index}").into();
     let row = div()
         .id(SharedString::from(format!(
             "pull-request-row-{index}-{}-{}",
             item.repository, item.number
         )))
-        .when(index > 0, |element| {
-            element.border_t_1().border_color(theme.border)
-        })
+        .group(group.clone())
+        .w_full()
+        .flex_none()
+        .border_b_1()
+        .border_color(crate::theme::hairline(0.04))
         .cursor_pointer()
-        .hover(|style| style.bg(crate::theme::ink(0.035)))
+        .hover(|style| style.bg(crate::theme::ink(0.025)))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             cx.open_url(&url);
@@ -516,18 +525,18 @@ fn render_table_row(
 
     match layout {
         PullRequestTableLayout::Narrow => row
-            .px(px(14.0))
-            .py(px(13.0))
+            .px(px(8.0))
+            .py(px(10.0))
             .flex()
             .flex_col()
-            .gap(px(11.0))
+            .gap(px(8.0))
             .child(render_pr_identity(item, false, theme))
             .child(
                 div()
-                    .pl(px(40.0))
+                    .pl(px(23.0))
                     .flex()
                     .items_center()
-                    .gap(px(12.0))
+                    .gap(px(10.0))
                     .child(render_author(item, true, theme))
                     .child(render_diff_stats(item, true, theme))
                     .child(div().flex_1())
@@ -542,47 +551,49 @@ fn render_table_row(
                     )
                     .child(
                         icon(icons::ARROW_UP_RIGHT)
-                            .size(px(14.0))
-                            .text_color(theme.accent.opacity(0.65)),
+                            .size(px(12.0))
+                            .text_color(theme.accent.opacity(0.7)),
                     ),
             )
             .into_any_element(),
         PullRequestTableLayout::Compact | PullRequestTableLayout::Wide => row
-            .min_h(px(76.0))
-            .px(px(16.0))
-            .py(px(11.0))
+            .h(px(PR_TABLE_ROW_HEIGHT))
+            .px(px(8.0))
             .flex()
             .items_center()
-            .gap(px(14.0))
-            .child(render_pr_identity(
-                item,
-                layout == PullRequestTableLayout::Compact,
-                theme,
-            ))
-            .when(layout == PullRequestTableLayout::Wide, |element| {
-                element.child(div().w(px(150.0)).child(render_author(item, true, theme)))
-            })
+            .gap(px(8.0))
+            .child(render_pr_identity(item, true, theme))
             .child(
                 div()
-                    .w(px(174.0))
+                    .w(px(PR_TABLE_CHANGES_WIDTH))
+                    .flex_none()
                     .child(render_diff_stats(item, false, theme)),
             )
             .child(
                 div()
-                    .w(px(108.0))
-                    .text_size(px(11.5))
-                    .text_color(theme.text_muted.opacity(0.7))
+                    .w(px(PR_TABLE_UPDATED_WIDTH))
+                    .flex_none()
+                    .truncate()
+                    .text_size(px(10.5))
+                    .text_color(theme.text_muted)
                     .child(SharedString::from(relative_updated_at(
                         item.updated_at,
                         Utc::now(),
                     ))),
             )
             .child(
-                div().w(px(20.0)).flex().justify_end().child(
-                    icon(icons::ARROW_UP_RIGHT)
-                        .size(px(15.0))
-                        .text_color(theme.accent.opacity(0.65)),
-                ),
+                div()
+                    .w(px(PR_TABLE_ACTION_WIDTH))
+                    .flex_none()
+                    .flex()
+                    .justify_end()
+                    .opacity(0.0)
+                    .group_hover(group, |style| style.opacity(1.0))
+                    .child(
+                        icon(icons::ARROW_UP_RIGHT)
+                            .size(px(12.0))
+                            .text_color(theme.accent.opacity(0.7)),
+                    ),
             )
             .into_any_element(),
     }
@@ -598,11 +609,11 @@ fn render_pr_identity(
         .min_w_0()
         .flex()
         .items_center()
-        .gap(px(10.0))
+        .gap(px(8.0))
         .child(
             icon(icons::PULL_REQUEST)
                 .flex_none()
-                .size(px(17.0))
+                .size(px(15.0))
                 .text_color(theme.success_muted),
         )
         .child(
@@ -611,12 +622,11 @@ fn render_pr_identity(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .gap(px(5.0))
+                .gap(px(2.0))
                 .child(
                     div()
                         .truncate()
-                        .text_size(px(13.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_size(px(12.0))
                         .text_color(theme.text)
                         .child(SharedString::from(truncate_title(&item.title, 120))),
                 )
@@ -624,10 +634,10 @@ fn render_pr_identity(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(7.0))
+                        .gap(px(5.0))
                         .min_w_0()
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted.opacity(0.65))
+                        .text_size(px(10.0))
+                        .text_color(theme.text_faint)
                         .child(
                             div()
                                 .min_w_0()
@@ -639,10 +649,12 @@ fn render_pr_identity(
                             element.child(
                                 div()
                                     .px(px(6.0))
-                                    .py(px(1.0))
+                                    .h(px(15.0))
+                                    .flex()
+                                    .items_center()
                                     .rounded_full()
                                     .bg(theme.warning.opacity(0.1))
-                                    .text_size(px(9.5))
+                                    .text_size(px(9.0))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(theme.warning)
                                     .child("DRAFT"),
@@ -654,7 +666,7 @@ fn render_pr_identity(
                                 .child(
                                     div()
                                         .flex_none()
-                                        .size(px(16.0))
+                                        .size(px(14.0))
                                         .rounded_full()
                                         .overflow_hidden()
                                         .border_1()
@@ -676,12 +688,12 @@ fn render_author(item: &ChangeRequestListItem, show_login: bool, theme: &Theme) 
     div()
         .flex()
         .items_center()
-        .gap(px(8.0))
+        .gap(px(6.0))
         .min_w_0()
         .child(
             div()
                 .flex_none()
-                .size(px(26.0))
+                .size(px(20.0))
                 .rounded_full()
                 .overflow_hidden()
                 .border_1()
@@ -698,8 +710,8 @@ fn render_author(item: &ChangeRequestListItem, show_login: bool, theme: &Theme) 
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(11.5))
-                    .text_color(theme.text_muted.opacity(0.8))
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
                     .child(SharedString::from(item.author_login.clone())),
             )
         })
@@ -710,9 +722,9 @@ fn render_diff_stats(item: &ChangeRequestListItem, compact: bool, theme: &Theme)
     div()
         .flex()
         .items_center()
-        .gap(px(if compact { 7.0 } else { 10.0 }))
+        .gap(px(if compact { 6.0 } else { 8.0 }))
         .font_family(theme.font_mono.clone())
-        .text_size(px(if compact { 10.5 } else { 11.0 }))
+        .text_size(px(10.5))
         .child(
             div()
                 .text_color(theme.success_muted)

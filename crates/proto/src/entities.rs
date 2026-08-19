@@ -384,6 +384,10 @@ pub struct ChangeRequestListItem {
     pub url: String,
     pub state: ChangeRequestState,
     pub is_draft: bool,
+    pub author_login: String,
+    pub author_avatar_url: String,
+    pub additions: u64,
+    pub deletions: u64,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -685,6 +689,10 @@ mod tests {
                 url: "https://github.com/private-owner/private-repo/pull/123".into(),
                 state,
                 is_draft: true,
+                author_login: "octocat".into(),
+                author_avatar_url: "https://avatars.githubusercontent.com/u/1?v=4".into(),
+                additions: 42,
+                deletions: 7,
                 updated_at: Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap(),
             };
 
@@ -692,6 +700,13 @@ mod tests {
             assert_eq!(value["repository"], "private-owner/private-repo");
             assert_eq!(value["state"], encoded_state);
             assert_eq!(value["isDraft"], true);
+            assert_eq!(value["authorLogin"], "octocat");
+            assert_eq!(
+                value["authorAvatarUrl"],
+                "https://avatars.githubusercontent.com/u/1?v=4"
+            );
+            assert_eq!(value["additions"], 42);
+            assert_eq!(value["deletions"], 7);
             assert_eq!(value["updatedAt"], "2026-08-19T12:00:00Z");
             assert!(value.get("baseRef").is_none());
             assert!(value.get("headRef").is_none());

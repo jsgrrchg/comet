@@ -21,9 +21,8 @@ const GITHUB_TIMEOUT: Duration = Duration::from_secs(20);
 const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GITHUB_RESULT_LIMIT: &str = "20";
-const GITHUB_SEARCH_RESULT_LIMIT: &str = "100";
 const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
-const GITHUB_SEARCH_JSON_FIELDS: &str = "number,title,url,state,repository,updatedAt,isDraft";
+const GITHUB_SEARCH_QUERY: &str = "query { search(query: \"is:pr is:open author:@me sort:updated-desc\", type: ISSUE, first: 100) { nodes { ... on PullRequest { number title url state isDraft updatedAt additions deletions repository { nameWithOwner } author { login avatarUrl } } } } }";
 
 /// Repository identity extracted from a Git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,20 +209,10 @@ impl GitHubCli {
         let request = ProcessRequest {
             program: "gh".into(),
             args: vec![
-                "search".into(),
-                "prs".into(),
-                "--author".into(),
-                "@me".into(),
-                "--state".into(),
-                "open".into(),
-                "--sort".into(),
-                "updated".into(),
-                "--order".into(),
-                "desc".into(),
-                "--limit".into(),
-                GITHUB_SEARCH_RESULT_LIMIT.into(),
-                "--json".into(),
-                GITHUB_SEARCH_JSON_FIELDS.into(),
+                "api".into(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={GITHUB_SEARCH_QUERY}"),
             ],
             cwd: None,
             env: vec![
@@ -241,9 +230,12 @@ impl GitHubCli {
             return Err(ChangeRequestError::Decode);
         }
 
-        let results: Vec<GhSearchPullRequest> =
+        let response: GhSearchResponse =
             serde_json::from_slice(&output.stdout).map_err(|_| ChangeRequestError::Decode)?;
-        let mut items = results
+        let mut items = response
+            .data
+            .search
+            .nodes
             .into_iter()
             .map(to_list_item)
             .collect::<Result<Vec<_>, _>>()?;
@@ -700,10 +692,28 @@ struct GhSearchPullRequest {
     number: u64,
     title: String,
     url: String,
-    state: GhSearchPullRequestState,
+    state: GhPullRequestState,
     repository: GhSearchRepository,
+    author: GhSearchAuthor,
     updated_at: DateTime<Utc>,
     is_draft: bool,
+    additions: u64,
+    deletions: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhSearchResponse {
+    data: GhSearchData,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhSearchData {
+    search: GhSearchConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhSearchConnection {
+    nodes: Vec<GhSearchPullRequest>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -712,18 +722,16 @@ struct GhSearchRepository {
     name_with_owner: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhSearchAuthor {
+    login: String,
+    avatar_url: String,
+}
+
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum GhPullRequestState {
-    Open,
-    Closed,
-    Merged,
-}
-
-/// `gh search prs` emits lowercase state values, unlike `gh pr list`.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum GhSearchPullRequestState {
     Open,
     Closed,
     Merged,
@@ -735,16 +743,6 @@ impl From<GhPullRequestState> for ChangeRequestState {
             GhPullRequestState::Open => Self::Open,
             GhPullRequestState::Closed => Self::Closed,
             GhPullRequestState::Merged => Self::Merged,
-        }
-    }
-}
-
-impl From<GhSearchPullRequestState> for ChangeRequestState {
-    fn from(state: GhSearchPullRequestState) -> Self {
-        match state {
-            GhSearchPullRequestState::Open => Self::Open,
-            GhSearchPullRequestState::Closed => Self::Closed,
-            GhSearchPullRequestState::Merged => Self::Merged,
         }
     }
 }
@@ -844,7 +842,7 @@ fn to_list_item(
         || name.is_empty()
         || repository_parts.next().is_some()
         || repository.chars().any(char::is_whitespace)
-        || !matches!(pull_request.state, GhSearchPullRequestState::Open)
+        || !matches!(pull_request.state, GhPullRequestState::Open)
     {
         return Err(ChangeRequestError::Decode);
     }
@@ -857,9 +855,18 @@ fn to_list_item(
     if title.is_empty() {
         return Err(ChangeRequestError::Decode);
     }
+    let author_login = pull_request.author.login.trim();
+    if author_login.is_empty() || author_login.chars().any(char::is_whitespace) {
+        return Err(ChangeRequestError::Decode);
+    }
     let url =
         reqwest::Url::parse(pull_request.url.trim()).map_err(|_| ChangeRequestError::Decode)?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(ChangeRequestError::Decode);
+    }
+    let avatar_url = reqwest::Url::parse(pull_request.author.avatar_url.trim())
+        .map_err(|_| ChangeRequestError::Decode)?;
+    if !matches!(avatar_url.scheme(), "http" | "https") || avatar_url.host_str().is_none() {
         return Err(ChangeRequestError::Decode);
     }
 
@@ -871,6 +878,10 @@ fn to_list_item(
         url: url.to_string(),
         state: pull_request.state.into(),
         is_draft: pull_request.is_draft,
+        author_login: author_login.into(),
+        author_avatar_url: avatar_url.to_string(),
+        additions: pull_request.additions,
+        deletions: pull_request.deletions,
         updated_at: pull_request.updated_at,
     })
 }
@@ -1133,12 +1144,24 @@ mod tests {
             "url": format!("https://github.com/{repository}/pull/{number}"),
             "state": state,
             "repository": {
-                "name": repository.rsplit('/').next().unwrap_or_default(),
                 "nameWithOwner": repository,
+            },
+            "author": {
+                "login": "octocat",
+                "avatarUrl": "https://avatars.githubusercontent.com/u/1?v=4",
             },
             "updatedAt": updated_at,
             "isDraft": is_draft,
+            "additions": 42,
+            "deletions": 7,
         })
+    }
+
+    fn search_response(items: Vec<serde_json::Value>) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "data": { "search": { "nodes": items } }
+        }))
+        .unwrap()
     }
 
     async fn list_with(
@@ -1209,20 +1232,22 @@ mod tests {
 
     #[tokio::test]
     async fn github_search_uses_exact_global_arguments_and_environment() {
-        let json = serde_json::to_vec(&vec![search_pull_request(
+        let json = search_response(vec![search_pull_request(
             "acme/zeron",
             123,
             "Dashboard",
-            "open",
+            "OPEN",
             "2026-08-19T12:00:00Z",
             true,
-        )])
-        .unwrap();
+        )]);
         let (result, runner) = list_with(command_success(json)).await;
 
         let item = &result.unwrap()[0];
         assert_eq!(item.repository, "acme/zeron");
         assert!(item.is_draft);
+        assert_eq!(item.author_login, "octocat");
+        assert_eq!(item.additions, 42);
+        assert_eq!(item.deletions, 7);
         let requests = runner.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].program, "gh");
@@ -1230,20 +1255,10 @@ mod tests {
         assert_eq!(
             requests[0].args,
             [
-                "search",
-                "prs",
-                "--author",
-                "@me",
-                "--state",
-                "open",
-                "--sort",
-                "updated",
-                "--order",
-                "desc",
-                "--limit",
-                "100",
-                "--json",
-                GITHUB_SEARCH_JSON_FIELDS,
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={GITHUB_SEARCH_QUERY}")
             ]
         );
         assert_eq!(
@@ -1259,12 +1274,12 @@ mod tests {
 
     #[tokio::test]
     async fn github_search_normalizes_titles_and_sorts_results_stably() {
-        let json = serde_json::to_vec(&vec![
+        let json = search_response(vec![
             search_pull_request(
                 "zeta/repo",
                 8,
                 "  A title\nwith\tspacing  ",
-                "open",
+                "OPEN",
                 "2026-08-19T11:00:00Z",
                 false,
             ),
@@ -1272,7 +1287,7 @@ mod tests {
                 "alpha/repo",
                 4,
                 "Alpha",
-                "open",
+                "OPEN",
                 "2026-08-19T12:00:00Z",
                 true,
             ),
@@ -1280,12 +1295,11 @@ mod tests {
                 "alpha/repo",
                 2,
                 "Earlier number",
-                "open",
+                "OPEN",
                 "2026-08-19T12:00:00Z",
                 false,
             ),
-        ])
-        .unwrap();
+        ]);
 
         let (result, _) = list_with(command_success(json)).await;
         let items = result.unwrap();
@@ -1306,7 +1320,7 @@ mod tests {
             "acme/zeron",
             1,
             "Valid",
-            "open",
+            "OPEN",
             "2026-08-19T12:00:00Z",
             false,
         );
@@ -1317,7 +1331,9 @@ mod tests {
             ("/repository/nameWithOwner", serde_json::json!("zeron")),
             ("/repository/nameWithOwner", serde_json::json!("a/b/c")),
             ("/url", serde_json::json!("file:///tmp/pr")),
-            ("/state", serde_json::json!("closed")),
+            ("/state", serde_json::json!("CLOSED")),
+            ("/author/login", serde_json::json!(" ")),
+            ("/author/avatarUrl", serde_json::json!("file:///tmp/avatar")),
         ] {
             let mut item = base.clone();
             *item.pointer_mut(pointer).unwrap() = value;
@@ -1325,7 +1341,7 @@ mod tests {
         }
 
         for item in invalid_items {
-            let json = serde_json::to_vec(&vec![item]).unwrap();
+            let json = search_response(vec![item]);
             let (result, _) = list_with(command_success(json)).await;
             assert_eq!(result.unwrap_err(), ChangeRequestError::Decode);
         }
@@ -1358,7 +1374,7 @@ mod tests {
             command_success(b"not-json".to_vec()),
             Ok(ProcessOutput {
                 success: true,
-                stdout: b"[]".to_vec(),
+                stdout: search_response(Vec::new()),
                 stderr: Vec::new(),
                 stdout_truncated: true,
             }),

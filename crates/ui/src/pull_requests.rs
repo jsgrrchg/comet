@@ -344,7 +344,7 @@ impl Render for PullRequestsPage {
                     .max_w(px(1120.0))
                     .mx_auto()
                     .px(px(24.0))
-                    .pt(px(16.0))
+                    .pt(px(Theme::TITLEBAR_HEIGHT + Theme::SPACE_SM))
                     .pb(px(64.0))
                     .flex()
                     .flex_col()

@@ -370,6 +370,23 @@ pub struct ChangeRequestSummary {
     pub head_ref: String,
 }
 
+/// Provider-neutral change request metadata for global listing surfaces.
+///
+/// Unlike [`ChangeRequestSummary`], this contract is not tied to a checkout
+/// and therefore identifies the repository instead of requiring branch refs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeRequestListItem {
+    pub provider: String,
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: ChangeRequestState,
+    pub is_draft: bool,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Latest successful change request resolution for one checkout and branch.
 ///
 /// `change_request: None` is an authoritative successful lookup with no match;
@@ -649,6 +666,38 @@ mod tests {
             assert_eq!(
                 serde_json::from_value::<CheckoutChangeRequestStatus>(value).unwrap(),
                 status
+            );
+        }
+    }
+
+    #[test]
+    fn change_request_list_item_round_trips_all_states_as_camel_case() {
+        for (state, encoded_state) in [
+            (ChangeRequestState::Open, "open"),
+            (ChangeRequestState::Closed, "closed"),
+            (ChangeRequestState::Merged, "merged"),
+        ] {
+            let item = ChangeRequestListItem {
+                provider: "github".into(),
+                repository: "private-owner/private-repo".into(),
+                number: 123,
+                title: "Add pull request dashboard".into(),
+                url: "https://github.com/private-owner/private-repo/pull/123".into(),
+                state,
+                is_draft: true,
+                updated_at: Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap(),
+            };
+
+            let value = serde_json::to_value(&item).unwrap();
+            assert_eq!(value["repository"], "private-owner/private-repo");
+            assert_eq!(value["state"], encoded_state);
+            assert_eq!(value["isDraft"], true);
+            assert_eq!(value["updatedAt"], "2026-08-19T12:00:00Z");
+            assert!(value.get("baseRef").is_none());
+            assert!(value.get("headRef").is_none());
+            assert_eq!(
+                serde_json::from_value::<ChangeRequestListItem>(value).unwrap(),
+                item
             );
         }
     }

@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, Render, ScrollHandle, SharedString, Subscription,
-    Task, Window, container_query, div, prelude::*, px,
+    AnyElement, Context, Entity, IntoElement, ObjectFit, Render, ScrollHandle, SharedString,
+    StyledImage as _, Subscription, Task, Window, div, img, prelude::*, px,
 };
 use zeron_proto::{ChangeRequestListItem, Device};
 use zeron_rpc::{RpcError, capability_errors, methods};
@@ -310,7 +310,7 @@ impl PullRequestsPage {
 }
 
 impl Render for PullRequestsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let initial_loading =
             self.items.is_empty() && matches!(self.load_state, PullRequestsLoadState::Loading);
@@ -323,7 +323,7 @@ impl Render for PullRequestsPage {
             || !self.items.is_empty())
         .then_some(self.items.len());
         let items = self.items.clone();
-        let grid_theme = theme.clone();
+        let layout = table_layout_for_viewport(f32::from(window.viewport_size().width));
         let scroll = self.scroll.clone();
 
         div()
@@ -334,7 +334,7 @@ impl Render for PullRequestsPage {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(1040.0))
+                    .max_w(px(1120.0))
                     .mx_auto()
                     .px(px(24.0))
                     .pt(px(32.0))
@@ -404,127 +404,330 @@ impl Render for PullRequestsPage {
                     } else if items.is_empty() {
                         self.render_empty_or_error(&theme)
                     } else {
-                        container_query(move |size, _, cx| {
-                            render_card_grid(
-                                &items,
-                                dashboard_columns(f32::from(size.width)),
-                                &grid_theme,
-                                cx,
-                            )
-                        })
-                        .mt(px(24.0))
-                        .into_any_element()
+                        div()
+                            .mt(px(24.0))
+                            .child(render_pull_request_table(&items, layout, &theme))
+                            .into_any_element()
                     }),
             )
     }
 }
 
-fn render_card_grid(
-    items: &[ChangeRequestListItem],
-    columns: usize,
-    theme: &Theme,
-    _cx: &mut gpui::App,
-) -> AnyElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .gap(px(14.0))
-        .children(items.chunks(columns).enumerate().map(|(row, chunk)| {
-            div()
-                .w_full()
-                .flex()
-                .gap(px(14.0))
-                .children(
-                    chunk
-                        .iter()
-                        .enumerate()
-                        .map(|(column, item)| render_card(item, row * columns + column, theme)),
-                )
-                .when(chunk.len() < columns, |element| {
-                    element.children((chunk.len()..columns).map(|_| div().flex_1().min_w_0()))
-                })
-        }))
-        .into_any_element()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullRequestTableLayout {
+    Narrow,
+    Compact,
+    Wide,
 }
 
-fn render_card(item: &ChangeRequestListItem, index: usize, theme: &Theme) -> AnyElement {
-    let url = item.url.clone();
-    let updated = relative_updated_at(item.updated_at, Utc::now());
-    let title = truncate_title(&item.title, 120);
+fn table_layout(width: f32) -> PullRequestTableLayout {
+    if width < 640.0 {
+        PullRequestTableLayout::Narrow
+    } else if width < 900.0 {
+        PullRequestTableLayout::Compact
+    } else {
+        PullRequestTableLayout::Wide
+    }
+}
+
+fn table_layout_for_viewport(viewport_width: f32) -> PullRequestTableLayout {
+    table_layout((viewport_width - 48.0).max(0.0).min(1_072.0))
+}
+
+fn render_pull_request_table(
+    items: &[ChangeRequestListItem],
+    layout: PullRequestTableLayout,
+    theme: &Theme,
+) -> AnyElement {
+    let show_header = layout != PullRequestTableLayout::Narrow;
     div()
-        .id(SharedString::from(format!(
-            "pull-request-card-{index}-{}-{}",
-            item.repository, item.number
-        )))
-        .flex_1()
-        .min_w_0()
-        .h(px(156.0))
-        .p(px(16.0))
-        .rounded(px(12.0))
+        .w_full()
+        .rounded(px(14.0))
         .border_1()
         .border_color(theme.border)
         .bg(theme.card_glass_bg())
-        .cursor_pointer()
-        .hover(|style| {
-            style
-                .bg(crate::theme::ink(0.035))
-                .border_color(theme.border.opacity(0.9))
+        .overflow_hidden()
+        .when(show_header, |element| {
+            element.child(render_table_header(layout, theme))
         })
+        .children(
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| render_table_row(item, index, layout, theme)),
+        )
+        .into_any_element()
+}
+
+fn render_table_header(layout: PullRequestTableLayout, theme: &Theme) -> AnyElement {
+    let label = |copy: &'static str| {
+        div()
+            .text_size(px(10.5))
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .text_color(theme.text_muted.opacity(0.55))
+            .child(copy)
+    };
+    div()
+        .h(px(38.0))
+        .px(px(16.0))
+        .flex()
+        .items_center()
+        .gap(px(14.0))
+        .border_b_1()
+        .border_color(theme.border)
+        .bg(crate::theme::ink(0.018))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .pl(px(27.0))
+                .child(label("PULL REQUEST")),
+        )
+        .when(layout == PullRequestTableLayout::Wide, |element| {
+            element.child(div().w(px(150.0)).child(label("AUTHOR")))
+        })
+        .child(div().w(px(174.0)).child(label("CHANGES")))
+        .child(div().w(px(108.0)).child(label("UPDATED")))
+        .child(div().w(px(20.0)))
+        .into_any_element()
+}
+
+fn render_table_row(
+    item: &ChangeRequestListItem,
+    index: usize,
+    layout: PullRequestTableLayout,
+    theme: &Theme,
+) -> AnyElement {
+    let url = item.url.clone();
+    let row = div()
+        .id(SharedString::from(format!(
+            "pull-request-row-{index}-{}-{}",
+            item.repository, item.number
+        )))
+        .when(index > 0, |element| {
+            element.border_t_1().border_color(theme.border)
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(crate::theme::ink(0.035)))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             cx.open_url(&url);
-        })
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .text_size(px(11.5))
-                .text_color(theme.text_muted)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(SharedString::from(item.repository.clone())),
-                )
-                .child(SharedString::from(format!("#{}", item.number))),
-        )
-        .child(
-            div()
-                .mt(px(13.0))
-                .h(px(42.0))
-                .overflow_hidden()
-                .text_size(px(14.0))
-                .line_height(px(20.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text)
-                .child(SharedString::from(title)),
-        )
-        .child(div().flex_1())
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .when(item.is_draft, |element| {
-                    element.child(widgets::badge(theme, "Draft"))
-                })
-                .child(div().flex_1())
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(theme.text_muted.opacity(0.75))
-                        .child(SharedString::from(updated)),
-                )
-                .child(
+        });
+
+    match layout {
+        PullRequestTableLayout::Narrow => row
+            .px(px(14.0))
+            .py(px(13.0))
+            .flex()
+            .flex_col()
+            .gap(px(11.0))
+            .child(render_pr_identity(item, false, theme))
+            .child(
+                div()
+                    .pl(px(40.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(render_author(item, true, theme))
+                    .child(render_diff_stats(item, true, theme))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.65))
+                            .child(SharedString::from(compact_updated_at(
+                                item.updated_at,
+                                Utc::now(),
+                            ))),
+                    )
+                    .child(
+                        icon(icons::ARROW_UP_RIGHT)
+                            .size(px(14.0))
+                            .text_color(theme.accent.opacity(0.65)),
+                    ),
+            )
+            .into_any_element(),
+        PullRequestTableLayout::Compact | PullRequestTableLayout::Wide => row
+            .min_h(px(76.0))
+            .px(px(16.0))
+            .py(px(11.0))
+            .flex()
+            .items_center()
+            .gap(px(14.0))
+            .child(render_pr_identity(
+                item,
+                layout == PullRequestTableLayout::Compact,
+                theme,
+            ))
+            .when(layout == PullRequestTableLayout::Wide, |element| {
+                element.child(div().w(px(150.0)).child(render_author(item, true, theme)))
+            })
+            .child(
+                div()
+                    .w(px(174.0))
+                    .child(render_diff_stats(item, false, theme)),
+            )
+            .child(
+                div()
+                    .w(px(108.0))
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .child(SharedString::from(relative_updated_at(
+                        item.updated_at,
+                        Utc::now(),
+                    ))),
+            )
+            .child(
+                div().w(px(20.0)).flex().justify_end().child(
                     icon(icons::ARROW_UP_RIGHT)
-                        .size(px(14.0))
-                        .text_color(theme.text_muted.opacity(0.55)),
+                        .size(px(15.0))
+                        .text_color(theme.accent.opacity(0.65)),
                 ),
+            )
+            .into_any_element(),
+    }
+}
+
+fn render_pr_identity(
+    item: &ChangeRequestListItem,
+    include_author: bool,
+    theme: &Theme,
+) -> AnyElement {
+    div()
+        .flex_1()
+        .min_w_0()
+        .flex()
+        .items_center()
+        .gap(px(10.0))
+        .child(
+            icon(icons::PULL_REQUEST)
+                .flex_none()
+                .size(px(17.0))
+                .text_color(theme.success_muted),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(13.5))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text)
+                        .child(SharedString::from(truncate_title(&item.title, 120))),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .min_w_0()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.65))
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(item.repository.clone())),
+                        )
+                        .child(SharedString::from(format!("#{}", item.number)))
+                        .when(item.is_draft, |element| {
+                            element.child(
+                                div()
+                                    .px(px(6.0))
+                                    .py(px(1.0))
+                                    .rounded_full()
+                                    .bg(theme.warning.opacity(0.1))
+                                    .text_size(px(9.5))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.warning)
+                                    .child("DRAFT"),
+                            )
+                        })
+                        .when(include_author, |element| {
+                            element
+                                .child(div().text_color(theme.text_muted.opacity(0.25)).child("·"))
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .size(px(16.0))
+                                        .rounded_full()
+                                        .overflow_hidden()
+                                        .border_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            img(item.author_avatar_url.clone())
+                                                .size_full()
+                                                .object_fit(ObjectFit::Cover),
+                                        ),
+                                )
+                                .child(SharedString::from(item.author_login.clone()))
+                        }),
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_author(item: &ChangeRequestListItem, show_login: bool, theme: &Theme) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .min_w_0()
+        .child(
+            div()
+                .flex_none()
+                .size(px(26.0))
+                .rounded_full()
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme.border)
+                .bg(crate::theme::ink(0.04))
+                .child(
+                    img(item.author_avatar_url.clone())
+                        .size_full()
+                        .object_fit(ObjectFit::Cover),
+                ),
+        )
+        .when(show_login, |element| {
+            element.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted.opacity(0.8))
+                    .child(SharedString::from(item.author_login.clone())),
+            )
+        })
+        .into_any_element()
+}
+
+fn render_diff_stats(item: &ChangeRequestListItem, compact: bool, theme: &Theme) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(if compact { 7.0 } else { 10.0 }))
+        .font_family(theme.font_mono.clone())
+        .text_size(px(if compact { 10.5 } else { 11.0 }))
+        .child(
+            div()
+                .text_color(theme.success_muted)
+                .child(SharedString::from(format!(
+                    "+{}",
+                    format_compact_count(item.additions)
+                ))),
+        )
+        .child(
+            div()
+                .text_color(theme.danger_muted)
+                .child(SharedString::from(format!(
+                    "−{}",
+                    format_compact_count(item.deletions)
+                ))),
         )
         .into_any_element()
 }
@@ -617,16 +820,6 @@ fn platform_icon(platform: &str) -> &'static str {
     }
 }
 
-fn dashboard_columns(width: f32) -> usize {
-    if width < 560.0 {
-        1
-    } else if width < 900.0 {
-        2
-    } else {
-        3
-    }
-}
-
 fn relative_updated_at(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let seconds = now.signed_duration_since(updated_at).num_seconds().max(0);
     let (amount, unit) = if seconds < 60 {
@@ -648,6 +841,43 @@ fn relative_updated_at(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String 
         "Updated {amount} {unit}{} ago",
         if amount == 1 { "" } else { "s" }
     )
+}
+
+fn compact_updated_at(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(updated_at).num_seconds().max(0);
+    if seconds < 60 {
+        "now".into()
+    } else if seconds < 3_600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3_600)
+    } else if seconds < 604_800 {
+        format!("{}d ago", seconds / 86_400)
+    } else if seconds < 2_592_000 {
+        format!("{}w ago", seconds / 604_800)
+    } else {
+        format!("{}mo ago", seconds / 2_592_000)
+    }
+}
+
+fn format_compact_count(value: u64) -> String {
+    if value < 1_000 {
+        value.to_string()
+    } else if value < 1_000_000 {
+        let tenths = value / 100;
+        if tenths % 10 == 0 {
+            format!("{}k", value / 1_000)
+        } else {
+            format!("{}.{:01}k", value / 1_000, tenths % 10)
+        }
+    } else {
+        let tenths = value / 100_000;
+        if tenths % 10 == 0 {
+            format!("{}m", value / 1_000_000)
+        } else {
+            format!("{}.{:01}m", value / 1_000_000, tenths % 10)
+        }
+    }
 }
 
 fn truncate_title(title: &str, max_chars: usize) -> String {
@@ -721,11 +951,23 @@ mod tests {
     }
 
     #[test]
-    fn grid_breakpoints_follow_the_content_width() {
-        assert_eq!(dashboard_columns(559.0), 1);
-        assert_eq!(dashboard_columns(560.0), 2);
-        assert_eq!(dashboard_columns(899.0), 2);
-        assert_eq!(dashboard_columns(900.0), 3);
+    fn table_breakpoints_follow_the_content_width() {
+        assert_eq!(table_layout(639.0), PullRequestTableLayout::Narrow);
+        assert_eq!(table_layout(640.0), PullRequestTableLayout::Compact);
+        assert_eq!(table_layout(899.0), PullRequestTableLayout::Compact);
+        assert_eq!(table_layout(900.0), PullRequestTableLayout::Wide);
+        assert_eq!(
+            table_layout_for_viewport(687.0),
+            PullRequestTableLayout::Narrow
+        );
+        assert_eq!(
+            table_layout_for_viewport(688.0),
+            PullRequestTableLayout::Compact
+        );
+        assert_eq!(
+            table_layout_for_viewport(948.0),
+            PullRequestTableLayout::Wide
+        );
     }
 
     #[test]
@@ -740,6 +982,16 @@ mod tests {
             relative_updated_at(now - TimeDelta::days(2), now),
             "Updated 2 days ago"
         );
+        assert_eq!(compact_updated_at(now - TimeDelta::hours(2), now), "2h ago");
+        assert_eq!(compact_updated_at(now + TimeDelta::hours(2), now), "now");
+    }
+
+    #[test]
+    fn diff_counts_stay_compact_without_losing_scale() {
+        assert_eq!(format_compact_count(999), "999");
+        assert_eq!(format_compact_count(1_000), "1k");
+        assert_eq!(format_compact_count(13_223), "13.2k");
+        assert_eq!(format_compact_count(1_250_000), "1.2m");
     }
 
     #[test]

@@ -4967,7 +4967,9 @@ impl Shell {
                 .min_w_0()
                 .h_full()
                 .pt(px(Theme::TITLEBAR_HEIGHT))
-                .child(outlet)
+                .flex()
+                .flex_col()
+                .child(div().flex_1().min_h_0().child(outlet))
                 .into_any_element();
         }
 

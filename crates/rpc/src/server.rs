@@ -7,6 +7,10 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::tungstenite::handshake::server::{
+    ErrorResponse, Request as HandshakeRequest, Response as HandshakeResponse,
+};
+use tokio_tungstenite::tungstenite::http::StatusCode;
 
 use crate::{ClientFrame, RpcError, RpcReply, RpcService, ServerFrame};
 
@@ -87,6 +91,20 @@ async fn handle_request(
             .await;
         }
         Ok(RpcReply::Stream(mut stream)) => {
+            // Only the versioned checkout-PR stream uses an explicit readiness
+            // frame. Sending it for legacy streams would make older clients remove
+            // their pending stream as if it were a unary response.
+            if method == crate::methods::WATCH_CHECKOUT_CHANGE_REQUEST
+                && send(ServerFrame {
+                    id,
+                    ok: Some(serde_json::json!({ "stream": true })),
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
             while let Some(item) = stream.next().await {
                 if send(ServerFrame {
                     id,
@@ -134,7 +152,29 @@ pub async fn serve_ws_listener(listener: TcpListener, service: Arc<dyn RpcServic
 }
 
 async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
-    let ws = match tokio_tungstenite::accept_async(stream).await {
+    // Native viewports dial this socket with a bare `connect_async` and send
+    // no `Origin` header. A browser always attaches `Origin` to a WebSocket
+    // handshake and cannot forge or suppress it from script, and WebSockets
+    // are exempt from the Same-Origin Policy — so only rejecting any handshake
+    // that carries `Origin` keeps a page the user happens to visit from
+    // reaching this local socket. Keep this check.
+    //
+    // The large `Err` (ErrorResponse) is the shape tungstenite's Callback
+    // trait requires; it can't be boxed away here.
+    #[allow(clippy::result_large_err)]
+    let reject_cross_origin = |req: &HandshakeRequest, resp: HandshakeResponse| {
+        if let Some(origin) = req.headers().get("origin") {
+            tracing::warn!(
+                origin = %String::from_utf8_lossy(origin.as_bytes()),
+                "rpc: rejecting handshake carrying an Origin header (cross-origin browser dial)"
+            );
+            let mut err = ErrorResponse::new(Some("origin not allowed on local IPC".to_string()));
+            *err.status_mut() = StatusCode::FORBIDDEN;
+            return Err(err);
+        }
+        Ok(resp)
+    };
+    let ws = match tokio_tungstenite::accept_hdr_async(stream, reject_cross_origin).await {
         Ok(ws) => ws,
         Err(err) => {
             tracing::warn!(error = %err, "rpc: websocket handshake failed");

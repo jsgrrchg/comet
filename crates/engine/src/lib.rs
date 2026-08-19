@@ -17,6 +17,7 @@ use zeron_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
+pub mod change_requests;
 pub mod chat2_host;
 pub mod diff_sync;
 pub mod doc_host;
@@ -28,6 +29,7 @@ pub mod repos;
 pub mod rpc;
 pub mod run_journal;
 pub mod sessions;
+pub mod source_control;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;
@@ -36,6 +38,7 @@ pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
@@ -49,6 +52,11 @@ pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
 pub use run_journal::{JournalError, RunJournal};
 pub use sessions::{JournaledEvent, SessionsEngine, SteerOutcome};
+pub use source_control::{
+    BranchHeadContext, ChangeRequestError, ChangeRequestProvider, ChangeRequestResolution,
+    ChangeRequestResolver, CheckoutChangeRequestLookup, CheckoutSourceContext, GitHubCli,
+    GitRemote, parse_git_remote,
+};
 pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
@@ -113,6 +121,7 @@ pub struct EngineCore {
     pub registry: Arc<HarnessRegistry>,
     pub repos: Repos,
     pub terminals: Terminals,
+    pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
@@ -229,6 +238,8 @@ impl EngineCore {
         }
         doc_host.spawn_transcript_salvage(profile.store_root().join("journals"));
         let repos = Repos::new(data_dir, &device_id);
+        doc_host.set_repos(repos.clone());
+        let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
         let terminals = Terminals::new();
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
@@ -275,6 +286,7 @@ impl EngineCore {
             registry,
             repos,
             terminals,
+            change_requests,
             diff_sync,
             spaces_sync,
             uploads,
@@ -402,6 +414,7 @@ impl EngineCore {
             self.registry.clone(),
             self.repos.clone(),
             self.terminals.clone(),
+            self.change_requests.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
@@ -438,6 +451,7 @@ impl EngineCore {
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
+        self.change_requests.shutdown();
         // Cancel + await every worker that can reach Edge before flushing: a
         // replaced synced runtime must not keep polling releases or draining
         // the attachment outbox under the old identity after Local boots.
@@ -673,10 +687,16 @@ impl Engine {
         let edge_enabled = match profile.scope() {
             WorkspaceScope::Local => false,
             WorkspaceScope::Synced => {
-                // Validate a persisted session once so definitive revocation
-                // still transitions auth to SignedOut. A transient failure
-                // must not gate construction of the recovery supervisors.
-                let _ = auth.access_token().await;
+                // Validate the persisted session in the BACKGROUND: the probe
+                // still transitions auth to SignedOut on definitive revocation
+                // (and warms the single-flight refresh every first dial waits
+                // on), but assembly — and the viewport blocked on it — no
+                // longer stalls on a WorkOS round trip that can take seconds
+                // on a bad link. Everything shown at boot is local anyway.
+                let auth_probe = auth.clone();
+                tokio::spawn(async move {
+                    let _ = auth_probe.access_token().await;
+                });
                 true
             }
             // Dev Auth always exposes `dev_user_id` as its synthetic access
@@ -731,6 +751,10 @@ impl Engine {
             core.set_updater(updater);
         }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
+        // Managed ACP adapters install in the background at boot (agents
+        // whose CLI is present but whose adapter isn't yet), so a first chat
+        // never waits on — or dies inside — an npm run.
+        zeron_harness::acp::prewarm_managed_adapters();
 
         let host_relay = edge.as_ref().map(|edge| {
             let links = zeron_rpc::LinkCache::new(zeron_rpc::LinkCacheConfig::new(

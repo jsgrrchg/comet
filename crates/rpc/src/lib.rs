@@ -22,7 +22,7 @@ mod client;
 pub mod device_room;
 mod server;
 
-pub use client::{RpcClient, connect_ws};
+pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
     NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
@@ -96,6 +96,8 @@ pub mod methods {
     pub const FETCH_ALL: &str = "FetchAll";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
+    /// The device's browse roots: home plus mounted drives/volumes.
+    pub const LIST_DRIVES: &str = "ListDrives";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
@@ -109,6 +111,8 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
+    /// Current pull request for one checkout, resolved on the checkout's host device.
+    pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     /// Permanently restore one chat-owned checkout to its current HEAD and
     /// remove only its untracked, non-ignored paths.
@@ -221,8 +225,43 @@ pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
 mod tests {
     use super::*;
     use futures::StreamExt;
+    use std::sync::Mutex;
 
     struct TestService;
+
+    struct CancelAwareService {
+        dropped: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.0.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RpcService for CancelAwareService {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            if method != methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+                return Err(RpcError::UnknownMethod(method.into()));
+            }
+            let guard = DropSignal(self.dropped.lock().unwrap().take());
+            let stream = futures::stream::unfold(guard, |guard| async move {
+                let item = std::future::pending::<Option<(serde_json::Value, DropSignal)>>().await;
+                drop(guard);
+                item
+            });
+            Ok(RpcReply::Stream(stream.boxed()))
+        }
+    }
 
     #[async_trait]
     impl RpcService for TestService {
@@ -281,6 +320,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checked_stream_acknowledges_support_and_preserves_unknown_method() {
+        let client = memory_client(Arc::new(TestService));
+
+        let mut items = client
+            .subscribe_checked("Count", serde_json::json!({"n": 1}))
+            .await
+            .unwrap();
+        assert_eq!(items.recv().await, Some(serde_json::json!(0)));
+        assert_eq!(items.recv().await, None);
+
+        let error = match client
+            .subscribe_checked("FutureStream", serde_json::Value::Null)
+            .await
+        {
+            Ok(_) => panic!("old service must reject unknown stream"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, RpcError::UnknownMethod(method) if method == "FutureStream"));
+    }
+
+    #[tokio::test]
+    async fn dropping_checked_subscription_cancels_pending_server_stream() {
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
+        let client = memory_client(Arc::new(CancelAwareService {
+            dropped: Mutex::new(Some(dropped_tx)),
+        }));
+        let stream = client
+            .subscribe_checked(
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST,
+                serde_json::Value::Null,
+            )
+            .await
+            .unwrap();
+
+        drop(stream);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .expect("server stream cancelled")
+            .expect("drop signal");
+    }
+
+    #[tokio::test]
     async fn websocket_round_trip() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -300,6 +382,34 @@ mod tests {
         assert_eq!(items.recv().await, Some(serde_json::json!(0)));
         assert_eq!(items.recv().await, Some(serde_json::json!(1)));
         assert_eq!(items.recv().await, None);
+    }
+
+    #[tokio::test]
+    async fn handshake_with_origin_header_is_rejected() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+
+        // A browser page opening ws://127.0.0.1:{port} always sends Origin;
+        // the server must refuse the handshake before serving any RPC.
+        let mut req = format!("ws://127.0.0.1:{port}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("origin", "https://evil.example".parse().unwrap());
+        let result = tokio_tungstenite::connect_async(req).await;
+        assert!(
+            result.is_err(),
+            "handshake carrying an Origin header must be rejected"
+        );
+
+        // A native viewport (no Origin) still connects and can call RPC — the
+        // reject must not be a blanket denial.
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();
+        assert_eq!(echoed, serde_json::json!("ok"));
     }
 
     #[tokio::test]

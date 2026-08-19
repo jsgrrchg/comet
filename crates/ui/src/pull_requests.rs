@@ -1,9 +1,12 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, Render, ScrollHandle, SharedString, Subscription,
-    Task, Window, div, prelude::*, px,
+    AnimationExt, AnyElement, Context, Entity, IntoElement, Render, ScrollHandle, SharedString,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 use zeron_proto::{ChangeRequestListItem, Device};
 use zeron_rpc::{RpcError, capability_errors, methods};
@@ -23,6 +26,9 @@ const PR_TABLE_OPENED_WIDTH: f32 = 92.0;
 const PR_TABLE_UPDATED_WIDTH: f32 = 92.0;
 const PR_TABLE_ACTION_WIDTH: f32 = 22.0;
 const PR_ROW_HOVER_TEXT_SCALE: f32 = 0.06;
+const PR_SORT_OFFSET_PER_ROW: f32 = 8.0;
+const PR_SORT_MAX_OFFSET: f32 = 24.0;
+const PR_SORT_ANIMATION: motion::MotionSpec = motion::MotionSpec::new(180, motion::EASE_RESORT);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PullRequestsPageError {
@@ -101,6 +107,8 @@ pub struct PullRequestsPage {
     target_device: Option<String>,
     items: Vec<ChangeRequestListItem>,
     sort: PullRequestSort,
+    sort_epoch: u64,
+    sort_offsets: HashMap<String, f32>,
     load_state: PullRequestsLoadState,
     last_loaded_at: Option<Instant>,
     generation: u64,
@@ -118,6 +126,8 @@ impl PullRequestsPage {
             target_device: None,
             items: Vec::new(),
             sort: PullRequestSort::DEFAULT,
+            sort_epoch: 0,
+            sort_offsets: HashMap::new(),
             load_state: PullRequestsLoadState::Idle,
             last_loaded_at: None,
             generation: 0,
@@ -132,6 +142,9 @@ impl PullRequestsPage {
 
     /// Called whenever shell navigation makes the already-owned entity visible again.
     pub fn on_visible(&mut self, cx: &mut Context<Self>) {
+        // Resort offsets describe one click transition, not durable page state.
+        // Dropping them here prevents a completed animation from replaying after navigation.
+        self.sort_offsets.clear();
         let stale = self
             .last_loaded_at
             .is_none_or(|loaded| loaded.elapsed() >= SNAPSHOT_TTL);
@@ -157,6 +170,7 @@ impl PullRequestsPage {
         self.request_task = None;
         self.target_device = target;
         self.items.clear();
+        self.sort_offsets.clear();
         self.load_state = PullRequestsLoadState::Idle;
         self.last_loaded_at = None;
         self.scroll.set_offset(gpui::Point::default());
@@ -170,7 +184,23 @@ impl PullRequestsPage {
     }
 
     fn select_sort(&mut self, field: PullRequestSortField, cx: &mut Context<Self>) {
-        self.sort = self.sort.select(field);
+        let mut previous = self.items.clone();
+        sort_pull_requests(&mut previous, self.sort);
+        let previous: Vec<_> = previous.iter().map(pull_request_key).collect();
+
+        let next_sort = self.sort.select(field);
+        let mut next = self.items.clone();
+        sort_pull_requests(&mut next, next_sort);
+        let next: Vec<_> = next.iter().map(pull_request_key).collect();
+
+        self.sort = next_sort;
+        self.sort_offsets.clear();
+        if !motion::reduced_motion(cx) {
+            self.sort_offsets = sort_row_offsets(&previous, &next);
+            if !self.sort_offsets.is_empty() {
+                self.sort_epoch = self.sort_epoch.wrapping_add(1);
+            }
+        }
         self.scroll.set_offset(gpui::Point::default());
         cx.notify();
     }
@@ -476,7 +506,13 @@ impl Render for PullRequestsPage {
                         div()
                             .mt(px(24.0))
                             .child(render_pull_request_table(
-                                &items, layout, self.sort, &theme, cx,
+                                &items,
+                                layout,
+                                self.sort,
+                                self.sort_epoch,
+                                &self.sort_offsets,
+                                &theme,
+                                cx,
                             ))
                             .into_any_element()
                     }),
@@ -526,10 +562,37 @@ fn sort_pull_requests(items: &mut [ChangeRequestListItem], sort: PullRequestSort
     });
 }
 
+fn pull_request_key(item: &ChangeRequestListItem) -> String {
+    format!("{}#{}", item.repository, item.number)
+}
+
+fn sort_row_offsets(previous: &[String], next: &[String]) -> HashMap<String, f32> {
+    let previous_positions: HashMap<&str, usize> = previous
+        .iter()
+        .enumerate()
+        .map(|(index, key)| (key.as_str(), index))
+        .collect();
+    next.iter()
+        .enumerate()
+        .filter_map(|(next_index, key)| {
+            let previous_index = *previous_positions.get(key.as_str())?;
+            let delta = previous_index as f32 - next_index as f32;
+            (delta.abs() > f32::EPSILON).then(|| {
+                (
+                    key.clone(),
+                    (delta * PR_SORT_OFFSET_PER_ROW).clamp(-PR_SORT_MAX_OFFSET, PR_SORT_MAX_OFFSET),
+                )
+            })
+        })
+        .collect()
+}
+
 fn render_pull_request_table(
     items: &[ChangeRequestListItem],
     layout: PullRequestTableLayout,
     sort: PullRequestSort,
+    sort_epoch: u64,
+    sort_offsets: &HashMap<String, f32>,
     theme: &Theme,
     cx: &mut Context<PullRequestsPage>,
 ) -> AnyElement {
@@ -539,11 +602,24 @@ fn render_pull_request_table(
         .when(show_header, |element| {
             element.child(render_table_header(layout, sort, theme, cx))
         })
-        .children(
-            items
-                .iter()
-                .map(|item| render_table_row(item, layout, theme)),
-        )
+        .children(items.iter().map(|item| {
+            let row = render_table_row(item, layout, theme);
+            let key = pull_request_key(item);
+            let Some(offset) = sort_offsets.get(&key).copied() else {
+                return row;
+            };
+            let animation_id = SharedString::from(format!("pull-request-sort-{sort_epoch}-{key}"));
+            div()
+                .w_full()
+                .flex_none()
+                .child(row)
+                .with_animation(animation_id, PR_SORT_ANIMATION.animation(), move |el, t| {
+                    el.relative()
+                        .top(px(offset * (1.0 - t)))
+                        .opacity(0.82 + 0.18 * t)
+                })
+                .into_any_element()
+        }))
         .into_any_element()
 }
 
@@ -1224,6 +1300,23 @@ mod tests {
             },
         );
         assert_eq!(numbers(&items), [1, 3, 2]);
+    }
+
+    #[test]
+    fn sort_animation_offsets_preserve_direction_and_limit_distance() {
+        let previous = ["a", "b", "c", "d", "e"].map(str::to_owned).to_vec();
+        let next = ["e", "b", "c", "d", "a"].map(str::to_owned).to_vec();
+        let offsets = sort_row_offsets(&previous, &next);
+
+        assert_eq!(offsets.get("e"), Some(&PR_SORT_MAX_OFFSET));
+        assert_eq!(offsets.get("a"), Some(&-PR_SORT_MAX_OFFSET));
+        assert!(!offsets.contains_key("b"));
+        assert!(!offsets.contains_key("c"));
+        assert!(!offsets.contains_key("d"));
+
+        let adjacent = sort_row_offsets(&["a".into(), "b".into()], &["b".into(), "a".into()]);
+        assert_eq!(adjacent.get("b"), Some(&PR_SORT_OFFSET_PER_ROW));
+        assert_eq!(adjacent.get("a"), Some(&-PR_SORT_OFFSET_PER_ROW));
     }
 
     #[test]

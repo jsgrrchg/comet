@@ -462,7 +462,7 @@ fn render_pull_request_table(
 fn render_table_header(theme: &Theme) -> AnyElement {
     let label = |copy: &'static str| {
         div()
-            .text_size(px(9.5))
+            .text_size(px(12.0))
             .text_color(theme.text_faint)
             .child(copy)
     };

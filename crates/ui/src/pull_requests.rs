@@ -9,6 +9,7 @@ use zeron_proto::{ChangeRequestListItem, Device};
 use zeron_rpc::{RpcError, capability_errors, methods};
 
 use crate::icons::{self, icon};
+use crate::motion;
 use crate::popover;
 use crate::settings::widgets;
 use crate::state::AppState;
@@ -20,6 +21,7 @@ const PR_TABLE_ROW_HEIGHT: f32 = 52.0;
 const PR_TABLE_CHANGES_WIDTH: f32 = 92.0;
 const PR_TABLE_UPDATED_WIDTH: f32 = 92.0;
 const PR_TABLE_ACTION_WIDTH: f32 = 22.0;
+const PR_ROW_HOVER_TEXT_SCALE: f32 = 0.06;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PullRequestsPageError {
@@ -506,16 +508,20 @@ fn render_table_row(
 ) -> AnyElement {
     let url = item.url.clone();
     let group: SharedString = format!("pull-request-row-hover-{index}").into();
+    let hover_t = motion::hover_t(&group);
     let row = div()
         .id(SharedString::from(format!(
             "pull-request-row-{index}-{}-{}",
             item.repository, item.number
         )))
         .group(group.clone())
+        .relative()
+        .top(px(-0.75 * hover_t))
         .w_full()
         .flex_none()
         .cursor_pointer()
         .hover(|style| style.bg(crate::theme::ink(0.025)))
+        .on_hover(motion::hover_listener(group.clone()))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             cx.open_url(&url);
@@ -528,18 +534,19 @@ fn render_table_row(
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .child(render_pr_identity(item, theme))
+            .child(render_pr_identity(item, theme, hover_t))
             .child(
                 div()
                     .pl(px(23.0))
                     .flex()
                     .items_center()
                     .gap(px(10.0))
-                    .child(render_diff_stats(item, true, theme))
+                    .child(render_diff_stats(item, true, theme, hover_t))
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .line_height(px(14.0))
+                            .text_size(hover_text_size(11.0, hover_t))
                             .text_color(theme.text_muted.opacity(0.65))
                             .child(SharedString::from(compact_updated_at(
                                 item.updated_at,
@@ -559,19 +566,20 @@ fn render_table_row(
             .flex()
             .items_center()
             .gap(px(8.0))
-            .child(render_pr_identity(item, theme))
+            .child(render_pr_identity(item, theme, hover_t))
             .child(
                 div()
                     .w(px(PR_TABLE_CHANGES_WIDTH))
                     .flex_none()
-                    .child(render_diff_stats(item, false, theme)),
+                    .child(render_diff_stats(item, false, theme, hover_t)),
             )
             .child(
                 div()
                     .w(px(PR_TABLE_UPDATED_WIDTH))
                     .flex_none()
                     .truncate()
-                    .text_size(px(10.5))
+                    .line_height(px(14.0))
+                    .text_size(hover_text_size(10.5, hover_t))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(relative_updated_at(
                         item.updated_at,
@@ -596,7 +604,7 @@ fn render_table_row(
     }
 }
 
-fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme) -> AnyElement {
+fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme, hover_t: f32) -> AnyElement {
     div()
         .flex_1()
         .min_w_0()
@@ -620,7 +628,8 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme) -> AnyElement
                 .child(
                     div()
                         .truncate()
-                        .text_size(px(12.0))
+                        .line_height(px(15.0))
+                        .text_size(hover_text_size(12.0, hover_t))
                         .text_color(theme.text)
                         .child(SharedString::from(truncate_title(&item.title, 120))),
                 )
@@ -630,7 +639,8 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme) -> AnyElement
                         .items_center()
                         .gap(px(5.0))
                         .min_w_0()
-                        .text_size(px(10.0))
+                        .line_height(px(13.0))
+                        .text_size(hover_text_size(10.0, hover_t))
                         .text_color(theme.text_faint)
                         .child(
                             div()
@@ -659,13 +669,19 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme) -> AnyElement
         .into_any_element()
 }
 
-fn render_diff_stats(item: &ChangeRequestListItem, compact: bool, theme: &Theme) -> AnyElement {
+fn render_diff_stats(
+    item: &ChangeRequestListItem,
+    compact: bool,
+    theme: &Theme,
+    hover_t: f32,
+) -> AnyElement {
     div()
         .flex()
         .items_center()
         .gap(px(if compact { 6.0 } else { 8.0 }))
         .font_family(theme.font_mono.clone())
-        .text_size(px(10.5))
+        .line_height(px(14.0))
+        .text_size(hover_text_size(10.5, hover_t))
         .child(
             div()
                 .text_color(theme.success_muted)
@@ -683,6 +699,10 @@ fn render_diff_stats(item: &ChangeRequestListItem, compact: bool, theme: &Theme)
                 ))),
         )
         .into_any_element()
+}
+
+fn hover_text_size(base: f32, hover_t: f32) -> gpui::Pixels {
+    px(base * (1.0 + PR_ROW_HOVER_TEXT_SCALE * hover_t))
 }
 
 fn eligible_desktop_devices(devices: &[Device]) -> Vec<Device> {

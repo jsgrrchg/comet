@@ -94,6 +94,12 @@ pub trait ChangeRequestProvider: Send + Sync {
     ) -> Result<Option<ChangeRequestSummary>, ChangeRequestError>;
 }
 
+/// Host-side boundary for global change request listing surfaces.
+#[async_trait]
+pub trait OpenChangeRequestLookup: Send + Sync {
+    async fn list_authored_open(&self) -> Result<Vec<ChangeRequestListItem>, ChangeRequestError>;
+}
+
 /// Checkout inspection plus provider resolution, injectable for cache/service tests.
 #[async_trait]
 pub trait CheckoutChangeRequestLookup: Send + Sync {
@@ -325,6 +331,13 @@ impl GitHubCli {
 impl Default for GitHubCli {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[async_trait]
+impl OpenChangeRequestLookup for GitHubCli {
+    async fn list_authored_open(&self) -> Result<Vec<ChangeRequestListItem>, ChangeRequestError> {
+        GitHubCli::list_authored_open(self).await
     }
 }
 

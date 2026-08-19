@@ -128,6 +128,8 @@ pub mod methods {
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
     /// Current pull request for one checkout, resolved on the checkout's host device.
     pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
+    /// Open pull requests authored by the active GitHub CLI account on the target device.
+    pub const LIST_OPEN_CHANGE_REQUESTS: &str = "ListOpenChangeRequests";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     pub const GET_CHECKOUT_FILE_DIFF_TEXT: &str = "GetCheckoutFileDiffText";
     // Agent accounts (ControlRpc, relay-forwardable — CLI logins are per-device).
@@ -153,12 +155,25 @@ pub mod methods {
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
 }
 
+/// Stable capability error codes transported without provider stderr.
+pub mod capability_errors {
+    pub const PULL_REQUESTS_CLI_UNAVAILABLE: &str = "pull_requests.cli_unavailable";
+    pub const PULL_REQUESTS_AUTHENTICATION: &str = "pull_requests.authentication";
+    pub const PULL_REQUESTS_RATE_LIMITED: &str = "pull_requests.rate_limited";
+    pub const PULL_REQUESTS_TIMEOUT: &str = "pull_requests.timeout";
+    pub const PULL_REQUESTS_DECODE: &str = "pull_requests.decode";
+    pub const PULL_REQUESTS_COMMAND_FAILED: &str = "pull_requests.command_failed";
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
     #[error("unknown method: {0}")]
     UnknownMethod(String),
     #[error("bad params: {0}")]
     BadParams(String),
+    /// Stable machine-readable capability failure preserved across transports.
+    #[error("capability error: {0}")]
+    Capability(String),
     #[error("{0}")]
     Failed(String),
     #[error("transport: {0}")]
@@ -292,6 +307,9 @@ mod tests {
                 }
                 "Never" => Ok(RpcReply::Stream(futures::stream::pending().boxed())),
                 "Boom" => Err(RpcError::Failed("boom".into())),
+                "Capability" => Err(RpcError::Capability(
+                    capability_errors::PULL_REQUESTS_AUTHENTICATION.into(),
+                )),
                 other => Err(RpcError::UnknownMethod(other.into())),
             }
         }
@@ -329,6 +347,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RpcError::Failed(m) if m == "boom"));
+
+        let err = client
+            .call("Capability", serde_json::Value::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            RpcError::Capability(code)
+                if code == capability_errors::PULL_REQUESTS_AUTHENTICATION
+        ));
     }
 
     #[tokio::test]

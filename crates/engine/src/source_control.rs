@@ -700,7 +700,7 @@ struct GhSearchPullRequest {
     number: u64,
     title: String,
     url: String,
-    state: GhPullRequestState,
+    state: GhSearchPullRequestState,
     repository: GhSearchRepository,
     updated_at: DateTime<Utc>,
     is_draft: bool,
@@ -720,12 +720,31 @@ enum GhPullRequestState {
     Merged,
 }
 
+/// `gh search prs` emits lowercase state values, unlike `gh pr list`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum GhSearchPullRequestState {
+    Open,
+    Closed,
+    Merged,
+}
+
 impl From<GhPullRequestState> for ChangeRequestState {
     fn from(state: GhPullRequestState) -> Self {
         match state {
             GhPullRequestState::Open => Self::Open,
             GhPullRequestState::Closed => Self::Closed,
             GhPullRequestState::Merged => Self::Merged,
+        }
+    }
+}
+
+impl From<GhSearchPullRequestState> for ChangeRequestState {
+    fn from(state: GhSearchPullRequestState) -> Self {
+        match state {
+            GhSearchPullRequestState::Open => Self::Open,
+            GhSearchPullRequestState::Closed => Self::Closed,
+            GhSearchPullRequestState::Merged => Self::Merged,
         }
     }
 }
@@ -825,7 +844,7 @@ fn to_list_item(
         || name.is_empty()
         || repository_parts.next().is_some()
         || repository.chars().any(char::is_whitespace)
-        || !matches!(pull_request.state, GhPullRequestState::Open)
+        || !matches!(pull_request.state, GhSearchPullRequestState::Open)
     {
         return Err(ChangeRequestError::Decode);
     }
@@ -1194,7 +1213,7 @@ mod tests {
             "acme/zeron",
             123,
             "Dashboard",
-            "OPEN",
+            "open",
             "2026-08-19T12:00:00Z",
             true,
         )])
@@ -1245,7 +1264,7 @@ mod tests {
                 "zeta/repo",
                 8,
                 "  A title\nwith\tspacing  ",
-                "OPEN",
+                "open",
                 "2026-08-19T11:00:00Z",
                 false,
             ),
@@ -1253,7 +1272,7 @@ mod tests {
                 "alpha/repo",
                 4,
                 "Alpha",
-                "OPEN",
+                "open",
                 "2026-08-19T12:00:00Z",
                 true,
             ),
@@ -1261,7 +1280,7 @@ mod tests {
                 "alpha/repo",
                 2,
                 "Earlier number",
-                "OPEN",
+                "open",
                 "2026-08-19T12:00:00Z",
                 false,
             ),
@@ -1287,7 +1306,7 @@ mod tests {
             "acme/zeron",
             1,
             "Valid",
-            "OPEN",
+            "open",
             "2026-08-19T12:00:00Z",
             false,
         );
@@ -1298,7 +1317,7 @@ mod tests {
             ("/repository/nameWithOwner", serde_json::json!("zeron")),
             ("/repository/nameWithOwner", serde_json::json!("a/b/c")),
             ("/url", serde_json::json!("file:///tmp/pr")),
-            ("/state", serde_json::json!("CLOSED")),
+            ("/state", serde_json::json!("closed")),
         ] {
             let mut item = base.clone();
             *item.pointer_mut(pointer).unwrap() = value;

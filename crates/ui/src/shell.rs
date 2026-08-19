@@ -32,6 +32,7 @@ use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
 use crate::popover::{self, Loadable};
+use crate::pull_requests::PullRequestsPage;
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
@@ -85,8 +86,8 @@ pub fn titlebar_spacer_width(is_macos: bool, fullscreen: bool, container_pad: f3
 }
 
 /// Width of the persistent top-left button cluster itself (sidebar toggle +
-/// back/forward: three 24px buttons, 2px gaps).
-pub const CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 3.0 + 2.0 * 2.0;
+/// back/forward + pull requests: four 24px buttons, 2px gaps).
+pub const CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 4.0 + 2.0 * 3.0;
 
 /// Width of a row of `count` Linux caption buttons, drawn at the cluster's
 /// own 24px-button / 2px-gap rhythm.
@@ -214,6 +215,7 @@ impl SettingsSection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Route {
     Chat,
+    PullRequests,
     Settings(SettingsSection),
 }
 
@@ -288,6 +290,7 @@ impl SessionPanels {
 pub enum NavEntry {
     /// A chat route; the id of the selected chat ("" = the new-chat canvas).
     Chat(String),
+    PullRequests,
     Settings(SettingsSection),
 }
 
@@ -827,10 +830,11 @@ pub struct Shell {
     /// Surface-tab strip scroll (the strip overflows horizontally, t3
     /// ScrollArea-style; drag drop-math reads the offset back out).
     right_tab_scroll: gpui::ScrollHandle,
-    /// Chat outlet vs settings pages.
+    /// Chat outlet, pull request dashboard, or settings pages.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
+    pull_requests_page: Option<Entity<PullRequestsPage>>,
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
@@ -1031,6 +1035,7 @@ impl Shell {
         // straight into a settings section — these pages have no deep link and
         // synthetic input can't reach them on headless compositors.
         let route = match std::env::var("ZERON_OPEN_ROUTE").ok().as_deref() {
+            Some("pull-requests") => Route::PullRequests,
             Some("settings") | Some("settings/devices") => {
                 Route::Settings(SettingsSection::Devices)
             }
@@ -1067,6 +1072,7 @@ impl Shell {
         };
         let nav = NavHistory::new(match route {
             Route::Chat => NavEntry::Chat(String::new()),
+            Route::PullRequests => NavEntry::PullRequests,
             Route::Settings(section) => NavEntry::Settings(section),
         });
         Self {
@@ -1093,6 +1099,7 @@ impl Shell {
             right_tab_scroll: gpui::ScrollHandle::new(),
             route,
             nav,
+            pull_requests_page: None,
             devices_page: None,
             archived_page: None,
             appearance_page: None,
@@ -2050,6 +2057,22 @@ impl Shell {
         cx.notify();
     }
 
+    fn open_pull_requests(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::PullRequests;
+        self.nav.push(NavEntry::PullRequests);
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
+        self.add_space = None;
+        self.close_right_plus(cx);
+        if self.spaces_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.spaces_menu);
+        }
+        if self.space_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.space_menu);
+        }
+        cx.notify();
+    }
+
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
@@ -2081,6 +2104,9 @@ impl Shell {
                 if self.state.read(cx).selected_chat != target {
                     self.state.update(cx, |s, cx| s.select_chat(target, cx));
                 }
+            }
+            NavEntry::PullRequests => {
+                self.route = Route::PullRequests;
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
@@ -2924,7 +2950,7 @@ impl Shell {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_title_bar(cx),
-            Route::Settings(_) => {
+            Route::PullRequests | Route::Settings(_) => {
                 let inner = div()
                     .size_full()
                     .flex()
@@ -2933,8 +2959,12 @@ impl Shell {
                     .pl(px(self.title_bar_content_start()))
                     .pr(px(self.titlebar_right_pad(Theme::SPACE_LG)));
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
-                self.titlebar_drag_region("settings-header-titlebar", bar, cx)
-                    .into_any_element()
+                let id = if matches!(self.route, Route::PullRequests) {
+                    "pull-requests-titlebar"
+                } else {
+                    "settings-header-titlebar"
+                };
+                self.titlebar_drag_region(id, bar, cx).into_any_element()
             }
         }
     }
@@ -3050,6 +3080,16 @@ impl Shell {
                 can_forward,
                 &theme,
                 cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
+            ))
+            .child(window_control_button_with_options(
+                "open-pull-requests",
+                icons::PULL_REQUEST,
+                WindowControlButtonOptions {
+                    active: matches!(self.route, Route::PullRequests),
+                    tooltip: Some("Pull requests"),
+                },
+                &theme,
+                cx.listener(|this, _, _, cx| this.open_pull_requests(cx)),
             ))
             .children(show_plus.then(|| {
                 div()
@@ -3262,7 +3302,7 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            Route::Chat | Route::PullRequests => self.render_chat_sidebar(&theme, cx),
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
@@ -4904,6 +4944,26 @@ impl Shell {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
+
+        if matches!(self.route, Route::PullRequests) {
+            if self.pull_requests_page.is_none() {
+                self.pull_requests_page =
+                    Some(cx.new(|_| PullRequestsPage::new(self.state.clone())));
+            }
+            let outlet = self
+                .pull_requests_page
+                .as_ref()
+                .cloned()
+                .map(IntoElement::into_any_element)
+                .unwrap_or_else(|| Empty.into_any_element());
+            return div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .child(outlet)
+                .into_any_element();
+        }
 
         // Settings route: just the section outlet — the section label lives in
         // the unified window titlebar now (render_title_bar). Settings never
@@ -6577,7 +6637,33 @@ fn window_control_button(
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let muted = theme.text_muted;
+    window_control_button_with_options(
+        id,
+        icon_path,
+        WindowControlButtonOptions::default(),
+        theme,
+        on_click,
+    )
+}
+
+#[derive(Default, Clone, Copy)]
+struct WindowControlButtonOptions {
+    active: bool,
+    tooltip: Option<&'static str>,
+}
+
+fn window_control_button_with_options(
+    id: &'static str,
+    icon_path: &'static str,
+    options: WindowControlButtonOptions,
+    theme: &Theme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let icon_color = if options.active {
+        theme.text
+    } else {
+        theme.text_muted
+    };
     let fade_key = format!("window-control-{id}");
     div()
         .id(id)
@@ -6591,9 +6677,16 @@ fn window_control_button(
         // zeron window-controls.tsx: `transition-colors` — the wash fades.
         .bg(motion::hover_blend(
             &fade_key,
-            theme.glass_hover().opacity(0.0),
+            if options.active {
+                theme.glass_hover()
+            } else {
+                theme.glass_hover().opacity(0.0)
+            },
             theme.glass_hover(),
         ))
+        .when(options.active, |button| {
+            button.border_1().border_color(theme.border_strong)
+        })
         .on_hover(motion::hover_listener(fade_key))
         // Buttons in/over a titlebar drag strip must be EXCLUDED from the
         // strip's event surface entirely. `.occlude()` (gpui
@@ -6613,7 +6706,33 @@ fn window_control_button(
             cx.stop_propagation();
             on_click(event, window, cx)
         })
-        .child(icon(icon_path).size(px(16.0)).text_color(muted))
+        .child(icon(icon_path).size(px(16.0)).text_color(icon_color))
+        .when_some(options.tooltip, |button, label| {
+            button
+                .tooltip(move |_, cx| cx.new(|_| WindowControlTooltip { label }).into())
+                .tooltip_show_delay(Duration::from_millis(350))
+        })
+}
+
+struct WindowControlTooltip {
+    label: &'static str,
+}
+
+impl Render for WindowControlTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            .child(self.label)
+    }
 }
 
 const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 36.0;
@@ -6847,7 +6966,7 @@ impl Render for Shell {
                     // reads None (the render hook below re-lands focus when the
                     // route returns to Chat; a lingering unmounted handle would
                     // otherwise dead-end keyboard dispatch for good).
-                    Route::Settings(_) => window.blur(),
+                    Route::PullRequests | Route::Settings(_) => window.blur(),
                 }
             }));
         }
@@ -7512,21 +7631,22 @@ mod tests {
 
     #[test]
     fn cluster_clearance_clears_the_overlay_buttons() {
-        // Linux: buttons at 10..86; a 16px-padded header needs 78 more px to
-        // put content at 86 + 8 breathing room.
-        assert_eq!(cluster_clearance(false, false, 0, 16.0), 78.0);
-        assert_eq!(cluster_clearance(false, false, 0, 10.0), 84.0);
+        assert_eq!(CLUSTER_BUTTONS_WIDTH, 102.0);
+        // Linux: buttons at 10..112; a 16px-padded header needs 104 more px to
+        // put content at 112 + 8 breathing room.
+        assert_eq!(cluster_clearance(false, false, 0, 16.0), 104.0);
+        assert_eq!(cluster_clearance(false, false, 0, 10.0), 110.0);
         // Linux with a left-side close caption: everything shifts one slot.
-        assert_eq!(cluster_clearance(false, false, 1, 16.0), 78.0 + 26.0);
+        assert_eq!(cluster_clearance(false, false, 1, 16.0), 104.0 + 26.0);
         // macOS: buttons start at the 88px traffic-light cluster start.
         assert_eq!(
             cluster_clearance(true, false, 0, 16.0),
-            88.0 + 76.0 + 8.0 - 16.0
+            88.0 + 102.0 + 8.0 - 16.0
         );
         // macOS fullscreen: cluster reclaims the inset (starts at 12).
         assert_eq!(
             cluster_clearance(true, true, 0, 16.0),
-            12.0 + 76.0 + 8.0 - 16.0
+            12.0 + 102.0 + 8.0 - 16.0
         );
     }
 
@@ -7747,5 +7867,26 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    #[test]
+    fn pull_request_route_participates_in_browser_history() {
+        let mut nav = NavHistory::new(chat("a"));
+        nav.push(NavEntry::PullRequests);
+        assert_eq!(nav.back(), Some(chat("a")));
+        assert_eq!(nav.forward(), Some(NavEntry::PullRequests));
+
+        nav.push(NavEntry::PullRequests);
+        assert_eq!(nav.len(), 2, "reopening the active dashboard deduplicates");
+        nav.push(chat("a"));
+        assert_eq!(nav.back(), Some(NavEntry::PullRequests));
+    }
+
+    #[test]
+    fn pull_request_route_can_open_from_and_return_to_settings() {
+        let settings = NavEntry::Settings(SettingsSection::Devices);
+        let mut nav = NavHistory::new(settings.clone());
+        nav.push(NavEntry::PullRequests);
+        assert_eq!(nav.back(), Some(settings));
     }
 }

@@ -28,6 +28,7 @@ const PR_TABLE_ACTION_WIDTH: f32 = 22.0;
 const PR_ROW_HOVER_TEXT_SCALE: f32 = 0.06;
 const PR_SORT_OFFSET_PER_ROW: f32 = 8.0;
 const PR_SORT_MAX_OFFSET: f32 = 24.0;
+const PR_SCROLL_FADE_BAND: f32 = 24.0;
 const PR_SORT_ANIMATION: motion::MotionSpec = motion::MotionSpec::new(180, motion::EASE_RESORT);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,98 +445,116 @@ impl Render for PullRequestsPage {
         let layout = table_layout_for_viewport(f32::from(window.viewport_size().width));
         let scroll = self.scroll.clone();
 
-        div()
-            .id("pull-requests-page")
-            .size_full()
-            .overflow_y_scroll()
-            .track_scroll(&scroll)
-            .child(
+        div().id("pull-requests-page").size_full().child(
+            crate::edge_fade::edge_faded(
+                PR_SCROLL_FADE_BAND,
+                true,
+                false,
                 div()
-                    .w_full()
-                    .max_w(px(1120.0))
-                    .mx_auto()
-                    .px(px(24.0))
-                    .pt(px(Theme::TITLEBAR_HEIGHT + Theme::SPACE_SM))
-                    .pb(px(64.0))
-                    .flex()
-                    .flex_col()
+                    .id("pull-requests-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&scroll)
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(px(10.0))
-                            .child(widgets::page_header(&theme, "Pull requests", count))
-                            .child(div().flex_1())
-                            .child(self.render_device_switcher(&theme, cx))
-                            .child(
-                                widgets::ghost_action(&theme)
-                                    .id("pull-requests-refresh")
-                                    .flex_none()
-                                    .hover(|style| widgets::ghost_hover(&theme, style))
-                                    .when(
-                                        matches!(self.load_state, PullRequestsLoadState::Loading),
-                                        |element| element.opacity(0.5),
-                                    )
-                                    .on_click(cx.listener(|page, _, _, cx| page.refresh(cx)))
-                                    .child(if refreshing || initial_loading {
-                                        crate::loaders::mini_gradient_spinner(
-                                            "pull-requests-refresh-spinner",
-                                            1.75,
-                                            cx.entity_id(),
-                                            cx,
-                                        )
-                                        .into_any_element()
-                                    } else {
-                                        icon(icons::REFRESH)
-                                            .size(px(16.0))
-                                            .text_color(theme.text_muted)
-                                            .into_any_element()
-                                    })
-                                    .child("Refresh"),
-                            ),
-                    )
-                    .child(widgets::page_subtitle(
-                        &theme,
-                        "Open pull requests authored by you on GitHub.",
-                    ))
-                    .when(refresh_error, |element| {
-                        element.child(widgets::error_strip(&theme, "Refresh failed. Try again."))
-                    })
-                    .child(if initial_loading {
-                        div()
-                            .mt(px(72.0))
+                            .w_full()
+                            .max_w(px(1120.0))
+                            .mx_auto()
+                            .px(px(24.0))
+                            .pt(px(Theme::TITLEBAR_HEIGHT + Theme::SPACE_SM))
+                            .pb(px(64.0))
                             .flex()
                             .flex_col()
-                            .items_center()
-                            .gap(px(12.0))
-                            .text_size(px(13.0))
-                            .text_color(theme.text_muted)
-                            .child(crate::loaders::gradient_spinner(
-                                "pull-requests-loading",
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .child(widgets::page_header(&theme, "Pull requests", count))
+                                    .child(div().flex_1())
+                                    .child(self.render_device_switcher(&theme, cx))
+                                    .child(
+                                        widgets::ghost_action(&theme)
+                                            .id("pull-requests-refresh")
+                                            .flex_none()
+                                            .hover(|style| widgets::ghost_hover(&theme, style))
+                                            .when(
+                                                matches!(
+                                                    self.load_state,
+                                                    PullRequestsLoadState::Loading
+                                                ),
+                                                |element| element.opacity(0.5),
+                                            )
+                                            .on_click(
+                                                cx.listener(|page, _, _, cx| page.refresh(cx)),
+                                            )
+                                            .child(if refreshing || initial_loading {
+                                                crate::loaders::mini_gradient_spinner(
+                                                    "pull-requests-refresh-spinner",
+                                                    1.75,
+                                                    cx.entity_id(),
+                                                    cx,
+                                                )
+                                                .into_any_element()
+                                            } else {
+                                                icon(icons::REFRESH)
+                                                    .size(px(16.0))
+                                                    .text_color(theme.text_muted)
+                                                    .into_any_element()
+                                            })
+                                            .child("Refresh"),
+                                    ),
+                            )
+                            .child(widgets::page_subtitle(
                                 &theme,
-                                3.0,
-                                cx.entity_id(),
-                                cx,
+                                "Open pull requests authored by you on GitHub.",
                             ))
-                            .child("Loading pull requests…")
-                            .into_any_element()
-                    } else if items.is_empty() {
-                        self.render_empty_or_error(&theme)
-                    } else {
-                        div()
-                            .mt(px(24.0))
-                            .child(render_pull_request_table(
-                                &items,
-                                layout,
-                                self.sort,
-                                self.sort_epoch,
-                                &self.sort_offsets,
-                                &theme,
-                                cx,
-                            ))
-                            .into_any_element()
-                    }),
+                            .when(refresh_error, |element| {
+                                element.child(widgets::error_strip(
+                                    &theme,
+                                    "Refresh failed. Try again.",
+                                ))
+                            })
+                            .child(if initial_loading {
+                                div()
+                                    .mt(px(72.0))
+                                    .flex()
+                                    .flex_col()
+                                    .items_center()
+                                    .gap(px(12.0))
+                                    .text_size(px(13.0))
+                                    .text_color(theme.text_muted)
+                                    .child(crate::loaders::gradient_spinner(
+                                        "pull-requests-loading",
+                                        &theme,
+                                        3.0,
+                                        cx.entity_id(),
+                                        cx,
+                                    ))
+                                    .child("Loading pull requests…")
+                                    .into_any_element()
+                            } else if items.is_empty() {
+                                self.render_empty_or_error(&theme)
+                            } else {
+                                div()
+                                    .mt(px(24.0))
+                                    .child(render_pull_request_table(
+                                        &items,
+                                        layout,
+                                        self.sort,
+                                        self.sort_epoch,
+                                        &self.sort_offsets,
+                                        &theme,
+                                        cx,
+                                    ))
+                                    .into_any_element()
+                            }),
+                    ),
             )
+            .inset_top(Theme::TITLEBAR_HEIGHT)
+            .band_top(PR_SCROLL_FADE_BAND)
+            .fade_overflow_y(&scroll),
+        )
     }
 }
 

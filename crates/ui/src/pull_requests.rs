@@ -19,6 +19,8 @@ use crate::state::AppState;
 use crate::theme::Theme;
 
 const SNAPSHOT_TTL: Duration = Duration::from_secs(60);
+const PR_PAGE_MAX_WIDTH: f32 = 1120.0;
+const PR_PAGE_HORIZONTAL_PADDING: f32 = 24.0;
 const PR_TABLE_HEADER_HEIGHT: f32 = 24.0;
 const PR_TABLE_ROW_HEIGHT: f32 = 52.0;
 const PR_TABLE_CHANGES_WIDTH: f32 = 92.0;
@@ -134,13 +136,20 @@ pub struct PullRequestsPage {
     generation: u64,
     request_task: Option<Task<()>>,
     scroll: ScrollHandle,
+    content_width: Option<f32>,
     device_menu: popover::Popup<()>,
     _observe: Subscription,
 }
 
 impl PullRequestsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let observe = cx.observe(&state, |_, _, cx| cx.notify());
+        let observe = cx.observe(&state, |page, _, cx| {
+            if page.reconcile_target_device(cx) {
+                page.load(cx);
+            } else {
+                cx.notify();
+            }
+        });
         let mut page = Self {
             state,
             target_device: None,
@@ -153,6 +162,7 @@ impl PullRequestsPage {
             generation: 0,
             request_task: None,
             scroll: ScrollHandle::new(),
+            content_width: None,
             device_menu: popover::Popup::default(),
             _observe: observe,
         };
@@ -165,10 +175,11 @@ impl PullRequestsPage {
         // Resort offsets describe one click transition, not durable page state.
         // Dropping them here prevents a completed animation from replaying after navigation.
         self.sort_offsets.clear();
+        let target_changed = self.reconcile_target_device(cx);
         let stale = self
             .last_loaded_at
             .is_none_or(|loaded| loaded.elapsed() >= SNAPSHOT_TTL);
-        if !matches!(self.load_state, PullRequestsLoadState::Loading) && stale {
+        if target_changed || (!matches!(self.load_state, PullRequestsLoadState::Loading) && stale) {
             self.load(cx);
         }
     }
@@ -186,6 +197,11 @@ impl PullRequestsPage {
             return;
         }
 
+        self.reset_for_target(target);
+        self.load(cx);
+    }
+
+    fn reset_for_target(&mut self, target: Option<String>) {
         self.generation = self.generation.wrapping_add(1);
         self.request_task = None;
         self.target_device = target;
@@ -194,7 +210,26 @@ impl PullRequestsPage {
         self.load_state = PullRequestsLoadState::Idle;
         self.last_loaded_at = None;
         self.scroll.set_offset(gpui::Point::default());
-        self.load(cx);
+    }
+
+    /// Heal a selected remote that is no longer present in an authoritative
+    /// device frame. The local row proves the frame has landed, so the empty
+    /// pre-sync list cannot accidentally discard a valid remote selection.
+    fn reconcile_target_device(&mut self, cx: &mut Context<Self>) -> bool {
+        let normalized = {
+            let state = self.state.read(cx);
+            normalized_target_device(
+                self.target_device.as_deref(),
+                &state.devices,
+                state.local_device_id.as_deref(),
+            )
+        };
+        if normalized == self.target_device {
+            return false;
+        }
+        self.close_device_menu(cx);
+        self.reset_for_target(normalized);
+        true
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -226,6 +261,7 @@ impl PullRequestsPage {
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
+        self.reconcile_target_device(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.load_state = PullRequestsLoadState::Failed(PullRequestsPageError::Network);
             cx.notify();
@@ -428,7 +464,7 @@ impl PullRequestsPage {
 }
 
 impl Render for PullRequestsPage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let initial_loading =
             self.items.is_empty() && matches!(self.load_state, PullRequestsLoadState::Loading);
@@ -442,8 +478,32 @@ impl Render for PullRequestsPage {
         .then_some(self.items.len());
         let mut items = self.items.clone();
         sort_pull_requests(&mut items, self.sort);
-        let layout = table_layout_for_viewport(f32::from(window.viewport_size().width));
+        let layout = self
+            .content_width
+            .map(table_layout)
+            .unwrap_or(PullRequestTableLayout::Narrow);
         let scroll = self.scroll.clone();
+        let width_probe = {
+            let page = cx.weak_entity();
+            gpui::canvas(
+                move |bounds, _, cx| {
+                    let width = table_content_width(f32::from(bounds.size.width));
+                    page.update(cx, |page, cx| {
+                        if page
+                            .content_width
+                            .is_none_or(|current| (current - width).abs() > 0.5)
+                        {
+                            page.content_width = Some(width);
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .inset_0()
+        };
 
         div().id("pull-requests-page").size_full().child(
             crate::edge_fade::edge_faded(
@@ -458,13 +518,15 @@ impl Render for PullRequestsPage {
                     .child(
                         div()
                             .w_full()
-                            .max_w(px(1120.0))
+                            .max_w(px(PR_PAGE_MAX_WIDTH))
                             .mx_auto()
-                            .px(px(24.0))
+                            .relative()
+                            .px(px(PR_PAGE_HORIZONTAL_PADDING))
                             .pt(px(Theme::TITLEBAR_HEIGHT + Theme::SPACE_SM))
                             .pb(px(64.0))
                             .flex()
                             .flex_col()
+                            .child(width_probe)
                             .child(
                                 div()
                                     .flex()
@@ -575,8 +637,10 @@ fn table_layout(width: f32) -> PullRequestTableLayout {
     }
 }
 
-fn table_layout_for_viewport(viewport_width: f32) -> PullRequestTableLayout {
-    table_layout((viewport_width - 48.0).max(0.0).min(1_072.0))
+fn table_content_width(container_width: f32) -> f32 {
+    (container_width - PR_PAGE_HORIZONTAL_PADDING * 2.0)
+        .max(0.0)
+        .min(PR_PAGE_MAX_WIDTH - PR_PAGE_HORIZONTAL_PADDING * 2.0)
 }
 
 fn sort_pull_requests(items: &mut [ChangeRequestListItem], sort: PullRequestSort) {
@@ -1035,6 +1099,32 @@ fn eligible_desktop_devices(devices: &[Device]) -> Vec<Device> {
     devices
 }
 
+fn normalized_target_device(
+    target: Option<&str>,
+    devices: &[Device],
+    local_id: Option<&str>,
+) -> Option<String> {
+    let target = target?;
+    if local_id == Some(target) {
+        return None;
+    }
+
+    // The local row is inserted before the first device snapshot is emitted.
+    // Until it arrives, keep the selection instead of judging an empty or
+    // partial pre-sync list as authoritative.
+    let local_is_present = local_id
+        .is_some_and(|local_id| devices.iter().any(|device| device.id.as_str() == local_id));
+    if !local_is_present
+        || devices.iter().any(|device| {
+            device.id == target && !matches!(device.platform.as_str(), "ios" | "android")
+        })
+    {
+        Some(target.to_string())
+    } else {
+        None
+    }
+}
+
 fn params_for_target(target: Option<&str>) -> serde_json::Value {
     match target {
         Some(target) => serde_json::json!({ "targetDeviceId": target }),
@@ -1266,22 +1356,47 @@ mod tests {
     }
 
     #[test]
-    fn table_breakpoints_follow_the_content_width() {
+    fn table_breakpoints_follow_the_measured_content_width() {
         assert_eq!(table_layout(639.0), PullRequestTableLayout::Narrow);
         assert_eq!(table_layout(640.0), PullRequestTableLayout::Compact);
         assert_eq!(table_layout(899.0), PullRequestTableLayout::Compact);
         assert_eq!(table_layout(900.0), PullRequestTableLayout::Wide);
         assert_eq!(
-            table_layout_for_viewport(687.0),
+            table_layout(table_content_width(687.0)),
             PullRequestTableLayout::Narrow
         );
         assert_eq!(
-            table_layout_for_viewport(688.0),
+            table_layout(table_content_width(688.0)),
             PullRequestTableLayout::Compact
         );
         assert_eq!(
-            table_layout_for_viewport(948.0),
+            table_layout(table_content_width(948.0)),
             PullRequestTableLayout::Wide
+        );
+    }
+
+    #[test]
+    fn missing_remote_target_falls_back_only_after_an_authoritative_device_frame() {
+        let local = device("local", "macos");
+        let remote = device("remote", "linux");
+
+        assert_eq!(
+            normalized_target_device(Some("remote"), &[local.clone(), remote], Some("local")),
+            Some("remote".into())
+        );
+        assert_eq!(
+            normalized_target_device(Some("remote"), &[local], Some("local")),
+            None
+        );
+        assert_eq!(
+            normalized_target_device(Some("remote"), &[], Some("local")),
+            Some("remote".into()),
+            "the empty pre-sync list must not discard the selection"
+        );
+        assert_eq!(
+            normalized_target_device(Some("local"), &[], Some("local")),
+            None,
+            "local calls stay direct even before the device frame"
         );
     }
 

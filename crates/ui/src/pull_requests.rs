@@ -42,12 +42,65 @@ enum PullRequestsLoadState {
     Failed(PullRequestsPageError),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullRequestSortField {
+    Changes,
+    Opened,
+    Updated,
+}
+
+impl PullRequestSortField {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Changes => "changes",
+            Self::Opened => "opened",
+            Self::Updated => "updated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortDirection {
+    Ascending,
+    Descending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PullRequestSort {
+    field: PullRequestSortField,
+    direction: SortDirection,
+}
+
+impl PullRequestSort {
+    const DEFAULT: Self = Self {
+        field: PullRequestSortField::Updated,
+        direction: SortDirection::Descending,
+    };
+
+    fn select(self, field: PullRequestSortField) -> Self {
+        if self.field != field {
+            return Self {
+                field,
+                direction: SortDirection::Descending,
+            };
+        }
+        Self {
+            field,
+            direction: match self.direction {
+                SortDirection::Ascending => SortDirection::Descending,
+                SortDirection::Descending => SortDirection::Ascending,
+            },
+        }
+    }
+}
+
 /// Ephemeral dashboard for open pull requests authored by the active GitHub CLI account.
 pub struct PullRequestsPage {
     state: Entity<AppState>,
     /// `None` keeps local calls direct; a value is forwarded by the relay.
     target_device: Option<String>,
     items: Vec<ChangeRequestListItem>,
+    sort: PullRequestSort,
     load_state: PullRequestsLoadState,
     last_loaded_at: Option<Instant>,
     generation: u64,
@@ -64,6 +117,7 @@ impl PullRequestsPage {
             state,
             target_device: None,
             items: Vec::new(),
+            sort: PullRequestSort::DEFAULT,
             load_state: PullRequestsLoadState::Idle,
             last_loaded_at: None,
             generation: 0,
@@ -113,6 +167,12 @@ impl PullRequestsPage {
         if !matches!(self.load_state, PullRequestsLoadState::Loading) {
             self.load(cx);
         }
+    }
+
+    fn select_sort(&mut self, field: PullRequestSortField, cx: &mut Context<Self>) {
+        self.sort = self.sort.select(field);
+        self.scroll.set_offset(gpui::Point::default());
+        cx.notify();
     }
 
     fn load(&mut self, cx: &mut Context<Self>) {
@@ -330,7 +390,8 @@ impl Render for PullRequestsPage {
             && !matches!(self.load_state, PullRequestsLoadState::Failed(_))
             || !self.items.is_empty())
         .then_some(self.items.len());
-        let items = self.items.clone();
+        let mut items = self.items.clone();
+        sort_pull_requests(&mut items, self.sort);
         let layout = table_layout_for_viewport(f32::from(window.viewport_size().width));
         let scroll = self.scroll.clone();
 
@@ -414,7 +475,9 @@ impl Render for PullRequestsPage {
                     } else {
                         div()
                             .mt(px(24.0))
-                            .child(render_pull_request_table(&items, layout, &theme))
+                            .child(render_pull_request_table(
+                                &items, layout, self.sort, &theme, cx,
+                            ))
                             .into_any_element()
                     }),
             )
@@ -442,27 +505,54 @@ fn table_layout_for_viewport(viewport_width: f32) -> PullRequestTableLayout {
     table_layout((viewport_width - 48.0).max(0.0).min(1_072.0))
 }
 
+fn sort_pull_requests(items: &mut [ChangeRequestListItem], sort: PullRequestSort) {
+    items.sort_by(|left, right| {
+        let primary = match sort.field {
+            PullRequestSortField::Changes => left
+                .additions
+                .saturating_add(left.deletions)
+                .cmp(&right.additions.saturating_add(right.deletions)),
+            PullRequestSortField::Opened => left.created_at.cmp(&right.created_at),
+            PullRequestSortField::Updated => left.updated_at.cmp(&right.updated_at),
+        };
+        let primary = match sort.direction {
+            SortDirection::Ascending => primary,
+            SortDirection::Descending => primary.reverse(),
+        };
+        primary
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+            .then_with(|| left.repository.cmp(&right.repository))
+            .then_with(|| left.number.cmp(&right.number))
+    });
+}
+
 fn render_pull_request_table(
     items: &[ChangeRequestListItem],
     layout: PullRequestTableLayout,
+    sort: PullRequestSort,
     theme: &Theme,
+    cx: &mut Context<PullRequestsPage>,
 ) -> AnyElement {
     let show_header = layout != PullRequestTableLayout::Narrow;
     div()
         .w_full()
         .when(show_header, |element| {
-            element.child(render_table_header(layout, theme))
+            element.child(render_table_header(layout, sort, theme, cx))
         })
         .children(
             items
                 .iter()
-                .enumerate()
-                .map(|(index, item)| render_table_row(item, index, layout, theme)),
+                .map(|item| render_table_row(item, layout, theme)),
         )
         .into_any_element()
 }
 
-fn render_table_header(layout: PullRequestTableLayout, theme: &Theme) -> AnyElement {
+fn render_table_header(
+    layout: PullRequestTableLayout,
+    sort: PullRequestSort,
+    theme: &Theme,
+    cx: &mut Context<PullRequestsPage>,
+) -> AnyElement {
     let label = |copy: &'static str| {
         div()
             .text_size(px(12.0))
@@ -485,42 +575,98 @@ fn render_table_header(layout: PullRequestTableLayout, theme: &Theme) -> AnyElem
                 .pl(px(23.0))
                 .child(label("Pull request")),
         )
-        .child(
-            div()
-                .w(px(PR_TABLE_CHANGES_WIDTH))
-                .flex_none()
-                .child(label("Changes")),
-        )
+        .child(render_sort_header(
+            "Changes",
+            PR_TABLE_CHANGES_WIDTH,
+            PullRequestSortField::Changes,
+            sort,
+            theme,
+            cx,
+        ))
         .when(layout == PullRequestTableLayout::Wide, |element| {
-            element.child(
-                div()
-                    .w(px(PR_TABLE_OPENED_WIDTH))
-                    .flex_none()
-                    .child(label("Opened")),
-            )
+            element.child(render_sort_header(
+                "Opened",
+                PR_TABLE_OPENED_WIDTH,
+                PullRequestSortField::Opened,
+                sort,
+                theme,
+                cx,
+            ))
         })
+        .child(render_sort_header(
+            "Updated",
+            PR_TABLE_UPDATED_WIDTH,
+            PullRequestSortField::Updated,
+            sort,
+            theme,
+            cx,
+        ))
+        .child(div().w(px(PR_TABLE_ACTION_WIDTH)).flex_none())
+        .into_any_element()
+}
+
+fn render_sort_header(
+    label: &'static str,
+    width: f32,
+    field: PullRequestSortField,
+    sort: PullRequestSort,
+    theme: &Theme,
+    cx: &mut Context<PullRequestsPage>,
+) -> AnyElement {
+    let active = sort.field == field;
+    let arrow = match sort.direction {
+        SortDirection::Ascending => icons::ARROW_UP,
+        SortDirection::Descending => icons::ARROW_DOWN,
+    };
+    div()
+        .id(SharedString::from(format!(
+            "pull-requests-sort-{}",
+            field.key()
+        )))
+        .w(px(width))
+        .h_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .cursor_pointer()
+        .text_size(px(12.0))
+        .text_color(if active {
+            theme.text_muted
+        } else {
+            theme.text_faint
+        })
+        .hover(|style| style.text_color(theme.text))
+        .on_click(cx.listener(move |page, _, _, cx| page.select_sort(field, cx)))
+        .child(label)
         .child(
             div()
-                .w(px(PR_TABLE_UPDATED_WIDTH))
+                .w(px(10.0))
+                .h(px(10.0))
                 .flex_none()
-                .child(label("Updated")),
+                .when(active, |element| {
+                    element.child(
+                        icon(arrow)
+                            .size(px(9.0))
+                            .text_color(theme.text_muted.opacity(0.8)),
+                    )
+                }),
         )
-        .child(div().w(px(PR_TABLE_ACTION_WIDTH)).flex_none())
         .into_any_element()
 }
 
 fn render_table_row(
     item: &ChangeRequestListItem,
-    index: usize,
     layout: PullRequestTableLayout,
     theme: &Theme,
 ) -> AnyElement {
     let url = item.url.clone();
-    let group: SharedString = format!("pull-request-row-hover-{index}").into();
+    let group: SharedString =
+        format!("pull-request-row-hover-{}-{}", item.repository, item.number).into();
     let hover_t = motion::hover_t(&group);
     let row = div()
         .id(SharedString::from(format!(
-            "pull-request-row-{index}-{}-{}",
+            "pull-request-row-{}-{}",
             item.repository, item.number
         )))
         .group(group.clone())
@@ -911,7 +1057,7 @@ fn settle_snapshot<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeDelta;
+    use chrono::{TimeDelta, TimeZone};
 
     fn device(id: &str, platform: &str) -> Device {
         Device {
@@ -922,6 +1068,34 @@ mod tests {
             created_at: None,
             version: None,
         }
+    }
+
+    fn pull_request(
+        repository: &str,
+        number: u64,
+        changes: u64,
+        opened_day: u32,
+        updated_hour: u32,
+    ) -> ChangeRequestListItem {
+        ChangeRequestListItem {
+            provider: "github".into(),
+            repository: repository.into(),
+            number,
+            title: format!("Pull request {number}"),
+            url: format!("https://github.com/{repository}/pull/{number}"),
+            state: zeron_proto::ChangeRequestState::Open,
+            is_draft: false,
+            additions: changes,
+            deletions: 0,
+            created_at: Utc.with_ymd_and_hms(2026, 8, opened_day, 8, 0, 0).unwrap(),
+            updated_at: Utc
+                .with_ymd_and_hms(2026, 8, 19, updated_hour, 0, 0)
+                .unwrap(),
+        }
+    }
+
+    fn numbers(items: &[ChangeRequestListItem]) -> Vec<u64> {
+        items.iter().map(|item| item.number).collect()
     }
 
     #[test]
@@ -965,6 +1139,91 @@ mod tests {
             table_layout_for_viewport(948.0),
             PullRequestTableLayout::Wide
         );
+    }
+
+    #[test]
+    fn sorting_defaults_to_recent_updates_and_toggles_each_column() {
+        assert_eq!(
+            PullRequestSort::DEFAULT,
+            PullRequestSort {
+                field: PullRequestSortField::Updated,
+                direction: SortDirection::Descending,
+            }
+        );
+        assert_eq!(
+            PullRequestSort::DEFAULT.select(PullRequestSortField::Updated),
+            PullRequestSort {
+                field: PullRequestSortField::Updated,
+                direction: SortDirection::Ascending,
+            }
+        );
+        assert_eq!(
+            PullRequestSort::DEFAULT.select(PullRequestSortField::Changes),
+            PullRequestSort {
+                field: PullRequestSortField::Changes,
+                direction: SortDirection::Descending,
+            }
+        );
+    }
+
+    #[test]
+    fn table_sorting_uses_changes_opened_and_updated_values() {
+        let original = vec![
+            pull_request("beta/repo", 2, 30, 3, 9),
+            pull_request("alpha/repo", 1, 10, 1, 10),
+            pull_request("alpha/repo", 3, 30, 2, 11),
+        ];
+
+        let mut items = original.clone();
+        sort_pull_requests(&mut items, PullRequestSort::DEFAULT);
+        assert_eq!(numbers(&items), [3, 1, 2]);
+
+        let mut items = original.clone();
+        sort_pull_requests(
+            &mut items,
+            PullRequestSort {
+                field: PullRequestSortField::Changes,
+                direction: SortDirection::Descending,
+            },
+        );
+        assert_eq!(numbers(&items), [3, 2, 1]);
+
+        let mut items = original.clone();
+        sort_pull_requests(
+            &mut items,
+            PullRequestSort {
+                field: PullRequestSortField::Opened,
+                direction: SortDirection::Ascending,
+            },
+        );
+        assert_eq!(numbers(&items), [1, 3, 2]);
+
+        let mut items = original;
+        sort_pull_requests(
+            &mut items,
+            PullRequestSort {
+                field: PullRequestSortField::Updated,
+                direction: SortDirection::Ascending,
+            },
+        );
+        assert_eq!(numbers(&items), [2, 1, 3]);
+    }
+
+    #[test]
+    fn table_sorting_breaks_ties_by_repository_and_number() {
+        let mut items = vec![
+            pull_request("zeta/repo", 2, 10, 1, 10),
+            pull_request("alpha/repo", 3, 10, 1, 10),
+            pull_request("alpha/repo", 1, 10, 1, 10),
+        ];
+        sort_pull_requests(
+            &mut items,
+            PullRequestSort {
+                field: PullRequestSortField::Changes,
+                direction: SortDirection::Descending,
+            },
+        );
+        assert_eq!(numbers(&items), [1, 3, 2]);
     }
 
     #[test]

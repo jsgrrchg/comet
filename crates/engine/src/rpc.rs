@@ -698,6 +698,8 @@ impl EngineRpc {
         };
         let client = links.client(target).await?;
         if is_stream_method(method) {
+            // Streams are unbounded by design (a quiet WATCH_* is healthy);
+            // only unary calls below get the reply deadline.
             if method == methods::WATCH_CHECKOUT_CHANGE_REQUEST {
                 let rx = match client.subscribe_checked(method, params).await {
                     Ok(rx) => rx,
@@ -713,8 +715,6 @@ impl EngineRpc {
                 });
                 return Ok(RpcReply::Stream(stream.boxed()));
             }
-            // Streams are unbounded by design (a quiet WATCH_* is healthy);
-            // only unary calls below get the reply deadline.
             let rx = match client.subscribe(method, params).await {
                 Ok(rx) => rx,
                 Err(err) => {

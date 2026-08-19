@@ -777,7 +777,7 @@ fn platform_icon(platform: &str) -> &'static str {
 fn relative_updated_at(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let seconds = now.signed_duration_since(updated_at).num_seconds().max(0);
     let (amount, unit) = if seconds < 60 {
-        return "Updated just now".into();
+        return "just now".into();
     } else if seconds < 3_600 {
         (seconds / 60, "minute")
     } else if seconds < 86_400 {
@@ -791,10 +791,7 @@ fn relative_updated_at(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String 
     } else {
         (seconds / 31_536_000, "year")
     };
-    format!(
-        "Updated {amount} {unit}{} ago",
-        if amount == 1 { "" } else { "s" }
-    )
+    format!("{amount} {unit}{} ago", if amount == 1 { "" } else { "s" })
 }
 
 fn compact_updated_at(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
@@ -927,14 +924,14 @@ mod tests {
     #[test]
     fn relative_dates_are_readable_and_pluralized() {
         let now = Utc::now();
-        assert_eq!(relative_updated_at(now, now), "Updated just now");
+        assert_eq!(relative_updated_at(now, now), "just now");
         assert_eq!(
             relative_updated_at(now - TimeDelta::hours(1), now),
-            "Updated 1 hour ago"
+            "1 hour ago"
         );
         assert_eq!(
             relative_updated_at(now - TimeDelta::days(2), now),
-            "Updated 2 days ago"
+            "2 days ago"
         );
         assert_eq!(compact_updated_at(now - TimeDelta::hours(2), now), "2h ago");
         assert_eq!(compact_updated_at(now + TimeDelta::hours(2), now), "now");

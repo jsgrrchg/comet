@@ -22,7 +22,7 @@ const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GITHUB_RESULT_LIMIT: &str = "20";
 const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
-const GITHUB_SEARCH_QUERY: &str = "query { search(query: \"is:pr is:open author:@me sort:updated-desc\", type: ISSUE, first: 100) { nodes { ... on PullRequest { number title url state isDraft updatedAt additions deletions repository { nameWithOwner } author { login avatarUrl } } } } }";
+const GITHUB_SEARCH_QUERY: &str = "query { search(query: \"is:pr is:open author:@me sort:updated-desc\", type: ISSUE, first: 100) { nodes { ... on PullRequest { number title url state isDraft updatedAt additions deletions repository { nameWithOwner } } } } }";
 
 /// Repository identity extracted from a Git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -694,7 +694,6 @@ struct GhSearchPullRequest {
     url: String,
     state: GhPullRequestState,
     repository: GhSearchRepository,
-    author: GhSearchAuthor,
     updated_at: DateTime<Utc>,
     is_draft: bool,
     additions: u64,
@@ -720,13 +719,6 @@ struct GhSearchConnection {
 #[serde(rename_all = "camelCase")]
 struct GhSearchRepository {
     name_with_owner: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhSearchAuthor {
-    login: String,
-    avatar_url: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -855,21 +847,11 @@ fn to_list_item(
     if title.is_empty() {
         return Err(ChangeRequestError::Decode);
     }
-    let author_login = pull_request.author.login.trim();
-    if author_login.is_empty() || author_login.chars().any(char::is_whitespace) {
-        return Err(ChangeRequestError::Decode);
-    }
     let url =
         reqwest::Url::parse(pull_request.url.trim()).map_err(|_| ChangeRequestError::Decode)?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
         return Err(ChangeRequestError::Decode);
     }
-    let avatar_url = reqwest::Url::parse(pull_request.author.avatar_url.trim())
-        .map_err(|_| ChangeRequestError::Decode)?;
-    if !matches!(avatar_url.scheme(), "http" | "https") || avatar_url.host_str().is_none() {
-        return Err(ChangeRequestError::Decode);
-    }
-
     Ok(ChangeRequestListItem {
         provider: "github".into(),
         repository: repository.into(),
@@ -878,8 +860,6 @@ fn to_list_item(
         url: url.to_string(),
         state: pull_request.state.into(),
         is_draft: pull_request.is_draft,
-        author_login: author_login.into(),
-        author_avatar_url: avatar_url.to_string(),
         additions: pull_request.additions,
         deletions: pull_request.deletions,
         updated_at: pull_request.updated_at,
@@ -1146,10 +1126,6 @@ mod tests {
             "repository": {
                 "nameWithOwner": repository,
             },
-            "author": {
-                "login": "octocat",
-                "avatarUrl": "https://avatars.githubusercontent.com/u/1?v=4",
-            },
             "updatedAt": updated_at,
             "isDraft": is_draft,
             "additions": 42,
@@ -1245,7 +1221,6 @@ mod tests {
         let item = &result.unwrap()[0];
         assert_eq!(item.repository, "acme/zeron");
         assert!(item.is_draft);
-        assert_eq!(item.author_login, "octocat");
         assert_eq!(item.additions, 42);
         assert_eq!(item.deletions, 7);
         let requests = runner.requests();
@@ -1332,8 +1307,6 @@ mod tests {
             ("/repository/nameWithOwner", serde_json::json!("a/b/c")),
             ("/url", serde_json::json!("file:///tmp/pr")),
             ("/state", serde_json::json!("CLOSED")),
-            ("/author/login", serde_json::json!(" ")),
-            ("/author/avatarUrl", serde_json::json!("file:///tmp/avatar")),
         ] {
             let mut item = base.clone();
             *item.pointer_mut(pointer).unwrap() = value;

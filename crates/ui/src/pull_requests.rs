@@ -2,8 +2,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, IntoElement, ObjectFit, Render, ScrollHandle, SharedString,
-    StyledImage as _, Subscription, Task, Window, div, img, prelude::*, px,
+    AnyElement, Context, Entity, IntoElement, Render, ScrollHandle, SharedString, Subscription,
+    Task, Window, div, prelude::*, px,
 };
 use zeron_proto::{ChangeRequestListItem, Device};
 use zeron_rpc::{RpcError, capability_errors, methods};
@@ -530,14 +530,13 @@ fn render_table_row(
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .child(render_pr_identity(item, false, theme))
+            .child(render_pr_identity(item, theme))
             .child(
                 div()
                     .pl(px(23.0))
                     .flex()
                     .items_center()
                     .gap(px(10.0))
-                    .child(render_author(item, true, theme))
                     .child(render_diff_stats(item, true, theme))
                     .child(div().flex_1())
                     .child(
@@ -562,7 +561,7 @@ fn render_table_row(
             .flex()
             .items_center()
             .gap(px(8.0))
-            .child(render_pr_identity(item, true, theme))
+            .child(render_pr_identity(item, theme))
             .child(
                 div()
                     .w(px(PR_TABLE_CHANGES_WIDTH))
@@ -599,11 +598,7 @@ fn render_table_row(
     }
 }
 
-fn render_pr_identity(
-    item: &ChangeRequestListItem,
-    include_author: bool,
-    theme: &Theme,
-) -> AnyElement {
+fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme) -> AnyElement {
     div()
         .flex_1()
         .min_w_0()
@@ -659,62 +654,9 @@ fn render_pr_identity(
                                     .text_color(theme.warning)
                                     .child("DRAFT"),
                             )
-                        })
-                        .when(include_author, |element| {
-                            element
-                                .child(div().text_color(theme.text_muted.opacity(0.25)).child("·"))
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .size(px(14.0))
-                                        .rounded_full()
-                                        .overflow_hidden()
-                                        .border_1()
-                                        .border_color(theme.border)
-                                        .child(
-                                            img(item.author_avatar_url.clone())
-                                                .size_full()
-                                                .object_fit(ObjectFit::Cover),
-                                        ),
-                                )
-                                .child(SharedString::from(item.author_login.clone()))
                         }),
                 ),
         )
-        .into_any_element()
-}
-
-fn render_author(item: &ChangeRequestListItem, show_login: bool, theme: &Theme) -> AnyElement {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .min_w_0()
-        .child(
-            div()
-                .flex_none()
-                .size(px(20.0))
-                .rounded_full()
-                .overflow_hidden()
-                .border_1()
-                .border_color(theme.border)
-                .bg(crate::theme::ink(0.04))
-                .child(
-                    img(item.author_avatar_url.clone())
-                        .size_full()
-                        .object_fit(ObjectFit::Cover),
-                ),
-        )
-        .when(show_login, |element| {
-            element.child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(item.author_login.clone())),
-            )
-        })
         .into_any_element()
 }
 

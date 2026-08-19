@@ -889,8 +889,6 @@ async fn pull_request_list_dispatch_returns_provider_items() {
         url: "https://github.com/acme/zeron/pull/123".into(),
         state: ChangeRequestState::Open,
         is_draft: false,
-        author_login: "octocat".into(),
-        author_avatar_url: "https://avatars.githubusercontent.com/u/1?v=4".into(),
         additions: 42,
         deletions: 7,
         updated_at: chrono::DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")

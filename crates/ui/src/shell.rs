@@ -2060,6 +2060,9 @@ impl Shell {
     fn open_pull_requests(&mut self, cx: &mut Context<Self>) {
         self.route = Route::PullRequests;
         self.nav.push(NavEntry::PullRequests);
+        if let Some(page) = self.pull_requests_page.as_ref().cloned() {
+            page.update(cx, |page, cx| page.on_visible(cx));
+        }
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
         self.add_space = None;
@@ -2107,6 +2110,9 @@ impl Shell {
             }
             NavEntry::PullRequests => {
                 self.route = Route::PullRequests;
+                if let Some(page) = self.pull_requests_page.as_ref().cloned() {
+                    page.update(cx, |page, cx| page.on_visible(cx));
+                }
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section);
@@ -4948,7 +4954,7 @@ impl Shell {
         if matches!(self.route, Route::PullRequests) {
             if self.pull_requests_page.is_none() {
                 self.pull_requests_page =
-                    Some(cx.new(|_| PullRequestsPage::new(self.state.clone())));
+                    Some(cx.new(|cx| PullRequestsPage::new(self.state.clone(), cx)));
             }
             let outlet = self
                 .pull_requests_page

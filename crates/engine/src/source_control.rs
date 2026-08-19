@@ -14,7 +14,9 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use zeron_proto::{ChangeRequestListItem, ChangeRequestState, ChangeRequestSummary};
+use zeron_proto::{
+    ChangeRequestListItem, ChangeRequestMergeability, ChangeRequestState, ChangeRequestSummary,
+};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(20);
@@ -22,7 +24,7 @@ const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GITHUB_RESULT_LIMIT: &str = "20";
 const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
-const GITHUB_SEARCH_QUERY: &str = "query { search(query: \"is:pr is:open author:@me sort:updated-desc\", type: ISSUE, first: 100) { nodes { ... on PullRequest { number title url state isDraft createdAt updatedAt additions deletions repository { nameWithOwner } } } } }";
+const GITHUB_SEARCH_QUERY: &str = "query { search(query: \"is:pr is:open author:@me sort:updated-desc\", type: ISSUE, first: 100) { nodes { ... on PullRequest { number title url state isDraft mergeable createdAt updatedAt additions deletions repository { nameWithOwner } } } } }";
 
 /// Repository identity extracted from a Git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -694,6 +696,7 @@ struct GhSearchPullRequest {
     url: String,
     state: GhPullRequestState,
     repository: GhSearchRepository,
+    mergeable: GhMergeability,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     is_draft: bool,
@@ -730,12 +733,30 @@ enum GhPullRequestState {
     Merged,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum GhMergeability {
+    Mergeable,
+    Conflicting,
+    Unknown,
+}
+
 impl From<GhPullRequestState> for ChangeRequestState {
     fn from(state: GhPullRequestState) -> Self {
         match state {
             GhPullRequestState::Open => Self::Open,
             GhPullRequestState::Closed => Self::Closed,
             GhPullRequestState::Merged => Self::Merged,
+        }
+    }
+}
+
+impl From<GhMergeability> for ChangeRequestMergeability {
+    fn from(mergeability: GhMergeability) -> Self {
+        match mergeability {
+            GhMergeability::Mergeable => Self::Mergeable,
+            GhMergeability::Conflicting => Self::Conflicting,
+            GhMergeability::Unknown => Self::Unknown,
         }
     }
 }
@@ -863,6 +884,7 @@ fn to_list_item(
         is_draft: pull_request.is_draft,
         additions: pull_request.additions,
         deletions: pull_request.deletions,
+        mergeability: pull_request.mergeable.into(),
         created_at: pull_request.created_at,
         updated_at: pull_request.updated_at,
     })
@@ -1117,6 +1139,7 @@ mod tests {
         number: u64,
         title: &str,
         state: &str,
+        mergeable: &str,
         created_at: &str,
         updated_at: &str,
         is_draft: bool,
@@ -1126,6 +1149,7 @@ mod tests {
             "title": title,
             "url": format!("https://github.com/{repository}/pull/{number}"),
             "state": state,
+            "mergeable": mergeable,
             "repository": {
                 "nameWithOwner": repository,
             },
@@ -1217,6 +1241,7 @@ mod tests {
             123,
             "Dashboard",
             "OPEN",
+            "CONFLICTING",
             "2026-08-10T09:30:00Z",
             "2026-08-19T12:00:00Z",
             true,
@@ -1228,6 +1253,7 @@ mod tests {
         assert!(item.is_draft);
         assert_eq!(item.additions, 42);
         assert_eq!(item.deletions, 7);
+        assert_eq!(item.mergeability, ChangeRequestMergeability::Conflicting);
         assert_eq!(
             item.created_at,
             DateTime::parse_from_rfc3339("2026-08-10T09:30:00Z")
@@ -1266,6 +1292,7 @@ mod tests {
                 8,
                 "  A title\nwith\tspacing  ",
                 "OPEN",
+                "MERGEABLE",
                 "2026-08-01T08:00:00Z",
                 "2026-08-19T11:00:00Z",
                 false,
@@ -1275,6 +1302,7 @@ mod tests {
                 4,
                 "Alpha",
                 "OPEN",
+                "UNKNOWN",
                 "2026-08-02T08:00:00Z",
                 "2026-08-19T12:00:00Z",
                 true,
@@ -1284,6 +1312,7 @@ mod tests {
                 2,
                 "Earlier number",
                 "OPEN",
+                "MERGEABLE",
                 "2026-08-03T08:00:00Z",
                 "2026-08-19T12:00:00Z",
                 false,
@@ -1310,6 +1339,7 @@ mod tests {
             1,
             "Valid",
             "OPEN",
+            "MERGEABLE",
             "2026-08-01T08:00:00Z",
             "2026-08-19T12:00:00Z",
             false,
@@ -1322,6 +1352,7 @@ mod tests {
             ("/repository/nameWithOwner", serde_json::json!("a/b/c")),
             ("/url", serde_json::json!("file:///tmp/pr")),
             ("/state", serde_json::json!("CLOSED")),
+            ("/mergeable", serde_json::json!("BLOCKED")),
         ] {
             let mut item = base.clone();
             *item.pointer_mut(pointer).unwrap() = value;

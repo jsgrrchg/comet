@@ -8,7 +8,7 @@ use gpui::{
     AnimationExt, AnyElement, Context, Entity, IntoElement, Render, ScrollHandle, SharedString,
     Subscription, Task, Window, div, prelude::*, px,
 };
-use zeron_proto::{ChangeRequestListItem, Device};
+use zeron_proto::{ChangeRequestListItem, ChangeRequestMergeability, Device};
 use zeron_rpc::{RpcError, capability_errors, methods};
 
 use crate::icons::{self, icon};
@@ -75,6 +75,25 @@ enum SortDirection {
 struct PullRequestSort {
     field: PullRequestSortField,
     direction: SortDirection,
+}
+
+struct MergeConflictTooltip;
+
+impl Render for MergeConflictTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.danger_muted)
+            .child("Merge conflicts")
+    }
 }
 
 impl PullRequestSort {
@@ -837,19 +856,39 @@ fn render_table_row(
 }
 
 fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme, hover_t: f32) -> AnyElement {
+    let conflicting = item.mergeability == ChangeRequestMergeability::Conflicting;
+    let status_icon = div()
+        .id(SharedString::from(format!(
+            "pull-request-status-{}-{}",
+            item.repository, item.number
+        )))
+        .size(px(15.0))
+        .flex_none()
+        .mt(px(3.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            icon(pull_request_status_icon(item.mergeability))
+                .size(px(15.0))
+                .text_color(if conflicting {
+                    theme.danger_muted
+                } else {
+                    theme.success_muted
+                }),
+        )
+        .when(conflicting, |element| {
+            element
+                .tooltip(|_, cx| cx.new(|_| MergeConflictTooltip).into())
+                .tooltip_show_delay(Duration::from_millis(350))
+        });
     div()
         .flex_1()
         .min_w_0()
         .flex()
         .items_start()
         .gap(px(8.0))
-        .child(
-            icon(icons::PULL_REQUEST)
-                .flex_none()
-                .mt(px(3.0))
-                .size(px(15.0))
-                .text_color(theme.success_muted),
-        )
+        .child(status_icon)
         .child(
             div()
                 .flex_1()
@@ -899,6 +938,15 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme, hover_t: f32)
                 ),
         )
         .into_any_element()
+}
+
+fn pull_request_status_icon(mergeability: ChangeRequestMergeability) -> &'static str {
+    match mergeability {
+        ChangeRequestMergeability::Conflicting => icons::DANGER_TRIANGLE,
+        ChangeRequestMergeability::Mergeable | ChangeRequestMergeability::Unknown => {
+            icons::PULL_REQUEST
+        }
+    }
 }
 
 fn render_diff_stats(
@@ -1163,6 +1211,7 @@ mod tests {
             is_draft: false,
             additions: changes,
             deletions: 0,
+            mergeability: ChangeRequestMergeability::Mergeable,
             created_at: Utc.with_ymd_and_hms(2026, 8, opened_day, 8, 0, 0).unwrap(),
             updated_at: Utc
                 .with_ymd_and_hms(2026, 8, 19, updated_hour, 0, 0)
@@ -1330,6 +1379,20 @@ mod tests {
             "2h ago"
         );
         assert_eq!(compact_relative_time(now + TimeDelta::hours(2), now), "now");
+    }
+
+    #[test]
+    fn only_conflicting_requests_use_the_warning_icon() {
+        assert_eq!(
+            pull_request_status_icon(ChangeRequestMergeability::Conflicting),
+            icons::DANGER_TRIANGLE
+        );
+        for mergeability in [
+            ChangeRequestMergeability::Mergeable,
+            ChangeRequestMergeability::Unknown,
+        ] {
+            assert_eq!(pull_request_status_icon(mergeability), icons::PULL_REQUEST);
+        }
     }
 
     #[test]

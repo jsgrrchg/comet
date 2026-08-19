@@ -357,6 +357,15 @@ pub enum ChangeRequestState {
     Merged,
 }
 
+/// Whether a change request can be merged without resolving conflicts first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChangeRequestMergeability {
+    Mergeable,
+    Conflicting,
+    Unknown,
+}
+
 /// Compact provider-neutral change request metadata for checkout surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -386,6 +395,7 @@ pub struct ChangeRequestListItem {
     pub is_draft: bool,
     pub additions: u64,
     pub deletions: u64,
+    pub mergeability: ChangeRequestMergeability,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -690,6 +700,7 @@ mod tests {
                 is_draft: true,
                 additions: 42,
                 deletions: 7,
+                mergeability: ChangeRequestMergeability::Conflicting,
                 created_at: Utc.with_ymd_and_hms(2026, 8, 10, 9, 30, 0).unwrap(),
                 updated_at: Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap(),
             };
@@ -700,6 +711,7 @@ mod tests {
             assert_eq!(value["isDraft"], true);
             assert_eq!(value["additions"], 42);
             assert_eq!(value["deletions"], 7);
+            assert_eq!(value["mergeability"], "conflicting");
             assert_eq!(value["createdAt"], "2026-08-10T09:30:00Z");
             assert_eq!(value["updatedAt"], "2026-08-19T12:00:00Z");
             assert!(value.get("baseRef").is_none());
@@ -707,6 +719,22 @@ mod tests {
             assert_eq!(
                 serde_json::from_value::<ChangeRequestListItem>(value).unwrap(),
                 item
+            );
+        }
+    }
+
+    #[test]
+    fn change_request_mergeability_round_trips_all_states() {
+        for (state, encoded) in [
+            (ChangeRequestMergeability::Mergeable, "mergeable"),
+            (ChangeRequestMergeability::Conflicting, "conflicting"),
+            (ChangeRequestMergeability::Unknown, "unknown"),
+        ] {
+            let value = serde_json::to_value(state).unwrap();
+            assert_eq!(value, encoded);
+            assert_eq!(
+                serde_json::from_value::<ChangeRequestMergeability>(value).unwrap(),
+                state
             );
         }
     }

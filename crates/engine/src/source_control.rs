@@ -14,14 +14,16 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use zeron_proto::{ChangeRequestState, ChangeRequestSummary};
+use zeron_proto::{ChangeRequestListItem, ChangeRequestState, ChangeRequestSummary};
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(20);
 const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GITHUB_RESULT_LIMIT: &str = "20";
+const GITHUB_SEARCH_RESULT_LIMIT: &str = "100";
 const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
+const GITHUB_SEARCH_JSON_FIELDS: &str = "number,title,url,state,repository,updatedAt,isDraft";
 
 /// Repository identity extracted from a Git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,6 +197,60 @@ impl GitHubCli {
         Self { runner }
     }
 
+    /// List open pull requests authored by the active GitHub CLI account.
+    pub async fn list_authored_open(
+        &self,
+    ) -> Result<Vec<ChangeRequestListItem>, ChangeRequestError> {
+        let request = ProcessRequest {
+            program: "gh".into(),
+            args: vec![
+                "search".into(),
+                "prs".into(),
+                "--author".into(),
+                "@me".into(),
+                "--state".into(),
+                "open".into(),
+                "--sort".into(),
+                "updated".into(),
+                "--order".into(),
+                "desc".into(),
+                "--limit".into(),
+                GITHUB_SEARCH_RESULT_LIMIT.into(),
+                "--json".into(),
+                GITHUB_SEARCH_JSON_FIELDS.into(),
+            ],
+            cwd: None,
+            env: vec![
+                ("GH_PROMPT_DISABLED".into(), "1".into()),
+                ("GH_HOST".into(), "github.com".into()),
+            ],
+            timeout: GITHUB_TIMEOUT,
+            output_limit: GITHUB_OUTPUT_LIMIT,
+        };
+        let output = self.runner.run(request).await.map_err(classify_run_error)?;
+        if !output.success {
+            return Err(classify_github_failure(&output.stderr));
+        }
+        if output.stdout_truncated {
+            return Err(ChangeRequestError::Decode);
+        }
+
+        let results: Vec<GhSearchPullRequest> =
+            serde_json::from_slice(&output.stdout).map_err(|_| ChangeRequestError::Decode)?;
+        let mut items = results
+            .into_iter()
+            .map(to_list_item)
+            .collect::<Result<Vec<_>, _>>()?;
+        items.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.repository.cmp(&right.repository))
+                .then_with(|| left.number.cmp(&right.number))
+        });
+        Ok(items)
+    }
+
     async fn list_for_selector(
         &self,
         source: &CheckoutSourceContext,
@@ -214,7 +270,7 @@ impl GitHubCli {
                 "--json".into(),
                 GITHUB_JSON_FIELDS.into(),
             ],
-            cwd: source.checkout_root.clone(),
+            cwd: Some(source.checkout_root.clone()),
             env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
             timeout: GITHUB_TIMEOUT,
             output_limit: GITHUB_OUTPUT_LIMIT,
@@ -250,7 +306,7 @@ impl GitHubCli {
                 "--json".into(),
                 "defaultBranchRef".into(),
             ],
-            cwd: source.checkout_root.clone(),
+            cwd: Some(source.checkout_root.clone()),
             env: vec![("GH_PROMPT_DISABLED".into(), "1".into())],
             timeout: GITHUB_TIMEOUT,
             output_limit: GITHUB_OUTPUT_LIMIT,
@@ -584,7 +640,7 @@ impl GitCheckoutInspector {
             .run(ProcessRequest {
                 program: "git".into(),
                 args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-                cwd: cwd.to_owned(),
+                cwd: Some(cwd.to_owned()),
                 env: Vec::new(),
                 timeout: GIT_TIMEOUT,
                 output_limit: GIT_OUTPUT_LIMIT,
@@ -623,6 +679,24 @@ struct GhPullRequest {
     updated_at: DateTime<Utc>,
     is_cross_repository: bool,
     head_repository_owner: GhRepositoryOwner,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhSearchPullRequest {
+    number: u64,
+    title: String,
+    url: String,
+    state: GhPullRequestState,
+    repository: GhSearchRepository,
+    updated_at: DateTime<Utc>,
+    is_draft: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhSearchRepository {
+    name_with_owner: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -726,6 +800,49 @@ fn to_summary(
     })
 }
 
+fn to_list_item(
+    pull_request: GhSearchPullRequest,
+) -> Result<ChangeRequestListItem, ChangeRequestError> {
+    let repository = pull_request.repository.name_with_owner.trim();
+    let mut repository_parts = repository.split('/');
+    let owner = repository_parts.next().unwrap_or_default();
+    let name = repository_parts.next().unwrap_or_default();
+    if pull_request.number == 0
+        || owner.is_empty()
+        || name.is_empty()
+        || repository_parts.next().is_some()
+        || repository.chars().any(char::is_whitespace)
+        || !matches!(pull_request.state, GhPullRequestState::Open)
+    {
+        return Err(ChangeRequestError::Decode);
+    }
+
+    let title = pull_request
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if title.is_empty() {
+        return Err(ChangeRequestError::Decode);
+    }
+    let url =
+        reqwest::Url::parse(pull_request.url.trim()).map_err(|_| ChangeRequestError::Decode)?;
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return Err(ChangeRequestError::Decode);
+    }
+
+    Ok(ChangeRequestListItem {
+        provider: "github".into(),
+        repository: repository.into(),
+        number: pull_request.number,
+        title,
+        url: url.to_string(),
+        state: pull_request.state.into(),
+        is_draft: pull_request.is_draft,
+        updated_at: pull_request.updated_at,
+    })
+}
+
 fn classify_github_failure(stderr: &[u8]) -> ChangeRequestError {
     let stderr = String::from_utf8_lossy(stderr).to_ascii_lowercase();
     if stderr.contains("rate limit") || stderr.contains("secondary rate") {
@@ -754,7 +871,7 @@ fn classify_run_error(error: ProcessRunError) -> ChangeRequestError {
 struct ProcessRequest {
     program: String,
     args: Vec<String>,
-    cwd: PathBuf,
+    cwd: Option<PathBuf>,
     env: Vec<(String, String)>,
     timeout: Duration,
     output_limit: usize,
@@ -789,9 +906,11 @@ impl ProcessRunner for SystemProcessRunner {
         if request.program == "gh" {
             zeron_harness::compose_login_shell_path(&mut command);
         }
+        command.args(&request.args);
+        if let Some(cwd) = &request.cwd {
+            command.current_dir(cwd);
+        }
         command
-            .args(&request.args)
-            .current_dir(&request.cwd)
             .envs(request.env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -968,6 +1087,40 @@ mod tests {
         })
     }
 
+    fn search_pull_request(
+        repository: &str,
+        number: u64,
+        title: &str,
+        state: &str,
+        updated_at: &str,
+        is_draft: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "number": number,
+            "title": title,
+            "url": format!("https://github.com/{repository}/pull/{number}"),
+            "state": state,
+            "repository": {
+                "name": repository.rsplit('/').next().unwrap_or_default(),
+                "nameWithOwner": repository,
+            },
+            "updatedAt": updated_at,
+            "isDraft": is_draft,
+        })
+    }
+
+    async fn list_with(
+        response: Result<ProcessOutput, ProcessRunError>,
+    ) -> (
+        Result<Vec<ChangeRequestListItem>, ChangeRequestError>,
+        Arc<FakeProcessRunner>,
+    ) {
+        let runner = FakeProcessRunner::with_responses([response]);
+        let github = GitHubCli::with_runner(runner.clone());
+        let result = github.list_authored_open().await;
+        (result, runner)
+    }
+
     async fn resolve_with(
         source: &CheckoutSourceContext,
         response: Result<ProcessOutput, ProcessRunError>,
@@ -1001,7 +1154,7 @@ mod tests {
         let requests = runner.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].program, "gh");
-        assert_eq!(requests[0].cwd, Path::new("/checkout"));
+        assert_eq!(requests[0].cwd.as_deref(), Some(Path::new("/checkout")));
         assert_eq!(
             requests[0].args,
             [
@@ -1020,6 +1173,167 @@ mod tests {
         assert_eq!(requests[0].env, [("GH_PROMPT_DISABLED".into(), "1".into())]);
         assert_eq!(requests[0].timeout, GITHUB_TIMEOUT);
         assert_eq!(requests[0].output_limit, GITHUB_OUTPUT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn github_search_uses_exact_global_arguments_and_environment() {
+        let json = serde_json::to_vec(&vec![search_pull_request(
+            "acme/zeron",
+            123,
+            "Dashboard",
+            "OPEN",
+            "2026-08-19T12:00:00Z",
+            true,
+        )])
+        .unwrap();
+        let (result, runner) = list_with(command_success(json)).await;
+
+        let item = &result.unwrap()[0];
+        assert_eq!(item.repository, "acme/zeron");
+        assert!(item.is_draft);
+        let requests = runner.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].program, "gh");
+        assert_eq!(requests[0].cwd, None);
+        assert_eq!(
+            requests[0].args,
+            [
+                "search",
+                "prs",
+                "--author",
+                "@me",
+                "--state",
+                "open",
+                "--sort",
+                "updated",
+                "--order",
+                "desc",
+                "--limit",
+                "100",
+                "--json",
+                GITHUB_SEARCH_JSON_FIELDS,
+            ]
+        );
+        assert_eq!(
+            requests[0].env,
+            [
+                ("GH_PROMPT_DISABLED".into(), "1".into()),
+                ("GH_HOST".into(), "github.com".into()),
+            ]
+        );
+        assert_eq!(requests[0].timeout, GITHUB_TIMEOUT);
+        assert_eq!(requests[0].output_limit, GITHUB_OUTPUT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn github_search_normalizes_titles_and_sorts_results_stably() {
+        let json = serde_json::to_vec(&vec![
+            search_pull_request(
+                "zeta/repo",
+                8,
+                "  A title\nwith\tspacing  ",
+                "OPEN",
+                "2026-08-19T11:00:00Z",
+                false,
+            ),
+            search_pull_request(
+                "alpha/repo",
+                4,
+                "Alpha",
+                "OPEN",
+                "2026-08-19T12:00:00Z",
+                true,
+            ),
+            search_pull_request(
+                "alpha/repo",
+                2,
+                "Earlier number",
+                "OPEN",
+                "2026-08-19T12:00:00Z",
+                false,
+            ),
+        ])
+        .unwrap();
+
+        let (result, _) = list_with(command_success(json)).await;
+        let items = result.unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.repository.as_str(), item.number))
+                .collect::<Vec<_>>(),
+            [("alpha/repo", 2), ("alpha/repo", 4), ("zeta/repo", 8)]
+        );
+        assert_eq!(items[2].title, "A title with spacing");
+        assert_eq!(items[0].state, ChangeRequestState::Open);
+    }
+
+    #[tokio::test]
+    async fn github_search_rejects_invalid_structural_fields() {
+        let base = search_pull_request(
+            "acme/zeron",
+            1,
+            "Valid",
+            "OPEN",
+            "2026-08-19T12:00:00Z",
+            false,
+        );
+        let mut invalid_items = Vec::new();
+        for (pointer, value) in [
+            ("/number", serde_json::json!(0)),
+            ("/title", serde_json::json!(" \n\t ")),
+            ("/repository/nameWithOwner", serde_json::json!("zeron")),
+            ("/repository/nameWithOwner", serde_json::json!("a/b/c")),
+            ("/url", serde_json::json!("file:///tmp/pr")),
+            ("/state", serde_json::json!("CLOSED")),
+        ] {
+            let mut item = base.clone();
+            *item.pointer_mut(pointer).unwrap() = value;
+            invalid_items.push(item);
+        }
+
+        for item in invalid_items {
+            let json = serde_json::to_vec(&vec![item]).unwrap();
+            let (result, _) = list_with(command_success(json)).await;
+            assert_eq!(result.unwrap_err(), ChangeRequestError::Decode);
+        }
+    }
+
+    #[tokio::test]
+    async fn github_search_classifies_process_and_output_failures() {
+        for (response, expected) in [
+            (
+                Err(ProcessRunError::Spawn(io::ErrorKind::NotFound)),
+                ChangeRequestError::CliUnavailable,
+            ),
+            (Err(ProcessRunError::Timeout), ChangeRequestError::Timeout),
+            (
+                command_failure("not logged in; token secret-value"),
+                ChangeRequestError::Authentication,
+            ),
+            (
+                command_failure("API rate limit exceeded"),
+                ChangeRequestError::RateLimited,
+            ),
+        ] {
+            let (result, _) = list_with(response).await;
+            let error = result.unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.to_string().contains("secret-value"));
+        }
+
+        for output in [
+            command_success(b"not-json".to_vec()),
+            Ok(ProcessOutput {
+                success: true,
+                stdout: b"[]".to_vec(),
+                stderr: Vec::new(),
+                stdout_truncated: true,
+            }),
+        ] {
+            let (result, _) = list_with(output).await;
+            assert_eq!(result.unwrap_err(), ChangeRequestError::Decode);
+        }
     }
 
     #[tokio::test]
@@ -1491,7 +1805,7 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         assert_eq!(source.branch.owner.as_deref(), Some("contributor"));
         assert_eq!(source.default_branch.as_deref(), Some("main"));
         let requests = runner.requests();
-        assert_eq!(requests[0].cwd, Path::new("/nested/path"));
+        assert_eq!(requests[0].cwd.as_deref(), Some(Path::new("/nested/path")));
         assert_eq!(requests[0].args, ["rev-parse", "--show-toplevel"]);
         assert_eq!(requests[4].args, ["remote", "get-url", "--push", "fork"]);
     }

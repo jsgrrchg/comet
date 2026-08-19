@@ -514,8 +514,6 @@ fn render_table_row(
         .group(group.clone())
         .w_full()
         .flex_none()
-        .border_b_1()
-        .border_color(crate::theme::hairline(0.04))
         .cursor_pointer()
         .hover(|style| style.bg(crate::theme::ink(0.025)))
         .on_click(move |_, _, cx| {
@@ -603,11 +601,12 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme) -> AnyElement
         .flex_1()
         .min_w_0()
         .flex()
-        .items_center()
+        .items_start()
         .gap(px(8.0))
         .child(
             icon(icons::PULL_REQUEST)
                 .flex_none()
+                .mt(px(3.0))
                 .size(px(15.0))
                 .text_color(theme.success_muted),
         )

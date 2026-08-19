@@ -135,6 +135,7 @@ pub struct PullRequestsPage {
     last_loaded_at: Option<Instant>,
     generation: u64,
     request_task: Option<Task<()>>,
+    visible: bool,
     scroll: ScrollHandle,
     content_width: Option<f32>,
     device_menu: popover::Popup<()>,
@@ -144,7 +145,8 @@ pub struct PullRequestsPage {
 impl PullRequestsPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |page, _, cx| {
-            if page.reconcile_target_device(cx) {
+            let target_changed = page.reconcile_target_device(cx);
+            if target_changed && page.visible {
                 page.load(cx);
             } else {
                 cx.notify();
@@ -161,6 +163,8 @@ impl PullRequestsPage {
             last_loaded_at: None,
             generation: 0,
             request_task: None,
+            // The entity is created lazily only while this route is active.
+            visible: true,
             scroll: ScrollHandle::new(),
             content_width: None,
             device_menu: popover::Popup::default(),
@@ -172,6 +176,7 @@ impl PullRequestsPage {
 
     /// Called whenever shell navigation makes the already-owned entity visible again.
     pub fn on_visible(&mut self, cx: &mut Context<Self>) {
+        self.visible = true;
         // Resort offsets describe one click transition, not durable page state.
         // Dropping them here prevents a completed animation from replaying after navigation.
         self.sort_offsets.clear();
@@ -182,6 +187,11 @@ impl PullRequestsPage {
         if target_changed || (!matches!(self.load_state, PullRequestsLoadState::Loading) && stale) {
             self.load(cx);
         }
+    }
+
+    /// Keep the retained route entity dormant while another outlet is active.
+    pub fn on_hidden(&mut self) {
+        self.visible = false;
     }
 
     fn close_device_menu(&mut self, cx: &mut Context<Self>) {

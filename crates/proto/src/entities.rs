@@ -386,6 +386,7 @@ pub struct ChangeRequestListItem {
     pub is_draft: bool,
     pub additions: u64,
     pub deletions: u64,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -689,6 +690,7 @@ mod tests {
                 is_draft: true,
                 additions: 42,
                 deletions: 7,
+                created_at: Utc.with_ymd_and_hms(2026, 8, 10, 9, 30, 0).unwrap(),
                 updated_at: Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap(),
             };
 
@@ -698,6 +700,7 @@ mod tests {
             assert_eq!(value["isDraft"], true);
             assert_eq!(value["additions"], 42);
             assert_eq!(value["deletions"], 7);
+            assert_eq!(value["createdAt"], "2026-08-10T09:30:00Z");
             assert_eq!(value["updatedAt"], "2026-08-19T12:00:00Z");
             assert!(value.get("baseRef").is_none());
             assert!(value.get("headRef").is_none());

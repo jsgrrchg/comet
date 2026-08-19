@@ -22,7 +22,7 @@ const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GITHUB_RESULT_LIMIT: &str = "20";
 const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
-const GITHUB_SEARCH_QUERY: &str = "query { search(query: \"is:pr is:open author:@me sort:updated-desc\", type: ISSUE, first: 100) { nodes { ... on PullRequest { number title url state isDraft updatedAt additions deletions repository { nameWithOwner } } } } }";
+const GITHUB_SEARCH_QUERY: &str = "query { search(query: \"is:pr is:open author:@me sort:updated-desc\", type: ISSUE, first: 100) { nodes { ... on PullRequest { number title url state isDraft createdAt updatedAt additions deletions repository { nameWithOwner } } } } }";
 
 /// Repository identity extracted from a Git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -694,6 +694,7 @@ struct GhSearchPullRequest {
     url: String,
     state: GhPullRequestState,
     repository: GhSearchRepository,
+    created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     is_draft: bool,
     additions: u64,
@@ -862,6 +863,7 @@ fn to_list_item(
         is_draft: pull_request.is_draft,
         additions: pull_request.additions,
         deletions: pull_request.deletions,
+        created_at: pull_request.created_at,
         updated_at: pull_request.updated_at,
     })
 }
@@ -1115,6 +1117,7 @@ mod tests {
         number: u64,
         title: &str,
         state: &str,
+        created_at: &str,
         updated_at: &str,
         is_draft: bool,
     ) -> serde_json::Value {
@@ -1126,6 +1129,7 @@ mod tests {
             "repository": {
                 "nameWithOwner": repository,
             },
+            "createdAt": created_at,
             "updatedAt": updated_at,
             "isDraft": is_draft,
             "additions": 42,
@@ -1213,6 +1217,7 @@ mod tests {
             123,
             "Dashboard",
             "OPEN",
+            "2026-08-10T09:30:00Z",
             "2026-08-19T12:00:00Z",
             true,
         )]);
@@ -1223,6 +1228,12 @@ mod tests {
         assert!(item.is_draft);
         assert_eq!(item.additions, 42);
         assert_eq!(item.deletions, 7);
+        assert_eq!(
+            item.created_at,
+            DateTime::parse_from_rfc3339("2026-08-10T09:30:00Z")
+                .unwrap()
+                .with_timezone(&Utc)
+        );
         let requests = runner.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].program, "gh");
@@ -1255,6 +1266,7 @@ mod tests {
                 8,
                 "  A title\nwith\tspacing  ",
                 "OPEN",
+                "2026-08-01T08:00:00Z",
                 "2026-08-19T11:00:00Z",
                 false,
             ),
@@ -1263,6 +1275,7 @@ mod tests {
                 4,
                 "Alpha",
                 "OPEN",
+                "2026-08-02T08:00:00Z",
                 "2026-08-19T12:00:00Z",
                 true,
             ),
@@ -1271,6 +1284,7 @@ mod tests {
                 2,
                 "Earlier number",
                 "OPEN",
+                "2026-08-03T08:00:00Z",
                 "2026-08-19T12:00:00Z",
                 false,
             ),
@@ -1296,6 +1310,7 @@ mod tests {
             1,
             "Valid",
             "OPEN",
+            "2026-08-01T08:00:00Z",
             "2026-08-19T12:00:00Z",
             false,
         );

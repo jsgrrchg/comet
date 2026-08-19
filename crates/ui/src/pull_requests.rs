@@ -19,6 +19,7 @@ const SNAPSHOT_TTL: Duration = Duration::from_secs(60);
 const PR_TABLE_HEADER_HEIGHT: f32 = 24.0;
 const PR_TABLE_ROW_HEIGHT: f32 = 52.0;
 const PR_TABLE_CHANGES_WIDTH: f32 = 92.0;
+const PR_TABLE_OPENED_WIDTH: f32 = 92.0;
 const PR_TABLE_UPDATED_WIDTH: f32 = 92.0;
 const PR_TABLE_ACTION_WIDTH: f32 = 22.0;
 const PR_ROW_HOVER_TEXT_SCALE: f32 = 0.06;
@@ -450,7 +451,7 @@ fn render_pull_request_table(
     div()
         .w_full()
         .when(show_header, |element| {
-            element.child(render_table_header(theme))
+            element.child(render_table_header(layout, theme))
         })
         .children(
             items
@@ -461,7 +462,7 @@ fn render_pull_request_table(
         .into_any_element()
 }
 
-fn render_table_header(theme: &Theme) -> AnyElement {
+fn render_table_header(layout: PullRequestTableLayout, theme: &Theme) -> AnyElement {
     let label = |copy: &'static str| {
         div()
             .text_size(px(12.0))
@@ -490,6 +491,14 @@ fn render_table_header(theme: &Theme) -> AnyElement {
                 .flex_none()
                 .child(label("Changes")),
         )
+        .when(layout == PullRequestTableLayout::Wide, |element| {
+            element.child(
+                div()
+                    .w(px(PR_TABLE_OPENED_WIDTH))
+                    .flex_none()
+                    .child(label("Opened")),
+            )
+        })
         .child(
             div()
                 .w(px(PR_TABLE_UPDATED_WIDTH))
@@ -548,7 +557,7 @@ fn render_table_row(
                             .line_height(px(14.0))
                             .text_size(hover_text_size(11.0, hover_t))
                             .text_color(theme.text_muted.opacity(0.65))
-                            .child(SharedString::from(compact_updated_at(
+                            .child(SharedString::from(compact_relative_time(
                                 item.updated_at,
                                 Utc::now(),
                             ))),
@@ -573,19 +582,20 @@ fn render_table_row(
                     .flex_none()
                     .child(render_diff_stats(item, false, theme, hover_t)),
             )
-            .child(
-                div()
-                    .w(px(PR_TABLE_UPDATED_WIDTH))
-                    .flex_none()
-                    .truncate()
-                    .line_height(px(14.0))
-                    .text_size(hover_text_size(10.5, hover_t))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(relative_updated_at(
-                        item.updated_at,
-                        Utc::now(),
-                    ))),
-            )
+            .when(layout == PullRequestTableLayout::Wide, |element| {
+                element.child(render_relative_time_cell(
+                    item.created_at,
+                    PR_TABLE_OPENED_WIDTH,
+                    hover_t,
+                    theme,
+                ))
+            })
+            .child(render_relative_time_cell(
+                item.updated_at,
+                PR_TABLE_UPDATED_WIDTH,
+                hover_t,
+                theme,
+            ))
             .child(
                 div()
                     .w(px(PR_TABLE_ACTION_WIDTH))
@@ -705,6 +715,23 @@ fn hover_text_size(base: f32, hover_t: f32) -> gpui::Pixels {
     px(base * (1.0 + PR_ROW_HOVER_TEXT_SCALE * hover_t))
 }
 
+fn render_relative_time_cell(
+    timestamp: DateTime<Utc>,
+    width: f32,
+    hover_t: f32,
+    theme: &Theme,
+) -> AnyElement {
+    div()
+        .w(px(width))
+        .flex_none()
+        .truncate()
+        .line_height(px(14.0))
+        .text_size(hover_text_size(10.5, hover_t))
+        .text_color(theme.text_muted)
+        .child(SharedString::from(relative_time(timestamp, Utc::now())))
+        .into_any_element()
+}
+
 fn eligible_desktop_devices(devices: &[Device]) -> Vec<Device> {
     let mut devices: Vec<_> = devices
         .iter()
@@ -793,8 +820,8 @@ fn platform_icon(platform: &str) -> &'static str {
     }
 }
 
-fn relative_updated_at(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let seconds = now.signed_duration_since(updated_at).num_seconds().max(0);
+fn relative_time(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(timestamp).num_seconds().max(0);
     let (amount, unit) = if seconds < 60 {
         return "just now".into();
     } else if seconds < 3_600 {
@@ -813,8 +840,8 @@ fn relative_updated_at(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String 
     format!("{amount} {unit}{} ago", if amount == 1 { "" } else { "s" })
 }
 
-fn compact_updated_at(updated_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
-    let seconds = now.signed_duration_since(updated_at).num_seconds().max(0);
+fn compact_relative_time(timestamp: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let seconds = now.signed_duration_since(timestamp).num_seconds().max(0);
     if seconds < 60 {
         "now".into()
     } else if seconds < 3_600 {
@@ -943,17 +970,14 @@ mod tests {
     #[test]
     fn relative_dates_are_readable_and_pluralized() {
         let now = Utc::now();
-        assert_eq!(relative_updated_at(now, now), "just now");
+        assert_eq!(relative_time(now, now), "just now");
+        assert_eq!(relative_time(now - TimeDelta::hours(1), now), "1 hour ago");
+        assert_eq!(relative_time(now - TimeDelta::days(2), now), "2 days ago");
         assert_eq!(
-            relative_updated_at(now - TimeDelta::hours(1), now),
-            "1 hour ago"
+            compact_relative_time(now - TimeDelta::hours(2), now),
+            "2h ago"
         );
-        assert_eq!(
-            relative_updated_at(now - TimeDelta::days(2), now),
-            "2 days ago"
-        );
-        assert_eq!(compact_updated_at(now - TimeDelta::hours(2), now), "2h ago");
-        assert_eq!(compact_updated_at(now + TimeDelta::hours(2), now), "now");
+        assert_eq!(compact_relative_time(now + TimeDelta::hours(2), now), "now");
     }
 
     #[test]

@@ -891,6 +891,9 @@ async fn pull_request_list_dispatch_returns_provider_items() {
         is_draft: false,
         additions: 42,
         deletions: 7,
+        created_at: chrono::DateTime::parse_from_rfc3339("2026-08-10T09:30:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc),
         updated_at: chrono::DateTime::parse_from_rfc3339("2026-08-19T12:00:00Z")
             .unwrap()
             .with_timezone(&chrono::Utc),

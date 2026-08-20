@@ -408,6 +408,8 @@ pub struct UiSettings {
     pub files_editor_font_size: f32,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
+    /// Changes pane: side-by-side diffs instead of the unified stack.
+    pub diff_split: bool,
 }
 
 impl Default for UiSettings {
@@ -445,6 +447,7 @@ impl Default for UiSettings {
             files_word_wrap: false,
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
+            diff_split: false,
         }
     }
 }
@@ -826,6 +829,7 @@ mod tests {
             files_word_wrap: true,
             files_editor_font_size: 15.0,
             files_show_all: true,
+            diff_split: true,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);

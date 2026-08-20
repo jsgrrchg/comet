@@ -86,8 +86,8 @@ pub fn titlebar_spacer_width(is_macos: bool, fullscreen: bool, container_pad: f3
 }
 
 /// Width of the persistent top-left button cluster itself (sidebar toggle +
-/// back/forward + pull requests: four 24px buttons, 2px gaps).
-pub const CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 4.0 + 2.0 * 3.0;
+/// back/forward: three 24px buttons, 2px gaps).
+pub const CLUSTER_BUTTONS_WIDTH: f32 = 24.0 * 3.0 + 2.0 * 2.0;
 
 /// Width of a row of `count` Linux caption buttons, drawn at the cluster's
 /// own 24px-button / 2px-gap rhythm.
@@ -408,6 +408,10 @@ pub fn resort_offsets(
 const CHAT_ROW_HEIGHT: f32 = 61.0;
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
+/// Square action beside the account trigger in the sidebar footer.
+const SIDEBAR_FOOTER_ACTION_SIZE: f32 = 44.0;
+/// Breathing room between the account trigger and its adjacent action.
+const SIDEBAR_FOOTER_ACTION_GAP: f32 = 4.0;
 
 /// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
@@ -3100,16 +3104,6 @@ impl Shell {
                 &theme,
                 cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
             ))
-            .child(window_control_button_with_options(
-                "open-pull-requests",
-                icons::PULL_REQUEST,
-                WindowControlButtonOptions {
-                    active: matches!(self.route, Route::PullRequests),
-                    tooltip: Some("Pull requests"),
-                },
-                &theme,
-                cx.listener(|this, _, _, cx| this.open_pull_requests(cx)),
-            ))
             .children(show_plus.then(|| {
                 div()
                     .flex_none()
@@ -3932,6 +3926,34 @@ impl Shell {
         };
         let user_menu =
             self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
+        let pull_requests_button = div()
+            .id("open-pull-requests")
+            .size(px(SIDEBAR_FOOTER_ACTION_SIZE))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(8.0))
+            .bg(motion::hover_blend(
+                "sidebar-pull-requests",
+                theme.glass_hover().opacity(0.0),
+                theme.glass_hover(),
+            ))
+            .on_hover(motion::hover_listener("sidebar-pull-requests"))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.open_pull_requests(cx)))
+            .tooltip(|_, cx| {
+                cx.new(|_| WindowControlTooltip {
+                    label: "Pull requests",
+                })
+                .into()
+            })
+            .tooltip_show_delay(Duration::from_millis(350))
+            .child(
+                icon(icons::PULL_REQUEST)
+                    .size(px(18.0))
+                    .text_color(theme.text_muted),
+            );
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -4025,7 +4047,16 @@ impl Shell {
                         .child(notice),
                 )
             })
-            .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
+            .child(
+                div()
+                    .p(px(Theme::SPACE_SM))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(SIDEBAR_FOOTER_ACTION_GAP))
+                    .child(div().flex_1().min_w_0().child(user_menu))
+                    .child(pull_requests_button),
+            )
             .into_any_element()
     }
 
@@ -4197,7 +4228,7 @@ impl Shell {
             .into();
         let mut trigger = div()
             .id("user-menu")
-            .flex_none()
+            .w_full()
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
             .py(px(Theme::SPACE_SM))
@@ -4278,11 +4309,15 @@ impl Shell {
             let closing = self.user_menu.closing_since();
             // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
             // (exactly as wide as the trigger row — sidebar minus its p-2
-            // gutters), `flex-col gap-0.5`, then: one small muted email line
-            // (`px-2 pb-1 pt-1.5 text-[11px] text-muted-foreground/70`),
-            // the action selected by the runtime scope, then "Settings".
+            // gutters and the adjacent Pull Requests action), `flex-col
+            // gap-0.5`, then: one small muted email line (`px-2 pb-1 pt-1.5
+            // text-[11px] text-muted-foreground/70`), the action selected by
+            // the runtime scope, then "Settings".
             let menu = popover::popover_card(theme)
-                .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
+                .w(px(self.settings.sidebar_width
+                    - 2.0 * Theme::SPACE_SM
+                    - SIDEBAR_FOOTER_ACTION_SIZE
+                    - SIDEBAR_FOOTER_ACTION_GAP))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.close_user_menu(cx);
                 }))
@@ -7651,22 +7686,22 @@ mod tests {
 
     #[test]
     fn cluster_clearance_clears_the_overlay_buttons() {
-        assert_eq!(CLUSTER_BUTTONS_WIDTH, 102.0);
-        // Linux: buttons at 10..112; a 16px-padded header needs 104 more px to
-        // put content at 112 + 8 breathing room.
-        assert_eq!(cluster_clearance(false, false, 0, 16.0), 104.0);
-        assert_eq!(cluster_clearance(false, false, 0, 10.0), 110.0);
+        assert_eq!(CLUSTER_BUTTONS_WIDTH, 76.0);
+        // Linux: buttons at 10..86; a 16px-padded header needs 78 more px to
+        // put content at 86 + 8 breathing room.
+        assert_eq!(cluster_clearance(false, false, 0, 16.0), 78.0);
+        assert_eq!(cluster_clearance(false, false, 0, 10.0), 84.0);
         // Linux with a left-side close caption: everything shifts one slot.
-        assert_eq!(cluster_clearance(false, false, 1, 16.0), 104.0 + 26.0);
+        assert_eq!(cluster_clearance(false, false, 1, 16.0), 78.0 + 26.0);
         // macOS: buttons start at the 88px traffic-light cluster start.
         assert_eq!(
             cluster_clearance(true, false, 0, 16.0),
-            88.0 + 102.0 + 8.0 - 16.0
+            88.0 + 76.0 + 8.0 - 16.0
         );
         // macOS fullscreen: cluster reclaims the inset (starts at 12).
         assert_eq!(
             cluster_clearance(true, true, 0, 16.0),
-            12.0 + 102.0 + 8.0 - 16.0
+            12.0 + 76.0 + 8.0 - 16.0
         );
     }
 

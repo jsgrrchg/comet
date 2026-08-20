@@ -105,6 +105,8 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Changes pane: side-by-side diffs instead of the unified stack.
+    pub diff_split: bool,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
@@ -135,6 +137,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            diff_split: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
@@ -424,6 +427,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            diff_split: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
             files_editor_font_size: 15.0,

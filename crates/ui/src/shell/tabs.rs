@@ -1,11 +1,18 @@
 //! Session navigation — the horizontal tab strip is gone (wing 2026-08-10):
 //! the activity sidebar IS the session list, and the titlebar names the
-//! selected session (harness brand icon + title). When the sidebar is
-//! collapsed, a `+` new-session button fades into the titlebar's left end
-//! (riding the sidebar width tween). `UiSettings.open_tabs` is legacy — no
-//! longer read or written.
+//! selected session (harness brand icon + title). A `+` new-session button
+//! lives in the titlebar's left control cluster while an existing session is
+//! selected. `UiSettings.open_tabs` is legacy — no longer read or written.
 
 use super::*;
+
+pub(super) fn right_pane_expand_icon(expanded: bool) -> &'static str {
+    if expanded {
+        icons::COLLAPSE_ARROWS
+    } else {
+        icons::EXPAND_ARROWS
+    }
+}
 
 impl Shell {
     /// Boot landing: the most recently active visible chat once the first
@@ -36,10 +43,9 @@ impl Shell {
         cx.notify();
     }
 
-    /// `+` (sidebar header, or the titlebar while the sidebar is collapsed):
-    /// open the new-session canvas. A set sidebar filter re-homes the canvas
-    /// onto that project; under "All" the current pick (the last selected
-    /// project, restored from composer defaults) stands.
+    /// `+` in the titlebar: open the new-session canvas. A set sidebar filter
+    /// re-homes the canvas onto that project; under "All" the current pick
+    /// (the last selected project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         let target = {
@@ -59,7 +65,7 @@ impl Shell {
     }
 
     /// The unified titlebar in chat mode:
-    /// `[fading +] [harness icon + session title] … [toggle-changes]`.
+    /// `[new-session +] [harness icon + session title] … [toggle-changes]`.
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
     /// animated left inset, the toggle-changes button on git projects).
     pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -100,12 +106,11 @@ impl Shell {
             }
         };
 
-        // The new-session `+` renders in the WINDOW-CONTROL CLUSTER while the
-        // sidebar is collapsed (`render_titlebar_cluster`) — this row only
-        // budgets for it: the title's left inset grows by one button slot as
-        // the + fades in, so the text never sits under it.
+        // The new-session `+` renders in the WINDOW-CONTROL CLUSTER whenever a
+        // session is selected (`render_titlebar_cluster`) — this row budgets
+        // one button slot so the title never sits under it.
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-        let plus_inset = 26.0 * self.titlebar_plus_alpha();
+        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
 
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control
@@ -129,7 +134,7 @@ impl Shell {
         // (user report: misaligned dead space). With the sidebar COLLAPSED
         // the seam is the window edge, where the traffic lights + nav
         // cluster overlay lives — the strip must still clear it, but only
-        // just: `title_bar_content_start` carries a 10px TEXT margin the
+        // just: `title_bar_content_start` carries the identity-group margin the
         // strip doesn't want (it brings its own 8px pad), and doubling up
         // read as a hole after the `+` (user report).
         let row_left = if takeover {
@@ -142,74 +147,78 @@ impl Shell {
             // own 8px pad lands the first chip on the pane gutter. The
             // window-control cluster still wins while the sidebar is
             // collapsed (the chips clear it instead of underlapping).
-            let cluster_end = self.title_bar_content_start() - 10.0 + plus_inset - 14.0;
+            let cluster_end =
+                self.title_bar_content_start() - TITLEBAR_IDENTITY_GAP + plus_inset - 14.0;
             (sidebar_now - 8.0).max(cluster_end)
         } else {
             content_left
         };
         let row_gap = 8.0;
-        let right_pad = self.titlebar_right_pad(Theme::SPACE_LG);
-        let open_trailing_width = right_pane_open.then(|| {
+        let right_pad = self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET);
+        let open_controls_width = right_pane_open.then(|| {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
-            let gap_budget = if takeover { row_gap } else { row_gap * 3.0 };
+            let gap_budget = if takeover { row_gap } else { row_gap * 2.0 };
             let avail = self.viewport_width - row_left - right_pad - gap_budget;
-            (right_now - right_pad).min(avail).max(0.0)
+            ((right_now - right_pad).min(avail) - 28.0).max(0.0)
         });
         let trailing_width = if on_canvas {
             0.0
         } else {
-            open_trailing_width.unwrap_or(28.0)
+            open_controls_width.unwrap_or(0.0) + 28.0
         };
         let available_titlebar_width =
             (self.viewport_width - row_left - right_pad - trailing_width - row_gap * 3.0).max(0.0);
 
         let trailing: Option<gpui::AnyElement> = if on_canvas {
             None
-        } else if let Some(trailing_width) = open_trailing_width {
-            // The row's own left padding is part of its content box: a strip
-            // wider than what's left after it overflows and clips at the right
-            // edge (flex_none never shrinks) — cap to the available width. The
-            // row's 8px child gaps sit OUTSIDE the strip's width (one before
-            // the strip in takeover, three when title, Actions and spacer are
-            // present): without budgeting them the capped strip overflows and
-            // the buttons slide right on expand (user report).
-            // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
-            // options that used to live here moved into the pane's own
-            // second row; expand/close stay in this band (user request).
-            let controls = self.render_right_tab_strip(cx);
+        } else {
+            let mut controls = div()
+                .id("right-titlebar-controls")
+                .flex_none()
+                .h_full()
+                .flex()
+                .flex_row()
+                .items_center();
+            if let Some(animated_width) = open_controls_width {
+                // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
+                // options live in the pane's own second row. Only the tabs and
+                // expand action animate; the open/close trigger stays fixed.
+                let tabs = self.render_right_tab_strip(cx);
+                controls = controls.child(
+                    div()
+                        .w(px(animated_width))
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .overflow_hidden()
+                        // 8 + the trigger's own 8px pad = the pane's 16px
+                        // text gutter. The 4px right padding is the stable
+                        // gap before the fixed toggle.
+                        .pl(px(8.0))
+                        .pr(px(4.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .overflow_hidden()
+                                .child(tabs),
+                        )
+                        .child(header_icon_button(
+                            "expand-changes",
+                            right_pane_expand_icon(self.right_pane_expanded),
+                            &theme,
+                            cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
+                        )),
+                );
+            }
+            // Keep the trigger mounted at one fixed position while the pane
+            // controls reveal to its left.
             Some(
-                div()
-                    .flex_none()
-                    .h_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .overflow_hidden()
-                    // Right edge already sits at viewport minus the row's own
-                    // right padding, so this width starts the strip exactly at
-                    // the pane's left border and rides the open/close tween.
-                    .w(px(trailing_width))
-                    // 8 + the trigger's own 8px pad = the pane's 16px text
-                    // gutter, so the scope label sits flush over the stats
-                    // strip below.
-                    .pl(px(8.0))
-                    // Clipped: a long base-ref name must truncate inside the
-                    // controls, never paint under the buttons to the right.
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .overflow_hidden()
-                            .child(controls),
-                    )
-                    .child(header_icon_button(
-                        "expand-changes",
-                        icons::EXPAND_ARROWS,
-                        &theme,
-                        cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
-                    ))
+                controls
                     .child(header_icon_button(
                         "toggle-changes",
                         icons::SIDEBAR_MINIMALISTIC,
@@ -217,16 +226,6 @@ impl Shell {
                         cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                     ))
                     .into_any_element(),
-            )
-        } else {
-            Some(
-                header_icon_button(
-                    "toggle-changes",
-                    icons::SIDEBAR_MINIMALISTIC,
-                    &theme,
-                    cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-                )
-                .into_any_element(),
             )
         };
 

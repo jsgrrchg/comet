@@ -889,6 +889,7 @@ async fn pull_request_list_dispatch_returns_provider_items() {
         url: "https://github.com/acme/zeron/pull/123".into(),
         state: ChangeRequestState::Open,
         is_draft: false,
+        review_decision: zeron_proto::ChangeRequestReviewDecision::ChangesRequested,
         additions: 42,
         deletions: 7,
         mergeability: zeron_proto::ChangeRequestMergeability::Mergeable,

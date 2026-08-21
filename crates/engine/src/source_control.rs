@@ -15,7 +15,8 @@ use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use zeron_proto::{
-    ChangeRequestListItem, ChangeRequestMergeability, ChangeRequestState, ChangeRequestSummary,
+    ChangeRequestListItem, ChangeRequestMergeability, ChangeRequestReviewDecision,
+    ChangeRequestState, ChangeRequestSummary,
 };
 
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -24,7 +25,7 @@ const GIT_OUTPUT_LIMIT: usize = 64 * 1024;
 const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 const GITHUB_RESULT_LIMIT: &str = "20";
 const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
-const GITHUB_SEARCH_QUERY: &str = "query { search(query: \"is:pr is:open author:@me sort:updated-desc\", type: ISSUE, first: 100) { nodes { ... on PullRequest { number title url state isDraft mergeable createdAt updatedAt additions deletions repository { nameWithOwner } } } } }";
+const GITHUB_SEARCH_QUERY: &str = "query { search(query: \"is:pr is:open author:@me sort:updated-desc\", type: ISSUE, first: 100) { nodes { ... on PullRequest { number title url state isDraft mergeable reviewDecision createdAt updatedAt additions deletions repository { nameWithOwner } } } } }";
 
 /// Repository identity extracted from a Git remote URL.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,6 +698,7 @@ struct GhSearchPullRequest {
     state: GhPullRequestState,
     repository: GhSearchRepository,
     mergeable: GhMergeability,
+    review_decision: Option<GhReviewDecision>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     is_draft: bool,
@@ -741,6 +743,14 @@ enum GhMergeability {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum GhReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+}
+
 impl From<GhPullRequestState> for ChangeRequestState {
     fn from(state: GhPullRequestState) -> Self {
         match state {
@@ -757,6 +767,16 @@ impl From<GhMergeability> for ChangeRequestMergeability {
             GhMergeability::Mergeable => Self::Mergeable,
             GhMergeability::Conflicting => Self::Conflicting,
             GhMergeability::Unknown => Self::Unknown,
+        }
+    }
+}
+
+impl From<GhReviewDecision> for ChangeRequestReviewDecision {
+    fn from(decision: GhReviewDecision) -> Self {
+        match decision {
+            GhReviewDecision::Approved => Self::Approved,
+            GhReviewDecision::ChangesRequested => Self::ChangesRequested,
+            GhReviewDecision::ReviewRequired => Self::ReviewRequired,
         }
     }
 }
@@ -882,6 +902,10 @@ fn to_list_item(
         url: url.to_string(),
         state: pull_request.state.into(),
         is_draft: pull_request.is_draft,
+        review_decision: pull_request
+            .review_decision
+            .map(Into::into)
+            .unwrap_or_default(),
         additions: pull_request.additions,
         deletions: pull_request.deletions,
         mergeability: pull_request.mergeable.into(),
@@ -1143,6 +1167,7 @@ mod tests {
         created_at: &str,
         updated_at: &str,
         is_draft: bool,
+        review_decision: Option<&str>,
     ) -> serde_json::Value {
         serde_json::json!({
             "number": number,
@@ -1156,6 +1181,7 @@ mod tests {
             "createdAt": created_at,
             "updatedAt": updated_at,
             "isDraft": is_draft,
+            "reviewDecision": review_decision,
             "additions": 42,
             "deletions": 7,
         })
@@ -1245,12 +1271,17 @@ mod tests {
             "2026-08-10T09:30:00Z",
             "2026-08-19T12:00:00Z",
             true,
+            Some("CHANGES_REQUESTED"),
         )]);
         let (result, runner) = list_with(command_success(json)).await;
 
         let item = &result.unwrap()[0];
         assert_eq!(item.repository, "acme/zeron");
         assert!(item.is_draft);
+        assert_eq!(
+            item.review_decision,
+            ChangeRequestReviewDecision::ChangesRequested
+        );
         assert_eq!(item.additions, 42);
         assert_eq!(item.deletions, 7);
         assert_eq!(item.mergeability, ChangeRequestMergeability::Conflicting);
@@ -1296,6 +1327,7 @@ mod tests {
                 "2026-08-01T08:00:00Z",
                 "2026-08-19T11:00:00Z",
                 false,
+                Some("APPROVED"),
             ),
             search_pull_request(
                 "alpha/repo",
@@ -1306,6 +1338,7 @@ mod tests {
                 "2026-08-02T08:00:00Z",
                 "2026-08-19T12:00:00Z",
                 true,
+                Some("REVIEW_REQUIRED"),
             ),
             search_pull_request(
                 "alpha/repo",
@@ -1316,6 +1349,7 @@ mod tests {
                 "2026-08-03T08:00:00Z",
                 "2026-08-19T12:00:00Z",
                 false,
+                None,
             ),
         ]);
 
@@ -1343,6 +1377,7 @@ mod tests {
             "2026-08-01T08:00:00Z",
             "2026-08-19T12:00:00Z",
             false,
+            None,
         );
         let mut invalid_items = Vec::new();
         for (pointer, value) in [

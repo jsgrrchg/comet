@@ -88,6 +88,9 @@ def pull_requests():
                 "url": f"https://github.com/{repository}/pull/{number}",
                 "state": "OPEN",
                 "isDraft": index % 9 == 4,
+                "reviewDecision": (
+                    "CHANGES_REQUESTED" if index % 7 == 1 else "REVIEW_REQUIRED"
+                ),
                 "mergeable": "CONFLICTING" if index % 5 == 0 else "MERGEABLE",
                 "createdAt": iso8601(
                     now

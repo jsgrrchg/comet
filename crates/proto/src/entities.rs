@@ -366,6 +366,17 @@ pub enum ChangeRequestMergeability {
     Unknown,
 }
 
+/// Aggregate review decision reported for a change request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChangeRequestReviewDecision {
+    Approved,
+    ChangesRequested,
+    ReviewRequired,
+    #[default]
+    Unknown,
+}
+
 /// Compact provider-neutral change request metadata for checkout surfaces.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -393,6 +404,9 @@ pub struct ChangeRequestListItem {
     pub url: String,
     pub state: ChangeRequestState,
     pub is_draft: bool,
+    /// Optional on older engines and providers that do not expose reviews.
+    #[serde(default)]
+    pub review_decision: ChangeRequestReviewDecision,
     pub additions: u64,
     pub deletions: u64,
     pub mergeability: ChangeRequestMergeability,
@@ -716,6 +730,7 @@ mod tests {
                 url: "https://github.com/private-owner/private-repo/pull/123".into(),
                 state,
                 is_draft: true,
+                review_decision: ChangeRequestReviewDecision::ChangesRequested,
                 additions: 42,
                 deletions: 7,
                 mergeability: ChangeRequestMergeability::Conflicting,
@@ -727,6 +742,7 @@ mod tests {
             assert_eq!(value["repository"], "private-owner/private-repo");
             assert_eq!(value["state"], encoded_state);
             assert_eq!(value["isDraft"], true);
+            assert_eq!(value["reviewDecision"], "changesRequested");
             assert_eq!(value["additions"], 42);
             assert_eq!(value["deletions"], 7);
             assert_eq!(value["mergeability"], "conflicting");
@@ -755,6 +771,53 @@ mod tests {
                 state
             );
         }
+    }
+
+    #[test]
+    fn change_request_review_decision_round_trips_and_defaults_for_older_payloads() {
+        for (decision, encoded) in [
+            (ChangeRequestReviewDecision::Approved, "approved"),
+            (
+                ChangeRequestReviewDecision::ChangesRequested,
+                "changesRequested",
+            ),
+            (
+                ChangeRequestReviewDecision::ReviewRequired,
+                "reviewRequired",
+            ),
+            (ChangeRequestReviewDecision::Unknown, "unknown"),
+        ] {
+            let value = serde_json::to_value(decision).unwrap();
+            assert_eq!(value, encoded);
+            assert_eq!(
+                serde_json::from_value::<ChangeRequestReviewDecision>(value).unwrap(),
+                decision
+            );
+        }
+
+        let mut value = serde_json::to_value(ChangeRequestListItem {
+            provider: "github".into(),
+            repository: "acme/zeron".into(),
+            number: 1,
+            title: "Older payload".into(),
+            url: "https://github.com/acme/zeron/pull/1".into(),
+            state: ChangeRequestState::Open,
+            is_draft: false,
+            review_decision: ChangeRequestReviewDecision::Approved,
+            additions: 1,
+            deletions: 0,
+            mergeability: ChangeRequestMergeability::Mergeable,
+            created_at: Utc.with_ymd_and_hms(2026, 8, 10, 9, 30, 0).unwrap(),
+            updated_at: Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap(),
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("reviewDecision");
+        assert_eq!(
+            serde_json::from_value::<ChangeRequestListItem>(value)
+                .unwrap()
+                .review_decision,
+            ChangeRequestReviewDecision::Unknown
+        );
     }
 
     #[test]

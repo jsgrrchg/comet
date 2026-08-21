@@ -8,7 +8,9 @@ use gpui::{
     AnimationExt, AnyElement, Context, Entity, IntoElement, Render, ScrollHandle, SharedString,
     Subscription, Task, Window, div, prelude::*, px,
 };
-use zeron_proto::{ChangeRequestListItem, ChangeRequestMergeability, Device};
+use zeron_proto::{
+    ChangeRequestListItem, ChangeRequestMergeability, ChangeRequestReviewDecision, Device,
+};
 use zeron_rpc::{RpcError, capability_errors, methods};
 
 use crate::icons::{self, icon};
@@ -1005,21 +1007,14 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme, hover_t: f32)
                                 .child(SharedString::from(truncate_title(&item.title, 120))),
                         )
                         .when(item.is_draft, |element| {
-                            element.child(
-                                div()
-                                    .flex_none()
-                                    .px(px(6.0))
-                                    .h(px(15.0))
-                                    .flex()
-                                    .items_center()
-                                    .rounded_full()
-                                    .bg(theme.warning.opacity(0.1))
-                                    .text_size(px(9.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(theme.warning)
-                                    .child("DRAFT"),
-                            )
-                        }),
+                            element.child(render_pr_badge("DRAFT", theme.warning))
+                        })
+                        .when(
+                            item.review_decision == ChangeRequestReviewDecision::ChangesRequested,
+                            |element| {
+                                element.child(render_pr_badge("CHANGES REQUESTED", theme.warning))
+                            },
+                        ),
                 )
                 .child(
                     div()
@@ -1039,6 +1034,22 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme, hover_t: f32)
                         .child(SharedString::from(format!("#{}", item.number))),
                 ),
         )
+        .into_any_element()
+}
+
+fn render_pr_badge(label: &'static str, color: gpui::Hsla) -> AnyElement {
+    div()
+        .flex_none()
+        .px(px(6.0))
+        .h(px(15.0))
+        .flex()
+        .items_center()
+        .rounded_full()
+        .bg(color.opacity(0.1))
+        .text_size(px(9.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(color)
+        .child(label)
         .into_any_element()
 }
 
@@ -1337,6 +1348,7 @@ mod tests {
             url: format!("https://github.com/{repository}/pull/{number}"),
             state: zeron_proto::ChangeRequestState::Open,
             is_draft: false,
+            review_decision: ChangeRequestReviewDecision::Unknown,
             additions: changes,
             deletions: 0,
             mergeability: ChangeRequestMergeability::Mergeable,

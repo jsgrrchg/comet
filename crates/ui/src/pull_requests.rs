@@ -991,11 +991,35 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme, hover_t: f32)
                 .gap(px(2.0))
                 .child(
                     div()
-                        .truncate()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .min_w_0()
                         .line_height(px(15.0))
                         .text_size(hover_text_size(12.0, hover_t))
                         .text_color(theme.text)
-                        .child(SharedString::from(truncate_title(&item.title, 120))),
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(truncate_title(&item.title, 120))),
+                        )
+                        .when(item.is_draft, |element| {
+                            element.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.0))
+                                    .h(px(15.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded_full()
+                                    .bg(theme.warning.opacity(0.1))
+                                    .text_size(px(9.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.warning)
+                                    .child("DRAFT"),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -1012,22 +1036,7 @@ fn render_pr_identity(item: &ChangeRequestListItem, theme: &Theme, hover_t: f32)
                                 .truncate()
                                 .child(SharedString::from(item.repository.clone())),
                         )
-                        .child(SharedString::from(format!("#{}", item.number)))
-                        .when(item.is_draft, |element| {
-                            element.child(
-                                div()
-                                    .px(px(6.0))
-                                    .h(px(15.0))
-                                    .flex()
-                                    .items_center()
-                                    .rounded_full()
-                                    .bg(theme.warning.opacity(0.1))
-                                    .text_size(px(9.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(theme.warning)
-                                    .child("DRAFT"),
-                            )
-                        }),
+                        .child(SharedString::from(format!("#{}", item.number))),
                 ),
         )
         .into_any_element()

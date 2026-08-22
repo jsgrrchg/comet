@@ -622,6 +622,10 @@ pub struct AppState {
     /// agent was busy, in the order it will be sent. Device-agnostic: the
     /// chat's doc holds them (every device sees the same queue).
     pub queue: Vec<zeron_doc::QueuedMessage>,
+    /// The selected chat's opening `WatchDocMessages` reset has landed. An
+    /// empty transcript is otherwise indistinguishable from the pre-replay
+    /// gap after selection, where optimistic echoes may already be visible.
+    pub transcript_replayed: bool,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -688,6 +692,7 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             queue: Vec::new(),
+            transcript_replayed: false,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             upload_progress: None,
@@ -809,6 +814,7 @@ impl AppState {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
             self.selected_chat = None;
             self.transcript.clear();
+            self.transcript_replayed = false;
             self.transcript_task = None;
             self.queue.clear();
             self.queue_task = None;
@@ -972,6 +978,7 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+        self.transcript_replayed = true;
         self.ack_pending_send_from_transcript();
     }
 
@@ -981,7 +988,11 @@ impl AppState {
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
+        let is_reset = matches!(&frame, TranscriptFrame::Reset { .. });
         zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        if is_reset {
+            self.transcript_replayed = true;
+        }
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
@@ -1390,6 +1401,7 @@ impl AppState {
         self.chats_synced = false;
         self.spaces_synced = false;
         self.transcript.clear();
+        self.transcript_replayed = false;
         self.echoes.clear();
         self.pending_sends.clear();
         self.upload_progress = None;
@@ -1550,6 +1562,7 @@ impl AppState {
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
         self.transcript.clear();
+        self.transcript_replayed = false;
         self.transcript_task = None;
         self.queue.clear();
         self.queue_task = None;
@@ -3133,6 +3146,27 @@ mod tests {
             },
         );
         assert!(state.pending_echoes().is_empty());
+    }
+
+    #[test]
+    fn transcript_replay_barrier_requires_the_opening_reset() {
+        let mut state = AppState::new();
+        assert!(!state.transcript_replayed);
+
+        state
+            .apply_transcript_frame(TranscriptFrame::Delta {
+                upsert: Vec::new(),
+                append: Vec::new(),
+                remove: Vec::new(),
+                count: 0,
+            })
+            .expect("empty delta");
+        assert!(!state.transcript_replayed);
+
+        state
+            .apply_transcript_frame(TranscriptFrame::Reset { reset: Vec::new() })
+            .expect("empty reset");
+        assert!(state.transcript_replayed);
     }
 
     #[test]

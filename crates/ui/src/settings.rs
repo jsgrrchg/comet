@@ -428,6 +428,8 @@ pub struct UiSettings {
     pub git_history_column_order: GitHistoryColumnOrder,
     /// How authors are represented in Git History rows.
     pub git_history_author_display: GitHistoryAuthorDisplay,
+    /// Save edited workspace files automatically after the configured delay.
+    pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
@@ -486,6 +488,7 @@ impl Default for UiSettings {
             git_history_column_widths: GitHistoryColumnWidths::default(),
             git_history_column_order: GitHistoryColumnOrder::default(),
             git_history_author_display: GitHistoryAuthorDisplay::default(),
+            files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
@@ -1099,6 +1102,7 @@ mod tests {
                 dark: "catppuccin-mocha".into(),
             },
             diff_split: true,
+            files_autosave_enabled: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             legacy_accent_color: None,
@@ -1175,6 +1179,7 @@ mod tests {
             loaded.files_autosave_delay_ms,
             FILES_AUTOSAVE_DELAY_DEFAULT_MS
         );
+        assert!(!loaded.files_autosave_enabled);
         assert!(!loaded.files_word_wrap);
         assert_eq!(
             loaded.files_editor_font_size,

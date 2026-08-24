@@ -426,6 +426,10 @@ fn workspace_file_title(path: &str) -> SharedString {
     path.rsplit('/').next().unwrap_or(path).to_string().into()
 }
 
+fn show_file_dirty_indicator(dirty: bool, autosave_enabled: bool) -> bool {
+    dirty && !autosave_enabled
+}
+
 /// Per-chat panel open flags (zeron parity: `sessionPanels` — the terminal and
 /// changes panels open *per session*, in memory only; heights and every other
 /// persisted setting stay global).
@@ -2326,6 +2330,7 @@ impl Shell {
         }
         let key = self.panel_key(cx);
         if !self.files.contains_key(&key) {
+            let autosave_enabled = self.settings.files_autosave_enabled;
             let delay = self.settings.files_autosave_delay_ms;
             let editor_font_size = self.settings.files_editor_font_size;
             let word_wrap = self.settings.files_word_wrap;
@@ -2334,6 +2339,7 @@ impl Shell {
                 FilesSurface::new(
                     self.state.clone(),
                     self.active_chat.clone(),
+                    autosave_enabled,
                     delay,
                     editor_font_size,
                     word_wrap,
@@ -2393,6 +2399,7 @@ impl Shell {
                 self.state.clone(),
                 self.active_chat.clone(),
                 path.clone(),
+                self.settings.files_autosave_enabled,
                 self.settings.files_autosave_delay_ms,
                 self.settings.files_editor_font_size,
                 self.settings.files_word_wrap,
@@ -3170,6 +3177,7 @@ impl Shell {
                 if self.files_settings_page.is_none() {
                     let page = cx.new(|cx| {
                         FilesSettingsPage::new(
+                            self.settings.files_autosave_enabled,
                             self.settings.files_autosave_delay_ms,
                             self.settings.files_editor_font_size,
                             self.settings.files_word_wrap,
@@ -3181,6 +3189,18 @@ impl Shell {
                         &page,
                         window,
                         |this: &mut Shell, _, event: &FilesSettingsEvent, window, cx| match *event {
+                            FilesSettingsEvent::AutosaveChanged(autosave_enabled) => {
+                                this.settings.files_autosave_enabled = autosave_enabled;
+                                for surface in
+                                    this.files.values().chain(this.file_surfaces.values())
+                                {
+                                    surface.update(cx, |surface, cx| {
+                                        surface.set_autosave_enabled(autosave_enabled, cx)
+                                    });
+                                }
+                                this.schedule_save(cx);
+                                cx.notify();
+                            }
                             FilesSettingsEvent::AutosaveDelayChanged(autosave_delay_ms) => {
                                 this.settings.files_autosave_delay_ms = autosave_delay_ms;
                                 for surface in
@@ -7713,6 +7733,7 @@ impl Shell {
             }));
         for (ix, (surface, title, dirty, detail)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
+            let show_dirty = show_file_dirty_indicator(dirty, self.settings.files_autosave_enabled);
             let icon_path = match surface {
                 RightSurface::Files => icons::FOLDER_WITH_FILES,
                 RightSurface::File(_) => icons::DOCUMENT,
@@ -7891,7 +7912,16 @@ impl Shell {
                             theme.text_muted
                         })
                         .child(title),
-                );
+                )
+                .when(show_dirty, |chip| {
+                    chip.child(
+                        div()
+                            .flex_none()
+                            .size(px(5.0))
+                            .rounded_full()
+                            .bg(theme.warning_muted),
+                    )
+                });
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the
@@ -9393,6 +9423,13 @@ mod tests {
     fn right_pane_takeover_control_reverses_direction() {
         assert_eq!(tabs::right_pane_expand_icon(false), icons::EXPAND_ARROWS);
         assert_eq!(tabs::right_pane_expand_icon(true), icons::COLLAPSE_ARROWS);
+    }
+
+    #[test]
+    fn dirty_file_indicator_is_hidden_while_autosave_is_enabled() {
+        assert!(show_file_dirty_indicator(true, false));
+        assert!(!show_file_dirty_indicator(true, true));
+        assert!(!show_file_dirty_indicator(false, false));
     }
 
     #[test]

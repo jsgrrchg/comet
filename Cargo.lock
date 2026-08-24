@@ -2537,7 +2537,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.5.2"
-source = "git+https://github.com/jsgrrchg/gpui-component?rev=edefc2fb645473f330488fbee2c421536a85c69a#edefc2fb645473f330488fbee2c421536a85c69a"
+source = "git+https://github.com/jsgrrchg/gpui-component?rev=24783ffc46b840ecbbc4a70b7f5c8a57bd0b492a#24783ffc46b840ecbbc4a70b7f5c8a57bd0b492a"
 dependencies = [
  "aho-corasick",
  "anyhow",

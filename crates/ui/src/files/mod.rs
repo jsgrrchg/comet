@@ -369,6 +369,7 @@ impl FilesSurface {
     pub fn new(
         state: Entity<AppState>,
         chat_id: String,
+        autosave_enabled: bool,
         autosave_delay_ms: u64,
         editor_font_size: f32,
         word_wrap: bool,
@@ -380,6 +381,7 @@ impl FilesSurface {
             chat_id,
             FilesPresentation::Browser,
             None,
+            autosave_enabled,
             autosave_delay_ms,
             editor_font_size,
             word_wrap,
@@ -392,6 +394,7 @@ impl FilesSurface {
         state: Entity<AppState>,
         chat_id: String,
         path: String,
+        autosave_enabled: bool,
         autosave_delay_ms: u64,
         editor_font_size: f32,
         word_wrap: bool,
@@ -403,6 +406,7 @@ impl FilesSurface {
             chat_id,
             FilesPresentation::Editor,
             Some(path),
+            autosave_enabled,
             autosave_delay_ms,
             editor_font_size,
             word_wrap,
@@ -416,6 +420,7 @@ impl FilesSurface {
         chat_id: String,
         presentation: FilesPresentation,
         editor_path: Option<String>,
+        autosave_enabled: bool,
         autosave_delay_ms: u64,
         editor_font_size: f32,
         word_wrap: bool,
@@ -475,7 +480,12 @@ impl FilesSurface {
             watch_task: None,
             watch_sequence: None,
             watch_error: None,
-            preview: FilePreviewState::new(autosave_delay_ms, word_wrap, editor_font_size),
+            preview: FilePreviewState::new(
+                autosave_enabled,
+                autosave_delay_ms,
+                word_wrap,
+                editor_font_size,
+            ),
             editor_context_menu: crate::popover::Popup::default(),
             loads: HashMap::new(),
             error: None,
@@ -606,6 +616,14 @@ impl FilesSurface {
 
     pub fn set_autosave_delay_ms(&mut self, delay_ms: u64, cx: &mut Context<Self>) {
         let pending = self.preview.set_autosave_delay_ms(delay_ms);
+        for path in pending {
+            self.schedule_autosave(path, cx);
+        }
+        cx.notify();
+    }
+
+    pub fn set_autosave_enabled(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let pending = self.preview.set_autosave_enabled(enabled);
         for path in pending {
             self.schedule_autosave(path, cx);
         }

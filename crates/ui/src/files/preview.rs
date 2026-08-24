@@ -97,6 +97,7 @@ pub(super) struct FilePreviewState {
     surface_width: Rc<Cell<f32>>,
     word_wrap: bool,
     editor_font_size: f32,
+    autosave_enabled: bool,
     autosave_delay_ms: u64,
     reload_confirmation: Option<String>,
     close_requested: bool,
@@ -109,7 +110,12 @@ pub(super) struct FilePreviewState {
 }
 
 impl FilePreviewState {
-    pub(super) fn new(autosave_delay_ms: u64, word_wrap: bool, editor_font_size: f32) -> Self {
+    pub(super) fn new(
+        autosave_enabled: bool,
+        autosave_delay_ms: u64,
+        word_wrap: bool,
+        editor_font_size: f32,
+    ) -> Self {
         Self {
             documents: HashMap::new(),
             document_recency: VecDeque::new(),
@@ -121,6 +127,7 @@ impl FilePreviewState {
             surface_width: Rc::new(Cell::new(520.0)),
             word_wrap,
             editor_font_size,
+            autosave_enabled,
             autosave_delay_ms,
             reload_confirmation: None,
             close_requested: false,
@@ -292,7 +299,19 @@ impl FilePreviewState {
         let mut pending = Vec::new();
         for (path, document) in &mut self.documents {
             document.autosave_task = None;
-            if document.can_autosave() {
+            if self.autosave_enabled && document.can_autosave() {
+                pending.push(path.clone());
+            }
+        }
+        pending
+    }
+
+    pub(super) fn set_autosave_enabled(&mut self, enabled: bool) -> Vec<String> {
+        self.autosave_enabled = enabled;
+        let mut pending = Vec::new();
+        for (path, document) in &mut self.documents {
+            document.autosave_task = None;
+            if enabled && document.can_autosave() {
                 pending.push(path.clone());
             }
         }
@@ -767,11 +786,12 @@ impl FilesSurface {
         }
         self.preview.active_comment = None;
         self.require_review_comment_flush(&draft.path, cx);
-        if self
-            .preview
-            .documents
-            .get(&draft.path)
-            .is_some_and(FileDocument::can_autosave)
+        if self.preview.autosave_enabled
+            && self
+                .preview
+                .documents
+                .get(&draft.path)
+                .is_some_and(FileDocument::can_autosave)
         {
             self.save_document(draft.path, cx);
         }
@@ -1131,7 +1151,7 @@ impl FilesSurface {
     }
 
     pub(super) fn schedule_autosave(&mut self, path: String, cx: &mut Context<Self>) {
-        if self.preview.autosave_paused_for_reload(&path) {
+        if !self.preview.autosave_enabled || self.preview.autosave_paused_for_reload(&path) {
             return;
         }
         let delay = Duration::from_millis(self.preview.autosave_delay_ms);
@@ -1148,7 +1168,8 @@ impl FilesSurface {
         let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |surface, cx| {
-                let still_current = !surface.preview.autosave_paused_for_reload(&task_path)
+                let still_current = surface.preview.autosave_enabled
+                    && !surface.preview.autosave_paused_for_reload(&task_path)
                     && surface
                         .preview
                         .documents
@@ -1240,11 +1261,11 @@ impl FilesSurface {
                         current_content_hash,
                         ..
                     }) => {
-                        tracing::warn!(path = %task_path, "workspace file autosave conflicted");
+                        tracing::warn!(path = %task_path, "workspace file save conflicted");
                         document.conflict_save(revision, current_content_hash);
                     }
                     Err(error) => {
-                        tracing::warn!(path = %task_path, error = %error, "workspace file autosave failed");
+                        tracing::warn!(path = %task_path, error = %error, "workspace file save failed");
                         document.fail_save(revision, error.to_string());
                     }
                 }
@@ -1849,19 +1870,22 @@ impl FilesSurface {
     ) -> AnyElement {
         let parts = path.split('/').collect::<Vec<_>>();
         let reveal_path = path.to_string();
+        let save_path = path.to_string();
         let tooltip_path: SharedString = path.to_string().into();
+        let can_save = self
+            .preview
+            .documents
+            .get(path)
+            .is_some_and(FileDocument::can_save);
         let save_status =
             self.preview
                 .documents
                 .get(path)
                 .and_then(|document| match &document.phase {
                     DocumentPhase::Saving => None,
-                    DocumentPhase::SaveFailed(error) => Some((
-                        "Autosave failed",
-                        theme.danger_muted,
-                        true,
-                        Some(error.clone()),
-                    )),
+                    DocumentPhase::SaveFailed(error) => {
+                        Some(("Save failed", theme.danger_muted, true, Some(error.clone())))
+                    }
                     DocumentPhase::Conflict { .. } => Some((
                         "Save conflict",
                         theme.warning_muted,
@@ -1942,7 +1966,7 @@ impl FilesSurface {
                             element
                                 .cursor_pointer()
                                 .role(gpui::Role::Button)
-                                .aria_label("Retry autosave")
+                                .aria_label("Retry save")
                                 .on_click(cx.listener(|this, _, _, cx| this.retry_active_save(cx)))
                         })
                         .when_some(detail, |element, detail| {
@@ -1958,6 +1982,32 @@ impl FilesSurface {
                         .child(label),
                 )
             })
+            .child(
+                div()
+                    .id("files-save-active")
+                    .size(px(TOOLBAR_BUTTON_SIZE))
+                    .flex_none()
+                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .role(gpui::Role::Button)
+                    .aria_label("Save file")
+                    .when(can_save, |element| {
+                        element
+                            .cursor_pointer()
+                            .hover(|style| style.bg(crate::theme::wash(0.07)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.save_document(save_path.clone(), cx)
+                            }))
+                    })
+                    .when(!can_save, |element| element.cursor_default().opacity(0.38))
+                    .child(
+                        icon(icons::FLOPPY_DISK)
+                            .size(px(11.5))
+                            .text_color(theme.text_muted),
+                    ),
+            )
             .child(
                 div()
                     .id("files-reveal-active")
@@ -2683,7 +2733,7 @@ mod tests {
 
     #[test]
     fn reset_drops_documents_and_active_preview_from_the_previous_target() {
-        let mut preview = FilePreviewState::new(900, false, 11.5);
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
         preview.active = Some("private.env".into());
         preview.documents.insert(
             "private.env".into(),
@@ -2709,7 +2759,7 @@ mod tests {
 
     #[test]
     fn document_cache_evicts_the_oldest_safe_entries() {
-        let mut preview = FilePreviewState::new(900, false, 11.5);
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
         for index in 0..18 {
             let path = format!("src/{index}.rs");
             preview
@@ -2740,7 +2790,7 @@ mod tests {
 
     #[test]
     fn document_cache_uses_retained_bytes_not_only_entry_count() {
-        let mut preview = FilePreviewState::new(900, false, 11.5);
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
         for path in ["old.rs", "active.rs"] {
             preview
                 .documents
@@ -2763,7 +2813,7 @@ mod tests {
 
     #[test]
     fn document_eviction_cleans_path_scoped_companion_state() {
-        let mut preview = FilePreviewState::new(900, false, 11.5);
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
         for path in ["old.rs", "active.rs"] {
             preview
                 .documents
@@ -2800,17 +2850,46 @@ mod tests {
 
     #[test]
     fn reset_preserves_global_editor_preferences() {
-        let mut preview = FilePreviewState::new(900, true, 15.0);
+        let mut preview = FilePreviewState::new(false, 900, true, 15.0);
 
         preview.reset();
 
+        assert!(!preview.autosave_enabled);
         assert!(preview.word_wrap());
         assert_eq!(preview.editor_font_size, 15.0);
     }
 
     #[test]
+    fn autosave_is_opt_in_and_enabling_schedules_dirty_documents() {
+        let path = "src/lib.rs";
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
+        let mut document = FileDocument::loading(DocumentKey {
+            chat_id: "chat-1".into(),
+            checkout_id: Some("checkout-1".into()),
+            path: path.into(),
+        });
+        document.set_loaded(zeron_proto::WorkspaceFileText {
+            path: path.into(),
+            text: Some("fn main() {}".into()),
+            content_hash: Some("hash-1".into()),
+            size: 12,
+            modified_at: None,
+            encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+            line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+            read_only_reason: None,
+            truncated: false,
+        });
+        document.revision = 1;
+        preview.documents.insert(path.into(), document);
+
+        assert!(preview.set_autosave_delay_ms(600).is_empty());
+        assert_eq!(preview.set_autosave_enabled(true), vec![path.to_string()]);
+        assert!(preview.set_autosave_enabled(false).is_empty());
+    }
+
+    #[test]
     fn wide_layout_respects_an_explicitly_hidden_tree_sidebar() {
-        let mut preview = FilePreviewState::new(900, false, 11.5);
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
         preview.surface_width.set(WIDE_BREAKPOINT);
 
         assert!(preview.tree_sidebar_visible());
@@ -2825,7 +2904,7 @@ mod tests {
 
     #[test]
     fn explicitly_showing_tree_sidebar_clears_responsive_dismissal() {
-        let mut preview = FilePreviewState::new(900, false, 11.5);
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
         preview.surface_width.set(WIDE_BREAKPOINT);
         preview.toggle_tree_sidebar();
 
@@ -2839,7 +2918,7 @@ mod tests {
     #[test]
     fn dirty_reload_waits_for_explicit_discard_confirmation() {
         let path = "src/lib.rs";
-        let mut preview = FilePreviewState::new(900, false, 11.5);
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
         let mut document = FileDocument::loading(DocumentKey {
             chat_id: "chat-1".into(),
             checkout_id: Some("checkout-1".into()),
@@ -2865,7 +2944,7 @@ mod tests {
     #[test]
     fn clean_reload_proceeds_without_confirmation() {
         let path = "src/lib.rs";
-        let mut preview = FilePreviewState::new(900, false, 11.5);
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
         preview.documents.insert(
             path.into(),
             FileDocument::loading(DocumentKey {

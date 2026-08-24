@@ -137,6 +137,8 @@ pub struct UiSettings {
     pub theme_selection: zeron_theme::ThemeSelection,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
+    /// Save edited workspace files automatically after the configured delay.
+    pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
@@ -182,6 +184,7 @@ impl Default for UiSettings {
             appearance: crate::appearance::AppearanceMode::default(),
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
+            files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
@@ -697,6 +700,7 @@ mod tests {
                 dark: "catppuccin-mocha".into(),
             },
             diff_split: true,
+            files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
             files_editor_font_size: 15.0,
@@ -745,6 +749,7 @@ mod tests {
             loaded.files_autosave_delay_ms,
             FILES_AUTOSAVE_DELAY_DEFAULT_MS
         );
+        assert!(!loaded.files_autosave_enabled);
         assert!(!loaded.files_word_wrap);
         assert_eq!(
             loaded.files_editor_font_size,

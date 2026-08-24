@@ -10,6 +10,7 @@ const FONT_SIZE_OPTIONS: [f32; 5] = [10.0, 11.5, 13.0, 15.0, 17.0];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FilesSettingsEvent {
+    AutosaveChanged(bool),
     AutosaveDelayChanged(u64),
     EditorFontSizeChanged(f32),
     WordWrapChanged(bool),
@@ -17,6 +18,7 @@ pub enum FilesSettingsEvent {
 }
 
 pub struct FilesSettingsPage {
+    autosave_enabled: bool,
     autosave_delay_ms: u64,
     editor_font_size: f32,
     word_wrap: bool,
@@ -27,6 +29,7 @@ impl EventEmitter<FilesSettingsEvent> for FilesSettingsPage {}
 
 impl FilesSettingsPage {
     pub fn new(
+        autosave_enabled: bool,
         autosave_delay_ms: u64,
         editor_font_size: f32,
         word_wrap: bool,
@@ -34,6 +37,7 @@ impl FilesSettingsPage {
         _cx: &mut Context<Self>,
     ) -> Self {
         Self {
+            autosave_enabled,
             autosave_delay_ms,
             editor_font_size,
             word_wrap,
@@ -61,6 +65,7 @@ impl FilesSettingsPage {
 impl Render for FilesSettingsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
+        let autosave_enabled = self.autosave_enabled;
         let selected = self.autosave_delay_ms;
         let selected_font_size = self.editor_font_size;
         let word_wrap = self.word_wrap;
@@ -139,6 +144,36 @@ impl Render for FilesSettingsPage {
         });
 
         let card = widgets::section_card(&theme)
+            .child(
+                widgets::card_row(&theme, true)
+                    .child(widgets::row_tile(&theme, icons::FOLDER))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(widgets::row_title(&theme, "Autosave"))
+                            .child(widgets::meta_line(
+                                &theme,
+                                vec![
+                                    div()
+                                        .child("Save edited workspace files to disk automatically.")
+                                        .into_any_element(),
+                                ],
+                            )),
+                    )
+                    .child(
+                        widgets::toggle_switch(&theme, autosave_enabled)
+                            .id("files-autosave-toggle")
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.autosave_enabled = !this.autosave_enabled;
+                                cx.emit(FilesSettingsEvent::AutosaveChanged(this.autosave_enabled));
+                                cx.notify();
+                            })),
+                    ),
+            )
             .child(
                 widgets::card_row(&theme, true)
                     .items_start()

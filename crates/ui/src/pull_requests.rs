@@ -563,9 +563,10 @@ impl Render for PullRequestsPage {
                                                 cx.listener(|page, _, _, cx| page.refresh(cx)),
                                             )
                                             .child(if refreshing || initial_loading {
-                                                crate::loaders::mini_gradient_spinner(
+                                                crate::loaders::mini_glyph_spinner(
                                                     "pull-requests-refresh-spinner",
                                                     1.75,
+                                                    theme.glyph,
                                                     cx.entity_id(),
                                                     cx,
                                                 )

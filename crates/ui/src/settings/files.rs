@@ -174,37 +174,37 @@ impl Render for FilesSettingsPage {
                             })),
                     ),
             )
-            .child(
-                widgets::card_row(&theme, true)
-                    .items_start()
-                    .child(widgets::row_tile(&theme, icons::FOLDER))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .child(widgets::row_title(&theme, "Autosave delay"))
-                            .child(widgets::meta_line(
-                                &theme,
-                                vec![
-                                    div()
+            .when(autosave_enabled, |card| {
+                card.child(
+                    widgets::card_row(&theme, true)
+                        .items_start()
+                        .child(widgets::row_tile(&theme, icons::FOLDER))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .child(widgets::row_title(&theme, "Autosave delay"))
+                                .child(widgets::meta_line(
+                                    &theme,
+                                    vec![div()
                                         .child(
                                             "Save files after editing has been idle for this long.",
                                         )
-                                        .into_any_element(),
-                                ],
-                            ))
-                            .child(
-                                div()
-                                    .mt(px(12.0))
-                                    .flex()
-                                    .flex_wrap()
-                                    .gap(px(7.0))
-                                    .children(options),
-                            ),
-                    ),
-            )
+                                        .into_any_element()],
+                                ))
+                                .child(
+                                    div()
+                                        .mt(px(12.0))
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap(px(7.0))
+                                        .children(options),
+                                ),
+                        ),
+                )
+            })
             .child(
                 widgets::card_row(&theme, true)
                     .items_start()

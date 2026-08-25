@@ -263,14 +263,12 @@ pub fn current_appearance() -> Appearance {
     }
 }
 
-/// Monotonic id of the current resolved text style (palette + UI family/size).
+/// Monotonic id of the current resolved style (palette + UI typography).
 pub fn style_generation() -> u32 {
     STYLE_GENERATION.load(Ordering::Relaxed)
 }
 
-/// Invalidate caches that bake resolved text styles. Typography calls this
-/// only after an effective family transition; appearance changes bump it in
-/// [`set_current_appearance`].
+/// Invalidate caches that bake resolved text styles.
 pub(crate) fn bump_style_generation() {
     STYLE_GENERATION.fetch_add(1, Ordering::Relaxed);
 }
@@ -1369,7 +1367,8 @@ impl Theme {
         cx: &mut App,
     ) {
         let next =
-            Self::for_selection(appearance, variant_id, accent_selection, surface_preference);
+            Self::for_selection(appearance, variant_id, accent_selection, surface_preference)
+                .with_font_sans(crate::typography::effective_family_name(cx));
         let changed = cx.try_global::<Theme>().is_some_and(|theme| {
             theme.variant_id != next.variant_id
                 || theme.accent_selection != next.accent_selection

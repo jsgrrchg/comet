@@ -72,6 +72,7 @@ actions!(
         ToggleChanges,
         AddSpacePalette,
         NewSession,
+        OpenSettings,
         NextSession,
         PrevSession,
         ArchiveSession
@@ -265,9 +266,9 @@ pub fn apply_keymap(
     // rebuilding Zeron's bindings so the file editor keymap remains active.
     gpui_base::init(cx);
     crate::composer::init(cx, composer_send_behavior);
-    // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
-    // these back the native menu key equivalents and must survive keymap
-    // re-application.
+    // Fixed app-level shortcuts (Settings on every platform; ⌘Q quit, ⌘W
+    // close, ⌘M minimize, ⌘H hide on macOS) — these back the native menu
+    // key equivalents and must survive keymap re-application.
     crate::app_menus::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new(
@@ -4837,7 +4838,7 @@ impl Shell {
                     .px(px(4.0))
                     .rounded(px(4.0))
                     .bg(tone.opacity(0.08))
-                    .text_size(px(10.0))
+                    .text_size(crate::typography::ui_rems(10.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(tone.opacity(0.85))
                     .font_family(theme.font_mono.clone())
@@ -5211,7 +5212,7 @@ impl Shell {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.0))
+                            .text_size(crate::typography::ui_rems(11.0))
                             .text_color(theme.text_faint)
                             .child(label),
                     ),
@@ -6085,7 +6086,7 @@ impl Shell {
                     card = card.child(
                         div()
                             .mt(px(4.0))
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .line_height(px(17.0))
                             .text_color(theme.text_muted)
                             .overflow_hidden()
@@ -6154,7 +6155,7 @@ impl Shell {
                     card.child(
                         div()
                             .mt(px(10.0))
-                            .text_size(px(12.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .line_height(px(17.0))
                             .text_color(theme.danger)
                             .child(error),
@@ -8977,6 +8978,11 @@ impl Render for Shell {
             // New session works from anywhere — `open_new_session` routes back
             // to chat itself, so Settings is not a dead spot.
             .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
+            // Native Settings menu item and the platform convention (Cmd+, on
+            // macOS, Ctrl+, elsewhere) always land on the default section.
+            .on_action(cx.listener(|this, _: &OpenSettings, _, cx| {
+                this.open_settings(SettingsSection::Devices, cx)
+            }))
             // Chat-scoped, unlike new-session — `cycle_session` holds the guard
             // and says why.
             .on_action(cx.listener(|this, _: &NextSession, _, cx| this.cycle_session(true, cx)))
@@ -8996,9 +9002,14 @@ impl Render for Shell {
             }))
             // A jump routes back to chat itself, so Settings is not a dead
             // spot — the same call a click on that sidebar row makes. But an
-            // open picker/palette owns the keyboard: no jumping underneath it.
+            // open picker/palette owns the keyboard: no jumping underneath
+            // it. The MODEL menu advertises these same slots on its rows and
+            // this matched binding beats its key handler to the dispatch —
+            // forward the slot instead of eating it.
             .on_action(cx.listener(|this, jump: &JumpSession, _, cx| {
-                if !this.overlay_owns_keyboard(cx) {
+                let pickers = this.composer.read(cx).pickers().clone();
+                let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
+                if !handled && !this.overlay_owns_keyboard(cx) {
                     this.jump_to_session(jump.0, cx)
                 }
             }))

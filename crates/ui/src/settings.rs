@@ -72,9 +72,7 @@ pub enum SavePolicy {
 ///
 /// Mutations land in `current` before any timer starts. Replacing a pending
 /// task cancels its stale snapshot, and immediate mutations cancel the timer
-/// before flushing synchronously. The file is tiny, so keeping the atomic
-/// write on GPUI's foreground executor is preferable to allowing concurrent
-/// background writers that can finish out of order.
+/// before flushing synchronously.
 pub struct SettingsStore {
     current: UiSettings,
     data_dir: PathBuf,
@@ -96,7 +94,6 @@ impl SettingsStore {
     }
 }
 
-/// Install the settings loaded at boot as the process-wide source of truth.
 pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
     cx.set_global(SettingsStore {
         current: settings,
@@ -107,15 +104,13 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
     });
 }
 
-/// Latest settings, including mutations that are still inside the debounce
-/// window and therefore may not have reached disk yet.
+/// Latest settings, including mutations still inside the debounce window.
 pub fn current(cx: &App) -> UiSettings {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.clone())
         .unwrap_or_default()
 }
 
-/// Mutate the central settings value and schedule its single writer.
 pub fn update(policy: SavePolicy, cx: &mut App, mutate: impl FnOnce(&mut UiSettings)) -> bool {
     let Some(store) = cx.try_global::<SettingsStore>() else {
         return false;
@@ -132,8 +127,6 @@ pub fn update(policy: SavePolicy, cx: &mut App, mutate: impl FnOnce(&mut UiSetti
     true
 }
 
-/// Replace the central value from a view that owns a working copy, such as the
-/// shell's pane geometry state.
 pub fn replace(settings: UiSettings, policy: SavePolicy, cx: &mut App) -> bool {
     update(policy, cx, |current| *current = settings)
 }

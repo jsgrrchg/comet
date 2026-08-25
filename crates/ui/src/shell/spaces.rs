@@ -337,7 +337,7 @@ impl Render for SidebarViewOptionsTooltip {
             .border_color(theme.border_strong)
             .bg(theme.surface_raised)
             .shadow_md()
-            .text_size(px(11.0))
+            .text_size(crate::typography::ui_rems(11.0))
             .text_color(theme.text)
             .child("Sidebar view options")
     }
@@ -426,7 +426,7 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
         .child(
             div()
                 .flex_none()
-                .text_size(px(12.0))
+                .text_size(crate::typography::ui_rems(12.0))
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_muted.opacity(0.5))
                 .child(label),
@@ -3289,7 +3289,7 @@ impl Shell {
                         div()
                             .px(px(8.0))
                             .pb(px(4.0))
-                            .text_size(px(11.0))
+                            .text_size(crate::typography::ui_rems(11.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(theme.text_muted.opacity(0.6))
                             .child(SharedString::from("Locations")),
@@ -3306,7 +3306,7 @@ impl Shell {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .text_size(px(12.5))
+                                .text_size(crate::typography::ui_rems(12.5))
                                 .cursor_pointer()
                                 .when(is_active, |el| {
                                     // The floating-card selection language:

@@ -4057,7 +4057,7 @@ impl Transcript {
                         .items_center()
                         .gap(px(Theme::SPACE_SM))
                         .pt(px(Theme::SPACE_LG))
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .text_color(theme.danger)
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))

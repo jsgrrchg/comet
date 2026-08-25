@@ -841,6 +841,21 @@ impl Pickers {
 
     /// Capture knob (`ZERON_OPEN_DIALOG=model`): open the combined
     /// harness/model menu programmatically.
+    /// A jump-slot press while the model menu is open. The shell's session
+    /// bindings (Mod+1…9) win the dispatch race — gpui runs a matched
+    /// binding before any key handler — so the shell forwards the slot here
+    /// instead of going quiet and eating the very chips the rows advertise
+    /// (macOS field report: "cmd shortcuts do nothing in the model
+    /// selector"). Returns whether the menu was open and the slot consumed.
+    pub fn jump_model_slot(&mut self, slot: usize, cx: &mut Context<Self>) -> bool {
+        if self.open_kind() != Some(PickerKind::HarnessModel) {
+            return false;
+        }
+        self.activate_model_index(slot, cx);
+        cx.notify();
+        true
+    }
+
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.open_kind() != Some(PickerKind::HarnessModel) {
             self.toggle(PickerKind::HarnessModel, window, cx);
@@ -1322,7 +1337,9 @@ impl Pickers {
     }
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
-        self.animate_close(cx);
+        // The card stays open on a pick (user request): model and traits
+        // share one popover now, and adjusting the tray right after choosing
+        // a model is the expected flow. Esc, click-out, or the chip close it.
         if self.state.read(cx).selected_chat.is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
@@ -2980,13 +2997,13 @@ impl Pickers {
                 )
                 .child(
                     div()
-                        .text_size(px(13.0))
+                        .text_size(crate::typography::ui_rems(13.0))
                         .text_color(theme.text)
                         .child(SharedString::from("No agents available")),
                 )
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(crate::typography::ui_rems(12.0))
                         .text_color(theme.text_muted)
                         .text_center()
                         .child(SharedString::from(

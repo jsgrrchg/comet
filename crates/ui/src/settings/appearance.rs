@@ -16,7 +16,7 @@ use zeron_theme::{
 
 use crate::appearance::{self, AppearanceMode};
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::icons::{self, icon};
+use crate::icons;
 use crate::popover::{self, Popup};
 use crate::settings::widgets;
 use crate::theme::{Appearance, Theme};
@@ -70,179 +70,6 @@ impl AppearancePage {
         }
     }
 
-    fn open_import(&mut self, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| {
-            ComposerInput::with_context(
-                "Theme file, package.json, or extension folder",
-                "PaletteSearch",
-                cx,
-            )
-        });
-        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
-            ComposerInputEvent::Edited => {
-                let source = this
-                    .import_dialog
-                    .as_ref()
-                    .map(|dialog| PathBuf::from(dialog.input.read(cx).text().trim()));
-                if let Some(dialog) = this.import_dialog.as_mut()
-                    && dialog
-                        .compilation
-                        .as_ref()
-                        .zip(source.as_ref())
-                        .is_some_and(|(compilation, source)| compilation.path != *source)
-                {
-                    dialog.compilation = None;
-                    dialog.selected.clear();
-                    dialog.review_variant = None;
-                    dialog.error = None;
-                    cx.notify();
-                }
-            }
-            ComposerInputEvent::Submitted => {
-                if this
-                    .import_dialog
-                    .as_ref()
-                    .is_some_and(|dialog| dialog.compilation.is_some())
-                {
-                    this.finish_import(cx);
-                } else {
-                    this.compile_import(cx);
-                }
-            }
-            _ => {}
-        });
-        self.import_dialog = Some(ImportDialog {
-            input,
-            _events: events,
-            focus: cx.focus_handle(),
-            focus_pending: true,
-            mode: InstallMode::Snapshot,
-            compilation: None,
-            selected: HashSet::new(),
-            review_variant: None,
-            error: None,
-        });
-        cx.notify();
-    }
-
-    fn compile_import(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.import_dialog.as_mut() else {
-            return;
-        };
-        let source = dialog.input.read(cx).text().trim().to_owned();
-        if source.is_empty() {
-            dialog.error = Some("Choose a local theme file or extension folder.".into());
-            cx.notify();
-            return;
-        }
-        let path = PathBuf::from(&source);
-        let family_name = source_name(&path);
-        let family_id = format!("custom-{}", slug(&family_name));
-        match theme_library::compile(&path, &family_id, &family_name) {
-            Ok(compilation) => {
-                dialog.selected = compilation
-                    .family
-                    .variants
-                    .iter()
-                    .map(|variant| variant.id.clone())
-                    .collect();
-                // Mapping diagnostics are useful, but they are an advanced
-                // inspection surface rather than part of the happy path.
-                dialog.review_variant = None;
-                dialog.compilation = Some(compilation);
-                dialog.error = None;
-            }
-            Err(error) => dialog.error = Some(error.to_string().into()),
-        }
-        cx.notify();
-    }
-
-    fn choose_import_source(&mut self, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: true,
-            directories: true,
-            multiple: false,
-            prompt: Some("Choose Theme Source".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let path = match receiver.await {
-                Ok(Ok(Some(mut paths))) => paths.pop(),
-                _ => None,
-            };
-            let Some(path) = path else {
-                return;
-            };
-            let _ = this.update(cx, |page, cx| {
-                if let Some(dialog) = page.import_dialog.as_mut() {
-                    dialog.input.update(cx, |input, cx| {
-                        input.set_text(path.display().to_string(), cx)
-                    });
-                }
-                page.compile_import(cx);
-            });
-        })
-        .detach();
-    }
-
-    fn finish_import(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.import_dialog.as_mut() else {
-            return;
-        };
-        if dialog.selected.is_empty() {
-            dialog.error = Some("Select at least one variant to import.".into());
-            cx.notify();
-            return;
-        }
-        let Some(compilation) = dialog.compilation.take() else {
-            return;
-        };
-        let selected = dialog.selected.iter().cloned().collect::<Vec<_>>();
-        match theme_library::install(compilation.clone(), &selected, dialog.mode, cx) {
-            Ok(_) => self.import_dialog = None,
-            Err(error) => {
-                dialog.compilation = Some(compilation);
-                dialog.error = Some(error.to_string().into());
-            }
-        }
-        cx.notify();
-    }
-}
-
-fn source_name(path: &Path) -> String {
-    let path = if path.file_name().and_then(|name| name.to_str()) == Some("package.json") {
-        path.parent().unwrap_or(path)
-    } else {
-        path
-    };
-    path.file_stem()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("Custom theme")
-        .to_owned()
-}
-
-fn slug(value: &str) -> String {
-    let mut result = String::new();
-    let mut separator = false;
-    for character in value.chars().flat_map(char::to_lowercase) {
-        if character.is_ascii_alphanumeric() {
-            if separator && !result.is_empty() {
-                result.push('-');
-            }
-            result.push(character);
-            separator = false;
-        } else {
-            separator = true;
-        }
-    }
-    if result.is_empty() {
-        "theme".into()
-    } else {
-        result
-    }
-}
-
-impl AppearancePage {
     fn commit_font(&mut self, cx: &mut Context<Self>) {
         if typography::is_available(&self.selected_font, cx) {
             typography::set_family(self.selected_font.clone(), cx);
@@ -422,6 +249,177 @@ impl AppearancePage {
             _ => {}
         }
     }
+
+    fn open_import(&mut self, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| {
+            ComposerInput::with_context(
+                "Theme file, package.json, or extension folder",
+                "PaletteSearch",
+                cx,
+            )
+        });
+        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::Edited => {
+                let source = this
+                    .import_dialog
+                    .as_ref()
+                    .map(|dialog| PathBuf::from(dialog.input.read(cx).text().trim()));
+                if let Some(dialog) = this.import_dialog.as_mut()
+                    && dialog
+                        .compilation
+                        .as_ref()
+                        .zip(source.as_ref())
+                        .is_some_and(|(compilation, source)| compilation.path != *source)
+                {
+                    dialog.compilation = None;
+                    dialog.selected.clear();
+                    dialog.review_variant = None;
+                    dialog.error = None;
+                    cx.notify();
+                }
+            }
+            ComposerInputEvent::Submitted => {
+                if this
+                    .import_dialog
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.compilation.is_some())
+                {
+                    this.finish_import(cx);
+                } else {
+                    this.compile_import(cx);
+                }
+            }
+            _ => {}
+        });
+        self.import_dialog = Some(ImportDialog {
+            input,
+            _events: events,
+            focus: cx.focus_handle(),
+            focus_pending: true,
+            mode: InstallMode::Snapshot,
+            compilation: None,
+            selected: HashSet::new(),
+            review_variant: None,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    fn compile_import(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.import_dialog.as_mut() else {
+            return;
+        };
+        let source = dialog.input.read(cx).text().trim().to_owned();
+        if source.is_empty() {
+            dialog.error = Some("Choose a local theme file or extension folder.".into());
+            cx.notify();
+            return;
+        }
+        let path = PathBuf::from(&source);
+        let family_name = source_name(&path);
+        let family_id = format!("custom-{}", slug(&family_name));
+        match theme_library::compile(&path, &family_id, &family_name) {
+            Ok(compilation) => {
+                dialog.selected = compilation
+                    .family
+                    .variants
+                    .iter()
+                    .map(|variant| variant.id.clone())
+                    .collect();
+                // Mapping diagnostics are useful, but they are an advanced
+                // inspection surface rather than part of the happy path.
+                dialog.review_variant = None;
+                dialog.compilation = Some(compilation);
+                dialog.error = None;
+            }
+            Err(error) => dialog.error = Some(error.to_string().into()),
+        }
+        cx.notify();
+    }
+
+    fn choose_import_source(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose Theme Source".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(mut paths))) => paths.pop(),
+                _ => None,
+            };
+            let Some(path) = path else {
+                return;
+            };
+            let _ = this.update(cx, |page, cx| {
+                if let Some(dialog) = page.import_dialog.as_mut() {
+                    dialog.input.update(cx, |input, cx| {
+                        input.set_text(path.display().to_string(), cx)
+                    });
+                }
+                page.compile_import(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_import(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.import_dialog.as_mut() else {
+            return;
+        };
+        if dialog.selected.is_empty() {
+            dialog.error = Some("Select at least one variant to import.".into());
+            cx.notify();
+            return;
+        }
+        let Some(compilation) = dialog.compilation.take() else {
+            return;
+        };
+        let selected = dialog.selected.iter().cloned().collect::<Vec<_>>();
+        match theme_library::install(compilation.clone(), &selected, dialog.mode, cx) {
+            Ok(_) => self.import_dialog = None,
+            Err(error) => {
+                dialog.compilation = Some(compilation);
+                dialog.error = Some(error.to_string().into());
+            }
+        }
+        cx.notify();
+    }
+}
+
+fn source_name(path: &Path) -> String {
+    let path = if path.file_name().and_then(|name| name.to_str()) == Some("package.json") {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("Custom theme")
+        .to_owned()
+}
+
+fn slug(value: &str) -> String {
+    let mut result = String::new();
+    let mut separator = false;
+    for character in value.chars().flat_map(char::to_lowercase) {
+        if character.is_ascii_alphanumeric() {
+            if separator && !result.is_empty() {
+                result.push('-');
+            }
+            result.push(character);
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+    if result.is_empty() {
+        "theme".into()
+    } else {
+        result
+    }
 }
 
 fn step_font(
@@ -526,7 +524,7 @@ fn surface_choice(
         } else {
             theme.surface_raised.opacity(0.28)
         })
-        .text_size(px(11.5))
+        .text_size(crate::typography::ui_rems(11.5))
         .font_weight(if selected {
             gpui::FontWeight::MEDIUM
         } else {
@@ -688,7 +686,7 @@ fn compact_action(
         .bg(theme.surface_raised.opacity(0.34))
         .flex()
         .items_center()
-        .text_size(px(11.5))
+        .text_size(crate::typography::ui_rems(11.5))
 }
 
 fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
@@ -727,7 +725,7 @@ fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
                 .gap(px(6.0))
                 .child(
                     div()
-                        .text_size(px(10.0))
+                        .text_size(crate::typography::ui_rems(10.0))
                         .font_family(theme.font_mono.clone())
                         .child(
                             div()
@@ -739,7 +737,7 @@ fn import_scene_preview(variant: &zeron_theme::ThemeVariant) -> AnyElement {
                 )
                 .child(
                     div()
-                        .text_size(px(10.0))
+                        .text_size(crate::typography::ui_rems(10.0))
                         .font_family(theme.font_mono.clone())
                         .text_color(theme.syntax.string)
                         .child("  \"Theme mapping\""),
@@ -814,7 +812,7 @@ fn report_panel(theme: &Theme, report: &ImportReport) -> gpui::Stateful<gpui::Di
         .border_color(theme.border)
         .bg(theme.surface_raised.opacity(0.35))
         .p(px(10.0))
-        .text_size(px(11.0))
+        .text_size(crate::typography::ui_rems(11.0))
         .line_height(px(16.0))
         .text_color(theme.text_muted)
         .child(div().text_color(theme.text).child(summary))
@@ -1032,7 +1030,7 @@ impl AppearancePage {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(12.5))
+                    .text_size(crate::typography::ui_rems(12.5))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text)
                     .child(SharedString::from(selected_variant.name.clone())),
@@ -1195,7 +1193,7 @@ impl AppearancePage {
                         )
                         .child(
                             div()
-                                .text_size(px(12.0))
+                                .text_size(crate::typography::ui_rems(12.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(if active { theme.text } else { theme.text_muted })
                                 .child(label),
@@ -1205,7 +1203,7 @@ impl AppearancePage {
                     div()
                         .mt(px(4.0))
                         .ml(px(23.0))
-                        .text_size(px(10.5))
+                        .text_size(crate::typography::ui_rems(10.5))
                         .text_color(theme.text_muted.opacity(0.68))
                         .child(description),
                 )
@@ -1214,7 +1212,7 @@ impl AppearancePage {
         let section_label = |label: &'static str| {
             div()
                 .mb(px(7.0))
-                .text_size(px(11.0))
+                .text_size(crate::typography::ui_rems(11.0))
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(theme.text_muted)
                 .child(label)
@@ -1285,7 +1283,7 @@ impl AppearancePage {
                     .child(section_label("Detected themes").mb(px(0.0)))
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(crate::typography::ui_rems(10.5))
                             .text_color(theme.text_muted.opacity(0.65))
                             .child(SharedString::from(format!(
                                 "{} variant{}",
@@ -1381,14 +1379,14 @@ impl AppearancePage {
                                         .min_w_0()
                                         .child(
                                             div()
-                                                .text_size(px(12.5))
+                                                .text_size(crate::typography::ui_rems(12.5))
                                                 .font_weight(gpui::FontWeight::MEDIUM)
                                                 .text_color(theme.text)
                                                 .child(SharedString::from(variant.name.clone())),
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(11.0))
+                                                .text_size(crate::typography::ui_rems(11.0))
                                                 .text_color(theme.text_muted.opacity(0.65))
                                                 .child(appearance),
                                         ),
@@ -1441,7 +1439,7 @@ impl AppearancePage {
                         .p(px(10.0))
                         .rounded(px(8.0))
                         .bg(theme.warning.opacity(0.08))
-                        .text_size(px(11.0))
+                        .text_size(crate::typography::ui_rems(11.0))
                         .text_color(theme.warning)
                         .child(SharedString::from(format!(
                             "{} could not be compiled · {}",
@@ -1456,7 +1454,7 @@ impl AppearancePage {
                     .flex()
                     .items_start()
                     .gap(px(7.0))
-                    .text_size(px(11.0))
+                    .text_size(crate::typography::ui_rems(11.0))
                     .line_height(px(16.0))
                     .text_color(theme.text_muted.opacity(0.72))
                     .child(
@@ -1479,7 +1477,7 @@ impl AppearancePage {
                     .flex()
                     .items_start()
                     .gap(px(7.0))
-                    .text_size(px(11.0))
+                    .text_size(crate::typography::ui_rems(11.0))
                     .line_height(px(16.0))
                     .text_color(theme.danger)
                     .child(
@@ -1656,7 +1654,7 @@ impl AppearancePage {
                 .child(
                     div()
                         .mt(px(14.0))
-                        .text_size(px(12.5))
+                        .text_size(crate::typography::ui_rems(12.5))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .child(SharedString::from(variant.name.clone())),
                 )
@@ -1728,7 +1726,7 @@ impl AppearancePage {
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(11.0))
+                            .text_size(crate::typography::ui_rems(11.0))
                             .text_color(
                                 if matches!(entry.status, CustomThemeStatus::Warning { .. }) {
                                     theme.warning
@@ -1868,7 +1866,7 @@ impl AppearancePage {
                     .pb(px(4.0))
                     .border_t_1()
                     .border_color(theme.border)
-                    .text_size(px(10.5))
+                    .text_size(crate::typography::ui_rems(10.5))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_faint)
                     .child("IMPORTED")
@@ -1888,7 +1886,7 @@ impl AppearancePage {
                     .pb(px(4.0))
                     .border_t_1()
                     .border_color(theme.border)
-                    .text_size(px(10.5))
+                    .text_size(crate::typography::ui_rems(10.5))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_faint)
                     .child("LINKED")
@@ -2088,7 +2086,11 @@ impl Render for AppearancePage {
                 .when(!available, |row| row.opacity(0.45))
                 .child(div().flex_1().min_w_0().truncate().child(label))
                 .child(div().w(px(18.0)).flex_none().when(selected, |slot| {
-                    slot.child(icon(icons::CHECK).size(px(14.0)).text_color(theme.accent))
+                    slot.child(
+                        icons::icon(icons::CHECK)
+                            .size(px(14.0))
+                            .text_color(theme.accent),
+                    )
                 }))
                 .into_any_element()
             })
@@ -2142,7 +2144,7 @@ impl Render for AppearancePage {
                     .child(SharedString::from(effective_font.label().to_owned())),
             )
             .child(
-                icon(icons::ALT_ARROW_DOWN)
+                icons::icon(icons::ALT_ARROW_DOWN)
                     .size(px(14.0))
                     .flex_none()
                     .text_color(theme.text_muted),
@@ -2155,33 +2157,36 @@ impl Render for AppearancePage {
                 ))
             });
 
-        let size_rows: Vec<AnyElement> =
-            UiFontSize::ALL
-                .into_iter()
-                .enumerate()
-                .map(|(ix, size)| {
-                    popover::menu_row_nav(
-                        &theme,
-                        size == typography::font_size(cx),
-                        size == self.selected_size,
-                        format!("interface-font-size-option-{ix}"),
-                    )
-                    .id(("interface-font-size-option", ix))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.selected_size = size;
-                        this.commit_size(window, cx);
-                    }))
-                    .child(div().flex_1().child(size.label()))
-                    .child(div().w(px(18.0)).flex_none().when(
-                        size == typography::font_size(cx),
-                        |slot| {
-                            slot.child(icon(icons::CHECK).size(px(14.0)).text_color(theme.accent))
-                        },
-                    ))
-                    .into_any_element()
-                })
-                .collect();
+        let size_rows: Vec<AnyElement> = UiFontSize::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(ix, size)| {
+                popover::menu_row_nav(
+                    &theme,
+                    size == typography::font_size(cx),
+                    size == self.selected_size,
+                    format!("interface-font-size-option-{ix}"),
+                )
+                .id(("interface-font-size-option", ix))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.selected_size = size;
+                    this.commit_size(window, cx);
+                }))
+                .child(div().flex_1().child(size.label()))
+                .child(div().w(px(18.0)).flex_none().when(
+                    size == typography::font_size(cx),
+                    |slot| {
+                        slot.child(
+                            icons::icon(icons::CHECK)
+                                .size(px(14.0))
+                                .text_color(theme.accent),
+                        )
+                    },
+                ))
+                .into_any_element()
+            })
+            .collect();
 
         let size_menu = popover::popover_card(&theme)
             .w(px(128.0))
@@ -2222,7 +2227,7 @@ impl Render for AppearancePage {
             }))
             .child(div().flex_1().child(typography::font_size(cx).label()))
             .child(
-                icon(icons::ALT_ARROW_DOWN)
+                icons::icon(icons::ALT_ARROW_DOWN)
                     .size(px(14.0))
                     .flex_none()
                     .text_color(theme.text_muted),
@@ -2260,15 +2265,6 @@ impl Render for AppearancePage {
                             .child(widgets::option_card_row().children(cards)),
                     )
                     .child(widgets::section_card(&theme).children(settings_rows))
-                    .when_some(library_warning, |page, warning| {
-                        page.child(
-                            div()
-                                .mt(px(8.0))
-                                .text_size(crate::typography::ui_rems(11.5))
-                                .text_color(theme.warning)
-                                .child(warning),
-                        )
-                    })
                     .child(
                         div()
                             .mt(px(36.0))
@@ -2322,7 +2318,16 @@ impl Render for AppearancePage {
                                     .font_family(fixed.clone()),
                                 )
                             }),
-                    ),
+                    )
+                    .when_some(library_warning, |page, warning| {
+                        page.child(
+                            div()
+                                .mt(px(8.0))
+                                .text_size(crate::typography::ui_rems(11.5))
+                                .text_color(theme.warning)
+                                .child(warning),
+                        )
+                    }),
             )
             .children(modal)
     }

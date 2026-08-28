@@ -435,6 +435,8 @@ pub struct UiSettings {
     pub theme_selection: zeron_theme::ThemeSelection,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
+    /// Changes pane: wrap long source lines instead of scrolling horizontally.
+    pub diff_wrap: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
@@ -488,6 +490,7 @@ impl Default for UiSettings {
             files_show_all: false,
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
+            diff_wrap: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
             legacy_accent_color: None,
@@ -1096,11 +1099,14 @@ mod tests {
             },
             diff_split: true,
             files_autosave_enabled: true,
+            diff_wrap: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
+        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(json.contains(r#""diffWrap": true"#));
         assert_eq!(UiSettings::load(dir.path()), settings);
     }
 
@@ -1226,6 +1232,7 @@ mod tests {
         );
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
+        assert!(!loaded.diff_wrap);
         assert_eq!(
             loaded.ui_font_size,
             crate::typography::UiFontSize::default()

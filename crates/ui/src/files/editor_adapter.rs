@@ -308,6 +308,33 @@ mod tests {
     }
 
     #[test]
+    fn stale_highlight_ranges_remain_utf8_boundaries_after_text_changes() {
+        let stale_source = "ab";
+        let stale_document = highlighted(
+            stale_source,
+            vec![HighlightSpan {
+                range: 1..2,
+                kind: HighlightKind::Variable,
+            }],
+        );
+        let highlighter = ZeronInputHighlighter::new(stale_source, &stale_document);
+        let resolver = ZeronHighlightStyleResolver {
+            palette: Theme::dark().syntax,
+        };
+        let updated_text = "é";
+
+        let runs = highlighter.styles(&(0..updated_text.len()), &resolver);
+
+        assert!(
+            runs.iter().all(|(range, _)| {
+                updated_text.is_char_boundary(range.start)
+                    && updated_text.is_char_boundary(range.end)
+            }),
+            "stale highlight produced ranges that split updated UTF-8 text: {runs:?}"
+        );
+    }
+
+    #[test]
     fn editor_caret_uses_the_same_theme_token_as_other_inputs() {
         for theme in [Theme::dark(), Theme::light()] {
             assert_eq!(editor_style(&theme).caret, theme.caret);

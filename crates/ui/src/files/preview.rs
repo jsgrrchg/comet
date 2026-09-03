@@ -2860,6 +2860,49 @@ mod tests {
     }
 
     #[test]
+    fn file_highlight_completion_rejects_a_result_after_a_user_edit() {
+        let path = "src/lib.rs";
+        let disk_hash = "disk-hash-1";
+        let stale_source = "ab";
+        let updated_source = "é";
+        let mut document = FileDocument::loading(DocumentKey {
+            chat_id: "chat-1".into(),
+            checkout_id: Some("checkout-1".into()),
+            path: path.into(),
+        });
+        document.set_loaded(zeron_proto::WorkspaceFileText {
+            path: path.into(),
+            text: Some(stale_source.into()),
+            content_hash: Some(disk_hash.into()),
+            size: stale_source.len() as u64,
+            modified_at: None,
+            encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+            line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+            read_only_reason: None,
+            truncated: false,
+        });
+        let task_document_key = document.key.clone();
+        let task_generation = document.generation;
+        let task_revision = document.revision;
+        let stale_highlight_key =
+            DocumentHighlightKey::new(zeron_syntax::LanguageId::Rust, stale_source);
+
+        document.mark_user_edit();
+        let current_highlight_key =
+            DocumentHighlightKey::new(zeron_syntax::LanguageId::Rust, updated_source);
+
+        assert_ne!(document.revision, task_revision);
+        assert_ne!(current_highlight_key, stale_highlight_key);
+        let accepted_by_completion_guard = document.accepts(&task_document_key, task_generation)
+            && document.content_hash() == Some(disk_hash);
+        assert!(
+            !accepted_by_completion_guard,
+            "highlight for revision {task_revision} was accepted at revision {} after the editor source changed from {stale_source:?} to {updated_source:?}",
+            document.revision
+        );
+    }
+
+    #[test]
     fn autosave_is_opt_in_and_enabling_schedules_dirty_documents() {
         let path = "src/lib.rs";
         let mut preview = FilePreviewState::new(false, 900, false, 11.5);

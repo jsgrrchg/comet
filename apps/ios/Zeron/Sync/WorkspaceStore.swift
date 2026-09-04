@@ -304,6 +304,10 @@ final class WorkspaceStore {
         return v >= min
     }
 
+    func deviceSupports(_ deviceId: String, _ capability: String) -> Bool {
+        devices.first(where: { $0.id == deviceId })?.supports(capability) ?? false
+    }
+
     // MARK: Projection (rows → typed entities)
 
     private func project() {
@@ -315,7 +319,9 @@ final class WorkspaceStore {
                              platform: f["platform"]?.stringValue ?? "",
                              lastSeenAt: f["lastSeenAt"]?.int64Value,
                              createdAt: f["createdAt"]?.int64Value,
-                             version: f["version"]?.stringValue)
+                             version: f["version"]?.stringValue,
+                             capabilities: (f["capabilities"]?.listValue ?? [])
+                                .compactMap(\.stringValue))
         }.sorted { $0.name < $1.name }
 
         spaces = doc.overlayRows(kind: "spaces").compactMap { row in

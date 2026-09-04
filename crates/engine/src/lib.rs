@@ -672,6 +672,7 @@ impl Engine {
         Ok(EngineInfo {
             device_id: load_or_create_device_id(&config.data_dir)?,
             workspace_scope,
+            capabilities: zeron_proto::capabilities::current(),
         })
     }
 

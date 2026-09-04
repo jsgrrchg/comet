@@ -487,6 +487,7 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
             Ok(EngineInfo {
                 device_id: legacy.device_id,
                 workspace_scope: WorkspaceScope::Synced,
+                capabilities: Vec::new(),
             })
         }
         Err(err) => Err(err),
@@ -935,6 +936,28 @@ impl AppState {
             .and_then(|d| d.version.as_deref())
             .and_then(version_triple)
             .is_some_and(|v| v >= min)
+    }
+
+    /// Capability checks use the live EngineInfo for this device (including a
+    /// localhost daemon that may not match the UI binary) and synced device
+    /// rows for peers. Missing declarations are conservatively unsupported.
+    pub fn device_supports(&self, device_id: &str, capability: &str) -> bool {
+        if let Some(engine) = self.engine.as_ref()
+            && engine.engine_info().device_id == device_id
+        {
+            return engine.engine_info().supports(capability);
+        }
+        self.devices
+            .iter()
+            .find(|device| device.id == device_id)
+            .is_some_and(|device| device.supports(capability))
+    }
+
+    pub fn chat_host_supports(&self, chat_id: &str, capability: &str) -> bool {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_some_and(|chat| self.device_supports(&chat.device_id, capability))
     }
 
     /// First project on the composer's picked device (falling back through
@@ -1547,7 +1570,12 @@ impl AppState {
         if let Some(chat_id) = self.selected_chat.clone() {
             self.transcript_task =
                 Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
-            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+            if handle
+                .engine_info()
+                .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+            {
+                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+            }
         }
         cx.notify();
     }
@@ -1671,7 +1699,12 @@ impl AppState {
         if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
             self.transcript_task =
                 Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
-            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+            if handle
+                .engine_info()
+                .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+            {
+                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+            }
         }
         cx.notify();
     }
@@ -2400,6 +2433,7 @@ mod tests {
                 engine_info: EngineInfo {
                     device_id: "owner-device".into(),
                     workspace_scope: WorkspaceScope::Local,
+                    capabilities: zeron_proto::capabilities::current(),
                 },
                 state: state_rx,
             }),
@@ -2794,6 +2828,7 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: None,
+            capabilities: Vec::new(),
         }
     }
 
@@ -3566,6 +3601,7 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: Some("0.2.12".into()),
+            capabilities: Vec::new(),
         }];
         assert!(s.device_version_at_least("d1", (0, 2, 12)));
         assert!(!s.device_version_at_least("d1", (0, 2, 13)));
@@ -3574,6 +3610,34 @@ mod tests {
             !s.device_version_at_least("d1", (0, 2, 12)),
             "unstamped version conservatively fails the gate"
         );
+    }
+
+    #[test]
+    fn explicit_capabilities_distinguish_same_version_builds() {
+        let mut state = AppState::default();
+        state.devices = vec![
+            Device {
+                id: "personal".into(),
+                name: "personal".into(),
+                platform: "macos".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: Some("0.2.31".into()),
+                capabilities: vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()],
+            },
+            Device {
+                id: "upstream".into(),
+                name: "upstream".into(),
+                platform: "macos".into(),
+                last_seen_at: None,
+                created_at: None,
+                version: Some("0.2.31".into()),
+                capabilities: Vec::new(),
+            },
+        ];
+
+        assert!(state.device_supports("personal", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
+        assert!(!state.device_supports("upstream", zeron_proto::capabilities::MESSAGE_QUEUE_V1));
     }
 
     #[test]
@@ -3594,6 +3658,7 @@ mod tests {
             last_seen_at: Some(now),
             created_at: None,
             version: None,
+            capabilities: Vec::new(),
         }];
         s.connectivity.state = ConnectivityState::Connected;
         s.connectivity.chats = vec![ChatConnectivity {

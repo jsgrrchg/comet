@@ -27,7 +27,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
     FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
-    UserInputQuestion,
+    UserInputQuestion, capabilities,
 };
 use zeron_rpc::{RpcError, methods};
 
@@ -5186,8 +5186,22 @@ impl Composer {
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
         // New chats always start a Run. Existing busy chats use the personal
-        // cut's visible/editable message queue.
-        let queue = queue && !is_new;
+        // cut's visible/editable message queue only when both the UI's engine
+        // and the chat host explicitly advertise it. Same-version upstream
+        // builds do not, so they retain the legacy durable Steer command.
+        let queue_requested = queue && !is_new;
+        let queue_capability = if staged.is_empty() {
+            capabilities::MESSAGE_QUEUE_V1
+        } else {
+            capabilities::MESSAGE_QUEUE_ATTACHMENTS_V1
+        };
+        let queue = queue_requested
+            && engine.engine_info().supports(queue_capability)
+            && self
+                .state
+                .read(cx)
+                .chat_host_supports(&chat_id, queue_capability);
+        let legacy_steer = queue_requested && !queue;
 
         // Queued-attachment flow (durable-by-design): stage the bytes on the
         // LOCAL engine, queue the command immediately with `pending://` refs,
@@ -5596,21 +5610,28 @@ impl Composer {
                     return Ok(Some(queue_id.to_string()));
                 }
 
-                let command = SessionCommandPayload::Run {
-                    request: RunRequest {
+                let command = if legacy_steer {
+                    SessionCommandPayload::Steer {
                         prompt: content.clone(),
-                        harness: resolved.harness,
-                        model: resolved.model.clone(),
-                        reasoning: resolved.reasoning,
-                        model_options: resolved.model_options.clone(),
-                        cwd,
-                        sandbox: SandboxLevel::WorkspaceWrite,
-                        auto_approve: false,
-                        resume: None,
-                        attachments: attachment_paths,
-                        worktree: run_worktree,
-                    },
-                    message_id: message_id.clone(),
+                        message_id: Some(message_id.clone()),
+                    }
+                } else {
+                    SessionCommandPayload::Run {
+                        request: RunRequest {
+                            prompt: content.clone(),
+                            harness: resolved.harness,
+                            model: resolved.model.clone(),
+                            reasoning: resolved.reasoning,
+                            model_options: resolved.model_options.clone(),
+                            cwd,
+                            sandbox: SandboxLevel::WorkspaceWrite,
+                            auto_approve: false,
+                            resume: None,
+                            attachments: attachment_paths,
+                            worktree: run_worktree,
+                        },
+                        message_id: message_id.clone(),
+                    }
                 };
                 let command = serde_json::to_value(&command)
                     .map_err(|e| format!("Send failed: {e}"))?;

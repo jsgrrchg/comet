@@ -842,7 +842,7 @@ impl Composer {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let (chat_id, host_device_id) = {
+        let (chat_id, host_device_id, host_supports_action) = {
             let state = self.state.read(cx);
             let Some(chat_id) = state.selected_chat.clone() else {
                 return;
@@ -850,8 +850,18 @@ impl Composer {
             let host = queue_action_needs_host(method)
                 .then(|| state.selected_chat_row().map(|chat| chat.device_id.clone()))
                 .flatten();
-            (chat_id, host)
+            let supported = !queue_action_needs_host(method)
+                || state.chat_host_supports(
+                    &chat_id,
+                    zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
+                );
+            (chat_id, host, supported)
         };
+        if !host_supports_action {
+            self.failure = Some("The chat host does not support queue actions".into());
+            cx.notify();
+            return;
+        }
         let mut params = params;
         if let Some(object) = params.as_object_mut() {
             object.insert("chatId".into(), serde_json::Value::String(chat_id));

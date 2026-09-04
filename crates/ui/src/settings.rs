@@ -255,6 +255,9 @@ pub struct UiSettings {
     pub theme_selection: zeron_theme::ThemeSelection,
     /// Changes pane: side-by-side diffs instead of the unified stack.
     pub diff_split: bool,
+    /// Agent-sent Markdown fences: wrap long lines to the chat width instead
+    /// of exposing their horizontal scroll plane.
+    pub code_fences_fit_content: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
@@ -294,6 +297,7 @@ impl Default for UiSettings {
             ui_font_size: crate::typography::UiFontSize::default(),
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
+            code_fences_fit_content: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
             legacy_accent_color: None,
@@ -799,12 +803,15 @@ mod tests {
                 dark: "catppuccin-mocha".into(),
             },
             diff_split: true,
+            code_fences_fit_content: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);
+        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(json.contains(r#""codeFencesFitContent": true"#));
     }
 
     #[test]
@@ -963,6 +970,7 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.sidebar_width, SIDEBAR_MAX);
         assert_eq!(loaded.right_pane_width, RIGHT_PANE_MIN);
+        assert!(!loaded.code_fences_fit_content);
     }
 
     #[test]

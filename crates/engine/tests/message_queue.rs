@@ -579,6 +579,68 @@ async fn steer_now_leaves_the_row_when_the_agent_cannot_steer_mid_turn() {
     core.shutdown().await;
 }
 
+/// A provider's queue action remains `Steer` even if the active turn finishes
+/// before the click lands. With nothing left to interrupt, the selected row
+/// becomes the next turn and unpauses normal queue draining.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn steer_now_starts_the_next_turn_when_the_previous_turn_is_already_idle() {
+    let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
+
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "the first turn to start",
+    )
+    .await;
+
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let reply = client
+        .call(
+            zeron_rpc::methods::QUEUE_MESSAGE,
+            serde_json::json!({
+                "chatId": CHAT,
+                "text": "after cancel",
+                "holdForTurnEnd": true,
+            }),
+        )
+        .await
+        .expect("queue held message");
+    let id = reply["id"].as_str().expect("queue id").to_string();
+
+    core.doc_host
+        .queue_command(CHAT, SessionCommandPayload::Interrupt {})
+        .expect("queue interrupt");
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "the interrupted turn to settle",
+    )
+    .await;
+    assert_eq!(queue_texts(&core), vec!["after cancel"]);
+
+    assert!(
+        core.doc_host
+            .steer_queued_now(CHAT, &id)
+            .await
+            .expect("non-interrupting queue promotion")
+    );
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "after cancel"),
+        "the selected row to start the next turn",
+    )
+    .await;
+    assert_eq!(
+        user_message_id(&core, "after cancel").as_deref(),
+        Some(id.as_str()),
+        "promoting an idle queued row preserves its transcript identity"
+    );
+    assert!(queue_texts(&core).is_empty());
+
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
 /// Attachments never steer: the steer path carries a prompt and nothing else,
 /// so a message with files waits for a turn that can inline them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -615,8 +677,8 @@ async fn a_message_with_attachments_holds_even_for_a_steerable_agent() {
     core.shutdown().await;
 }
 
-/// "Send now" (and the empty-composer Enter that pops the head) interrupts the
-/// running turn and sends that one message, leaving the rest queued.
+/// "Send now" interrupts the running turn and sends that one message, leaving
+/// the rest queued. The UI selects this action for providers that cannot steer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn send_now_interrupts_the_running_turn() {
     let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;

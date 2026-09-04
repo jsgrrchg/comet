@@ -35,7 +35,7 @@ use zeron_proto::{
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
-use crate::registry::HarnessRegistry;
+use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
 
@@ -258,9 +258,7 @@ impl SessionsEngine {
             .descriptors()
             .iter()
             .find(|d| d.id == harness)
-            .is_some_and(|d| {
-                d.supports_steering && d.steering_mode == zeron_proto::SteeringMode::StepBoundary
-            })
+            .is_some_and(HarnessDescriptor::steers_mid_turn)
     }
 
     /// Whether this chat has a turn in flight — streaming, or parked on a

@@ -2337,8 +2337,9 @@ impl DocHost {
 
     /// "Send this one now": take it out of the queue and put it in front of the
     /// agent, interrupting whatever is running. Deliberately blunt — it is the
-    /// explicit override, including the empty-composer Enter that pops the
-    /// head. `false` when another device already took the row.
+    /// explicit override. The empty-composer Enter gesture reaches this path
+    /// only when the selected provider cannot steer the row. `false` when
+    /// another device already took it.
     pub async fn send_queued_now(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
         let handle = self.open(chat_id)?;
         // Sending one now sends ONE: the lock keeps the flush out of the idle
@@ -2365,20 +2366,19 @@ impl DocHost {
         Ok(true)
     }
 
-    /// Inject one held row into the current turn without interrupting it.
-    /// Unsupported harnesses leave the row untouched. If the turn ends in the
-    /// narrow window after the capability check, normal steering fallback
-    /// starts the next turn instead of losing or duplicating the message.
+    /// Promote one held row without ever interrupting a turn. A live,
+    /// steerable turn receives it as steering; if that turn has already ended,
+    /// it starts normally as the next turn. Unsupported harnesses and
+    /// attachment-bearing rows stay untouched.
     pub async fn steer_queued_now(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
         let handle = self.open(chat_id)?;
         let _drain = handle.drain_lock.lock().await;
         let Some(sessions) = self.sessions() else {
             return Err(EngineError::Other("sessions engine not wired".into()));
         };
-        if !sessions.turn_in_flight(chat_id) || !sessions.steers_mid_turn(self.harness_for(chat_id))
-        {
+        if !sessions.steers_mid_turn(self.harness_for(chat_id)) {
             return Err(EngineError::Other(
-                "the active agent cannot accept steering right now".into(),
+                "the selected agent cannot accept mid-turn steering".into(),
             ));
         }
         let Some(candidate) = handle
@@ -2399,6 +2399,9 @@ impl DocHost {
         };
         let was_paused = handle.queue_paused.swap(false, Ordering::AcqRel);
         handle.publish_queue();
+        // Always attempt the non-interrupting path first. If no turn exists,
+        // `dispatch_queued` falls through to NextTurn; if a new turn appeared
+        // after our capability check, the prompt steers that turn instead.
         if let Err(err) = self.dispatch_queued(&handle, &item, QueueSend::Steer).await {
             if was_paused {
                 handle.queue_paused.store(true, Ordering::Release);

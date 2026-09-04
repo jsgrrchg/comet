@@ -308,7 +308,7 @@ pub enum ActiveTurnSendBehavior {
     #[default]
     Steer,
     /// Keep the message visible and editable in the queue until the turn ends
-    /// or the user explicitly chooses Steer now / Send now.
+    /// or the user explicitly chooses the row's Steer / Send now action.
     Queue,
 }
 

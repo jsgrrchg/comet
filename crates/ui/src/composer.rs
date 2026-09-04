@@ -3612,6 +3612,10 @@ fn slash_error_message(err: &RpcError) -> SharedString {
 pub struct Composer {
     pub(crate) state: Entity<AppState>,
     pub(crate) input: Entity<ComposerInput>,
+    /// Dedicated text input mounted inside whichever queue row is being
+    /// edited. Keeping it separate means a half-written prompt below never
+    /// moves or changes while a queued message is corrected.
+    pub(crate) queue_edit_input: Entity<ComposerInput>,
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
     /// Shared with the shell's new-session canvas, which renders the
     /// device/project target selectors ([`Pickers::render_target_selectors`]).
@@ -3666,11 +3670,12 @@ pub struct Composer {
     /// another chat's request when the user navigates quickly.
     interrupting: HashSet<String>,
     interrupt_tasks: HashMap<String, Task<()>>,
-    /// The queued message being retyped in the input box (see
+    /// The queued message being edited in its own row (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
-    /// Whatever was half-typed when that edit started, put back afterwards.
-    pub(crate) queue_edit_stash: Option<String>,
+    /// Returning focus to the main composer must wait until the inline input
+    /// has been unmounted by the next render.
+    pub(crate) queue_edit_focus_pending: bool,
     /// Live drag over the queue panel: which row, and where it would land.
     pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
     /// Interrupt/answer commands get their own slot: assigning `send_task`
@@ -3714,6 +3719,7 @@ pub struct Composer {
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
+    _queue_edit_input_events: Subscription,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -3745,6 +3751,8 @@ impl Composer {
             input.enable_mentions();
             input
         });
+        let queue_edit_input = cx
+            .new(|cx| ComposerInput::new("Edit queued message", cx).with_text_metrics(12.5, 16.0));
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
@@ -3790,10 +3798,29 @@ impl Composer {
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
+        let queue_edit_input_events = cx.subscribe(
+            &queue_edit_input,
+            |this: &mut Self, _, event, cx| match event {
+                ComposerInputEvent::Submitted => {
+                    this.commit_queue_edit(cx);
+                }
+                ComposerInputEvent::Edited
+                | ComposerInputEvent::CursorMoved
+                | ComposerInputEvent::ViewportChanged => cx.notify(),
+                // Queue rows are text-only. Their compact editor does not
+                // open composer completion UI or stage pasted files.
+                ComposerInputEvent::MentionNavigate(_)
+                | ComposerInputEvent::MentionAccept
+                | ComposerInputEvent::MentionDismiss
+                | ComposerInputEvent::PastedImages(_)
+                | ComposerInputEvent::PastedPaths(_) => {}
+            },
+        );
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
             state,
             input,
+            queue_edit_input,
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
@@ -3822,7 +3849,7 @@ impl Composer {
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
-            queue_edit_stash: None,
+            queue_edit_focus_pending: false,
             queue_drag: None,
             expanded_mode: false,
             flip_epoch: 0,
@@ -3839,6 +3866,7 @@ impl Composer {
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
+            _queue_edit_input_events: queue_edit_input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
@@ -4898,13 +4926,24 @@ impl Composer {
         self.interrupt_tasks
             .retain(|chat_id, _| self.interrupting.contains(chat_id));
 
-        let (key, pending) = {
+        let editing_id = self.editing_queued.clone();
+        let (key, pending, edited_row_exists) = {
             let s = self.state.read(cx);
             (
                 s.selected_chat.clone().unwrap_or_default(),
                 pending_input_request(&s.transcript),
+                editing_id
+                    .as_ref()
+                    .is_none_or(|id| s.queue.iter().any(|item| item.id == *id)),
             )
         };
+
+        // A queue edit belongs to exactly one visible row. Navigation or a
+        // remote drain/removal cancels it instead of leaving a focused but
+        // unmounted editor entity behind.
+        if (!edited_row_exists || key != self.current_key) && self.editing_queued.is_some() {
+            self.clear_queue_edit(cx);
+        }
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
@@ -5033,16 +5072,10 @@ impl Composer {
             self.wizard_advance(cx);
             return;
         }
-        // Retyping a queued message: Enter saves the row rather than sending
-        // anything, and saving it to nothing removes it.
-        if self.commit_queue_edit(cx) {
-            return;
-        }
         let text = self.input.read(cx).text().trim().to_string();
-        // Empty box with a queue behind it: Enter sends the top message now,
-        // which stops the turn to do it. This outranks Stop — hitting Enter on
-        // an empty composer while messages wait is asking for the next one,
-        // not just for silence.
+        // Empty box with a queue behind it: Enter activates the top row's own
+        // Steer/Send now action. This outranks Stop — hitting Enter while
+        // messages wait is asking for the next one, not just for silence.
         if text.is_empty()
             && self.staged().is_empty()
             && self.staged_comments(cx).is_empty()
@@ -6153,6 +6186,11 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.queue_edit_focus_pending {
+            self.queue_edit_focus_pending = false;
+            let focus = self.input.focus_handle(cx);
+            window.focus(&focus, cx);
+        }
         let theme = Theme::of(cx).clone();
         let wizard_active = self.wizard.is_some();
         if self.mention.token.is_some()

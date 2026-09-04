@@ -784,6 +784,18 @@ impl Pickers {
             .map(|d| d.steering_mode)
     }
 
+    /// Whether the selected harness can accept a prompt inside the current
+    /// turn. This is deliberately stricter than `supports_steering`: a
+    /// turn-boundary harness cannot fulfil the queue row's non-interrupting
+    /// `Steer` action.
+    pub fn resolved_mid_turn_steering(&self, cx: &App) -> Option<bool> {
+        let harness = self.effective_harness(cx)?;
+        self.harnesses
+            .ready()
+            .and_then(|list| list.iter().find(|d| d.id == harness))
+            .map(HarnessDescriptor::steers_mid_turn)
+    }
+
     /// The catalog is loaded and offers nothing runnable — the no-agents
     /// state (every enabled harness is missing its CLI, or nothing is
     /// enabled). False while the catalog is still loading or failed

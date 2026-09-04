@@ -2426,8 +2426,22 @@ impl DocHost {
         Ok(changed)
     }
 
-    pub fn remove_queued_message(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
+    /// Cancel one queued message at the chat host. Removal shares the same
+    /// lock as automatic and explicit delivery, so the acknowledgement is the
+    /// linearization point: `true` guarantees this host did not take the row.
+    pub async fn remove_queued_message(
+        &self,
+        chat_id: &str,
+        id: &str,
+    ) -> Result<bool, EngineError> {
+        if !self.is_host(chat_id) {
+            return Err(EngineError::Other(format!(
+                "device {} does not host chat {chat_id}",
+                self.inner.config.device_id
+            )));
+        }
         let handle = self.open(chat_id)?;
+        let _drain = handle.drain_lock.lock().await;
         let removed = handle.doc.remove_queued(id)?;
         if removed {
             handle.publish_queue();

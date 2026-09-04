@@ -791,6 +791,50 @@ async fn editing_a_queued_message_to_empty_removes_it() {
     core.shutdown().await;
 }
 
+/// A positive removal acknowledgement is stronger than a local CRDT delete:
+/// the host has serialized it against automatic drain, so ending the current
+/// turn cannot materialize the cancelled row in the transcript afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acknowledged_removal_cannot_materialize_after_turn_end() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "the first turn to start",
+    )
+    .await;
+
+    let id = core
+        .doc_host
+        .queue_message(CHAT, "cancelled", Vec::new())
+        .expect("queue cancelled row");
+    assert!(
+        core.doc_host
+            .remove_queued_message(CHAT, &id)
+            .await
+            .expect("host removal acknowledgement")
+    );
+
+    let _ = harness.finish.send(());
+    let handle = core.doc_host.open(CHAT).expect("open chat doc");
+    core.doc_host.drain_queue(&handle).await;
+
+    assert!(queue_texts(&core).is_empty());
+    assert!(
+        !prompts.lock().unwrap().iter().any(|p| p == "cancelled"),
+        "an acknowledged removal must never reach the harness"
+    );
+    assert!(
+        !user_messages(&core).iter().any(|p| p == "cancelled"),
+        "an acknowledged removal must never reach the transcript"
+    );
+
+    core.shutdown().await;
+}
+
 /// Reordering, over the RPC surface the UIs actually call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queue_rpc_reorders_and_streams() {
@@ -894,6 +938,13 @@ async fn explicit_queue_delivery_is_rejected_off_host_without_taking_the_row() {
         .await
         .expect_err("non-host steer-now must fail");
     assert!(steer_error.to_string().contains("does not host chat"));
+
+    let remove_error = core
+        .doc_host
+        .remove_queued_message(CHAT, &id)
+        .await
+        .expect_err("non-host removal must fail");
+    assert!(remove_error.to_string().contains("does not host chat"));
     assert_eq!(queue_texts(&core), vec!["remote-only"]);
 
     let _ = harness.finish.send(());

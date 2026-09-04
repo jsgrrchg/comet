@@ -1443,6 +1443,7 @@ impl RpcService for EngineRpc {
                 let removed = self
                     .doc_host
                     .remove_queued_message(&p.chat_id, &p.id)
+                    .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "removed": removed }))
             }

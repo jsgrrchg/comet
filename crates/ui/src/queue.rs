@@ -25,13 +25,14 @@ use crate::terminal::panel::{drop_index, slide_offset};
 use crate::theme::Theme;
 
 /// Queue rows are replicated CRDT state, so ordinary mutations deliberately
-/// land on the local engine. Only operations that hand a row to the agent must
-/// execute on the chat's owning device.
+/// land on the local engine. Delivery and cancellation must execute on the
+/// chat's owning device because they race over the same row.
 fn queue_action_needs_host(method: &str) -> bool {
     matches!(
         method,
         methods::SEND_QUEUED_MESSAGE_NOW
             | methods::STEER_QUEUED_MESSAGE_NOW
+            | methods::REMOVE_QUEUED_MESSAGE
             | methods::BEGIN_QUEUED_MESSAGE_EDIT
             | methods::RENEW_QUEUED_MESSAGE_EDIT
             | methods::FINISH_QUEUED_MESSAGE_EDIT
@@ -356,7 +357,9 @@ impl Composer {
     ) -> AnyElement {
         let key = SharedString::from(format!("queue-{}", item.id));
         let being_edited = editing.as_deref() == Some(item.id.as_str());
+        let being_removed = self.queue_removing.contains(&item.id);
         let delivery_blocked = item.delivery_gate.is_some();
+        let interaction_blocked = delivery_blocked || being_removed;
         let text = match &item.delivery_gate {
             Some(QueueDeliveryGate::Editing {
                 owner_device_id, ..
@@ -373,6 +376,7 @@ impl Composer {
             "edit",
             "Edit",
             icons::QUEUE_EDIT,
+            !being_removed,
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.begin_queue_edit(edit_id.clone(), cx);
@@ -382,8 +386,13 @@ impl Composer {
         let discard = self.queue_action(
             &key,
             "drop",
-            "Remove",
+            if being_removed {
+                "Removing…"
+            } else {
+                "Remove"
+            },
             icons::QUEUE_TRASH,
+            !being_removed,
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.remove_queued(drop_id.clone(), cx);
@@ -392,7 +401,7 @@ impl Composer {
         let resolved_primary = available_queue_primary_action(
             mid_turn_steering,
             !item.attachments.is_empty(),
-            delivery_blocked,
+            interaction_blocked,
             host_supports_actions,
         );
         let primary_action = resolved_primary.unwrap_or(QueuePrimaryAction::SendNow);
@@ -411,6 +420,7 @@ impl Composer {
             "save",
             "Save",
             icons::QUEUE_CHECK,
+            true,
             theme,
             cx.listener(|this, _, _, cx| {
                 this.commit_queue_edit(cx);
@@ -421,6 +431,7 @@ impl Composer {
             "cancel",
             "Cancel",
             icons::QUEUE_CLOSE,
+            true,
             theme,
             cx.listener(|this, _, _, cx| {
                 this.cancel_queue_edit(cx);
@@ -438,7 +449,7 @@ impl Composer {
             .justify_center()
             .rounded(px(4.0))
             .cursor_pointer()
-            .when(delivery_blocked, |el| {
+            .when(interaction_blocked, |el| {
                 el.cursor(gpui::CursorStyle::Arrow).opacity(0.35)
             })
             .child(
@@ -458,14 +469,15 @@ impl Composer {
             .gap(px(8.0))
             .rounded(px(8.0))
             .when(being_edited, |el| el.bg(crate::theme::ink(0.06)))
-            .when(!being_edited, |el| {
+            .when(!being_edited && !being_removed, |el| {
                 el.hover(|s| s.bg(crate::theme::ink(0.04)))
             })
+            .when(being_removed, |el| el.opacity(0.55))
             .cursor(gpui::CursorStyle::Arrow)
             // The marker hints that the row belongs to the queue, while the
             // proven full-row drag hitbox keeps reordering easy. Editing
             // disables it so selection cannot become a reorder gesture.
-            .when(!being_edited && !delivery_blocked, |el| {
+            .when(!being_edited && !interaction_blocked, |el| {
                 el.on_drag(
                     QueueDragPayload {
                         chat: drag_chat,
@@ -537,7 +549,7 @@ impl Composer {
                             queue_head_shortcut_visible(
                                 ix,
                                 show_head_shortcut,
-                                resolved_primary.is_some(),
+                                resolved_primary.is_some() && !being_removed,
                             ),
                             |el| {
                                 el.child(crate::popover::kbd_hint(
@@ -581,6 +593,7 @@ impl Composer {
         slot: &str,
         label: &'static str,
         glyph: &'static str,
+        enabled: bool,
         theme: &Theme,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> AnyElement {
@@ -594,10 +607,15 @@ impl Composer {
             .items_center()
             .justify_center()
             .rounded(px(5.0))
-            .cursor_pointer()
             .opacity(0.72)
-            .hover(|s| s.opacity(1.0).bg(crate::theme::ink(0.07)))
-            .on_click(on_click)
+            .when(enabled, |el| {
+                el.cursor_pointer()
+                    .hover(|s| s.opacity(1.0).bg(crate::theme::ink(0.07)))
+                    .on_click(on_click)
+            })
+            .when(!enabled, |el| {
+                el.cursor(gpui::CursorStyle::Arrow).opacity(0.45)
+            })
             .tooltip(move |_, cx| {
                 cx.new(|_| QueueActionTooltip {
                     label: label.into(),
@@ -729,21 +747,95 @@ impl Composer {
         );
     }
 
-    /// Drop a queued message.
+    /// Cancel a queued message at its host. The row remains visible and inert
+    /// until the host acknowledges winning the race against automatic drain.
     pub(crate) fn remove_queued(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.queue_removing.contains(&id) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let (chat_id, host_device_id, supported) = {
+            let state = self.state.read(cx);
+            let Some(chat_id) = state.selected_chat.clone() else {
+                return;
+            };
+            let Some(host_device_id) = state.selected_chat_row().map(|chat| chat.device_id.clone())
+            else {
+                return;
+            };
+            let supported = state.chat_host_supports(
+                &chat_id,
+                zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
+            );
+            (chat_id, host_device_id, supported)
+        };
+        if !supported {
+            self.failure = Some("The chat host does not support safe queue removal".into());
+            cx.notify();
+            return;
+        }
         if self.editing_queued.as_deref() == Some(id.as_str()) {
             self.clear_queue_edit(cx);
         }
-        self.state.update(cx, |state, cx| {
-            state.queue.retain(|item| item.id != id);
-            cx.notify();
+        self.queue_removing.insert(id.clone());
+        self.queue_drag = None;
+        cx.notify();
+
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "id": id,
+            "targetDeviceId": host_device_id,
         });
-        self.queue_rpc(
-            methods::REMOVE_QUEUED_MESSAGE,
-            serde_json::json!({ "id": id }),
-            "Couldn't remove the message",
-            cx,
-        );
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::REMOVE_QUEUED_MESSAGE, params)
+                .await;
+            this.update(cx, |composer, cx| {
+                composer.queue_removing.remove(&id);
+                let selected_matches =
+                    composer.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str());
+                match result {
+                    Ok(reply)
+                        if queue_mutation_acknowledged(methods::REMOVE_QUEUED_MESSAGE, &reply) =>
+                    {
+                        if selected_matches {
+                            composer.state.update(cx, |state, cx| {
+                                state.queue.retain(|item| item.id != id);
+                                cx.notify();
+                            });
+                        }
+                    }
+                    Ok(reply) => {
+                        tracing::debug!(
+                            ?reply,
+                            "queued message had already left the queue before removal"
+                        );
+                        if selected_matches {
+                            composer.failure =
+                                Some("That message had already left the queue".into());
+                            composer
+                                .state
+                                .update(cx, |state, cx| state.refresh_selected_queue(cx));
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "host-authoritative queue removal failed");
+                        if selected_matches {
+                            composer.failure = Some("Couldn't remove the message".into());
+                            composer
+                                .state
+                                .update(cx, |state, cx| state.refresh_selected_queue(cx));
+                        }
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Send one now: the host stops the turn and hands this message over. Not
@@ -1291,16 +1383,16 @@ mod tests {
     }
 
     #[test]
-    fn only_agent_execution_actions_route_to_the_host() {
+    fn host_authoritative_queue_actions_route_to_the_host() {
         assert!(queue_action_needs_host(methods::SEND_QUEUED_MESSAGE_NOW));
         assert!(queue_action_needs_host(methods::STEER_QUEUED_MESSAGE_NOW));
+        assert!(queue_action_needs_host(methods::REMOVE_QUEUED_MESSAGE));
         assert!(queue_action_needs_host(methods::BEGIN_QUEUED_MESSAGE_EDIT));
         assert!(queue_action_needs_host(methods::RENEW_QUEUED_MESSAGE_EDIT));
         assert!(queue_action_needs_host(methods::FINISH_QUEUED_MESSAGE_EDIT));
         assert!(!queue_action_needs_host(methods::QUEUE_MESSAGE));
         assert!(!queue_action_needs_host(methods::UPDATE_QUEUED_MESSAGE));
         assert!(!queue_action_needs_host(methods::MOVE_QUEUED_MESSAGE));
-        assert!(!queue_action_needs_host(methods::REMOVE_QUEUED_MESSAGE));
     }
 
     #[test]

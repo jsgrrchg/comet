@@ -3734,6 +3734,9 @@ pub struct Composer {
     pub(crate) queue_edit_focus_pending: bool,
     /// Live drag over the queue panel: which row, and where it would land.
     pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
+    /// Rows awaiting a host-authoritative removal acknowledgement. They stay
+    /// visible but inert until the host wins the race against queue delivery.
+    pub(crate) queue_removing: HashSet<String>,
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
@@ -3929,6 +3932,7 @@ impl Composer {
             queue_edit_inline_focus_pending: false,
             queue_edit_focus_pending: false,
             queue_drag: None,
+            queue_removing: HashSet::new(),
             queue_shortcut_revealed: false,
             expanded_mode: false,
             flip_epoch: 0,
@@ -5001,6 +5005,8 @@ impl Composer {
                     Indicator::Working | Indicator::AwaitingInput
                 )
             });
+            self.queue_removing
+                .retain(|id| state.queue.iter().any(|item| item.id == *id));
         }
         self.interrupt_tasks
             .retain(|chat_id, _| self.interrupting.contains(chat_id));

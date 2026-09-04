@@ -61,7 +61,6 @@ icon_assets![
     // language of the supplied Central Icons reference without changing
     // shared application glyphs or copying third-party artwork.
     (QUEUE_DRAG_HANDLE, "queue-drag-handle"),
-    (QUEUE_STEER, "queue-steer"),
     (QUEUE_SEND, "queue-send"),
     (QUEUE_CHECK, "queue-check"),
     (QUEUE_CLOSE, "queue-close"),

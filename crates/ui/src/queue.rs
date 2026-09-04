@@ -105,10 +105,10 @@ impl QueuePrimaryAction {
         }
     }
 
-    fn glyph(self) -> &'static str {
+    fn glyph(self) -> Option<&'static str> {
         match self {
-            Self::Steer => icons::QUEUE_STEER,
-            Self::SendNow => icons::QUEUE_SEND,
+            Self::Steer => None,
+            Self::SendNow => Some(icons::QUEUE_SEND),
         }
     }
 }
@@ -678,12 +678,14 @@ impl Composer {
             })
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(action.label())
-            .child(
-                icon(action.glyph())
-                    .size(px(QUEUE_ICON_SIZE))
-                    .text_color(theme.text_muted.opacity(0.72))
-                    .group_hover(own, |s| s.text_color(theme.text)),
-            )
+            .when_some(action.glyph(), |el, glyph| {
+                el.child(
+                    icon(glyph)
+                        .size(px(QUEUE_ICON_SIZE))
+                        .text_color(theme.text_muted.opacity(0.72))
+                        .group_hover(own, |s| s.text_color(theme.text)),
+                )
+            })
             .into_any_element()
     }
 

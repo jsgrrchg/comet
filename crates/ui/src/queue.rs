@@ -71,18 +71,16 @@ impl Render for QueueActionTooltip {
     }
 }
 
-/// Each queued prompt is a compact raised card inside the outlined queue.
-const ROW_HEIGHT: f32 = 38.0;
-const ROW_GAP: f32 = 6.0;
+/// Compact, borderless rows inside the queue's single glass surface.
+const ROW_HEIGHT: f32 = 34.0;
+const ROW_GAP: f32 = 2.0;
 const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
-const ROW_PAD_X: f32 = 10.0;
+const ROW_PAD_X: f32 = 8.0;
 const LEAD: f32 = 14.0;
-const PANEL_RADIUS: f32 = 14.0;
-/// The body begins one pixel before the open-bottom tab ends, so the tab's
-/// fill masks the body's top border and both read as one continuous outline.
-const PANEL_TAB_HEIGHT: f32 = 27.0;
-const PANEL_TOP_PAD: f32 = PANEL_TAB_HEIGHT - 1.0;
-const BODY_ROWS_PAD_TOP: f32 = 13.0;
+const PANEL_RADIUS: f32 = 18.0;
+const PANEL_PAD_TOP: f32 = 6.0;
+const PANEL_HEADER_HEIGHT: f32 = 22.0;
+const PANEL_ROWS_TOP: f32 = PANEL_PAD_TOP + PANEL_HEADER_HEIGHT;
 
 /// The single trailing action a queue row advertises and executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,11 +150,10 @@ fn queue_head_shortcut_visible(
     index == 0 && reveal_requested && action_available
 }
 
-/// Translate a pointer inside the whole outlined panel into a row slot. The
-/// label and the body's top padding both belong to slot zero; the bottom pad
-/// clamps to the final row.
+/// Translate a pointer inside the whole panel into a row slot. The quiet
+/// header belongs to slot zero; the bottom pad clamps to the final row.
 fn queue_drop_index(panel_y: f32, count: usize) -> usize {
-    drop_index(panel_y - PANEL_TOP_PAD - BODY_ROWS_PAD_TOP, ROW_SLOT, count)
+    drop_index(panel_y - PANEL_ROWS_TOP, ROW_SLOT, count)
 }
 
 /// Paint-only start and target positions for the PR #90 reorder treatment.
@@ -242,9 +239,9 @@ pub fn queue_label(count: usize) -> Option<String> {
 }
 
 impl Composer {
-    /// The queue panel, or `None` when nothing is waiting. Its legend sits in
-    /// the outline like a fieldset, keeping it visually separate from the
-    /// composer pill below.
+    /// The queue panel, or `None` when nothing is waiting. Like the composer,
+    /// it is one frosted surface; rows use spacing and hover wash rather than
+    /// nesting raised cards inside it.
     pub(crate) fn render_queue_panel(
         &mut self,
         show_head_shortcut: bool,
@@ -295,48 +292,34 @@ impl Composer {
                 )
             }));
 
-        let body = div()
+        let header = div()
+            .h(px(PANEL_HEADER_HEIGHT))
+            .px(px(ROW_PAD_X))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(10.5))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text_muted.opacity(0.62))
+            .child(
+                icon(icons::LIST)
+                    .size(px(11.0))
+                    .text_color(theme.text_muted.opacity(0.56)),
+            )
+            .child(SharedString::from(label));
+        let panel = div()
             .rounded(px(PANEL_RADIUS))
             .bg(theme.input_glass_bg())
             .border_1()
             .border_color(theme.border)
-            .when(!theme.is_glass(), |el| el.shadow_lg())
+            .when(!theme.is_frost(), |el| el.shadow_lg())
             .px(px(8.0))
-            .pt(px(BODY_ROWS_PAD_TOP))
+            .pt(px(PANEL_PAD_TOP))
             .pb(px(8.0))
-            .child(rows);
-        // Open-bottom tab joined to the body's top edge. A fully-rounded,
-        // independently-filled pill here reads as an object laid on top; the
-        // reference is one notched silhouette shared by tab and body.
-        let legend = div()
-            .absolute()
-            .top_0()
-            .left(px(12.0))
-            .h(px(PANEL_TAB_HEIGHT))
-            .px(px(10.0))
             .flex()
-            .items_center()
-            .gap(px(6.0))
-            .rounded_t(px(9.0))
-            .border_t_1()
-            .border_l_1()
-            .border_r_1()
-            .border_color(theme.border)
-            .bg(theme.input_glass_bg())
-            .text_size(px(11.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_muted.opacity(0.78))
-            .child(
-                icon(icons::LIST)
-                    .size(px(12.0))
-                    .text_color(theme.text_muted.opacity(0.68)),
-            )
-            .child(SharedString::from(label));
-        let panel = div()
-            .relative()
-            .pt(px(PANEL_TOP_PAD))
-            // The complete outlined panel is a drop target, not just the
-            // surviving row hitboxes. This includes the legend and padding.
+            .flex_col()
+            // The complete glass surface is a drop target, including its
+            // header and padding.
             .on_drag_move::<QueueDragPayload>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<QueueDragPayload>, _, cx| {
                     let payload = event.drag(cx);
@@ -369,8 +352,8 @@ impl Composer {
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.cancel_queue_drag(cx)),
             )
-            .child(body)
-            .child(crate::frost::layered(legend));
+            .child(header)
+            .child(rows);
         Some(crate::frost::frosted(PANEL_RADIUS, 16.0, panel).into_any_element())
     }
 
@@ -474,7 +457,7 @@ impl Composer {
             .justify_center()
             .rounded(px(4.0))
             .cursor_pointer()
-            .when(being_edited || delivery_blocked, |el| {
+            .when(delivery_blocked, |el| {
                 el.cursor(gpui::CursorStyle::Arrow).opacity(0.35)
             })
             .child(
@@ -492,13 +475,10 @@ impl Composer {
             .flex_row()
             .items_center()
             .gap(px(8.0))
-            .rounded(px(9.0))
-            .border_1()
-            .border_color(theme.border.opacity(0.72))
-            .bg(theme.surface_raised.opacity(0.72))
-            .when(being_edited, |el| el.bg(crate::theme::ink(0.08)))
+            .rounded(px(8.0))
+            .when(being_edited, |el| el.bg(crate::theme::ink(0.06)))
             .when(!being_edited, |el| {
-                el.hover(|s| s.bg(theme.surface_raised_hover.opacity(0.78)))
+                el.hover(|s| s.bg(crate::theme::ink(0.04)))
             })
             .cursor(gpui::CursorStyle::Arrow)
             // Keep the grip as the visual affordance, but retain the proven
@@ -516,7 +496,10 @@ impl Composer {
                     },
                 )
             })
-            .child(drag_handle)
+            .when(!being_edited, |el| el.child(drag_handle))
+            // Preserve text alignment while removing the disabled drag glyph
+            // from the editing state.
+            .when(being_edited, |el| el.child(div().w(px(14.0)).flex_none()))
             .child(
                 div()
                     .w(px(LEAD))
@@ -545,15 +528,10 @@ impl Composer {
                         .id(SharedString::from(format!("{key}-editor")))
                         .flex_1()
                         .min_w_0()
-                        .h(px(26.0))
-                        .px(px(6.0))
+                        .h(px(24.0))
                         .flex()
                         .items_center()
                         .overflow_hidden()
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(theme.border.opacity(0.82))
-                        .bg(theme.bg.opacity(0.38))
                         .child(self.queue_edit_input.clone()),
                 )
             })
@@ -1292,10 +1270,9 @@ mod tests {
     use zeron_rpc::methods;
 
     use super::{
-        BODY_ROWS_PAD_TOP, PANEL_TOP_PAD, QueuePrimaryAction, ROW_SLOT,
-        available_queue_primary_action, one_line, queue_action_needs_host, queue_drag_offsets,
-        queue_drop_index, queue_head_shortcut_visible, queue_label, queue_mutation_acknowledged,
-        queue_primary_action, queue_visible_text,
+        PANEL_ROWS_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action, one_line,
+        queue_action_needs_host, queue_drag_offsets, queue_drop_index, queue_head_shortcut_visible,
+        queue_label, queue_mutation_acknowledged, queue_primary_action, queue_visible_text,
     };
 
     #[test]
@@ -1385,15 +1362,9 @@ mod tests {
 
     #[test]
     fn the_whole_panel_maps_to_a_clamped_queue_drop_slot() {
-        assert_eq!(queue_drop_index(0.0, 2), 0, "legend targets the head");
-        assert_eq!(
-            queue_drop_index(PANEL_TOP_PAD + BODY_ROWS_PAD_TOP + ROW_SLOT - 0.1, 2),
-            0
-        );
-        assert_eq!(
-            queue_drop_index(PANEL_TOP_PAD + BODY_ROWS_PAD_TOP + ROW_SLOT, 2),
-            1
-        );
+        assert_eq!(queue_drop_index(0.0, 2), 0, "header targets the head");
+        assert_eq!(queue_drop_index(PANEL_ROWS_TOP + ROW_SLOT - 0.1, 2), 0);
+        assert_eq!(queue_drop_index(PANEL_ROWS_TOP + ROW_SLOT, 2), 1);
         assert_eq!(queue_drop_index(10_000.0, 2), 1);
     }
 

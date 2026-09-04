@@ -57,6 +57,8 @@ pub const TEXTAREA_MAX: f32 = 260.0;
 pub const ACTIONS_ROW_HEIGHT: f32 = 46.0;
 /// The pill's 1px hairline, top + bottom (`rounded-[26px] border`).
 pub const PILL_BORDER_V: f32 = 2.0;
+/// Corner radius shared by the composer and the queue tray behind it.
+pub(crate) const COMPOSER_RADIUS: f32 = 26.0;
 /// Expanded composer bounds, border-box: 76 + 46 + 2 = 124 when empty (the
 /// new-chat canvas), 260 + 46 + 2 = 308 at the content cap.
 pub const COMPOSER_MIN_HEIGHT: f32 = TEXTAREA_MIN + ACTIONS_ROW_HEIGHT + PILL_BORDER_V;
@@ -67,6 +69,11 @@ pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BO
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
 /// `max-w-3xl`: stable outer width of the centered composer column.
 const COMPOSER_MAX_WIDTH: f32 = 768.0;
+/// The queue reads as a narrower tray emerging from behind the composer.
+const QUEUE_SIDE_INSET: f32 = 16.0;
+/// The composer covers the tray's lower padding so the queue reads as emerging
+/// from behind it instead of as a separate rounded pill.
+pub(crate) const QUEUE_COMPOSER_OVERLAP: f32 = 18.0;
 /// Ignore subpixel noise when the shell reports the conversation width.
 const COMPOSER_WIDTH_EPSILON: f32 = 0.5;
 /// Below this pill input width the composer always expands.
@@ -6139,7 +6146,7 @@ impl Composer {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_wizard_key(event, window, cx)
             }))
-            .rounded(px(26.0))
+            .rounded(px(COMPOSER_RADIUS))
             .border_1()
             .border_color(theme.border)
             .bg(theme.input_glass_bg())
@@ -6607,7 +6614,17 @@ impl Render for Composer {
             );
         let container = container.when_some(
             self.render_queue_panel(show_queue_head_shortcut, cx),
-            |el, panel| el.child(motion::fade_quick("composer-queue", div().child(panel))),
+            |el, panel| {
+                el.child(motion::fade_quick(
+                    "composer-queue",
+                    div()
+                        .mx(px(QUEUE_SIDE_INSET))
+                        // Cancel the column gap, then tuck the tray one pixel
+                        // behind the composer painted after it.
+                        .mb(px(-(Theme::SPACE_SM + QUEUE_COMPOSER_OVERLAP)))
+                        .child(panel),
+                ))
+            },
         );
         // Escape backs out of a queue-row edit (the row keeps its old text).
         // Bound here rather than in the input: the input's own Escape belongs
@@ -6705,7 +6722,7 @@ impl Render for Composer {
         // shows through as an inner glow (theme.rs's card_selected_shadows
         // lesson; user report).
         let pill = div()
-            .rounded(px(26.0))
+            .rounded(px(COMPOSER_RADIUS))
             .bg(pill_bg)
             .border_1()
             .border_color(theme.border)
@@ -6860,7 +6877,7 @@ impl Render for Composer {
             div()
                 .relative()
                 .child(crate::frost::frosted(
-                    26.0,
+                    COMPOSER_RADIUS,
                     16.0,
                     motion::fade_quick("composer-input", body),
                 ))

@@ -17,7 +17,7 @@ use gpui::{
 use zeron_doc::{QueueDeliveryGate, QueuedMessage};
 use zeron_rpc::methods;
 
-use crate::composer::Composer;
+use crate::composer::{COMPOSER_RADIUS, Composer, QUEUE_COMPOSER_OVERLAP};
 use crate::icons::{self, icon};
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::settings::shortcuts::modifier_send_label;
@@ -72,15 +72,12 @@ impl Render for QueueActionTooltip {
 }
 
 /// Compact, borderless rows inside the queue's single glass surface.
-const ROW_HEIGHT: f32 = 34.0;
-const ROW_GAP: f32 = 2.0;
+const ROW_HEIGHT: f32 = 38.0;
+const ROW_GAP: f32 = 6.0;
 const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
 const ROW_PAD_X: f32 = 8.0;
-const LEAD: f32 = 14.0;
-const PANEL_RADIUS: f32 = 18.0;
-const PANEL_PAD_TOP: f32 = 6.0;
-const PANEL_HEADER_HEIGHT: f32 = 22.0;
-const PANEL_ROWS_TOP: f32 = PANEL_PAD_TOP + PANEL_HEADER_HEIGHT;
+const PANEL_RADIUS: f32 = COMPOSER_RADIUS;
+const PANEL_PAD_TOP: f32 = 8.0;
 
 /// The single trailing action a queue row advertises and executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,10 +147,10 @@ fn queue_head_shortcut_visible(
     index == 0 && reveal_requested && action_available
 }
 
-/// Translate a pointer inside the whole panel into a row slot. The quiet
-/// header belongs to slot zero; the bottom pad clamps to the final row.
+/// Translate a pointer inside the whole panel into a row slot. The top pad
+/// belongs to slot zero; the bottom pad clamps to the final row.
 fn queue_drop_index(panel_y: f32, count: usize) -> usize {
-    drop_index(panel_y - PANEL_ROWS_TOP, ROW_SLOT, count)
+    drop_index(panel_y - PANEL_PAD_TOP, ROW_SLOT, count)
 }
 
 /// Paint-only start and target positions for the PR #90 reorder treatment.
@@ -230,14 +227,6 @@ fn queue_visible_text(text: &str, attachments: &[String]) -> String {
     }
 }
 
-/// The fieldset-style legend shown on the queue's top edge.
-pub fn queue_label(count: usize) -> Option<String> {
-    match count {
-        0 => None,
-        n => Some(format!("Queue {n}")),
-    }
-}
-
 impl Composer {
     /// The queue panel, or `None` when nothing is waiting. Like the composer,
     /// it is one frosted surface; rows use spacing and hover wash rather than
@@ -261,7 +250,9 @@ impl Composer {
             );
             (state.queue.clone(), chat_id, host_supports_actions)
         };
-        let label = queue_label(items.len())?;
+        if items.is_empty() {
+            return None;
+        }
         let theme = Theme::of(cx).clone();
         let count = items.len();
         let drag = self
@@ -292,34 +283,22 @@ impl Composer {
                 )
             }));
 
-        let header = div()
-            .h(px(PANEL_HEADER_HEIGHT))
-            .px(px(ROW_PAD_X))
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .text_size(px(10.5))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text_muted.opacity(0.62))
-            .child(
-                icon(icons::LIST)
-                    .size(px(11.0))
-                    .text_color(theme.text_muted.opacity(0.56)),
-            )
-            .child(SharedString::from(label));
         let panel = div()
-            .rounded(px(PANEL_RADIUS))
+            .rounded_t(px(PANEL_RADIUS))
             .bg(theme.input_glass_bg())
             .border_1()
             .border_color(theme.border)
             .when(!theme.is_frost(), |el| el.shadow_lg())
             .px(px(8.0))
             .pt(px(PANEL_PAD_TOP))
-            .pb(px(8.0))
+            // This padding sits behind the composer; keeping it equal to the
+            // overlap protects the final row while hiding the tray's bottom
+            // edge and corners.
+            .pb(px(QUEUE_COMPOSER_OVERLAP))
             .flex()
             .flex_col()
             // The complete glass surface is a drop target, including its
-            // header and padding.
+            // padding.
             .on_drag_move::<QueueDragPayload>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<QueueDragPayload>, _, cx| {
                     let payload = event.drag(cx);
@@ -352,13 +331,12 @@ impl Composer {
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| this.cancel_queue_drag(cx)),
             )
-            .child(header)
             .child(rows);
         Some(crate::frost::frosted(PANEL_RADIUS, 16.0, panel).into_any_element())
     }
 
-    /// One queued message: a drag grip, its place in line, the text, quiet edit
-    /// controls, and one explicit primary delivery action.
+    /// One queued message: a quiet queue marker, the text, edit controls, and
+    /// one explicit primary delivery action.
     #[allow(clippy::too_many_arguments)]
     fn queue_row(
         &self,
@@ -402,7 +380,7 @@ impl Composer {
             &key,
             "drop",
             "Remove",
-            icons::CLOSE,
+            icons::TRASH_BIN_MINIMALISTIC,
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.remove_queued(drop_id.clone(), cx);
@@ -447,7 +425,7 @@ impl Composer {
         );
 
         let drag_chat = chat_id.to_string();
-        let drag_handle = div()
+        let queue_marker = div()
             .id(SharedString::from(format!("{key}-drag")))
             .w(px(14.0))
             .h(px(22.0))
@@ -481,9 +459,9 @@ impl Composer {
                 el.hover(|s| s.bg(crate::theme::ink(0.04)))
             })
             .cursor(gpui::CursorStyle::Arrow)
-            // Keep the grip as the visual affordance, but retain the proven
-            // full-row drag hitbox. Editing disables it so text selection can
-            // never accidentally become a reorder gesture.
+            // The marker hints that the row belongs to the queue, while the
+            // proven full-row drag hitbox keeps reordering easy. Editing
+            // disables it so selection cannot become a reorder gesture.
             .when(!being_edited && !delivery_blocked, |el| {
                 el.on_drag(
                     QueueDragPayload {
@@ -496,21 +474,10 @@ impl Composer {
                     },
                 )
             })
-            .when(!being_edited, |el| el.child(drag_handle))
+            .when(!being_edited, |el| el.child(queue_marker))
             // Preserve text alignment while removing the disabled drag glyph
             // from the editing state.
             .when(being_edited, |el| el.child(div().w(px(14.0)).flex_none()))
-            .child(
-                div()
-                    .w(px(LEAD))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted.opacity(0.64))
-                    .child(SharedString::from(format!("{}", ix + 1))),
-            )
             .when(!being_edited, |el| {
                 el.child(
                     div()
@@ -563,8 +530,6 @@ impl Composer {
                         .flex_row()
                         .items_center()
                         .gap(px(3.0))
-                        .child(edit)
-                        .child(discard)
                         .when(
                             queue_head_shortcut_visible(
                                 ix,
@@ -578,7 +543,9 @@ impl Composer {
                                 ))
                             },
                         )
-                        .child(primary),
+                        .child(primary)
+                        .child(discard)
+                        .child(edit),
                 )
             });
 
@@ -1270,17 +1237,10 @@ mod tests {
     use zeron_rpc::methods;
 
     use super::{
-        PANEL_ROWS_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action, one_line,
+        PANEL_PAD_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action, one_line,
         queue_action_needs_host, queue_drag_offsets, queue_drop_index, queue_head_shortcut_visible,
-        queue_label, queue_mutation_acknowledged, queue_primary_action, queue_visible_text,
+        queue_mutation_acknowledged, queue_primary_action, queue_visible_text,
     };
-
-    #[test]
-    fn label_counts_or_says_nothing() {
-        assert_eq!(queue_label(0), None);
-        assert_eq!(queue_label(1).as_deref(), Some("Queue 1"));
-        assert_eq!(queue_label(4).as_deref(), Some("Queue 4"));
-    }
 
     #[test]
     fn primary_action_only_promises_steer_when_the_row_can_use_it() {
@@ -1362,9 +1322,9 @@ mod tests {
 
     #[test]
     fn the_whole_panel_maps_to_a_clamped_queue_drop_slot() {
-        assert_eq!(queue_drop_index(0.0, 2), 0, "header targets the head");
-        assert_eq!(queue_drop_index(PANEL_ROWS_TOP + ROW_SLOT - 0.1, 2), 0);
-        assert_eq!(queue_drop_index(PANEL_ROWS_TOP + ROW_SLOT, 2), 1);
+        assert_eq!(queue_drop_index(0.0, 2), 0, "top pad targets the head");
+        assert_eq!(queue_drop_index(PANEL_PAD_TOP + ROW_SLOT - 0.1, 2), 0);
+        assert_eq!(queue_drop_index(PANEL_PAD_TOP + ROW_SLOT, 2), 1);
         assert_eq!(queue_drop_index(10_000.0, 2), 1);
     }
 

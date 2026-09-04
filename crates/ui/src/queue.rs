@@ -50,7 +50,10 @@ const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
 const ROW_PAD_X: f32 = 10.0;
 const LEAD: f32 = 14.0;
 const PANEL_RADIUS: f32 = 14.0;
-const PANEL_TOP_PAD: f32 = 8.0;
+/// The body begins one pixel before the open-bottom tab ends, so the tab's
+/// fill masks the body's top border and both read as one continuous outline.
+const PANEL_TAB_HEIGHT: f32 = 27.0;
+const PANEL_TOP_PAD: f32 = PANEL_TAB_HEIGHT - 1.0;
 const BODY_ROWS_PAD_TOP: f32 = 13.0;
 
 /// The single trailing action a queue row advertises and executes.
@@ -213,25 +216,30 @@ impl Composer {
             .pt(px(BODY_ROWS_PAD_TOP))
             .pb(px(8.0))
             .child(rows);
+        // Open-bottom tab joined to the body's top edge. A fully-rounded,
+        // independently-filled pill here reads as an object laid on top; the
+        // reference is one notched silhouette shared by tab and body.
         let legend = div()
             .absolute()
             .top_0()
             .left(px(12.0))
-            .h(px(20.0))
-            .px(px(8.0))
+            .h(px(PANEL_TAB_HEIGHT))
+            .px(px(10.0))
             .flex()
             .items_center()
-            .gap(px(5.0))
-            .rounded(px(7.0))
-            .border_1()
+            .gap(px(6.0))
+            .rounded_t(px(9.0))
+            .border_t_1()
+            .border_l_1()
+            .border_r_1()
             .border_color(theme.border)
-            .bg(theme.surface_overlay)
-            .text_size(px(10.5))
+            .bg(theme.input_glass_bg())
+            .text_size(px(11.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(theme.text_muted.opacity(0.78))
             .child(
                 icon(icons::LIST)
-                    .size(px(11.0))
+                    .size(px(12.0))
                     .text_color(theme.text_muted.opacity(0.68)),
             )
             .child(SharedString::from(label));

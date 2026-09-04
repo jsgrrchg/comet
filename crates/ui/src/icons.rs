@@ -56,6 +56,18 @@ icon_assets![
     (SORT_VERTICAL, "sort-vertical"),
     // Compact six-dot grip used to reorder queued prompts.
     (DRAG_HANDLE, "drag-handle"),
+    // Original queue-only line family: 24px canvas, 1.5px round strokes and
+    // medium-radius geometry. Kept separate so the queue can adopt the visual
+    // language of the supplied Central Icons reference without changing
+    // shared application glyphs or copying third-party artwork.
+    (QUEUE_DRAG_HANDLE, "queue-drag-handle"),
+    (QUEUE_STEER, "queue-steer"),
+    (QUEUE_SEND, "queue-send"),
+    (QUEUE_EDIT, "queue-edit"),
+    (QUEUE_TRASH, "queue-trash"),
+    (QUEUE_CHECK, "queue-check"),
+    (QUEUE_CLOSE, "queue-close"),
+    (QUEUE_PAPERCLIP, "queue-paperclip"),
     (CLOCK_CIRCLE, "clock-circle"),
     (CALENDAR, "calendar"),
     (LIST, "list"),

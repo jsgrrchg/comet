@@ -78,6 +78,9 @@ const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
 const ROW_PAD_X: f32 = 8.0;
 const PANEL_RADIUS: f32 = COMPOSER_RADIUS;
 const PANEL_PAD_TOP: f32 = 6.0;
+/// The custom 24px queue glyphs have quieter geometry than the legacy set, so
+/// render them slightly larger to preserve the previous optical weight.
+const QUEUE_ICON_SIZE: f32 = 13.0;
 
 /// The single trailing action a queue row advertises and executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +106,8 @@ impl QueuePrimaryAction {
 
     fn glyph(self) -> &'static str {
         match self {
-            Self::Steer => icons::RETURN,
-            Self::SendNow => icons::ARROW_RIGHT,
+            Self::Steer => icons::QUEUE_STEER,
+            Self::SendNow => icons::QUEUE_SEND,
         }
     }
 }
@@ -369,7 +372,7 @@ impl Composer {
             &key,
             "edit",
             "Edit",
-            icons::PEN,
+            icons::QUEUE_EDIT,
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.begin_queue_edit(edit_id.clone(), cx);
@@ -380,7 +383,7 @@ impl Composer {
             &key,
             "drop",
             "Remove",
-            icons::TRASH_BIN_MINIMALISTIC,
+            icons::QUEUE_TRASH,
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.remove_queued(drop_id.clone(), cx);
@@ -407,7 +410,7 @@ impl Composer {
             &key,
             "save",
             "Save",
-            icons::CHECK,
+            icons::QUEUE_CHECK,
             theme,
             cx.listener(|this, _, _, cx| {
                 this.commit_queue_edit(cx);
@@ -417,7 +420,7 @@ impl Composer {
             &key,
             "cancel",
             "Cancel",
-            icons::CLOSE,
+            icons::QUEUE_CLOSE,
             theme,
             cx.listener(|this, _, _, cx| {
                 this.cancel_queue_edit(cx);
@@ -439,8 +442,8 @@ impl Composer {
                 el.cursor(gpui::CursorStyle::Arrow).opacity(0.35)
             })
             .child(
-                icon(icons::DRAG_HANDLE)
-                    .size(px(12.0))
+                icon(icons::QUEUE_DRAG_HANDLE)
+                    .size(px(QUEUE_ICON_SIZE))
                     .text_color(theme.text_muted.opacity(0.5)),
             );
 
@@ -505,8 +508,8 @@ impl Composer {
             // Files are why a row can sit through a steerable turn, so say so.
             .when(!item.attachments.is_empty(), |el| {
                 el.child(
-                    crate::icons::icon(crate::icons::PAPERCLIP)
-                        .size(px(11.0))
+                    crate::icons::icon(crate::icons::QUEUE_PAPERCLIP)
+                        .size(px(QUEUE_ICON_SIZE))
                         .text_color(theme.text_muted.opacity(0.7)),
                 )
             })
@@ -604,7 +607,7 @@ impl Composer {
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(glyph)
-                    .size(px(11.0))
+                    .size(px(QUEUE_ICON_SIZE))
                     .text_color(theme.text_muted.opacity(0.8))
                     .group_hover(own, |s| s.text_color(theme.text)),
             )
@@ -657,7 +660,7 @@ impl Composer {
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
                 icon(action.glyph())
-                    .size(px(11.0))
+                    .size(px(QUEUE_ICON_SIZE))
                     .text_color(theme.text_muted.opacity(0.72))
                     .group_hover(own, |s| s.text_color(theme.text)),
             )

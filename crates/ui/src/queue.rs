@@ -545,6 +545,8 @@ impl Composer {
                         .flex_row()
                         .items_center()
                         .gap(px(3.0))
+                        .child(discard)
+                        .child(edit)
                         .when(
                             queue_head_shortcut_visible(
                                 ix,
@@ -558,9 +560,7 @@ impl Composer {
                                 ))
                             },
                         )
-                        .child(primary)
-                        .child(discard)
-                        .child(edit),
+                        .child(primary),
                 )
             });
 
@@ -655,6 +655,7 @@ impl Composer {
             .flex_none()
             .px(px(6.0))
             .flex()
+            .flex_row()
             .items_center()
             .gap(px(4.0))
             .rounded(px(6.0))
@@ -676,13 +677,13 @@ impl Composer {
                 .into()
             })
             .tooltip_show_delay(std::time::Duration::from_millis(350))
+            .child(action.label())
             .child(
                 icon(action.glyph())
                     .size(px(QUEUE_ICON_SIZE))
                     .text_color(theme.text_muted.opacity(0.72))
                     .group_hover(own, |s| s.text_color(theme.text)),
             )
-            .child(action.label())
             .into_any_element()
     }
 

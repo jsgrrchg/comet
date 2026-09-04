@@ -483,6 +483,18 @@ fn editor_overlay_layout(editor: &super::editor::FileEditorState) -> Option<Edit
     })
 }
 
+fn file_highlight_result_is_current(
+    document: &FileDocument,
+    document_key: &DocumentKey,
+    generation: u64,
+    revision: u64,
+    content_hash: &str,
+) -> bool {
+    document.accepts(document_key, generation)
+        && document.revision == revision
+        && document.content_hash() == Some(content_hash)
+}
+
 fn renamed_document_path(path: &str, old_path: &str, new_path: &str) -> Option<String> {
     if path == old_path {
         Some(new_path.to_string())
@@ -956,11 +968,11 @@ impl FilesSurface {
         let Some(language) = zeron_syntax::language_for_path(&path) else {
             return;
         };
-        let Some((document_key, generation)) = self
+        let Some((document_key, generation, revision)) = self
             .preview
             .documents
             .get(&path)
-            .map(|document| (document.key.clone(), document.generation))
+            .map(|document| (document.key.clone(), document.generation, document.revision))
         else {
             return;
         };
@@ -1007,8 +1019,13 @@ impl FilesSurface {
                     .documents
                     .get_mut(&highlight_path)
                     .is_some_and(|document| {
-                        let current = document.accepts(&task_document_key, generation)
-                            && document.content_hash() == Some(content_hash.as_str());
+                        let current = file_highlight_result_is_current(
+                            document,
+                            &task_document_key,
+                            generation,
+                            revision,
+                            &content_hash,
+                        );
                         if current {
                             document.highlight_task = None;
                         }
@@ -2887,16 +2904,28 @@ mod tests {
         let stale_highlight_key =
             DocumentHighlightKey::new(zeron_syntax::LanguageId::Rust, stale_source);
 
+        assert!(file_highlight_result_is_current(
+            &document,
+            &task_document_key,
+            task_generation,
+            task_revision,
+            disk_hash,
+        ));
+
         document.mark_user_edit();
         let current_highlight_key =
             DocumentHighlightKey::new(zeron_syntax::LanguageId::Rust, updated_source);
 
         assert_ne!(document.revision, task_revision);
         assert_ne!(current_highlight_key, stale_highlight_key);
-        let accepted_by_completion_guard = document.accepts(&task_document_key, task_generation)
-            && document.content_hash() == Some(disk_hash);
         assert!(
-            !accepted_by_completion_guard,
+            !file_highlight_result_is_current(
+                &document,
+                &task_document_key,
+                task_generation,
+                task_revision,
+                disk_hash,
+            ),
             "highlight for revision {task_revision} was accepted at revision {} after the editor source changed from {stale_source:?} to {updated_source:?}",
             document.revision
         );

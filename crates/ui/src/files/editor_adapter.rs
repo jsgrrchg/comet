@@ -142,6 +142,10 @@ pub(super) fn install_highlighter(
     document: Arc<HighlightedDocument>,
     cx: &mut gpui::App,
 ) {
+    let editor_source = editor.read(cx).value();
+    if !highlight_source_matches_editor(&source, &editor_source) {
+        return;
+    }
     editor.update(cx, |state, cx| {
         state.set_highlighter_factory(
             Rc::new(move |_| {
@@ -150,6 +154,10 @@ pub(super) fn install_highlighter(
             cx,
         );
     });
+}
+
+fn highlight_source_matches_editor(highlight_source: &str, editor_source: &str) -> bool {
+    highlight_source == editor_source
 }
 
 fn absolute_spans(
@@ -308,7 +316,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_highlight_ranges_remain_utf8_boundaries_after_text_changes() {
+    fn stale_highlight_ranges_are_rejected_before_updated_unicode_is_shaped() {
         let stale_source = "ab";
         let stale_document = highlighted(
             stale_source,
@@ -323,15 +331,12 @@ mod tests {
         };
         let updated_text = "é";
 
-        let runs = highlighter.styles(&(0..updated_text.len()), &resolver);
+        let stale_runs = highlighter.styles(&(0..updated_text.len()), &resolver);
 
-        assert!(
-            runs.iter().all(|(range, _)| {
-                updated_text.is_char_boundary(range.start)
-                    && updated_text.is_char_boundary(range.end)
-            }),
-            "stale highlight produced ranges that split updated UTF-8 text: {runs:?}"
-        );
+        assert!(stale_runs.iter().any(|(range, _)| {
+            !updated_text.is_char_boundary(range.start) || !updated_text.is_char_boundary(range.end)
+        }));
+        assert!(!highlight_source_matches_editor(stale_source, updated_text));
     }
 
     #[test]

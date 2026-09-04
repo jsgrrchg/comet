@@ -23,6 +23,16 @@ use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::terminal::panel::{drop_index, slide_offset};
 use crate::theme::Theme;
 
+/// Queue rows are replicated CRDT state, so ordinary mutations deliberately
+/// land on the local engine. Only operations that hand a row to the agent must
+/// execute on the chat's owning device.
+fn queue_action_needs_host(method: &str) -> bool {
+    matches!(
+        method,
+        methods::SEND_QUEUED_MESSAGE_NOW | methods::STEER_QUEUED_MESSAGE_NOW
+    )
+}
+
 struct QueueActionTooltip {
     label: SharedString,
 }
@@ -832,12 +842,22 @@ impl Composer {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
-            return;
+        let (chat_id, host_device_id) = {
+            let state = self.state.read(cx);
+            let Some(chat_id) = state.selected_chat.clone() else {
+                return;
+            };
+            let host = queue_action_needs_host(method)
+                .then(|| state.selected_chat_row().map(|chat| chat.device_id.clone()))
+                .flatten();
+            (chat_id, host)
         };
         let mut params = params;
         if let Some(object) = params.as_object_mut() {
             object.insert("chatId".into(), serde_json::Value::String(chat_id));
+            if let Some(host) = host_device_id {
+                object.insert("targetDeviceId".into(), serde_json::Value::String(host));
+            }
         }
         // Detached, not held: these are independent one-shot mutations, and
         // parking them in a single slot meant the next arrow tap dropped — and
@@ -859,9 +879,12 @@ impl Composer {
 
 #[cfg(test)]
 mod tests {
+    use zeron_rpc::methods;
+
     use super::{
         BODY_ROWS_PAD_TOP, PANEL_TOP_PAD, QueuePrimaryAction, ROW_SLOT, one_line,
-        queue_drag_offsets, queue_drop_index, queue_label, queue_primary_action,
+        queue_action_needs_host, queue_drag_offsets, queue_drop_index, queue_label,
+        queue_primary_action,
     };
 
     #[test]
@@ -886,6 +909,16 @@ mod tests {
             queue_primary_action(Some(true), true),
             Some(QueuePrimaryAction::SendNow)
         );
+    }
+
+    #[test]
+    fn only_agent_execution_actions_route_to_the_host() {
+        assert!(queue_action_needs_host(methods::SEND_QUEUED_MESSAGE_NOW));
+        assert!(queue_action_needs_host(methods::STEER_QUEUED_MESSAGE_NOW));
+        assert!(!queue_action_needs_host(methods::QUEUE_MESSAGE));
+        assert!(!queue_action_needs_host(methods::UPDATE_QUEUED_MESSAGE));
+        assert!(!queue_action_needs_host(methods::MOVE_QUEUED_MESSAGE));
+        assert!(!queue_action_needs_host(methods::REMOVE_QUEUED_MESSAGE));
     }
 
     #[test]

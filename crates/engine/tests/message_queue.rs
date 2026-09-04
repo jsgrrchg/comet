@@ -846,6 +846,39 @@ async fn queue_rpc_reorders_and_streams() {
     core.shutdown().await;
 }
 
+/// Even a malformed or version-skewed UI must not make a non-host engine take
+/// a shared queue row and start the chat on the wrong machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_queue_delivery_is_rejected_off_host_without_taking_the_row() {
+    let (core, harness, _prompts) = setup(SteeringMode::StepBoundary).await;
+    core.workspace
+        .set_chat_host(CHAT, "device-remote")
+        .expect("move chat host");
+    let id = core
+        .doc_host
+        .queue_message_with_behavior(CHAT, "remote-only", Vec::new(), true)
+        .expect("queue held row");
+
+    let send_error = core
+        .doc_host
+        .send_queued_now(CHAT, &id)
+        .await
+        .expect_err("non-host send-now must fail");
+    assert!(send_error.to_string().contains("does not host chat"));
+    assert_eq!(queue_texts(&core), vec!["remote-only"]);
+
+    let steer_error = core
+        .doc_host
+        .steer_queued_now(CHAT, &id)
+        .await
+        .expect_err("non-host steer-now must fail");
+    assert!(steer_error.to_string().contains("does not host chat"));
+    assert_eq!(queue_texts(&core), vec!["remote-only"]);
+
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
 /// The regression the review caught: `drain_queue` runs from both the
 /// doc-change task and the turn-end status watcher, and there is nothing about
 /// those two callers that keeps them apart. Driven concurrently against an idle

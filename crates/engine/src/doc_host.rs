@@ -2341,6 +2341,12 @@ impl DocHost {
     /// only when the selected provider cannot steer the row. `false` when
     /// another device already took it.
     pub async fn send_queued_now(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
+        if !self.is_host(chat_id) {
+            return Err(EngineError::Other(format!(
+                "device {} does not host chat {chat_id}",
+                self.inner.config.device_id
+            )));
+        }
         let handle = self.open(chat_id)?;
         // Sending one now sends ONE: the lock keeps the flush out of the idle
         // window the interrupt opens, and out of the take itself.
@@ -2371,6 +2377,12 @@ impl DocHost {
     /// it starts normally as the next turn. Unsupported harnesses and
     /// attachment-bearing rows stay untouched.
     pub async fn steer_queued_now(&self, chat_id: &str, id: &str) -> Result<bool, EngineError> {
+        if !self.is_host(chat_id) {
+            return Err(EngineError::Other(format!(
+                "device {} does not host chat {chat_id}",
+                self.inner.config.device_id
+            )));
+        }
         let handle = self.open(chat_id)?;
         let _drain = handle.drain_lock.lock().await;
         let Some(sessions) = self.sessions() else {

@@ -24,6 +24,8 @@ use crate::schema::{DocError, SessionDoc};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueuedMessage {
+    /// Stable through promotion: the host uses this as the transcript user
+    /// message id when the row is finally dispatched.
     pub id: String,
     /// What the user typed. Never empty — emptying it deletes the row.
     pub text: String,

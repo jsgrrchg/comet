@@ -183,6 +183,23 @@ fn user_messages(core: &EngineCore) -> Vec<String> {
         .collect()
 }
 
+fn user_message_id(core: &EngineCore, text: &str) -> Option<String> {
+    core.doc_host
+        .open(CHAT)
+        .ok()?
+        .doc()
+        .read_entries()
+        .ok()?
+        .into_iter()
+        .find(|entry| {
+            entry.role == MessageRole::User
+                && entry.parts.iter().any(
+                    |part| matches!(part, MessagePart::Text { text: body, .. } if body == text),
+                )
+        })
+        .map(|entry| entry.id)
+}
+
 async fn setup(steering: SteeringMode) -> (EngineCore, Arc<HeldHarness>, Arc<Mutex<Vec<String>>>) {
     setup_with(HeldHarness::new(steering)).await
 }
@@ -236,13 +253,19 @@ async fn setup_with(
 async fn queue_drains_immediately_when_the_agent_is_idle() {
     let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
 
-    core.doc_host
+    let queued_id = core
+        .doc_host
         .queue_message(CHAT, "first", Vec::new())
         .expect("queue message");
 
     wait_for(
         || prompts.lock().unwrap().iter().any(|p| p == "first"),
         "the queued message to dispatch",
+    )
+    .await;
+    wait_for(
+        || user_message_id(&core, "first").as_deref() == Some(queued_id.as_str()),
+        "the queue id to become the transcript message id",
     )
     .await;
     wait_for(|| queue_texts(&core).is_empty(), "the queue to empty").await;
@@ -268,10 +291,12 @@ async fn queue_holds_during_a_turn_and_flushes_in_order_at_its_end() {
     )
     .await;
 
-    core.doc_host
+    let second_id = core
+        .doc_host
         .queue_message(CHAT, "second", Vec::new())
         .expect("queue second");
-    core.doc_host
+    let third_id = core
+        .doc_host
         .queue_message(CHAT, "third", Vec::new())
         .expect("queue third");
 
@@ -287,6 +312,11 @@ async fn queue_holds_during_a_turn_and_flushes_in_order_at_its_end() {
         "the queue to flush at turn end",
     )
     .await;
+    wait_for(
+        || user_message_id(&core, "second").as_deref() == Some(second_id.as_str()),
+        "the held queue id to become the next-turn message id",
+    )
+    .await;
     assert_eq!(
         queue_texts(&core),
         vec!["third"],
@@ -297,6 +327,11 @@ async fn queue_holds_during_a_turn_and_flushes_in_order_at_its_end() {
     wait_for(
         || prompts.lock().unwrap().iter().any(|p| p == "third"),
         "the rest of the queue to flush",
+    )
+    .await;
+    wait_for(
+        || user_message_id(&core, "third").as_deref() == Some(third_id.as_str()),
+        "the next held queue id to remain stable too",
     )
     .await;
     let order = prompts.lock().unwrap().clone();

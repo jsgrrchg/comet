@@ -2512,7 +2512,11 @@ impl DocHost {
             return Err(EngineError::Other("sessions engine not wired".into()));
         };
         let chat_id = &handle.chat_id;
-        let message_id = new_id();
+        // Keep the queue row's identity when it becomes a real user message.
+        // The submitting viewport learns this id from QueueMessage and can
+        // therefore wait without disturbing the active turn's runway, then
+        // anchor the prompt only once this exact row reaches the transcript.
+        let message_id = item.id.clone();
         if send == QueueSend::Steer {
             match sessions
                 .steer(chat_id, &item.text, Some(message_id.clone()))

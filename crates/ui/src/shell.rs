@@ -1408,6 +1408,14 @@ impl Shell {
                         t.on_own_send(chat_id.clone(), message_id.clone(), cx)
                     });
                 }
+                ComposerEvent::Queued {
+                    chat_id,
+                    message_id,
+                } => {
+                    transcript.update(cx, |t, cx| {
+                        t.on_own_queued_send(chat_id.clone(), message_id.clone(), cx)
+                    });
+                }
                 ComposerEvent::WorktreeSetup {
                     chat_id,
                     setup_action,

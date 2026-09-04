@@ -443,6 +443,12 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     }
 }
 
+/// Only a send with an immediate transcript echo may claim the transcript's
+/// own-turn runway. Queue rows wait for their host-side promotion instead.
+fn should_emit_immediate_transcript_send(queue: bool) -> bool {
+    !queue
+}
+
 fn begin_interrupt(pending: &mut HashSet<String>, chat_id: &str) -> bool {
     pending.insert(chat_id.to_string())
 }
@@ -3452,6 +3458,10 @@ pub enum ComposerEvent {
     /// identity so it can anchor the prompt at the top with the reply's
     /// reserved space below it.
     Sent { chat_id: String, message_id: String },
+    /// A locally-authored queue row was accepted. It is not a transcript send
+    /// yet: the transcript remembers the stable id and promotes it to an
+    /// own-turn anchor only when the host materializes the matching bubble.
+    Queued { chat_id: String, message_id: String },
     /// A new worktree's host-side setup attempt completed after its chat id
     /// was minted. The shell attaches an already-open terminal to that exact
     /// chat, even when the user has selected another chat in the meantime.
@@ -5269,17 +5279,22 @@ impl Composer {
         self.drafts.remove(&self.current_key);
         self.failure = None;
         self.sending = true;
-        cx.emit(ComposerEvent::Sent {
-            chat_id: chat_id.clone(),
-            message_id: message_id.clone(),
-        });
+        // A queued row is represented by the queue panel, not the transcript.
+        // Claiming an own-turn anchor for it here would replace the live
+        // turn's runway with an id that has no transcript row yet.
+        if should_emit_immediate_transcript_send(queue) {
+            cx.emit(ComposerEvent::Sent {
+                chat_id: chat_id.clone(),
+                message_id: message_id.clone(),
+            });
+        }
         cx.notify();
 
         let restore_text = typed;
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
-            let result: Result<(), String> = async {
+            let result: Result<Option<String>, String> = async {
                 // Attachments stage FIRST — before the chat row or anything
                 // else exists. Staging is chat-independent (keyed by
                 // uploadId), and ordering it first makes a new-chat send
@@ -5535,12 +5550,17 @@ impl Composer {
                         "attachments": attachment_paths,
                         "holdForTurnEnd": hold_for_turn_end,
                     });
-                    engine
+                    let reply = engine
                         .client()
                         .call(methods::QUEUE_MESSAGE, params)
                         .await
                         .map_err(|e| format!("Send failed: {e}"))?;
-                    return Ok(());
+                    let queue_id = reply
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .ok_or_else(|| "Send failed: queue did not return an id".to_string())?;
+                    return Ok(Some(queue_id.to_string()));
                 }
 
                 let command = SessionCommandPayload::Run {
@@ -5577,7 +5597,7 @@ impl Composer {
                 )
                 .await
                 .map_err(|e| format!("Send failed: {e}"))?;
-                Ok(())
+                Ok(None)
             }
             .await;
             if result.is_err() && is_new {
@@ -5601,6 +5621,12 @@ impl Composer {
                 composer
                     .state
                     .update(cx, |s, _| s.end_upload_progress());
+                if let Ok(Some(message_id)) = &result {
+                    cx.emit(ComposerEvent::Queued {
+                        chat_id: err_chat_id.clone(),
+                        message_id: message_id.clone(),
+                    });
+                }
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
                     // draft, staged files back in the stash. A failed NEW
@@ -7441,6 +7467,12 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Steer);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+    }
+
+    #[test]
+    fn queued_submit_does_not_claim_the_active_transcript_runway() {
+        assert!(should_emit_immediate_transcript_send(false));
+        assert!(!should_emit_immediate_transcript_send(true));
     }
 
     #[test]

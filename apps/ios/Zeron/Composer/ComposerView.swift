@@ -438,7 +438,8 @@ struct ComposerView: View {
             clearDraft()
             return
         }
-        if model.hostSupportsQueuedAttachments(chat) {
+        if model.hostSupportsQueuedAttachments(chat)
+            && !(runLive && model.hostSupportsMessageQueue(chat, attachments: true)) {
             // Queued flow (host ≥ 0.2.12): the send is a durable local write
             // NOW — pending:// refs in the doc, bytes escorted afterwards
             // with retry-forever — so an image send survives a dead link
@@ -502,7 +503,14 @@ struct ComposerView: View {
         // the host's call (DocHost::drain_queue). It sits in the panel above
         // meanwhile, editable, which beats a bubble that looks sent.
         if runLive {
-            store.enqueueMessage(text: content, attachments: paths)
+            if model.hostSupportsMessageQueue(chat, attachments: !paths.isEmpty) {
+                store.enqueueMessage(text: content, attachments: paths, holdForTurnEnd: true)
+            } else {
+                // Same-version upstream and older hosts retain the proven
+                // durable command path instead of receiving an unknown queue
+                // document shape or RPC.
+                store.sendSteer(prompt: content)
+            }
         } else {
             store.sendRun(prompt: content, chat: chat, attachments: paths)
         }

@@ -31,7 +31,8 @@ extension SessionStore {
             attachments: (m["attachments"]?.listValue ?? []).compactMap(\.stringValue),
             issuedBy: m["issuedBy"]?.stringValue ?? "",
             issuedAt: m["issuedAt"]?.i64Value ?? 0,
-            editedAt: m["editedAt"]?.i64Value
+            editedAt: m["editedAt"]?.i64Value,
+            holdForTurnEnd: m["holdForTurnEnd"]?.boolValue ?? false
         )
     }
 
@@ -40,7 +41,8 @@ extension SessionStore {
     /// Park a message on the queue. The host decides where it goes from there —
     /// straight into the running turn, or the front of the next one.
     @discardableResult
-    func enqueueMessage(text: String, attachments: [String] = []) -> String? {
+    func enqueueMessage(text: String, attachments: [String] = [],
+                        holdForTurnEnd: Bool = true) -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let id = UUID().uuidString.lowercased()
@@ -51,6 +53,9 @@ extension SessionStore {
             try map.insert(key: "text", v: text)
             try map.insert(key: "issuedBy", v: deviceId)
             try map.insert(key: "issuedAt", v: nowMs())
+            if holdForTurnEnd {
+                try map.insert(key: "holdForTurnEnd", v: true)
+            }
             if !attachments.isEmpty {
                 try map.insert(key: "attachments", v: LoroValue.fromJSON(attachments))
             }
@@ -126,10 +131,33 @@ extension SessionStore {
                 method: "SendQueuedMessageNow",
                 params: ["chatId": chatId, "id": id]
             )
-            return reply.sent ?? true
+            return reply.sent == true
         } catch {
             roomLog.warning(
                 "chat2 \(self.chatId, privacy: .public): send-now failed for queued \(id, privacy: .public)"
+            )
+            return false
+        }
+    }
+
+    /// Feed one row into the active turn without interrupting it. Like send
+    /// now, taking the row remains host-only and a failed relay leaves it in
+    /// the shared document.
+    @discardableResult
+    func steerQueuedNow(id: String) async -> Bool {
+        struct Reply: Decodable { var sent: Bool? }
+        guard queue.contains(where: { $0.id == id }), let relay = hostRelayClient() else {
+            return false
+        }
+        do {
+            let reply: Reply = try await relay.call(
+                method: "SteerQueuedMessageNow",
+                params: ["chatId": chatId, "id": id]
+            )
+            return reply.sent == true
+        } catch {
+            roomLog.warning(
+                "chat2 \(self.chatId, privacy: .public): steer failed for queued \(id, privacy: .public)"
             )
             return false
         }

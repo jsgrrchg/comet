@@ -19,6 +19,9 @@ struct QueuedMessage: Identifiable, Equatable, Sendable {
     var issuedAt: Int64 = 0
     /// Epoch millis of the last text edit, when there has been one.
     var editedAt: Int64?
+    /// When true, the host must wait for the current turn to end instead of
+    /// opportunistically steering this row into it.
+    var holdForTurnEnd: Bool = false
 }
 
 enum MessageQueue {

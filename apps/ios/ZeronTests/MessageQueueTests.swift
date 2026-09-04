@@ -30,6 +30,7 @@ final class MessageQueueTests: XCTestCase {
         XCTAssertEqual(row.issuedBy, "ios-test")
         XCTAssertGreaterThan(row.issuedAt, 0)
         XCTAssertNil(row.editedAt)
+        XCTAssertTrue(row.holdForTurnEnd)
         // Nothing to send is not a queue row.
         XCTAssertNil(store.enqueueMessage(text: "   "))
         XCTAssertEqual(store.queue.count, 1)
@@ -92,6 +93,16 @@ final class MessageQueueTests: XCTestCase {
         XCTAssertEqual(store.queue[0].id, "q-desktop")
         XCTAssertEqual(store.queue[0].issuedBy, "desktop")
         XCTAssertEqual(store.queue[0].editedAt, 1_700_000_000_500)
+        // Old Desktop rows omitted the field and remain steerable.
+        XCTAssertFalse(store.queue[0].holdForTurnEnd)
+    }
+
+    func testHoldForTurnEndRoundTripsAndCanBeDisabled() {
+        let store = store()
+        _ = store.enqueueMessage(text: "next turn")
+        _ = store.enqueueMessage(text: "steer if possible", holdForTurnEnd: false)
+
+        XCTAssertEqual(store.queue.map(\.holdForTurnEnd), [true, false])
     }
 
     func testLabelsAndNeighbours() {

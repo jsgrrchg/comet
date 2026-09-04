@@ -320,7 +320,7 @@ final class WorkspaceStore {
                              lastSeenAt: f["lastSeenAt"]?.int64Value,
                              createdAt: f["createdAt"]?.int64Value,
                              version: f["version"]?.stringValue,
-                             capabilities: (f["capabilities"]?.listValue ?? [])
+                             capabilities: (f["capabilities"]?.arrayValue ?? [])
                                 .compactMap(\.stringValue))
         }.sorted { $0.name < $1.name }
 

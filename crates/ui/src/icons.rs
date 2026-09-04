@@ -63,8 +63,6 @@ icon_assets![
     (QUEUE_DRAG_HANDLE, "queue-drag-handle"),
     (QUEUE_STEER, "queue-steer"),
     (QUEUE_SEND, "queue-send"),
-    (QUEUE_EDIT, "queue-edit"),
-    (QUEUE_TRASH, "queue-trash"),
     (QUEUE_CHECK, "queue-check"),
     (QUEUE_CLOSE, "queue-close"),
     (QUEUE_PAPERCLIP, "queue-paperclip"),

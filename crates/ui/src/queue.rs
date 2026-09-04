@@ -375,7 +375,7 @@ impl Composer {
             &key,
             "edit",
             "Edit",
-            icons::QUEUE_EDIT,
+            icons::PEN,
             !being_removed,
             theme,
             cx.listener(move |this, _, _, cx| {
@@ -391,7 +391,7 @@ impl Composer {
             } else {
                 "Remove"
             },
-            icons::QUEUE_TRASH,
+            icons::TRASH_BIN_MINIMALISTIC,
             !being_removed,
             theme,
             cx.listener(move |this, _, _, cx| {

@@ -72,12 +72,12 @@ impl Render for QueueActionTooltip {
 }
 
 /// Compact, borderless rows inside the queue's single glass surface.
-const ROW_HEIGHT: f32 = 38.0;
-const ROW_GAP: f32 = 6.0;
+const ROW_HEIGHT: f32 = 36.0;
+const ROW_GAP: f32 = 2.0;
 const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
 const ROW_PAD_X: f32 = 8.0;
 const PANEL_RADIUS: f32 = COMPOSER_RADIUS;
-const PANEL_PAD_TOP: f32 = 8.0;
+const PANEL_PAD_TOP: f32 = 6.0;
 
 /// The single trailing action a queue row advertises and executes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

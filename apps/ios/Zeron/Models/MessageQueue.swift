@@ -56,6 +56,16 @@ enum QueueEditFinishResult: Sendable {
 }
 
 enum MessageQueue {
+    /// Queue text is user-editable and must not expose the attachment transport
+    /// trailer. Strip it only for legacy rows whose parsed paths exactly match
+    /// the separate attachments field.
+    static func visibleText(_ text: String, attachments: [String]) -> String {
+        guard !attachments.isEmpty else { return text }
+        let parsed = parseUserMessageImages(text)
+        guard parsed.attachments.map(\.path) == attachments else { return text }
+        return parsed.text.isEmpty ? attachmentOnlyText : parsed.text
+    }
+
     /// The panel header's aside. Nil when nothing waits.
     static func label(_ count: Int) -> String? {
         switch count {

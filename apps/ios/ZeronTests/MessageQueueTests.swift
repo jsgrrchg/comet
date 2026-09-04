@@ -142,4 +142,23 @@ final class MessageQueueTests: XCTestCase {
         XCTAssertNil(MessageQueue.neighbour(of: 0, direction: -1, count: 3))
         XCTAssertNil(MessageQueue.neighbour(of: 2, direction: 1, count: 3))
     }
+
+    func testLegacyAttachmentTrailerIsNotExposedAsQueueText() {
+        let paths = ["/tmp/image.png"]
+        let legacy = withAttachments(text: "inspect this", paths: paths)
+        XCTAssertEqual(
+            MessageQueue.visibleText(legacy, attachments: paths),
+            "inspect this"
+        )
+
+        let imageOnly = withAttachments(text: "", paths: paths)
+        XCTAssertEqual(
+            MessageQueue.visibleText(imageOnly, attachments: paths),
+            attachmentOnlyText
+        )
+        XCTAssertEqual(
+            MessageQueue.visibleText("literal user text", attachments: paths),
+            "literal user text"
+        )
+    }
 }

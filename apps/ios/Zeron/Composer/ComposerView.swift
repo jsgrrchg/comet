@@ -448,7 +448,7 @@ struct ComposerView: View {
             stashedDraft = text
             queueEditLease = lease
             editingQueuedId = item.id
-            text = lease.text
+            text = MessageQueue.visibleText(lease.text, attachments: item.attachments)
             uploadError = nil
         case .locked:
             uploadError = "That queued message is being edited on another device."
@@ -584,7 +584,10 @@ struct ComposerView: View {
         // meanwhile, editable, which beats a bubble that looks sent.
         if runLive {
             if model.hostSupportsMessageQueue(chat, attachments: !paths.isEmpty) {
-                store.enqueueMessage(text: content, attachments: paths, holdForTurnEnd: true)
+                let queueText = model.hostSupportsCleanQueueAttachmentText(chat)
+                    ? MessageQueue.visibleText(content, attachments: paths)
+                    : content
+                store.enqueueMessage(text: queueText, attachments: paths, holdForTurnEnd: true)
             } else {
                 // Same-version upstream and older hosts retain the proven
                 // durable command path instead of receiving an unknown queue

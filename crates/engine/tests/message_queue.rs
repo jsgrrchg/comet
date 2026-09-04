@@ -670,13 +670,29 @@ async fn a_message_with_attachments_holds_even_for_a_steerable_agent() {
         vec!["with a file"],
         "a message carrying files must not be steered"
     );
+    assert!(
+        user_messages(&core)
+            .iter()
+            .all(|message| !message.contains("with a file")),
+        "a held attachment row must not appear in the transcript before dispatch"
+    );
 
     let _ = harness.finish.send(());
     wait_for(
-        || prompts.lock().unwrap().iter().any(|p| p == "with a file"),
+        || {
+            prompts.lock().unwrap().iter().any(|p| {
+                p == "with a file\n\nAttached images (local files — open them to view):\n- att-1"
+            })
+        },
         "the held message to flush at turn end",
     )
     .await;
+    assert!(
+        user_messages(&core)
+            .iter()
+            .any(|message| message.contains("Attached images (local files")),
+        "the transport trailer is materialized only when the queued row dispatches"
+    );
 
     let _ = harness.finish.send(());
     core.shutdown().await;

@@ -689,6 +689,14 @@ final class AppModel {
         return workspace?.deviceSupports(chat.deviceId, capability) ?? false
     }
 
+    func hostSupportsCleanQueueAttachmentText(_ chat: Chat) -> Bool {
+        guard demo == nil else { return false }
+        return workspace?.deviceSupports(
+            chat.deviceId,
+            EngineCapability.messageQueueCleanAttachmentTextV1
+        ) ?? false
+    }
+
     func hostSupportsQueueEditLease(_ chat: Chat) -> Bool {
         guard demo == nil else { return false }
         return workspace?.deviceSupports(chat.deviceId, EngineCapability.messageQueueEditLeaseV1)

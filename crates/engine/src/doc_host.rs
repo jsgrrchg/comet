@@ -388,6 +388,34 @@ enum QueueSend {
     Interrupt,
 }
 
+const ATTACHMENT_ONLY_PROMPT: &str = "See the attached image(s).";
+const ATTACHMENT_PROMPT_HEADER: &str = "Attached images (local files — open them to view):";
+
+/// Queue rows keep the user's editable text separate from attachment paths.
+/// Rebuild the transcript/harness transport only when the row is dispatched.
+///
+/// Older clients stored the already-expanded prompt in `text`; recognize the
+/// exact trailer implied by `attachments` so those rows are not expanded a
+/// second time after an upgrade.
+fn queued_message_prompt(text: &str, attachments: &[String]) -> String {
+    if attachments.is_empty() {
+        return text.to_string();
+    }
+    let refs = attachments
+        .iter()
+        .map(|path| format!("- {path}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trailer = format!("\n\n{ATTACHMENT_PROMPT_HEADER}\n{refs}");
+    let body = text.strip_suffix(&trailer).unwrap_or(text);
+    let body = if body.trim().is_empty() {
+        ATTACHMENT_ONLY_PROMPT
+    } else {
+        body
+    };
+    format!("{body}{trailer}")
+}
+
 fn queue_text_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
@@ -2966,9 +2994,10 @@ impl DocHost {
         // therefore wait without disturbing the active turn's runway, then
         // anchor the prompt only once this exact row reaches the transcript.
         let message_id = item.id.clone();
+        let prompt = queued_message_prompt(&item.text, &item.attachments);
         if send == QueueSend::Steer {
             match sessions
-                .steer(chat_id, &item.text, Some(message_id.clone()))
+                .steer(chat_id, &prompt, Some(message_id.clone()))
                 .await?
             {
                 SteerOutcome::Accepted => return Ok(()),
@@ -2984,13 +3013,13 @@ impl DocHost {
         }
         let request = sessions
             .last_request(chat_id)
-            .or_else(|| self.request_from_chat_row(chat_id, &item.text));
+            .or_else(|| self.request_from_chat_row(chat_id, &prompt));
         let Some(mut request) = request else {
             return Err(EngineError::Other(
                 "no live run and no prior run config".into(),
             ));
         };
-        request.prompt = item.text.clone();
+        request.prompt = prompt;
         request.resume = None; // dispatch re-derives the harness session
         request.attachments = item.attachments.clone();
         let harness = self.harness_for_request(chat_id, &request);
@@ -4682,6 +4711,36 @@ mod part_segment_tests {
         assert_eq!(encode_part_segment("m1#c1"), "m1%23c1");
         assert_eq!(encode_part_segment("tool:call_9"), "tool%3Acall_9");
         assert_eq!(encode_part_segment("plain-id_0.diff~"), "plain-id_0.diff~");
+    }
+}
+
+#[cfg(test)]
+mod queued_message_prompt_tests {
+    use super::{ATTACHMENT_ONLY_PROMPT, ATTACHMENT_PROMPT_HEADER, queued_message_prompt};
+
+    #[test]
+    fn dispatch_adds_the_attachment_transport_to_visible_queue_text() {
+        let paths = vec!["/tmp/image.png".to_string()];
+        assert_eq!(
+            queued_message_prompt("inspect this", &paths),
+            format!("inspect this\n\n{ATTACHMENT_PROMPT_HEADER}\n- /tmp/image.png")
+        );
+    }
+
+    #[test]
+    fn legacy_expanded_rows_are_not_expanded_twice() {
+        let paths = vec!["/tmp/image.png".to_string()];
+        let legacy = format!("inspect this\n\n{ATTACHMENT_PROMPT_HEADER}\n- /tmp/image.png");
+        assert_eq!(queued_message_prompt(&legacy, &paths), legacy);
+    }
+
+    #[test]
+    fn attachment_only_rows_get_a_non_empty_prompt_body() {
+        let paths = vec!["/tmp/image.png".to_string()];
+        assert_eq!(
+            queued_message_prompt("", &paths),
+            format!("{ATTACHMENT_ONLY_PROMPT}\n\n{ATTACHMENT_PROMPT_HEADER}\n- /tmp/image.png")
+        );
     }
 }
 

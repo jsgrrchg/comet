@@ -43,7 +43,10 @@ struct QueuePanel: View {
             switch item.deliveryGate {
             case .editing(let owner, _): return "Editing on \(owner)"
             case .reviewRequired: return "Needs review"
-            case nil: return MessageQueue.oneLine(item.text)
+            case nil:
+                return MessageQueue.oneLine(
+                    MessageQueue.visibleText(item.text, attachments: item.attachments)
+                )
             }
         }()
         let content = HStack(spacing: 8) {
@@ -88,7 +91,9 @@ struct QueuePanel: View {
                                          item: QueuedMessage) -> some View {
         if item.deliveryGate == nil {
             content.draggable(item.id) {
-                Text(MessageQueue.oneLine(item.text))
+                Text(MessageQueue.oneLine(
+                    MessageQueue.visibleText(item.text, attachments: item.attachments)
+                ))
                     .font(Theme.sans(12.5))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)

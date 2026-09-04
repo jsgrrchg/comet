@@ -184,6 +184,30 @@ fn one_line(text: &str) -> SharedString {
     SharedString::from(flat)
 }
 
+/// New queue rows contain only editable user text. During a rolling upgrade,
+/// an older client may still have stored the attachment trailer in `text`.
+/// Hide it only when the parsed paths exactly match the row's attachment field.
+fn queue_visible_text(text: &str, attachments: &[String]) -> String {
+    if attachments.is_empty() {
+        return text.to_string();
+    }
+    let parsed = crate::attachments::parse_user_message_images(text);
+    let paths_match = parsed.attachments.len() == attachments.len()
+        && parsed
+            .attachments
+            .iter()
+            .zip(attachments)
+            .all(|(parsed, stored)| parsed.path == *stored);
+    if !paths_match {
+        return text.to_string();
+    }
+    if parsed.text.trim().is_empty() {
+        crate::attachments::ATTACHMENT_ONLY_TEXT.to_string()
+    } else {
+        parsed.text
+    }
+}
+
 /// The fieldset-style legend shown on the queue's top edge.
 pub fn queue_label(count: usize) -> Option<String> {
     match count {
@@ -336,7 +360,7 @@ impl Composer {
             Some(QueueDeliveryGate::ReviewRequired { .. }) if !being_edited => {
                 SharedString::from("Needs review")
             }
-            _ => one_line(&item.text),
+            _ => one_line(&queue_visible_text(&item.text, &item.attachments)),
         };
 
         let edit_id = item.id.clone();
@@ -850,11 +874,20 @@ impl Composer {
                             cx.notify();
                             return;
                         };
-                        let text = reply
+                        let raw_text = reply
                             .get("text")
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string();
+                        let attachments = composer
+                            .state
+                            .read(cx)
+                            .queue
+                            .iter()
+                            .find(|item| item.id == id)
+                            .map(|item| item.attachments.clone())
+                            .unwrap_or_default();
+                        let text = queue_visible_text(&raw_text, &attachments);
                         let selected_matches = composer.state.read(cx).selected_chat.as_deref()
                             == Some(chat_id.as_str());
                         if !selected_matches {
@@ -1190,7 +1223,7 @@ mod tests {
     use super::{
         BODY_ROWS_PAD_TOP, PANEL_TOP_PAD, QueuePrimaryAction, ROW_SLOT, one_line,
         queue_action_needs_host, queue_drag_offsets, queue_drop_index, queue_label,
-        queue_mutation_acknowledged, queue_primary_action,
+        queue_mutation_acknowledged, queue_primary_action, queue_visible_text,
     };
 
     #[test]
@@ -1286,5 +1319,22 @@ mod tests {
             "fix the test then ship it"
         );
         assert_eq!(one_line("  spaced   out  ").as_ref(), "spaced out");
+    }
+
+    #[test]
+    fn legacy_attachment_trailers_are_hidden_from_queue_text() {
+        let paths = vec!["/tmp/image.png".to_string()];
+        let legacy = crate::attachments::with_attachments("inspect this", &paths);
+        assert_eq!(queue_visible_text(&legacy, &paths), "inspect this");
+
+        let image_only = crate::attachments::with_attachments("", &paths);
+        assert_eq!(
+            queue_visible_text(&image_only, &paths),
+            crate::attachments::ATTACHMENT_ONLY_TEXT
+        );
+        assert_eq!(
+            queue_visible_text("literal user text", &paths),
+            "literal user text"
+        );
     }
 }

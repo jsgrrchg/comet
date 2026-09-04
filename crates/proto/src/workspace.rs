@@ -9,12 +9,15 @@ pub mod capabilities {
     pub const MESSAGE_QUEUE_V1: &str = "message-queue-v1";
     pub const MESSAGE_QUEUE_ACTIONS_V1: &str = "message-queue-actions-v1";
     pub const MESSAGE_QUEUE_ATTACHMENTS_V1: &str = "message-queue-attachments-v1";
+    pub const MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1: &str =
+        "message-queue-clean-attachment-text-v1";
     pub const MESSAGE_QUEUE_EDIT_LEASE_V1: &str = "message-queue-edit-lease-v1";
 
     pub const CURRENT: &[&str] = &[
         MESSAGE_QUEUE_V1,
         MESSAGE_QUEUE_ACTIONS_V1,
         MESSAGE_QUEUE_ATTACHMENTS_V1,
+        MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
         MESSAGE_QUEUE_EDIT_LEASE_V1,
     ];
 
@@ -87,6 +90,7 @@ mod tests {
                     "message-queue-v1",
                     "message-queue-actions-v1",
                     "message-queue-attachments-v1",
+                    "message-queue-clean-attachment-text-v1",
                     "message-queue-edit-lease-v1"
                 ],
             })

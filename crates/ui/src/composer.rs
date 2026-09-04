@@ -443,9 +443,9 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     }
 }
 
-/// Only a send with an immediate transcript echo may claim the transcript's
-/// own-turn runway. Queue rows wait for their host-side promotion instead.
-fn should_emit_immediate_transcript_send(queue: bool) -> bool {
+/// Queue rows are represented by the queue panel until the host promotes them
+/// into the transcript. They must never publish (or refresh) a local echo.
+fn should_publish_optimistic_echo(queue: bool) -> bool {
     !queue
 }
 
@@ -5234,6 +5234,14 @@ impl Composer {
                 .state
                 .read(cx)
                 .chat_host_supports(&chat_id, queue_capability);
+        let clean_queue_attachment_text = staged.is_empty()
+            || (engine
+                .engine_info()
+                .supports(capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1)
+                && self.state.read(cx).chat_host_supports(
+                    &chat_id,
+                    capabilities::MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
+                ));
         let legacy_steer = queue_requested && !queue;
 
         // Queued-attachment flow (durable-by-design): stage the bytes on the
@@ -5345,7 +5353,7 @@ impl Composer {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
-            if !queue {
+            if should_publish_optimistic_echo(queue) {
                 s.push_echo(&chat_id, echo);
                 // Working overlay until the host executes the queued command —
                 // without it a remote send flashed Completed (and could ring
@@ -5362,7 +5370,7 @@ impl Composer {
         // A queued row is represented by the queue panel, not the transcript.
         // Claiming an own-turn anchor for it here would replace the live
         // turn's runway with an id that has no transcript row yet.
-        if should_emit_immediate_transcript_send(queue) {
+        if should_publish_optimistic_echo(queue) {
             cx.emit(ComposerEvent::Sent {
                 chat_id: chat_id.clone(),
                 message_id: message_id.clone(),
@@ -5475,30 +5483,33 @@ impl Composer {
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
-                    // Refresh the echo in place with the attachment refs
-                    // (same id, same clock — the bubble grows its thumbnails
-                    // without flickering).
-                    let refreshed = SessionMessageEntry {
-                        id: message_id.clone(),
-                        role: zeron_doc::MessageRole::User,
-                        parts: vec![MessagePart::Text {
-                            id: "t0".into(),
-                            text: content.clone(),
-                        }],
-                        created_at,
-                        device_id: "local".into(),
-                        status: None,
-                        continuation_of: None,
-                    };
-                    let echo_chat_id = chat_id.clone();
-                    this.update(cx, |composer, cx| {
-                        composer.state.update(cx, |s, cx| {
-                            s.remove_echo(&echo_chat_id, &message_id);
-                            s.push_echo(&echo_chat_id, refreshed);
-                            cx.notify();
-                        });
-                    })
-                    .ok();
+                    // A normal send already has an optimistic echo: refresh it
+                    // in place with the uploaded refs so its thumbnails never
+                    // flicker. A queued message has no transcript echo at all;
+                    // its queue row is the only representation until dispatch.
+                    if should_publish_optimistic_echo(queue) {
+                        let refreshed = SessionMessageEntry {
+                            id: message_id.clone(),
+                            role: zeron_doc::MessageRole::User,
+                            parts: vec![MessagePart::Text {
+                                id: "t0".into(),
+                                text: content.clone(),
+                            }],
+                            created_at,
+                            device_id: "local".into(),
+                            status: None,
+                            continuation_of: None,
+                        };
+                        let echo_chat_id = chat_id.clone();
+                        this.update(cx, |composer, cx| {
+                            composer.state.update(cx, |s, cx| {
+                                s.remove_echo(&echo_chat_id, &message_id);
+                                s.push_echo(&echo_chat_id, refreshed);
+                                cx.notify();
+                            });
+                        })
+                        .ok();
+                    }
                 }
 
                 // Resolve the working directory: existing chats keep theirs;
@@ -5624,9 +5635,19 @@ impl Composer {
                 }
 
                 if queue {
+                    // A queue row is editable UI state, so its text must stay
+                    // free of the internal attachment-path trailer. The host
+                    // rebuilds that transport when it promotes the row.
+                    let queue_text = if !clean_queue_attachment_text {
+                        content.as_str()
+                    } else if text.trim().is_empty() && !attachment_paths.is_empty() {
+                        attachments::ATTACHMENT_ONLY_TEXT
+                    } else {
+                        text.as_str()
+                    };
                     let params = serde_json::json!({
                         "chatId": chat_id,
-                        "text": content,
+                        "text": queue_text,
                         "attachments": attachment_paths,
                         "holdForTurnEnd": hold_for_turn_end,
                     });
@@ -7566,9 +7587,9 @@ mod tests {
     }
 
     #[test]
-    fn queued_submit_does_not_claim_the_active_transcript_runway() {
-        assert!(should_emit_immediate_transcript_send(false));
-        assert!(!should_emit_immediate_transcript_send(true));
+    fn queued_submit_does_not_publish_an_optimistic_transcript_echo() {
+        assert!(should_publish_optimistic_echo(false));
+        assert!(!should_publish_optimistic_echo(true));
     }
 
     #[test]

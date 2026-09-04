@@ -3466,16 +3466,19 @@ impl Transcript {
         // blocks and the previous chat cannot accumulate stale handles.
         let active_code_fences: HashSet<SharedString> = new_rows
             .iter()
-            .filter_map(|row| match &row.kind {
-                RowKind::Markdown { tree, block_ix } | RowKind::LiveMarkdown { tree, block_ix }
-                    if tree
-                        .blocks
+            .flat_map(|row| match &row.kind {
+                RowKind::Markdown { tree, block_ix } | RowKind::LiveMarkdown { tree, block_ix } => {
+                    tree.blocks
                         .get(*block_ix)
-                        .is_some_and(|top| matches!(&top.block, Block::CodeBlock { .. })) =>
-                {
-                    Some(format!("{}#code{block_ix}", row.id).into())
+                        .map(|top| {
+                            render::code_block_indices(&top.block, *block_ix)
+                                .into_iter()
+                                .map(|ix| format!("{}#code{ix}", row.id).into())
+                                .collect()
+                        })
+                        .unwrap_or_default()
                 }
-                _ => None,
+                _ => Vec::new(),
             })
             .collect();
         self.code_fences
@@ -4279,8 +4282,7 @@ impl Transcript {
                 let Some(top) = tree.blocks.get(*block_ix) else {
                     return gpui::Empty.into_any_element();
                 };
-                let code = matches!(&top.block, Block::CodeBlock { .. })
-                    .then(|| self.code_ui_for(&row.id, *block_ix, cx));
+                let code = self.code_uis_for(&row.id, &top.block, *block_ix, cx);
                 let opts = RenderOptions {
                     row_key: row.id.clone(),
                     veil: None,
@@ -4307,8 +4309,7 @@ impl Transcript {
                 let Some(top) = tree.blocks.get(*block_ix) else {
                     return gpui::Empty.into_any_element();
                 };
-                let code = matches!(&top.block, Block::CodeBlock { .. })
-                    .then(|| self.code_ui_for(&row.id, *block_ix, cx));
+                let code = self.code_uis_for(&row.id, &top.block, *block_ix, cx);
                 // Per-appended-chunk fade veil (opacity only — layout commits
                 // instantly). Reduced motion renders with no veil at all.
                 // Baseline rows (text already streamed when the transcript
@@ -4694,6 +4695,24 @@ impl Transcript {
                 })
             },
         }
+    }
+
+    /// Provision independent interaction state for every fence nested below
+    /// one virtualized Markdown row (top-level, quoted, or listed).
+    fn code_uis_for(
+        &mut self,
+        row_id: &SharedString,
+        block: &Block,
+        block_ix: usize,
+        cx: &mut Context<Self>,
+    ) -> Option<HashMap<usize, render::CodeUi>> {
+        let indices = render::code_block_indices(block, block_ix);
+        (!indices.is_empty()).then(|| {
+            indices
+                .into_iter()
+                .map(|ix| (ix, self.code_ui_for(row_id, ix, cx)))
+                .collect()
+        })
     }
 
     /// Request highlights for the code blocks of a tree. `only` limits to one

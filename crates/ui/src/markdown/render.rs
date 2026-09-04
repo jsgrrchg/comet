@@ -83,8 +83,9 @@ pub struct RenderOptions {
     /// (previews outside the transcript).
     pub copy: Option<CopyUi>,
     /// Agent-transcript-only fence layout controls and tracked horizontal
-    /// scroll state. `None` keeps non-chat Markdown surfaces unchanged.
-    pub code: Option<CodeUi>,
+    /// scroll state, keyed by the same element discriminator passed to
+    /// [`render_block`]. `None` keeps non-chat Markdown surfaces unchanged.
+    pub code: Option<HashMap<usize, CodeUi>>,
 }
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code
@@ -260,6 +261,43 @@ pub fn render_tree(
         .into_any_element()
 }
 
+fn quote_child_ix(ix: usize, child_ix: usize) -> usize {
+    ix * 100 + child_ix
+}
+
+fn list_child_ix(ix: usize, item_ix: usize, child_ix: usize) -> usize {
+    ix * 100 + item_ix * 10 + child_ix
+}
+
+/// Element discriminators for every code block below `block`. Transcript rows
+/// use this to provision one independent scroll handle per nested fence before
+/// the renderer recursively reaches it.
+pub(crate) fn code_block_indices(block: &Block, ix: usize) -> Vec<usize> {
+    fn collect(block: &Block, ix: usize, out: &mut Vec<usize>) {
+        match block {
+            Block::CodeBlock { .. } => out.push(ix),
+            Block::BlockQuote { children } => {
+                for (child_ix, child) in children.iter().enumerate() {
+                    collect(child, quote_child_ix(ix, child_ix), out);
+                }
+            }
+            Block::List { items, .. } => {
+                for (item_ix, item) in items.iter().enumerate() {
+                    for (child_ix, child) in item.iter().enumerate() {
+                        collect(child, list_child_ix(ix, item_ix, child_ix), out);
+                    }
+                }
+            }
+            Block::Paragraph { .. } | Block::Heading { .. } | Block::Table { .. } | Block::Rule => {
+            }
+        }
+    }
+
+    let mut indices = Vec::new();
+    collect(block, ix, &mut indices);
+    indices
+}
+
 /// Render one block (top-level or nested). `top_ix` is the enclosing top-level
 /// block index (cache invalidation scope); `ix` the per-element discriminator.
 #[allow(clippy::too_many_arguments)]
@@ -312,7 +350,15 @@ pub fn render_block(
             .gap(px(8.0))
             .text_color(theme.text_muted)
             .children(children.iter().enumerate().map(|(ci, child)| {
-                render_block(child, top_ix, ix * 100 + ci, opts, theme, window, None)
+                render_block(
+                    child,
+                    top_ix,
+                    quote_child_ix(ix, ci),
+                    opts,
+                    theme,
+                    window,
+                    None,
+                )
             }))
             .into_any_element(),
         Block::List {
@@ -363,7 +409,7 @@ pub fn render_block(
                             render_block(
                                 child,
                                 top_ix,
-                                ix * 100 + item_ix * 10 + ci,
+                                list_child_ix(ix, item_ix, ci),
                                 opts,
                                 theme,
                                 window,
@@ -1153,7 +1199,7 @@ fn render_code_block(
         None => Vec::new(),
     };
     let scroll_id: SharedString = format!("{}-code{ix}", opts.row_key).into();
-    let code_ui = opts.code.clone();
+    let code_ui = opts.code.as_ref().and_then(|code| code.get(&ix)).cloned();
     let fit_content = code_ui.as_ref().is_some_and(|ui| ui.fit_content);
 
     // Header actions stay in normal header flow so Fit and Copy never overlap.
@@ -1495,7 +1541,19 @@ pub fn runs_for_syntax_line_with_plain(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::parser::InlineStyle;
+    use crate::markdown::parser::{InlineStyle, parse_full};
+
+    #[test]
+    fn code_block_indices_include_nested_quotes_and_lists() {
+        let quoted = parse_full("> ```rust\n> let x = 1;\n> ```\n");
+        assert_eq!(code_block_indices(&quoted.blocks[0].block, 0), vec![0]);
+
+        let listed = parse_full("- Result:\n\n  ```json\n  {\"ok\":true}\n  ```\n");
+        assert_eq!(code_block_indices(&listed.blocks[0].block, 0), vec![1]);
+
+        let top_level = parse_full("paragraph\n\n```text\nvalue\n```\n");
+        assert_eq!(code_block_indices(&top_level.blocks[1].block, 1), vec![1]);
+    }
 
     /// Model GPUI's upstream affinity at a soft-wrap boundary: byte 5 is
     /// reported at the end of row 0, while byte 6 is after the first glyph on

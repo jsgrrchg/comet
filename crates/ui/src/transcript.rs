@@ -2230,6 +2230,10 @@ pub struct Transcript {
     /// Family and size changes can alter prose wrapping without changing row
     /// identity, so the virtual list must explicitly discard cached heights.
     typography_generation: u32,
+    /// Last global code-fence layout generation applied to this transcript.
+    /// Each instance owns separate scroll handles and list measurements, so
+    /// every one must reset itself after a global Fit-mode transition.
+    code_fences_generation: u64,
     highlights: HighlightStore,
     show_jump_button: bool,
     /// Distance from the bottom at the last observation (wheel event or spring
@@ -2428,6 +2432,7 @@ impl Transcript {
             veil_attach_pending: true,
             render_cache: Rc::new(RefCell::new(RenderCache::default())),
             typography_generation: crate::typography::generation(cx),
+            code_fences_generation: crate::settings::code_fences_generation(cx),
             highlights: HighlightStore::default(),
             show_jump_button: false,
             last_scroll_distance: 0.0,
@@ -4631,35 +4636,16 @@ impl Transcript {
             scroll,
             scrollbar,
             toggle_fit: {
-                let entity = cx.weak_entity();
                 Rc::new(move |_window, cx| {
-                    entity
-                        .update(cx, |this, cx| {
-                            let fit = !crate::settings::current(cx).code_fences_fit_content;
-                            crate::settings::update(
-                                crate::settings::SavePolicy::Immediate,
-                                cx,
-                                |settings| settings.code_fences_fit_content = fit,
-                            );
-                            // Horizontal positions are not a preference. A
-                            // mode change starts every block at its left edge.
-                            for runtime in this.code_fences.values() {
-                                runtime.scroll.set_offset(Point::default());
-                            }
-                            // Fit changes every code row from analytic to
-                            // measured height (or back), so invalidate all
-                            // virtual-list measurements in one anchored pass.
-                            this.list.remeasure();
-                            if this.pinned {
-                                this.wake_spring();
-                            }
-                            if this.own_turn.is_some() {
-                                this.own_turn_kick = true;
-                            }
-                            cx.notify();
-                            cx.refresh_windows();
-                        })
-                        .ok();
+                    let fit = !crate::settings::current(cx).code_fences_fit_content;
+                    crate::settings::update(
+                        crate::settings::SavePolicy::Immediate,
+                        cx,
+                        |settings| settings.code_fences_fit_content = fit,
+                    );
+                    // Every Transcript observes the generation change during
+                    // its next render and resets its own local runtime state.
+                    cx.refresh_windows();
                 })
             },
             viewport_hover: {
@@ -6019,6 +6005,24 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let code_fences_generation = crate::settings::code_fences_generation(cx);
+        if self.code_fences_generation != code_fences_generation {
+            self.code_fences_generation = code_fences_generation;
+            // Horizontal positions are ephemeral. Reset every block owned by
+            // this Transcript even when the toggle originated in another one.
+            for runtime in self.code_fences.values() {
+                runtime.scroll.set_offset(Point::default());
+            }
+            // Fit changes every code row from analytic to measured height (or
+            // back), including virtual rows outside the current viewport.
+            self.list.remeasure();
+            if self.pinned {
+                self.wake_spring();
+            }
+            if self.own_turn.is_some() {
+                self.own_turn_kick = true;
+            }
+        }
         let typography_generation = crate::typography::generation(cx);
         if self.typography_generation != typography_generation {
             self.typography_generation = typography_generation;

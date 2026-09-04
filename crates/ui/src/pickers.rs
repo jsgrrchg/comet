@@ -519,7 +519,9 @@ impl Pickers {
                 }
                 cx.notify();
             }
-            ComposerInputEvent::Submitted => this.on_search_submit(cx),
+            ComposerInputEvent::Submitted | ComposerInputEvent::ModifiedSubmitted => {
+                this.on_search_submit(cx)
+            }
             // Pasted images/files don't apply to a search box.
             ComposerInputEvent::PastedImages(_)
             | ComposerInputEvent::PastedPaths(_)

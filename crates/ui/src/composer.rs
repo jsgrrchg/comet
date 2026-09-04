@@ -435,6 +435,20 @@ pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> 
     !text.trim().is_empty() || attachments > 0 || comments > 0
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModifiedSubmitTarget {
+    SubmitContent,
+    ActivateQueueHead,
+}
+
+fn modified_submit_target(has_content: bool) -> ModifiedSubmitTarget {
+    if has_content {
+        ModifiedSubmitTarget::SubmitContent
+    } else {
+        ModifiedSubmitTarget::ActivateQueueHead
+    }
+}
+
 pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     match (run_live, has_text) {
         (false, _) => SendButtonMode::Send,
@@ -705,6 +719,7 @@ actions!(
         Paste,
         Newline,
         MessageNewlineOrAccept,
+        ModifiedSubmit,
         Submit,
         Undo,
         Redo,
@@ -1215,6 +1230,7 @@ const PALETTE_SEARCH_CONTEXT: &str = "PaletteSearch";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MessageEnterBindingAction {
     Submit,
+    ModifiedSubmit,
     NewlineOrAccept,
 }
 
@@ -1229,10 +1245,16 @@ fn message_enter_bindings(
     modifier_combo: &str,
 ) -> Vec<MessageEnterBinding> {
     match behavior {
-        ComposerSendBehavior::Enter => vec![MessageEnterBinding {
-            keystroke: "enter".into(),
-            action: MessageEnterBindingAction::Submit,
-        }],
+        ComposerSendBehavior::Enter => vec![
+            MessageEnterBinding {
+                keystroke: "enter".into(),
+                action: MessageEnterBindingAction::Submit,
+            },
+            MessageEnterBinding {
+                keystroke: modifier_combo.into(),
+                action: MessageEnterBindingAction::ModifiedSubmit,
+            },
+        ],
         ComposerSendBehavior::ModEnter => vec![
             MessageEnterBinding {
                 keystroke: "enter".into(),
@@ -1240,7 +1262,7 @@ fn message_enter_bindings(
             },
             MessageEnterBinding {
                 keystroke: modifier_combo.into(),
-                action: MessageEnterBindingAction::Submit,
+                action: MessageEnterBindingAction::ModifiedSubmit,
             },
         ],
     }
@@ -1368,6 +1390,11 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
                 Submit,
                 Some(MESSAGE_COMPOSER_CONTEXT),
             )),
+            MessageEnterBindingAction::ModifiedSubmit => message_bindings.push(KeyBinding::new(
+                &binding.keystroke,
+                ModifiedSubmit,
+                Some(MESSAGE_COMPOSER_CONTEXT),
+            )),
             MessageEnterBindingAction::NewlineOrAccept => message_bindings.push(KeyBinding::new(
                 &binding.keystroke,
                 MessageNewlineOrAccept,
@@ -1449,6 +1476,7 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerInputEvent {
     Submitted,
+    ModifiedSubmitted,
     Edited,
     CursorMoved,
     ViewportChanged,
@@ -2404,6 +2432,14 @@ impl ComposerInput {
         match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
             EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
             EnterOutcome::Submit => cx.emit(ComposerInputEvent::Submitted),
+            EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
+        }
+    }
+
+    fn modified_submit(&mut self, _: &ModifiedSubmit, _: &mut Window, cx: &mut Context<Self>) {
+        match enter_outcome(self.mention_has_selection, EnterOutcome::Submit) {
+            EnterOutcome::AcceptCompletion => cx.emit(ComposerInputEvent::MentionAccept),
+            EnterOutcome::Submit => cx.emit(ComposerInputEvent::ModifiedSubmitted),
             EnterOutcome::Newline => unreachable!("submit action cannot insert a newline"),
         }
     }
@@ -3425,6 +3461,7 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::message_newline_or_accept))
+            .on_action(cx.listener(Self::modified_submit))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
@@ -3690,6 +3727,9 @@ pub struct Composer {
     pub(crate) queue_edit_focus_pending: bool,
     /// Live drag over the queue panel: which row, and where it would land.
     pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
+    /// Whether the modifier overlay should currently reveal the queue hint.
+    /// The shell owns modifier tracking and clears this on window deactivation.
+    queue_shortcut_revealed: bool,
     /// Interrupt/answer commands get their own slot: assigning `send_task`
     /// DROPPED an in-flight send future mid-upload — no banner, no cleanup,
     /// `sending` stuck true forever (2026-08-19 incident, "press Stop while
@@ -3756,6 +3796,13 @@ impl Composer {
         }
     }
 
+    pub(crate) fn set_queue_shortcut_revealed(&mut self, revealed: bool, cx: &mut Context<Self>) {
+        if self.queue_shortcut_revealed != revealed {
+            self.queue_shortcut_revealed = revealed;
+            cx.notify();
+        }
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             let mut input =
@@ -3773,6 +3820,7 @@ impl Composer {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
+            ComposerInputEvent::ModifiedSubmitted => this.on_modified_submit(cx),
             ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
                 this.on_input_edited(cx)
             }
@@ -3816,6 +3864,7 @@ impl Composer {
                 ComposerInputEvent::Submitted => {
                     this.commit_queue_edit(cx);
                 }
+                ComposerInputEvent::ModifiedSubmitted => {}
                 ComposerInputEvent::Edited
                 | ComposerInputEvent::CursorMoved
                 | ComposerInputEvent::ViewportChanged => cx.notify(),
@@ -3873,6 +3922,7 @@ impl Composer {
             queue_edit_inline_focus_pending: false,
             queue_edit_focus_pending: false,
             queue_drag: None,
+            queue_shortcut_revealed: false,
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,
@@ -5106,17 +5156,6 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
-        // Empty box with a queue behind it: Enter activates the top row's own
-        // Steer/Send now action. This outranks Stop — hitting Enter while
-        // messages wait is asking for the next one, not just for silence.
-        if text.is_empty()
-            && self.staged().is_empty()
-            && self.staged_comments(cx).is_empty()
-            && !self.state.read(cx).queue.is_empty()
-        {
-            self.queue_pop_head(cx);
-            return;
-        }
         let no_content =
             !composer_has_content(&text, self.staged().len(), self.staged_comments(cx).len());
         match self.button_mode(cx) {
@@ -5129,6 +5168,21 @@ impl Composer {
             // next one is the engine's call (`DocHost::drain_queue`) — the
             // composer only says "here, take this".
             SendButtonMode::Steer => self.send(text, true, cx),
+        }
+    }
+
+    /// Cmd/Ctrl+Enter remains an ordinary submit while the composer carries
+    /// content. With a truly empty composer it instead advances the queue's
+    /// first actionable row, and never turns an empty chord into Stop.
+    fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
+        let has_content = composer_has_content(
+            self.input.read(cx).text(),
+            self.staged().len(),
+            self.staged_comments(cx).len(),
+        );
+        match modified_submit_target(has_content) {
+            ModifiedSubmitTarget::SubmitContent => self.on_submit(cx),
+            ModifiedSubmitTarget::ActivateQueueHead => self.queue_pop_head(cx),
         }
     }
 
@@ -6543,9 +6597,18 @@ impl Render for Composer {
         // What is waiting to be sent, stacked directly above the box it was
         // typed in — the queue is a property of this composer, not a panel
         // somewhere else.
-        let container = container.when_some(self.render_queue_panel(cx), |el, panel| {
-            el.child(motion::fade_quick("composer-queue", div().child(panel)))
-        });
+        let show_queue_head_shortcut = self.queue_shortcut_revealed
+            && self.editing_queued.is_none()
+            && !self.pickers.read(cx).is_open()
+            && !composer_has_content(
+                self.input.read(cx).text(),
+                self.staged().len(),
+                self.staged_comments(cx).len(),
+            );
+        let container = container.when_some(
+            self.render_queue_panel(show_queue_head_shortcut, cx),
+            |el, panel| el.child(motion::fade_quick("composer-queue", div().child(panel))),
+        );
         // Escape backs out of a queue-row edit (the row keeps its old text).
         // Bound here rather than in the input: the input's own Escape belongs
         // to the mention/slash popups, which outrank this while they're open.
@@ -6872,10 +6935,16 @@ mod tests {
     fn message_enter_bindings_cover_both_platform_modifiers() {
         assert_eq!(
             message_enter_bindings(ComposerSendBehavior::Enter, "cmd-enter"),
-            vec![MessageEnterBinding {
-                keystroke: "enter".into(),
-                action: MessageEnterBindingAction::Submit,
-            }]
+            vec![
+                MessageEnterBinding {
+                    keystroke: "enter".into(),
+                    action: MessageEnterBindingAction::Submit,
+                },
+                MessageEnterBinding {
+                    keystroke: "cmd-enter".into(),
+                    action: MessageEnterBindingAction::ModifiedSubmit,
+                },
+            ]
         );
         assert_eq!(
             message_enter_bindings(ComposerSendBehavior::ModEnter, "cmd-enter"),
@@ -6886,7 +6955,7 @@ mod tests {
                 },
                 MessageEnterBinding {
                     keystroke: "cmd-enter".into(),
-                    action: MessageEnterBindingAction::Submit,
+                    action: MessageEnterBindingAction::ModifiedSubmit,
                 },
             ]
         );
@@ -6899,7 +6968,7 @@ mod tests {
                 },
                 MessageEnterBinding {
                     keystroke: "ctrl-enter".into(),
-                    action: MessageEnterBindingAction::Submit,
+                    action: MessageEnterBindingAction::ModifiedSubmit,
                 },
             ]
         );
@@ -7560,6 +7629,26 @@ mod tests {
         assert!(composer_has_content("hi", 0, 0));
         assert!(composer_has_content("", 1, 0));
         assert!(composer_has_content("", 0, 1));
+    }
+
+    #[test]
+    fn modified_submit_sends_content_and_advances_only_when_empty() {
+        assert_eq!(
+            modified_submit_target(composer_has_content("message", 0, 0)),
+            ModifiedSubmitTarget::SubmitContent
+        );
+        assert_eq!(
+            modified_submit_target(composer_has_content("", 1, 0)),
+            ModifiedSubmitTarget::SubmitContent
+        );
+        assert_eq!(
+            modified_submit_target(composer_has_content("", 0, 1)),
+            ModifiedSubmitTarget::SubmitContent
+        );
+        assert_eq!(
+            modified_submit_target(composer_has_content("  ", 0, 0)),
+            ModifiedSubmitTarget::ActivateQueueHead
+        );
     }
 
     #[test]

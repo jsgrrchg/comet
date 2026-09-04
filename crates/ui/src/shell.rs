@@ -48,7 +48,7 @@ use crate::settings::{
     self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
     SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT, UiSettings, badge_combo,
-    jump_hints_visible, platform_combo, sidebar_pin_profile_key,
+    jump_hints_visible, modifier_send_hint_visible, platform_combo, sidebar_pin_profile_key,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -3505,8 +3505,8 @@ impl Shell {
         self.add_space.is_some() || self.composer.read(cx).pickers().read(cx).is_open()
     }
 
-    /// Track the held modifiers so the sidebar can show its jump hints. Only a
-    /// change in visibility repaints — modifier traffic is otherwise constant.
+    /// Track held modifiers for sidebar jump hints and the queue's submit hint.
+    /// Only a visibility change repaints; modifier traffic is otherwise constant.
     fn on_modifiers_changed(&mut self, event: &ModifiersChangedEvent, cx: &mut Context<Self>) {
         let mods = &event.modifiers;
         let primary = if cfg!(target_os = "macos") {
@@ -3520,6 +3520,12 @@ impl Shell {
             && !self.overlay_owns_keyboard(cx)
             && jump_hints_visible(&self.settings.keymap, primary, mods.alt, mods.shift);
         self.set_jump_hints(visible, cx);
+        let queue_shortcut_revealed = matches!(self.route, Route::Chat)
+            && !self.overlay_owns_keyboard(cx)
+            && modifier_send_hint_visible(primary, mods.alt, mods.shift);
+        self.composer.update(cx, |composer, cx| {
+            composer.set_queue_shortcut_revealed(queue_shortcut_revealed, cx)
+        });
     }
 
     pub(super) fn set_jump_hints(&mut self, visible: bool, cx: &mut Context<Self>) {
@@ -8928,6 +8934,9 @@ impl Render for Shell {
                 |this: &mut Shell, window, cx| {
                     if !window.is_window_active() {
                         this.set_jump_hints(false, cx);
+                        this.composer.update(cx, |composer, cx| {
+                            composer.set_queue_shortcut_revealed(false, cx)
+                        });
                     }
                 },
             ));

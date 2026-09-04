@@ -20,6 +20,7 @@ use zeron_rpc::methods;
 use crate::composer::Composer;
 use crate::icons::{self, icon};
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
+use crate::settings::shortcuts::modifier_send_label;
 use crate::terminal::panel::{drop_index, slide_offset};
 use crate::theme::Theme;
 
@@ -127,6 +128,30 @@ fn queue_primary_action(
     }
 }
 
+/// The primary action is executable only when both the selected provider and
+/// the chat host can honor it, and nobody currently owns the row for editing
+/// or review. The row button, keyboard accelerator and its hint all use this
+/// decision so they cannot disagree about availability.
+fn available_queue_primary_action(
+    resolved_mid_turn_steering: Option<bool>,
+    has_attachments: bool,
+    delivery_blocked: bool,
+    host_supports_actions: bool,
+) -> Option<QueuePrimaryAction> {
+    if delivery_blocked || !host_supports_actions {
+        return None;
+    }
+    queue_primary_action(resolved_mid_turn_steering, has_attachments)
+}
+
+fn queue_head_shortcut_visible(
+    index: usize,
+    reveal_requested: bool,
+    action_available: bool,
+) -> bool {
+    index == 0 && reveal_requested && action_available
+}
+
 /// Translate a pointer inside the whole outlined panel into a row slot. The
 /// label and the body's top padding both belong to slot zero; the bottom pad
 /// clamps to the final row.
@@ -220,16 +245,27 @@ impl Composer {
     /// The queue panel, or `None` when nothing is waiting. Its legend sits in
     /// the outline like a fieldset, keeping it visually separate from the
     /// composer pill below.
-    pub(crate) fn render_queue_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_queue_panel(
+        &mut self,
+        show_head_shortcut: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         // A drop outside the panel ends GPUI's active drag without invoking our
         // `on_drop`. Never leave the source row replaced by a stale gap.
         if self.queue_drag.is_some() && !cx.has_active_drag() {
             self.queue_drag = None;
         }
-        let items = self.state.read(cx).queue.clone();
+        let (items, chat_id, host_supports_actions) = {
+            let state = self.state.read(cx);
+            let chat_id = state.selected_chat.clone()?;
+            let host_supports_actions = state.chat_host_supports(
+                &chat_id,
+                zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
+            );
+            (state.queue.clone(), chat_id, host_supports_actions)
+        };
         let label = queue_label(items.len())?;
         let theme = Theme::of(cx).clone();
-        let chat_id = self.state.read(cx).selected_chat.clone()?;
         let count = items.len();
         let drag = self
             .queue_drag
@@ -252,6 +288,8 @@ impl Composer {
                     drag,
                     &editing,
                     mid_turn_steering,
+                    host_supports_actions,
+                    show_head_shortcut,
                     &theme,
                     cx,
                 )
@@ -347,6 +385,8 @@ impl Composer {
         drag: Option<(usize, usize, usize, usize)>,
         editing: &Option<String>,
         mid_turn_steering: Option<bool>,
+        host_supports_actions: bool,
+        show_head_shortcut: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -385,14 +425,18 @@ impl Composer {
                 this.remove_queued(drop_id.clone(), cx);
             }),
         );
-        let resolved_primary =
-            queue_primary_action(mid_turn_steering, !item.attachments.is_empty());
+        let resolved_primary = available_queue_primary_action(
+            mid_turn_steering,
+            !item.attachments.is_empty(),
+            delivery_blocked,
+            host_supports_actions,
+        );
         let primary_action = resolved_primary.unwrap_or(QueuePrimaryAction::SendNow);
         let primary_id = item.id.clone();
         let primary = self.queue_primary_action_button(
             &key,
             primary_action,
-            resolved_primary.is_some() && !delivery_blocked,
+            resolved_primary.is_some(),
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.activate_queued_primary(primary_id.clone(), primary_action, cx);
@@ -543,6 +587,19 @@ impl Composer {
                         .gap(px(3.0))
                         .child(edit)
                         .child(discard)
+                        .when(
+                            queue_head_shortcut_visible(
+                                ix,
+                                show_head_shortcut,
+                                resolved_primary.is_some(),
+                            ),
+                            |el| {
+                                el.child(crate::popover::kbd_hint(
+                                    theme,
+                                    modifier_send_label(cfg!(target_os = "macos")),
+                                ))
+                            },
+                        )
                         .child(primary),
                 )
             });
@@ -784,22 +841,36 @@ impl Composer {
         }
     }
 
-    /// Hitting Enter on an empty composer activates the same action shown on
+    /// Cmd/Ctrl+Enter on an empty composer activates the same action shown on
     /// the first queued row: non-interrupting Steer when possible, Send now
-    /// otherwise.
+    /// otherwise. An edit/review gate or an old chat host makes it a no-op.
     pub(crate) fn queue_pop_head(&mut self, cx: &mut Context<Self>) {
-        let Some((id, has_attachments)) = self
-            .state
-            .read(cx)
-            .queue
-            .first()
-            .map(|item| (item.id.clone(), !item.attachments.is_empty()))
-        else {
+        if self.editing_queued.is_some() {
             return;
+        }
+        let (id, has_attachments, delivery_blocked, host_supports_actions) = {
+            let state = self.state.read(cx);
+            let Some(chat_id) = state.selected_chat.as_deref() else {
+                return;
+            };
+            let Some(item) = state.queue.first() else {
+                return;
+            };
+            (
+                item.id.clone(),
+                !item.attachments.is_empty(),
+                item.delivery_gate.is_some(),
+                state.chat_host_supports(
+                    chat_id,
+                    zeron_proto::capabilities::MESSAGE_QUEUE_ACTIONS_V1,
+                ),
+            )
         };
-        let Some(action) = queue_primary_action(
+        let Some(action) = available_queue_primary_action(
             self.pickers().read(cx).resolved_mid_turn_steering(cx),
             has_attachments,
+            delivery_blocked,
+            host_supports_actions,
         ) else {
             return;
         };
@@ -1221,9 +1292,10 @@ mod tests {
     use zeron_rpc::methods;
 
     use super::{
-        BODY_ROWS_PAD_TOP, PANEL_TOP_PAD, QueuePrimaryAction, ROW_SLOT, one_line,
-        queue_action_needs_host, queue_drag_offsets, queue_drop_index, queue_label,
-        queue_mutation_acknowledged, queue_primary_action, queue_visible_text,
+        BODY_ROWS_PAD_TOP, PANEL_TOP_PAD, QueuePrimaryAction, ROW_SLOT,
+        available_queue_primary_action, one_line, queue_action_needs_host, queue_drag_offsets,
+        queue_drop_index, queue_head_shortcut_visible, queue_label, queue_mutation_acknowledged,
+        queue_primary_action, queue_visible_text,
     };
 
     #[test]
@@ -1248,6 +1320,34 @@ mod tests {
             queue_primary_action(Some(true), true),
             Some(QueuePrimaryAction::SendNow)
         );
+    }
+
+    #[test]
+    fn available_primary_action_obeys_row_and_host_gates() {
+        assert_eq!(
+            available_queue_primary_action(Some(true), false, false, true),
+            Some(QueuePrimaryAction::Steer)
+        );
+        assert_eq!(
+            available_queue_primary_action(Some(false), false, false, true),
+            Some(QueuePrimaryAction::SendNow)
+        );
+        assert_eq!(
+            available_queue_primary_action(Some(true), false, true, true),
+            None
+        );
+        assert_eq!(
+            available_queue_primary_action(Some(true), false, false, false),
+            None
+        );
+    }
+
+    #[test]
+    fn queue_shortcut_only_appears_on_an_actionable_head_when_revealed() {
+        assert!(queue_head_shortcut_visible(0, true, true));
+        assert!(!queue_head_shortcut_visible(1, true, true));
+        assert!(!queue_head_shortcut_visible(0, false, true));
+        assert!(!queue_head_shortcut_visible(0, true, false));
     }
 
     #[test]

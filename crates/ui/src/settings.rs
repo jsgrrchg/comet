@@ -769,6 +769,18 @@ impl KeymapConfig {
                 .push(JUMP_DEFAULTS[self.jump_session.len()].to_string());
         }
     }
+
+    /// Cmd/Ctrl+Enter belongs to the composer on every send mode. Older
+    /// settings could assign it to an app shortcut while plain Enter was the
+    /// configured sender; restore only those newly-conflicting rows to their
+    /// defaults and preserve every unrelated customization.
+    fn heal_reserved_composer_shortcuts(&mut self) {
+        for id in ShortcutId::ALL {
+            if self.get(id) == "mod-enter" {
+                self.reset(id);
+            }
+        }
+    }
 }
 
 /// Build a combo string from a recorded keystroke. The primary modifier
@@ -866,6 +878,12 @@ pub fn jump_hints_visible(keymap: &KeymapConfig, primary: bool, alt: bool, shift
         .into_iter()
         .filter(|id| id.jump_slot().is_some())
         .any(|id| combo_modifiers(keymap.get(id)) == (primary, alt, shift))
+}
+
+/// Cmd on macOS and Ctrl elsewhere reveals the composer's modified-submit
+/// hint only while that modifier is held by itself.
+pub fn modifier_send_hint_visible(primary: bool, alt: bool, shift: bool) -> bool {
+    primary && !alt && !shift
 }
 
 /// Translate a stored combo into a bindable keystroke for this platform.
@@ -986,6 +1004,7 @@ impl UiSettings {
             FILES_EDITOR_FONT_SIZE_DEFAULT,
         );
         self.keymap.heal_jump_slots();
+        self.keymap.heal_reserved_composer_shortcuts();
         self
     }
 
@@ -1828,6 +1847,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_modifier_enter_shortcut_heals_without_losing_other_customizations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"keymap": {"newSession": "mod-enter", "toggleSidebar": "mod-shift-x"}}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(
+            loaded.keymap.get(ShortcutId::NewSession),
+            ShortcutId::NewSession.default_combo()
+        );
+        assert_eq!(loaded.keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
+    }
+
+    #[test]
     fn jump_hints_need_an_exact_modifier_match() {
         let keymap = KeymapConfig::default();
         // Mod alone matches mod-1..9.
@@ -1852,6 +1888,14 @@ mod tests {
         let mut bare = KeymapConfig::default();
         bare.set(ShortcutId::JumpSession(0), "f5".into());
         assert!(!jump_hints_visible(&bare, false, false, false));
+    }
+
+    #[test]
+    fn modifier_send_hint_needs_only_the_primary_modifier() {
+        assert!(modifier_send_hint_visible(true, false, false));
+        assert!(!modifier_send_hint_visible(false, false, false));
+        assert!(!modifier_send_hint_visible(true, true, false));
+        assert!(!modifier_send_hint_visible(true, false, true));
     }
 
     #[test]

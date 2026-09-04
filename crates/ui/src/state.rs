@@ -1709,6 +1709,24 @@ impl AppState {
         cx.notify();
     }
 
+    /// Replace the selected chat's queue subscription without clearing its
+    /// current projection. This is used after an optimistic mutation fails:
+    /// the authoritative opening frame repairs the local list even though the
+    /// document itself did not change and therefore emitted no new frame.
+    pub(crate) fn refresh_selected_queue(&mut self, cx: &mut Context<Self>) {
+        self.queue_task = None;
+        let (Some(chat_id), Some(handle)) = (self.selected_chat.clone(), self.engine.clone())
+        else {
+            return;
+        };
+        if handle
+            .engine_info()
+            .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+        {
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+        }
+    }
+
     /// Select a project; the caller (shell) decides which chat to land on.
     /// `Some` clears a "Don't work in a project" opt-out and re-aims the
     /// device pick at the project's host; `None` IS that opt-out.

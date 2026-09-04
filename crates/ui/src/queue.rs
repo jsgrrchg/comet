@@ -33,6 +33,19 @@ fn queue_action_needs_host(method: &str) -> bool {
     )
 }
 
+/// Queue mutation replies are deliberately explicit. A false or malformed
+/// acknowledgement means an optimistic local edit may not match the document
+/// (for example, another device removed the same row first).
+fn queue_mutation_acknowledged(method: &str, reply: &serde_json::Value) -> bool {
+    let field = match method {
+        methods::UPDATE_QUEUED_MESSAGE | methods::MOVE_QUEUED_MESSAGE => "changed",
+        methods::REMOVE_QUEUED_MESSAGE => "removed",
+        methods::SEND_QUEUED_MESSAGE_NOW | methods::STEER_QUEUED_MESSAGE_NOW => "sent",
+        _ => return true,
+    };
+    reply.get(field).and_then(serde_json::Value::as_bool) == Some(true)
+}
+
 struct QueueActionTooltip {
     label: SharedString,
 }
@@ -873,16 +886,35 @@ impl Composer {
         // parking them in a single slot meant the next arrow tap dropped — and
         // so cancelled — the move still in flight, leaving the optimistic list
         // showing an order the doc never got.
-        cx.spawn(async move |this, cx| {
-            if let Err(err) = engine.client().call(method, params).await {
-                tracing::warn!(method, error = %err, "queue mutation failed");
-                this.update(cx, |composer, cx| {
-                    composer.failure = Some(failure.into());
-                    cx.notify();
-                })
-                .ok();
-            }
-        })
+        cx.spawn(
+            async move |this, cx| match engine.client().call(method, params).await {
+                Ok(reply) if queue_mutation_acknowledged(method, &reply) => {}
+                Ok(reply) => {
+                    tracing::debug!(
+                        method,
+                        ?reply,
+                        "queue mutation was not applied; reconciling"
+                    );
+                    this.update(cx, |composer, cx| {
+                        composer
+                            .state
+                            .update(cx, |state, cx| state.refresh_selected_queue(cx));
+                    })
+                    .ok();
+                }
+                Err(err) => {
+                    tracing::warn!(method, error = %err, "queue mutation failed");
+                    this.update(cx, |composer, cx| {
+                        composer.failure = Some(failure.into());
+                        composer
+                            .state
+                            .update(cx, |state, cx| state.refresh_selected_queue(cx));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            },
+        )
         .detach();
     }
 }
@@ -894,7 +926,7 @@ mod tests {
     use super::{
         BODY_ROWS_PAD_TOP, PANEL_TOP_PAD, QueuePrimaryAction, ROW_SLOT, one_line,
         queue_action_needs_host, queue_drag_offsets, queue_drop_index, queue_label,
-        queue_primary_action,
+        queue_mutation_acknowledged, queue_primary_action,
     };
 
     #[test]
@@ -929,6 +961,26 @@ mod tests {
         assert!(!queue_action_needs_host(methods::UPDATE_QUEUED_MESSAGE));
         assert!(!queue_action_needs_host(methods::MOVE_QUEUED_MESSAGE));
         assert!(!queue_action_needs_host(methods::REMOVE_QUEUED_MESSAGE));
+    }
+
+    #[test]
+    fn mutation_acknowledgements_detect_conflicts_and_malformed_replies() {
+        assert!(queue_mutation_acknowledged(
+            methods::MOVE_QUEUED_MESSAGE,
+            &serde_json::json!({ "changed": true })
+        ));
+        assert!(!queue_mutation_acknowledged(
+            methods::MOVE_QUEUED_MESSAGE,
+            &serde_json::json!({ "changed": false })
+        ));
+        assert!(!queue_mutation_acknowledged(
+            methods::REMOVE_QUEUED_MESSAGE,
+            &serde_json::json!({})
+        ));
+        assert!(queue_mutation_acknowledged(
+            methods::SEND_QUEUED_MESSAGE_NOW,
+            &serde_json::json!({ "sent": true })
+        ));
     }
 
     #[test]

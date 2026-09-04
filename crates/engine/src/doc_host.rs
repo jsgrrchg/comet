@@ -22,13 +22,15 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use base64::Engine as _;
+use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use zeron_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    MessagePart, MessageRole, MessageStatus, QueuedMessage, SessionCommandEntry,
+    MessagePart, MessageRole, MessageStatus, QueueDeliveryGate, QueuedMessage, SessionCommandEntry,
     SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries,
 };
@@ -41,6 +43,11 @@ use crate::{EngineError, new_id, now_ms};
 
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
+
+/// An edit client renews every 20s. Sixty seconds tolerates two missed
+/// heartbeats without turning a vanished client into an invisible permanent
+/// lock. Expiry fails closed into ReviewRequired rather than releasing.
+pub const QUEUE_EDIT_LEASE_MS: i64 = 60_000;
 
 /// Warm-doc LRU: how many unwatched, run-less docs stay fully open. Everything
 /// beyond this (and beyond [`zeron_doc::DOC_LRU_BYTE_BUDGET`]) is evicted
@@ -379,6 +386,66 @@ enum QueueSend {
     Steer,
     /// The user said now: stop what is running first.
     Interrupt,
+}
+
+fn queue_text_hash(text: &str) -> String {
+    format!("{:x}", Sha256::digest(text.as_bytes()))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "outcome",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum BeginQueueEditOutcome {
+    Acquired {
+        lease_id: String,
+        text: String,
+        base_text_hash: String,
+        expires_at_ms: i64,
+    },
+    Locked {
+        owner_device_id: String,
+        expires_at_ms: i64,
+    },
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "outcome",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum RenewQueueEditOutcome {
+    Renewed { expires_at_ms: i64 },
+    Lost,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishQueueEditAction {
+    Commit,
+    Cancel,
+    Discard,
+    ReleaseUnchanged,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    tag = "outcome",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum FinishQueueEditOutcome {
+    Committed,
+    Cancelled,
+    Discarded,
+    Released,
+    Conflict { current_text: String },
+    Lost,
+    Missing,
 }
 
 /// One open chat doc: the `SessionDoc`, its change plumbing, and the room client.
@@ -1141,6 +1208,10 @@ impl DocHost {
             }
             handles.insert(chat_id.to_string(), handle.clone());
         }
+        // Snapshot recovery may restore several independently edited rows.
+        // Each row needs its own checked expiry wake; otherwise a non-head
+        // edit could remain displayed as live indefinitely.
+        self.arm_existing_queue_edit_expiries(&handle);
 
         // Edge room join — offline-tolerant AND supervised. `ChatClient` only
         // self-reconnects AFTER a first successful join; a one-shot attempt
@@ -2287,6 +2358,7 @@ impl DocHost {
             issued_by: self.inner.config.device_id.clone(),
             issued_at: now_ms(),
             edited_at: None,
+            delivery_gate: None,
         })?;
         handle.publish_queue();
         // Same reasoning as a command: the user is acting in this chat again.
@@ -2335,6 +2407,320 @@ impl DocHost {
         Ok(removed)
     }
 
+    /// Acquire the host-side right to edit one queued row. This operation and
+    /// every queue take share `drain_lock`, making the ACK the linearization
+    /// point: after Acquired the row cannot race into the agent.
+    pub async fn begin_queued_message_edit(
+        &self,
+        chat_id: &str,
+        id: &str,
+        owner_device_id: &str,
+        owner_instance_id: &str,
+    ) -> Result<BeginQueueEditOutcome, EngineError> {
+        if !self.is_host(chat_id) {
+            return Err(EngineError::Other(format!(
+                "device {} does not host chat {chat_id}",
+                self.inner.config.device_id
+            )));
+        }
+        let handle = self.open(chat_id)?;
+        let _drain = handle.drain_lock.lock().await;
+        let now = now_ms();
+        let Some(item) = handle
+            .doc
+            .read_queue()?
+            .into_iter()
+            .find(|item| item.id == id)
+        else {
+            return Ok(BeginQueueEditOutcome::Missing);
+        };
+        if let Some(QueueDeliveryGate::Editing {
+            owner_device_id,
+            expires_at_ms,
+            ..
+        }) = &item.delivery_gate
+            && *expires_at_ms > now
+        {
+            return Ok(BeginQueueEditOutcome::Locked {
+                owner_device_id: owner_device_id.clone(),
+                expires_at_ms: *expires_at_ms,
+            });
+        }
+
+        let lease_id = new_id();
+        let expires_at_ms = now + QUEUE_EDIT_LEASE_MS;
+        let gate = QueueDeliveryGate::Editing {
+            lease_id: lease_id.clone(),
+            owner_device_id: owner_device_id.to_string(),
+            owner_instance_id: owner_instance_id.to_string(),
+            acquired_at_ms: now,
+            expires_at_ms,
+            base_text_hash: queue_text_hash(&item.text),
+        };
+        let base_text_hash = queue_text_hash(&item.text);
+        if !handle.doc.set_queued_delivery_gate(id, Some(&gate))? {
+            return Ok(BeginQueueEditOutcome::Missing);
+        }
+        handle.publish_queue();
+        // A crash immediately after the client sees Acquired must not reopen
+        // the row as sendable from a pre-lease snapshot.
+        self.save_snapshot(&handle);
+        self.arm_queue_edit_expiry(&handle, id, &lease_id, expires_at_ms);
+        Ok(BeginQueueEditOutcome::Acquired {
+            lease_id,
+            text: item.text,
+            base_text_hash,
+            expires_at_ms,
+        })
+    }
+
+    /// Extend an edit lease. An already-expired generation is never revived;
+    /// it remains blocked and will be surfaced as ReviewRequired.
+    pub async fn renew_queued_message_edit(
+        &self,
+        chat_id: &str,
+        id: &str,
+        lease_id: &str,
+    ) -> Result<RenewQueueEditOutcome, EngineError> {
+        if !self.is_host(chat_id) {
+            return Err(EngineError::Other(format!(
+                "device {} does not host chat {chat_id}",
+                self.inner.config.device_id
+            )));
+        }
+        let handle = self.open(chat_id)?;
+        let _drain = handle.drain_lock.lock().await;
+        let now = now_ms();
+        let Some(item) = handle
+            .doc
+            .read_queue()?
+            .into_iter()
+            .find(|item| item.id == id)
+        else {
+            return Ok(RenewQueueEditOutcome::Missing);
+        };
+        let QueueDeliveryGate::Editing {
+            lease_id: current,
+            owner_device_id,
+            owner_instance_id,
+            acquired_at_ms,
+            expires_at_ms,
+            base_text_hash,
+        } = item
+            .delivery_gate
+            .unwrap_or(QueueDeliveryGate::ReviewRequired {
+                previous_lease_id: String::new(),
+                owner_device_id: String::new(),
+                since_ms: now,
+                base_text_hash: String::new(),
+            })
+        else {
+            return Ok(RenewQueueEditOutcome::Lost);
+        };
+        if current != lease_id || expires_at_ms <= now {
+            if current == lease_id && expires_at_ms <= now {
+                let review = QueueDeliveryGate::ReviewRequired {
+                    previous_lease_id: current,
+                    owner_device_id,
+                    since_ms: now,
+                    base_text_hash,
+                };
+                let _ = handle.doc.set_queued_delivery_gate(id, Some(&review));
+                handle.publish_queue();
+                self.save_snapshot(&handle);
+            }
+            return Ok(RenewQueueEditOutcome::Lost);
+        }
+        let expires_at_ms = now + QUEUE_EDIT_LEASE_MS;
+        let renewed = QueueDeliveryGate::Editing {
+            lease_id: current,
+            owner_device_id,
+            owner_instance_id,
+            acquired_at_ms,
+            expires_at_ms,
+            base_text_hash,
+        };
+        if !handle.doc.set_queued_delivery_gate(id, Some(&renewed))? {
+            return Ok(RenewQueueEditOutcome::Missing);
+        }
+        handle.publish_queue();
+        self.arm_queue_edit_expiry(&handle, id, lease_id, expires_at_ms);
+        Ok(RenewQueueEditOutcome::Renewed { expires_at_ms })
+    }
+
+    /// Resolve an edit lease. A late finish may still resolve the matching
+    /// ReviewRequired generation, but can never affect a newer lease.
+    pub async fn finish_queued_message_edit(
+        &self,
+        chat_id: &str,
+        id: &str,
+        lease_id: &str,
+        action: FinishQueueEditAction,
+        text: Option<&str>,
+        expected_text_hash: Option<&str>,
+    ) -> Result<FinishQueueEditOutcome, EngineError> {
+        if !self.is_host(chat_id) {
+            return Err(EngineError::Other(format!(
+                "device {} does not host chat {chat_id}",
+                self.inner.config.device_id
+            )));
+        }
+        if action == FinishQueueEditAction::Commit
+            && (text.is_none() || expected_text_hash.is_none())
+        {
+            return Err(EngineError::Other(
+                "commit requires text and expectedTextHash".into(),
+            ));
+        }
+        let handle = self.open(chat_id)?;
+        let outcome = {
+            let _drain = handle.drain_lock.lock().await;
+            let Some(item) = handle
+                .doc
+                .read_queue()?
+                .into_iter()
+                .find(|item| item.id == id)
+            else {
+                return Ok(FinishQueueEditOutcome::Missing);
+            };
+            let (current_lease, base_text_hash) = match &item.delivery_gate {
+                Some(QueueDeliveryGate::Editing {
+                    lease_id,
+                    base_text_hash,
+                    ..
+                }) => (lease_id, base_text_hash),
+                Some(QueueDeliveryGate::ReviewRequired {
+                    previous_lease_id,
+                    base_text_hash,
+                    ..
+                }) => (previous_lease_id, base_text_hash),
+                None => return Ok(FinishQueueEditOutcome::Lost),
+            };
+            if current_lease != lease_id {
+                return Ok(FinishQueueEditOutcome::Lost);
+            }
+            if action == FinishQueueEditAction::Commit
+                && (expected_text_hash != Some(base_text_hash.as_str())
+                    || queue_text_hash(&item.text) != *base_text_hash)
+            {
+                return Ok(FinishQueueEditOutcome::Conflict {
+                    current_text: item.text,
+                });
+            }
+
+            let replacement = match action {
+                FinishQueueEditAction::Commit => Some(text.unwrap_or_default()),
+                FinishQueueEditAction::Cancel | FinishQueueEditAction::ReleaseUnchanged => None,
+                FinishQueueEditAction::Discard => Some(""),
+            };
+            if !handle.doc.finish_queued_edit(id, replacement, now_ms())? {
+                return Ok(FinishQueueEditOutcome::Missing);
+            }
+            handle.publish_queue();
+            self.save_snapshot(&handle);
+            match action {
+                FinishQueueEditAction::Commit => FinishQueueEditOutcome::Committed,
+                FinishQueueEditAction::Cancel => FinishQueueEditOutcome::Cancelled,
+                FinishQueueEditAction::Discard => FinishQueueEditOutcome::Discarded,
+                FinishQueueEditAction::ReleaseUnchanged => FinishQueueEditOutcome::Released,
+            }
+        };
+        // Turn-end may already have happened while the edit was open.
+        self.drain_queue(&handle).await;
+        Ok(outcome)
+    }
+
+    fn arm_existing_queue_edit_expiries(&self, handle: &Arc<ChatDocHandle>) {
+        let Ok(queue) = handle.doc.read_queue() else {
+            return;
+        };
+        for item in queue {
+            if let Some(QueueDeliveryGate::Editing {
+                lease_id,
+                expires_at_ms,
+                ..
+            }) = item.delivery_gate
+            {
+                self.arm_queue_edit_expiry(handle, &item.id, &lease_id, expires_at_ms);
+            }
+        }
+    }
+
+    fn arm_queue_edit_expiry(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        id: &str,
+        lease_id: &str,
+        expires_at_ms: i64,
+    ) {
+        let delay_ms = expires_at_ms.saturating_sub(now_ms()).max(0) as u64;
+        let host = self.clone();
+        let handle = handle.clone();
+        let id = id.to_string();
+        let lease_id = lease_id.to_string();
+        self.spawn_worker(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            host.expire_queued_message_edit(&handle, &id, &lease_id, expires_at_ms)
+                .await;
+        });
+    }
+
+    /// Expire exactly the lease generation that scheduled this wake. A stale
+    /// timer from before a renewal observes a different deadline and no-ops;
+    /// timers for other rows are completely independent.
+    async fn expire_queued_message_edit(
+        &self,
+        handle: &Arc<ChatDocHandle>,
+        id: &str,
+        lease_id: &str,
+        scheduled_expires_at_ms: i64,
+    ) {
+        let changed = {
+            let _drain = handle.drain_lock.lock().await;
+            let Ok(queue) = handle.doc.read_queue() else {
+                return;
+            };
+            let Some(item) = queue.into_iter().find(|item| item.id == id) else {
+                return;
+            };
+            let Some(QueueDeliveryGate::Editing {
+                lease_id: current_lease_id,
+                owner_device_id,
+                expires_at_ms,
+                base_text_hash,
+                ..
+            }) = item.delivery_gate
+            else {
+                return;
+            };
+            if current_lease_id != lease_id
+                || expires_at_ms != scheduled_expires_at_ms
+                || expires_at_ms > now_ms()
+            {
+                return;
+            }
+            let review = QueueDeliveryGate::ReviewRequired {
+                previous_lease_id: current_lease_id,
+                owner_device_id,
+                since_ms: now_ms(),
+                base_text_hash,
+            };
+            let Ok(changed) = handle.doc.set_queued_delivery_gate(id, Some(&review)) else {
+                return;
+            };
+            if changed {
+                handle.publish_queue();
+                self.save_snapshot(handle);
+            }
+            changed
+        };
+        if changed {
+            // If this was the head, the drain now observes ReviewRequired. If
+            // it was not, publishing still updates every client's row state.
+            self.drain_queue(handle).await;
+        }
+    }
+
     /// "Send this one now": take it out of the queue and put it in front of the
     /// agent, interrupting whatever is running. Deliberately blunt — it is the
     /// explicit override. The empty-composer Enter gesture reaches this path
@@ -2351,6 +2737,19 @@ impl DocHost {
         // Sending one now sends ONE: the lock keeps the flush out of the idle
         // window the interrupt opens, and out of the take itself.
         let _drain = handle.drain_lock.lock().await;
+        let Some(candidate) = handle
+            .doc
+            .read_queue()?
+            .into_iter()
+            .find(|item| item.id == id)
+        else {
+            return Ok(false);
+        };
+        if candidate.delivery_gate.is_some() {
+            return Err(EngineError::Other(
+                "queued message is blocked for editing or review".into(),
+            ));
+        }
         let Some(item) = handle.doc.take_queued(id)? else {
             return Ok(false);
         };
@@ -2406,6 +2805,11 @@ impl DocHost {
                 "messages with attachments cannot be steered mid-turn".into(),
             ));
         }
+        if candidate.delivery_gate.is_some() {
+            return Err(EngineError::Other(
+                "queued message is blocked for editing or review".into(),
+            ));
+        }
         let Some(item) = handle.doc.take_queued(id)? else {
             return Ok(false);
         };
@@ -2451,6 +2855,36 @@ impl DocHost {
             let Ok(Some(head)) = handle.doc.read_queue().map(|q| q.into_iter().next()) else {
                 return;
             };
+            match &head.delivery_gate {
+                Some(QueueDeliveryGate::Editing {
+                    lease_id,
+                    owner_device_id,
+                    expires_at_ms,
+                    base_text_hash,
+                    ..
+                }) if *expires_at_ms <= now_ms() => {
+                    let review = QueueDeliveryGate::ReviewRequired {
+                        previous_lease_id: lease_id.clone(),
+                        owner_device_id: owner_device_id.clone(),
+                        since_ms: now_ms(),
+                        base_text_hash: base_text_hash.clone(),
+                    };
+                    let _ = handle.doc.set_queued_delivery_gate(&head.id, Some(&review));
+                    handle.publish_queue();
+                    self.save_snapshot(handle);
+                    return;
+                }
+                Some(QueueDeliveryGate::Editing {
+                    lease_id,
+                    expires_at_ms,
+                    ..
+                }) => {
+                    self.arm_queue_edit_expiry(handle, &head.id, lease_id, *expires_at_ms);
+                    return;
+                }
+                Some(QueueDeliveryGate::ReviewRequired { .. }) => return,
+                None => {}
+            }
             // In flight, not just Working: an agent parked on a question owns
             // the turn too, and the composer queues on the same reading. Taking
             // `AwaitingInput` for idle would send the follow-up as a fresh turn
@@ -3783,6 +4217,7 @@ impl DocHost {
             issued_by: self.inner.config.device_id.clone(),
             issued_at: now_ms(),
             edited_at: None,
+            delivery_gate: None,
         })?;
         handle.publish_queue();
         Ok(true)

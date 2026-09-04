@@ -3673,6 +3673,18 @@ pub struct Composer {
     /// The queued message being edited in its own row (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
+    /// Host-issued generation protecting `editing_queued` from automatic
+    /// delivery. The text buffer is kept until Finish receives an ACK.
+    pub(crate) queue_edit_lease_id: Option<String>,
+    pub(crate) queue_edit_base_text_hash: Option<String>,
+    pub(crate) queue_edit_chat_id: Option<String>,
+    pub(crate) queue_edit_host_device_id: Option<String>,
+    pub(crate) queue_edit_instance_id: String,
+    pub(crate) queue_edit_pending_id: Option<String>,
+    pub(crate) queue_edit_finishing: bool,
+    pub(crate) queue_edit_task: Option<Task<()>>,
+    pub(crate) queue_edit_renew_task: Option<Task<()>>,
+    pub(crate) queue_edit_inline_focus_pending: bool,
     /// Returning focus to the main composer must wait until the inline input
     /// has been unmounted by the next render.
     pub(crate) queue_edit_focus_pending: bool,
@@ -3849,6 +3861,16 @@ impl Composer {
             interrupting: HashSet::new(),
             interrupt_tasks: HashMap::new(),
             editing_queued: None,
+            queue_edit_lease_id: None,
+            queue_edit_base_text_hash: None,
+            queue_edit_chat_id: None,
+            queue_edit_host_device_id: None,
+            queue_edit_instance_id: uuid::Uuid::new_v4().to_string(),
+            queue_edit_pending_id: None,
+            queue_edit_finishing: false,
+            queue_edit_task: None,
+            queue_edit_renew_task: None,
+            queue_edit_inline_focus_pending: false,
             queue_edit_focus_pending: false,
             queue_drag: None,
             expanded_mode: false,
@@ -4941,7 +4963,18 @@ impl Composer {
         // A queue edit belongs to exactly one visible row. Navigation or a
         // remote drain/removal cancels it instead of leaving a focused but
         // unmounted editor entity behind.
-        if (!edited_row_exists || key != self.current_key) && self.editing_queued.is_some() {
+        if !edited_row_exists && self.editing_queued.is_some() && !self.queue_edit_finishing {
+            let recovered = self.queue_edit_input.read(cx).text().to_string();
+            if self.input.read(cx).text().is_empty() && !recovered.is_empty() {
+                self.input
+                    .update(cx, |input, cx| input.set_text(recovered, cx));
+            }
+            self.failure = Some(
+                "The queued message was removed; its unsaved edit was restored to the composer"
+                    .into(),
+            );
+            self.clear_queue_edit(cx);
+        } else if key != self.current_key && self.editing_queued.is_some() {
             self.clear_queue_edit(cx);
         }
 
@@ -6207,7 +6240,11 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.queue_edit_focus_pending {
+        if self.queue_edit_inline_focus_pending {
+            self.queue_edit_inline_focus_pending = false;
+            let focus = self.queue_edit_input.focus_handle(cx);
+            window.focus(&focus, cx);
+        } else if self.queue_edit_focus_pending {
             self.queue_edit_focus_pending = false;
             let focus = self.input.focus_handle(cx);
             window.focus(&focus, cx);

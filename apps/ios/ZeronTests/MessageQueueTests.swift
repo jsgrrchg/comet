@@ -105,6 +105,34 @@ final class MessageQueueTests: XCTestCase {
         XCTAssertEqual(store.queue.map(\.holdForTurnEnd), [true, false])
     }
 
+    func testDeliveryGatesDecodeAndUnknownKindsFailClosed() {
+        let store = store()
+        let list = store.doc.getMovableList(id: "queue")
+        for (index, kind) in ["editing", "futureGate"].enumerated() {
+            let map = try! list.insertMapContainer(pos: UInt32(index), child: LoroMap())
+            try! map.insert(key: "id", v: "q-\(index)")
+            try! map.insert(key: "text", v: "message \(index)")
+            try! map.insert(key: "issuedBy", v: "desktop")
+            try! map.insert(key: "issuedAt", v: Int64(1_000))
+            try! map.insert(key: "deliveryGate", v: LoroValue.fromJSON([
+                "kind": kind,
+                "ownerDeviceId": "desktop",
+                "expiresAtMs": Int64(60_000),
+            ]))
+        }
+        store.doc.commit()
+        store.refreshQueue()
+
+        XCTAssertEqual(
+            store.queue[0].deliveryGate,
+            .editing(ownerDeviceId: "desktop", expiresAtMs: 60_000)
+        )
+        XCTAssertEqual(
+            store.queue[1].deliveryGate,
+            .reviewRequired(ownerDeviceId: "desktop")
+        )
+    }
+
     func testLabelsAndNeighbours() {
         XCTAssertNil(MessageQueue.label(0))
         XCTAssertEqual(MessageQueue.label(1), "1 queued")

@@ -689,6 +689,12 @@ final class AppModel {
         return workspace?.deviceSupports(chat.deviceId, capability) ?? false
     }
 
+    func hostSupportsQueueEditLease(_ chat: Chat) -> Bool {
+        guard demo == nil else { return false }
+        return workspace?.deviceSupports(chat.deviceId, EngineCapability.messageQueueEditLeaseV1)
+            ?? false
+    }
+
     /// Whether a send to this chat would queue rather than deliver promptly:
     /// OS offline, the chat's room degraded (graced), or the host device
     /// presence-dark. Every chat is remote-hosted on the phone — there is no

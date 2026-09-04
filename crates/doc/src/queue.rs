@@ -44,6 +44,37 @@ pub struct QueuedMessage {
     /// Epoch millis of the last text edit, when there has been one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub edited_at: Option<i64>,
+    /// Host-authoritative barrier preventing this row from reaching the
+    /// agent while a client has an edit open. Expired edits fail closed into
+    /// `ReviewRequired`; they never silently become sendable again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_gate: Option<QueueDeliveryGate>,
+}
+
+/// Why a queued row is not currently eligible for automatic or explicit
+/// delivery. Kept on the row so moves preserve it and deleting the row cannot
+/// leave an orphaned lease behind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum QueueDeliveryGate {
+    Editing {
+        lease_id: String,
+        owner_device_id: String,
+        owner_instance_id: String,
+        acquired_at_ms: i64,
+        expires_at_ms: i64,
+        base_text_hash: String,
+    },
+    ReviewRequired {
+        previous_lease_id: String,
+        owner_device_id: String,
+        since_ms: i64,
+        base_text_hash: String,
+    },
 }
 
 fn is_false(value: &bool) -> bool {
@@ -64,6 +95,7 @@ impl QueuedMessage {
             issued_by: issued_by.into(),
             issued_at: 0,
             edited_at: None,
+            delivery_gate: None,
         }
     }
 }
@@ -144,6 +176,73 @@ impl SessionDoc {
         Ok(true)
     }
 
+    /// Install, replace or clear a host-authoritative delivery barrier.
+    /// Callers serialize this with the host's queue drain lock.
+    pub fn set_queued_delivery_gate(
+        &self,
+        id: &str,
+        gate: Option<&QueueDeliveryGate>,
+    ) -> Result<bool, DocError> {
+        let queue = self.doc().get_movable_list("queue");
+        let Some(index) = index_of(&queue, id) else {
+            return Ok(false);
+        };
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) = queue.get(index)
+        else {
+            return Ok(false);
+        };
+        match gate {
+            Some(gate) => map.insert(
+                "deliveryGate",
+                crate::schema::loro_value_from_json(&serde_json::to_value(gate)?),
+            )?,
+            None => {
+                map.delete("deliveryGate")?;
+            }
+        }
+        self.doc().commit();
+        Ok(true)
+    }
+
+    /// Resolve an edit in one document commit. `None` cancels and preserves
+    /// the old text; an empty replacement discards the row; any other value
+    /// updates the text and clears the delivery gate atomically.
+    ///
+    /// Lease ownership is deliberately checked by `DocHost` while holding
+    /// its drain lock immediately before this method is called.
+    pub fn finish_queued_edit(
+        &self,
+        id: &str,
+        replacement: Option<&str>,
+        now_ms: i64,
+    ) -> Result<bool, DocError> {
+        if replacement.is_some_and(|text| text.trim().is_empty()) {
+            return self.remove_queued(id);
+        }
+        let queue = self.doc().get_movable_list("queue");
+        let Some(index) = index_of(&queue, id) else {
+            return Ok(false);
+        };
+        let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) = queue.get(index)
+        else {
+            return Ok(false);
+        };
+        if let Some(text) = replacement {
+            let unchanged = matches!(
+                map.get("text"),
+                Some(loro::ValueOrContainer::Value(loro::LoroValue::String(s)))
+                    if s.as_str() == text
+            );
+            if !unchanged {
+                map.insert("text", text)?;
+                map.insert("editedAt", now_ms)?;
+            }
+        }
+        map.delete("deliveryGate")?;
+        self.doc().commit();
+        Ok(true)
+    }
+
     /// Move a row to `to` (clamped to the queue's bounds). `false` when the row
     /// is missing or already sits there.
     pub fn move_queued(&self, id: &str, to: usize) -> Result<bool, DocError> {
@@ -180,6 +279,15 @@ impl SessionDoc {
             return Ok(None);
         };
         let item = self.read_queue()?.into_iter().find(|item| item.id == id);
+        // Delivery gates are a model invariant, not merely a UI/engine
+        // convention. This keeps future take call sites from accidentally
+        // sending a row that is being edited or awaiting review.
+        if item
+            .as_ref()
+            .is_some_and(|item| item.delivery_gate.is_some())
+        {
+            return Ok(None);
+        }
         queue.delete(index, 1)?;
         self.doc().commit();
         Ok(item)
@@ -225,6 +333,12 @@ fn write_queued_map(map: &loro::LoroMap, item: &QueuedMessage) -> Result<(), Doc
     if let Some(edited_at) = item.edited_at {
         map.insert("editedAt", edited_at)?;
     }
+    if let Some(gate) = &item.delivery_gate {
+        map.insert(
+            "deliveryGate",
+            crate::schema::loro_value_from_json(&serde_json::to_value(gate)?),
+        )?;
+    }
     Ok(())
 }
 
@@ -255,6 +369,19 @@ fn queued_from_json(v: serde_json::Value) -> Option<QueuedMessage> {
             .to_string(),
         issued_at: v.get("issuedAt").and_then(|t| t.as_i64()).unwrap_or(0),
         edited_at: v.get("editedAt").and_then(|t| t.as_i64()),
+        delivery_gate: match v.get("deliveryGate") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(gate) => serde_json::from_value(gate.clone()).ok().or_else(|| {
+                // A future gate kind must fail closed on an older host. Treat
+                // it as review-required instead of silently sending the row.
+                Some(QueueDeliveryGate::ReviewRequired {
+                    previous_lease_id: String::new(),
+                    owner_device_id: String::new(),
+                    since_ms: 0,
+                    base_text_hash: String::new(),
+                })
+            }),
+        },
     })
 }
 
@@ -275,6 +402,7 @@ mod tests {
             issued_by: "device-a".into(),
             issued_at: 1_000,
             edited_at: None,
+            delivery_gate: None,
         }
     }
 
@@ -334,6 +462,56 @@ mod tests {
     }
 
     #[test]
+    fn delivery_gate_round_trips_and_finish_clears_it_atomically() {
+        let doc = doc();
+        let mut queued = item("q1", "original");
+        queued.delivery_gate = Some(QueueDeliveryGate::Editing {
+            lease_id: "lease-1".into(),
+            owner_device_id: "phone".into(),
+            owner_instance_id: "view-1".into(),
+            acquired_at_ms: 1_000,
+            expires_at_ms: 61_000,
+            base_text_hash: "hash".into(),
+        });
+        doc.push_queued(&queued).unwrap();
+        assert_eq!(doc.read_queue().unwrap(), vec![queued]);
+        let json = serde_json::to_value(doc.read_queue().unwrap()).unwrap();
+        assert_eq!(json[0]["deliveryGate"]["leaseId"], "lease-1");
+        assert_eq!(json[0]["deliveryGate"]["ownerDeviceId"], "phone");
+        assert!(json[0]["deliveryGate"].get("lease_id").is_none());
+
+        assert!(
+            doc.finish_queued_edit("q1", Some("revised"), 2_000)
+                .unwrap()
+        );
+        let row = doc.read_queue().unwrap().pop().unwrap();
+        assert_eq!(row.text, "revised");
+        assert_eq!(row.edited_at, Some(2_000));
+        assert_eq!(row.delivery_gate, None);
+    }
+
+    #[test]
+    fn cancelling_an_edit_only_clears_the_gate_and_empty_commit_discards() {
+        let doc = doc();
+        doc.push_queued(&item("q1", "original")).unwrap();
+        let review = QueueDeliveryGate::ReviewRequired {
+            previous_lease_id: "lease-1".into(),
+            owner_device_id: "phone".into(),
+            since_ms: 2_000,
+            base_text_hash: "hash".into(),
+        };
+        assert!(doc.set_queued_delivery_gate("q1", Some(&review)).unwrap());
+        assert!(doc.finish_queued_edit("q1", None, 3_000).unwrap());
+        let row = doc.read_queue().unwrap().pop().unwrap();
+        assert_eq!(row.text, "original");
+        assert_eq!(row.delivery_gate, None);
+
+        assert!(doc.set_queued_delivery_gate("q1", Some(&review)).unwrap());
+        assert!(doc.finish_queued_edit("q1", Some("  "), 4_000).unwrap());
+        assert!(doc.read_queue().unwrap().is_empty());
+    }
+
+    #[test]
     fn empty_ids_and_text_are_rejected() {
         let doc = doc();
         assert!(doc.push_queued(&item(" ", "hi")).is_err());
@@ -390,6 +568,25 @@ mod tests {
         assert_eq!(doc.take_queued("q2").unwrap().unwrap().text, "second");
         assert!(doc.take_queued("q2").unwrap().is_none());
         assert!(doc.take_queue_head().unwrap().is_none());
+    }
+
+    #[test]
+    fn delivery_gate_makes_row_untakeable() {
+        let doc = doc();
+        let mut row = item("q1", "still editing");
+        row.delivery_gate = Some(QueueDeliveryGate::Editing {
+            lease_id: "lease-1".into(),
+            owner_device_id: "device-a".into(),
+            owner_instance_id: "window-a".into(),
+            acquired_at_ms: 1_000,
+            expires_at_ms: 61_000,
+            base_text_hash: "hash".into(),
+        });
+        doc.push_queued(&row).unwrap();
+
+        assert!(doc.take_queued("q1").unwrap().is_none());
+        assert!(doc.take_queue_head().unwrap().is_none());
+        assert_eq!(texts(&doc), vec!["still editing"]);
     }
 
     #[test]

@@ -15,7 +15,12 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 
-use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
+use zeron_doc::{
+    MessagePart, MessageRole, QueueDeliveryGate, SessionCommandPayload, SessionMessageEntry,
+};
+use zeron_engine::doc_host::{
+    BeginQueueEditOutcome, FinishQueueEditAction, FinishQueueEditOutcome,
+};
 use zeron_engine::{EngineCore, HarnessRegistry};
 use zeron_harness::{Harness, HarnessError, RunControls};
 use zeron_proto::{
@@ -963,6 +968,223 @@ async fn a_message_holds_while_the_agent_waits_on_a_question() {
         !prompts.lock().unwrap().iter().any(|p| p == "follow-up"),
         "no fresh turn started under the parked question"
     );
+
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+/// Core regression: once BeginEdit wins the same lock as the drain, ending the
+/// current turn cannot promote the row until the lease is explicitly resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_acquired_edit_blocks_turn_end_and_commit_sends_the_new_text() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "opening turn",
+    )
+    .await;
+    let id = core
+        .doc_host
+        .queue_message(CHAT, "old text", Vec::new())
+        .expect("queue editable row");
+
+    let BeginQueueEditOutcome::Acquired {
+        lease_id,
+        base_text_hash,
+        ..
+    } = core
+        .doc_host
+        .begin_queued_message_edit(CHAT, &id, "phone", "view-1")
+        .await
+        .expect("begin edit")
+    else {
+        panic!("edit must be acquired");
+    };
+    let _ = harness.finish.send(());
+    wait_for(
+        || !core.sessions.turn_in_flight(CHAT),
+        "opening turn to end",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(queue_texts(&core), vec!["old text"]);
+    assert!(!prompts.lock().unwrap().iter().any(|p| p == "old text"));
+    assert!(core.doc_host.send_queued_now(CHAT, &id).await.is_err());
+
+    assert!(matches!(
+        core.doc_host
+            .finish_queued_message_edit(
+                CHAT,
+                &id,
+                &lease_id,
+                FinishQueueEditAction::Commit,
+                Some("new text"),
+                Some(&base_text_hash),
+            )
+            .await
+            .expect("finish edit"),
+        FinishQueueEditOutcome::Committed
+    ));
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "new text"),
+        "edited row to dispatch",
+    )
+    .await;
+    assert!(!prompts.lock().unwrap().iter().any(|p| p == "old text"));
+
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_one_editor_wins_and_an_expired_edit_requires_review() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "opening turn",
+    )
+    .await;
+    let id = core
+        .doc_host
+        .queue_message(CHAT, "review me", Vec::new())
+        .expect("queue row");
+
+    let (a, b) = tokio::join!(
+        core.doc_host
+            .begin_queued_message_edit(CHAT, &id, "a", "view-a"),
+        core.doc_host
+            .begin_queued_message_edit(CHAT, &id, "b", "view-b"),
+    );
+    let outcomes = [a.unwrap(), b.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, BeginQueueEditOutcome::Acquired { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, BeginQueueEditOutcome::Locked { .. }))
+            .count(),
+        1
+    );
+
+    // Force the persisted deadline into the past; turn-end must convert it to
+    // ReviewRequired, never treat expiry as permission to send.
+    let row = core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .read_queue()
+        .unwrap()[0]
+        .clone();
+    let QueueDeliveryGate::Editing {
+        lease_id,
+        owner_device_id,
+        base_text_hash,
+        ..
+    } = row.delivery_gate.unwrap()
+    else {
+        panic!("editing gate expected");
+    };
+    core.doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .set_queued_delivery_gate(
+            &id,
+            Some(&QueueDeliveryGate::Editing {
+                lease_id,
+                owner_device_id,
+                owner_instance_id: "expired".into(),
+                acquired_at_ms: 0,
+                expires_at_ms: 0,
+                base_text_hash,
+            }),
+        )
+        .unwrap();
+    let _ = harness.finish.send(());
+    wait_for(
+        || {
+            core.doc_host
+                .open(CHAT)
+                .unwrap()
+                .doc()
+                .read_queue()
+                .unwrap()
+                .first()
+                .is_some_and(|row| {
+                    matches!(
+                        row.delivery_gate,
+                        Some(QueueDeliveryGate::ReviewRequired { .. })
+                    )
+                })
+        },
+        "expired edit to require review",
+    )
+    .await;
+    assert!(!prompts.lock().unwrap().iter().any(|p| p == "review me"));
+
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn protected_edit_rpc_round_trips_its_camel_case_protocol() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "opening turn",
+    )
+    .await;
+    let id = core
+        .doc_host
+        .queue_message(CHAT, "rpc edit", Vec::new())
+        .expect("queue row");
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let begin = client
+        .call(
+            zeron_rpc::methods::BEGIN_QUEUED_MESSAGE_EDIT,
+            serde_json::json!({
+                "chatId": CHAT,
+                "id": id,
+                "editorDeviceId": "phone",
+                "editorInstanceId": "view-1",
+            }),
+        )
+        .await
+        .expect("begin edit rpc");
+    assert_eq!(begin["outcome"], "acquired");
+    assert!(begin["baseTextHash"].as_str().is_some());
+
+    let finish = client
+        .call(
+            zeron_rpc::methods::FINISH_QUEUED_MESSAGE_EDIT,
+            serde_json::json!({
+                "chatId": CHAT,
+                "id": id,
+                "leaseId": begin["leaseId"],
+                "action": "commit",
+                "text": "rpc revised",
+                "expectedTextHash": begin["baseTextHash"],
+            }),
+        )
+        .await
+        .expect("finish edit rpc");
+    assert_eq!(finish["outcome"], "committed");
+    // The current turn is still live, so the revised row remains queued.
+    assert_eq!(queue_texts(&core), vec!["rpc revised"]);
 
     let _ = harness.finish.send(());
     core.shutdown().await;

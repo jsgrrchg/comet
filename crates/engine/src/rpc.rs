@@ -153,6 +153,45 @@ struct QueuedMessageParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct BeginQueuedMessageEditParams {
+    chat_id: String,
+    id: String,
+    editor_device_id: String,
+    editor_instance_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RenewQueuedMessageEditParams {
+    chat_id: String,
+    id: String,
+    lease_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum FinishQueuedMessageEditAction {
+    Commit,
+    Cancel,
+    Discard,
+    ReleaseUnchanged,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FinishQueuedMessageEditParams {
+    chat_id: String,
+    id: String,
+    lease_id: String,
+    action: FinishQueuedMessageEditAction,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    expected_text_hash: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RepoPathParams {
     /// `repoPath` per §3.5 (the §2.1 shorthand `repo` is accepted as an alias).
     #[serde(alias = "repo")]
@@ -966,6 +1005,9 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_QUEUE
             | methods::QUEUE_MESSAGE
             | methods::UPDATE_QUEUED_MESSAGE
+            | methods::BEGIN_QUEUED_MESSAGE_EDIT
+            | methods::RENEW_QUEUED_MESSAGE_EDIT
+            | methods::FINISH_QUEUED_MESSAGE_EDIT
             | methods::MOVE_QUEUED_MESSAGE
             | methods::REMOVE_QUEUED_MESSAGE
             | methods::SEND_QUEUED_MESSAGE_NOW
@@ -1328,6 +1370,65 @@ impl RpcService for EngineRpc {
                     .update_queued_message(&p.chat_id, &p.id, &p.text)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "changed": changed }))
+            }
+            methods::BEGIN_QUEUED_MESSAGE_EDIT => {
+                let p: BeginQueuedMessageEditParams = parse_params(params)?;
+                let outcome = self
+                    .doc_host
+                    .begin_queued_message_edit(
+                        &p.chat_id,
+                        &p.id,
+                        &p.editor_device_id,
+                        &p.editor_instance_id,
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(
+                    &serde_json::to_value(outcome).map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::RENEW_QUEUED_MESSAGE_EDIT => {
+                let p: RenewQueuedMessageEditParams = parse_params(params)?;
+                let outcome = self
+                    .doc_host
+                    .renew_queued_message_edit(&p.chat_id, &p.id, &p.lease_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(
+                    &serde_json::to_value(outcome).map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::FINISH_QUEUED_MESSAGE_EDIT => {
+                let p: FinishQueuedMessageEditParams = parse_params(params)?;
+                let action = match p.action {
+                    FinishQueuedMessageEditAction::Commit => {
+                        crate::doc_host::FinishQueueEditAction::Commit
+                    }
+                    FinishQueuedMessageEditAction::Cancel => {
+                        crate::doc_host::FinishQueueEditAction::Cancel
+                    }
+                    FinishQueuedMessageEditAction::Discard => {
+                        crate::doc_host::FinishQueueEditAction::Discard
+                    }
+                    FinishQueuedMessageEditAction::ReleaseUnchanged => {
+                        crate::doc_host::FinishQueueEditAction::ReleaseUnchanged
+                    }
+                };
+                let outcome = self
+                    .doc_host
+                    .finish_queued_message_edit(
+                        &p.chat_id,
+                        &p.id,
+                        &p.lease_id,
+                        action,
+                        p.text.as_deref(),
+                        p.expected_text_hash.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(
+                    &serde_json::to_value(outcome).map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
             }
             methods::MOVE_QUEUED_MESSAGE => {
                 let p: QueuedMessageParams = parse_params(params)?;

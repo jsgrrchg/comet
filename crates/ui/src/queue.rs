@@ -10,11 +10,11 @@
 //! statement that "delete" would only be a second way to say it.
 
 use gpui::{
-    AnyElement, Context, Focusable as _, InteractiveElement as _, IntoElement, ParentElement as _,
-    Render, SharedString, StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
+    AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div, prelude::*, px,
 };
 
-use zeron_doc::QueuedMessage;
+use zeron_doc::{QueueDeliveryGate, QueuedMessage};
 use zeron_rpc::methods;
 
 use crate::composer::Composer;
@@ -29,7 +29,11 @@ use crate::theme::Theme;
 fn queue_action_needs_host(method: &str) -> bool {
     matches!(
         method,
-        methods::SEND_QUEUED_MESSAGE_NOW | methods::STEER_QUEUED_MESSAGE_NOW
+        methods::SEND_QUEUED_MESSAGE_NOW
+            | methods::STEER_QUEUED_MESSAGE_NOW
+            | methods::BEGIN_QUEUED_MESSAGE_EDIT
+            | methods::RENEW_QUEUED_MESSAGE_EDIT
+            | methods::FINISH_QUEUED_MESSAGE_EDIT
     )
 }
 
@@ -324,7 +328,16 @@ impl Composer {
     ) -> AnyElement {
         let key = SharedString::from(format!("queue-{}", item.id));
         let being_edited = editing.as_deref() == Some(item.id.as_str());
-        let text = one_line(&item.text);
+        let delivery_blocked = item.delivery_gate.is_some();
+        let text = match &item.delivery_gate {
+            Some(QueueDeliveryGate::Editing {
+                owner_device_id, ..
+            }) if !being_edited => SharedString::from(format!("Editing on {owner_device_id}")),
+            Some(QueueDeliveryGate::ReviewRequired { .. }) if !being_edited => {
+                SharedString::from("Needs review")
+            }
+            _ => one_line(&item.text),
+        };
 
         let edit_id = item.id.clone();
         let edit = self.queue_action(
@@ -333,8 +346,8 @@ impl Composer {
             "Edit",
             icons::PEN,
             theme,
-            cx.listener(move |this, _, window, cx| {
-                this.begin_queue_edit(edit_id.clone(), window, cx);
+            cx.listener(move |this, _, _, cx| {
+                this.begin_queue_edit(edit_id.clone(), cx);
             }),
         );
         let drop_id = item.id.clone();
@@ -355,7 +368,7 @@ impl Composer {
         let primary = self.queue_primary_action_button(
             &key,
             primary_action,
-            resolved_primary.is_some(),
+            resolved_primary.is_some() && !delivery_blocked,
             theme,
             cx.listener(move |this, _, _, cx| {
                 this.activate_queued_primary(primary_id.clone(), primary_action, cx);
@@ -393,7 +406,7 @@ impl Composer {
             .justify_center()
             .rounded(px(4.0))
             .cursor_pointer()
-            .when(being_edited, |el| {
+            .when(being_edited || delivery_blocked, |el| {
                 el.cursor(gpui::CursorStyle::Arrow).opacity(0.35)
             })
             .child(
@@ -423,7 +436,7 @@ impl Composer {
             // Keep the grip as the visual affordance, but retain the proven
             // full-row drag hitbox. Editing disables it so text selection can
             // never accidentally become a reorder gesture.
-            .when(!being_edited, |el| {
+            .when(!being_edited && !delivery_blocked, |el| {
                 el.on_drag(
                     QueueDragPayload {
                         chat: drag_chat,
@@ -771,59 +784,145 @@ impl Composer {
 
     /// Turn one queue row into its inline editor. The main composer is a
     /// separate draft and is deliberately left untouched.
-    pub(crate) fn begin_queue_edit(
-        &mut self,
-        id: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(item) = self
-            .state
-            .read(cx)
-            .queue
-            .iter()
-            .find(|item| item.id == id)
-            .cloned()
-        else {
+    pub(crate) fn begin_queue_edit(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.queue_edit_pending_id.is_some() || self.queue_edit_finishing {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        self.editing_queued = Some(id);
+        let (chat_id, host_device_id, supported) = {
+            let state = self.state.read(cx);
+            let Some(chat_id) = state.selected_chat.clone() else {
+                return;
+            };
+            let Some(host_device_id) = state.selected_chat_row().map(|chat| chat.device_id.clone())
+            else {
+                return;
+            };
+            let capability = zeron_proto::capabilities::MESSAGE_QUEUE_EDIT_LEASE_V1;
+            let supported = engine.engine_info().supports(capability)
+                && state.chat_host_supports(&chat_id, capability);
+            (chat_id, host_device_id, supported)
+        };
+        if !supported {
+            self.failure = Some("Update the chat host to edit queued messages safely".into());
+            cx.notify();
+            return;
+        }
+        if !self.state.read(cx).queue.iter().any(|item| item.id == id) {
+            return;
+        }
+        let owner_device_id = engine.engine_info().device_id.clone();
+        let instance_id = self.queue_edit_instance_id.clone();
+        self.queue_edit_pending_id = Some(id.clone());
         self.queue_drag = None;
-        self.queue_edit_focus_pending = false;
-        self.queue_edit_input
-            .update(cx, |input, cx| input.set_text(item.text.clone(), cx));
-        let focus = self.queue_edit_input.focus_handle(cx);
-        window.focus(&focus, cx);
         cx.notify();
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "id": id,
+            "editorDeviceId": owner_device_id,
+            "editorInstanceId": instance_id,
+            "targetDeviceId": host_device_id,
+        });
+        let task = cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::BEGIN_QUEUED_MESSAGE_EDIT, params)
+                .await;
+            this.update(cx, |composer, cx| {
+                composer.queue_edit_pending_id = None;
+                match result {
+                    Ok(reply)
+                        if reply.get("outcome").and_then(|v| v.as_str()) == Some("acquired") =>
+                    {
+                        let Some(lease_id) = reply.get("leaseId").and_then(|v| v.as_str()) else {
+                            composer.failure =
+                                Some("The chat host returned an invalid edit lease".into());
+                            cx.notify();
+                            return;
+                        };
+                        let Some(base_text_hash) =
+                            reply.get("baseTextHash").and_then(|v| v.as_str())
+                        else {
+                            composer.failure =
+                                Some("The chat host returned an invalid edit lease".into());
+                            cx.notify();
+                            return;
+                        };
+                        let text = reply
+                            .get("text")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string();
+                        let selected_matches = composer.state.read(cx).selected_chat.as_deref()
+                            == Some(chat_id.as_str());
+                        if !selected_matches {
+                            // Navigation won the race with acquisition. Release
+                            // immediately; the expiry/review path is the backup.
+                            let params = serde_json::json!({
+                                "chatId": chat_id,
+                                "id": id,
+                                "leaseId": lease_id,
+                                "action": "cancel",
+                                "targetDeviceId": host_device_id,
+                            });
+                            let engine = engine.clone();
+                            cx.spawn(async move |_, _| {
+                                let _ = engine
+                                    .client()
+                                    .call(methods::FINISH_QUEUED_MESSAGE_EDIT, params)
+                                    .await;
+                            })
+                            .detach();
+                            return;
+                        }
+                        composer.editing_queued = Some(id.clone());
+                        composer.queue_edit_lease_id = Some(lease_id.to_string());
+                        composer.queue_edit_base_text_hash = Some(base_text_hash.to_string());
+                        composer.queue_edit_chat_id = Some(chat_id.clone());
+                        composer.queue_edit_host_device_id = Some(host_device_id.clone());
+                        composer.queue_edit_inline_focus_pending = true;
+                        composer
+                            .queue_edit_input
+                            .update(cx, |input, cx| input.set_text(text, cx));
+                        composer.start_queue_edit_renewal(engine.clone(), cx);
+                    }
+                    Ok(reply)
+                        if reply.get("outcome").and_then(|v| v.as_str()) == Some("locked") =>
+                    {
+                        composer.failure =
+                            Some("That queued message is being edited on another device".into());
+                    }
+                    Ok(_) => {
+                        composer.failure =
+                            Some("That queued message is no longer available".into());
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "begin queue edit failed");
+                        composer.failure =
+                            Some("Connect to the chat host to edit this message".into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.queue_edit_task = Some(task);
     }
 
     /// Commit the inline edit. Empty text removes the row — emptying a
     /// message is how you take it back. `true` when this consumed the submit.
     pub(crate) fn commit_queue_edit(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(id) = self.editing_queued.take() else {
+        if self.editing_queued.is_none() {
             return false;
-        };
-        let text = self.queue_edit_input.read(cx).text().trim().to_string();
-        self.queue_edit_input
-            .update(cx, |input, cx| input.set_text(String::new(), cx));
-        self.queue_edit_focus_pending = true;
-        if text.is_empty() {
-            self.remove_queued(id, cx);
-        } else {
-            self.state.update(cx, |state, cx| {
-                if let Some(item) = state.queue.iter_mut().find(|item| item.id == id) {
-                    item.text = text.clone();
-                    cx.notify();
-                }
-            });
-            self.queue_rpc(
-                methods::UPDATE_QUEUED_MESSAGE,
-                serde_json::json!({ "id": id, "text": text }),
-                "Couldn't save that edit",
-                cx,
-            );
         }
-        cx.notify();
+        let text = self.queue_edit_input.read(cx).text().trim().to_string();
+        if text.is_empty() {
+            self.finish_queue_edit("discard", None, cx);
+        } else {
+            self.finish_queue_edit("commit", Some(text), cx);
+        }
         true
     }
 
@@ -832,16 +931,181 @@ impl Composer {
         if self.editing_queued.is_none() {
             return false;
         }
-        self.clear_queue_edit(cx);
+        self.finish_queue_edit("cancel", None, cx);
         true
     }
 
     pub(crate) fn clear_queue_edit(&mut self, cx: &mut Context<Self>) {
+        self.release_queue_edit_best_effort(cx);
+        self.clear_queue_edit_local(cx);
+    }
+
+    fn clear_queue_edit_local(&mut self, cx: &mut Context<Self>) {
         self.editing_queued = None;
+        self.queue_edit_lease_id = None;
+        self.queue_edit_base_text_hash = None;
+        self.queue_edit_chat_id = None;
+        self.queue_edit_host_device_id = None;
+        self.queue_edit_pending_id = None;
+        self.queue_edit_finishing = false;
+        self.queue_edit_task = None;
+        self.queue_edit_renew_task = None;
         self.queue_edit_input
             .update(cx, |input, cx| input.set_text(String::new(), cx));
         self.queue_edit_focus_pending = true;
         cx.notify();
+    }
+
+    fn finish_queue_edit(
+        &mut self,
+        action: &'static str,
+        text: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.queue_edit_finishing {
+            return;
+        }
+        let (Some(id), Some(lease_id), Some(chat_id), Some(host_device_id), Some(engine)) = (
+            self.editing_queued.clone(),
+            self.queue_edit_lease_id.clone(),
+            self.queue_edit_chat_id.clone(),
+            self.queue_edit_host_device_id.clone(),
+            self.state.read(cx).engine().cloned(),
+        ) else {
+            self.failure = Some("The edit lease was lost; your text is still in the editor".into());
+            cx.notify();
+            return;
+        };
+        let expected = self.queue_edit_base_text_hash.clone();
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "id": id,
+            "leaseId": lease_id,
+            "action": action,
+            "text": text,
+            "expectedTextHash": expected,
+            "targetDeviceId": host_device_id,
+        });
+        self.queue_edit_finishing = true;
+        cx.notify();
+        let task = cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::FINISH_QUEUED_MESSAGE_EDIT, params)
+                .await;
+            this.update(cx, |composer, cx| {
+                composer.queue_edit_finishing = false;
+                match result {
+                    Ok(reply) => match reply.get("outcome").and_then(|v| v.as_str()) {
+                        Some("committed" | "cancelled" | "discarded" | "released") => {
+                            composer.clear_queue_edit_local(cx);
+                            return;
+                        }
+                        Some("conflict") => {
+                            composer.failure = Some(
+                                "This message changed on another device; your edit was kept locally".into(),
+                            );
+                        }
+                        Some("missing") => {
+                            composer.failure = Some(
+                                "The queued message was removed; your edit was kept locally".into(),
+                            );
+                        }
+                        _ => {
+                            composer.failure = Some(
+                                "The edit lease changed; your text is still in the editor".into(),
+                            );
+                        }
+                    },
+                    Err(err) => {
+                        tracing::warn!(error = %err, "finish queue edit failed");
+                        composer.failure = Some(
+                            "Couldn't reach the chat host; your edit is still in the editor".into(),
+                        );
+                    }
+                }
+                cx.notify();
+            }).ok();
+        });
+        self.queue_edit_task = Some(task);
+    }
+
+    fn start_queue_edit_renewal(
+        &mut self,
+        engine: crate::state::EngineHandle,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(id), Some(lease_id), Some(chat_id), Some(host_device_id)) = (
+            self.editing_queued.clone(),
+            self.queue_edit_lease_id.clone(),
+            self.queue_edit_chat_id.clone(),
+            self.queue_edit_host_device_id.clone(),
+        ) else {
+            return;
+        };
+        self.queue_edit_renew_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(20))
+                    .await;
+                let params = serde_json::json!({
+                    "chatId": chat_id,
+                    "id": id,
+                    "leaseId": lease_id,
+                    "targetDeviceId": host_device_id,
+                });
+                match engine
+                    .client()
+                    .call(methods::RENEW_QUEUED_MESSAGE_EDIT, params)
+                    .await
+                {
+                    Ok(reply)
+                        if reply.get("outcome").and_then(|v| v.as_str()) == Some("renewed") => {}
+                    Ok(_) => {
+                        this.update(cx, |composer, cx| {
+                            composer.failure = Some(
+                                "Edit protection expired; review this message before sending"
+                                    .into(),
+                            );
+                            cx.notify();
+                        })
+                        .ok();
+                        break;
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "queue edit heartbeat failed");
+                        // A transient miss is tolerated by the 60s lease. Keep
+                        // trying; the host fails closed if all attempts miss.
+                    }
+                }
+            }
+        }));
+    }
+
+    fn release_queue_edit_best_effort(&self, cx: &mut Context<Self>) {
+        let (Some(id), Some(lease_id), Some(chat_id), Some(host_device_id), Some(engine)) = (
+            self.editing_queued.clone(),
+            self.queue_edit_lease_id.clone(),
+            self.queue_edit_chat_id.clone(),
+            self.queue_edit_host_device_id.clone(),
+            self.state.read(cx).engine().cloned(),
+        ) else {
+            return;
+        };
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "id": id,
+            "leaseId": lease_id,
+            "action": "cancel",
+            "targetDeviceId": host_device_id,
+        });
+        cx.spawn(async move |_, _| {
+            let _ = engine
+                .client()
+                .call(methods::FINISH_QUEUED_MESSAGE_EDIT, params)
+                .await;
+        })
+        .detach();
     }
 
     /// Fire one queue mutation at the chat's doc host.
@@ -957,6 +1221,9 @@ mod tests {
     fn only_agent_execution_actions_route_to_the_host() {
         assert!(queue_action_needs_host(methods::SEND_QUEUED_MESSAGE_NOW));
         assert!(queue_action_needs_host(methods::STEER_QUEUED_MESSAGE_NOW));
+        assert!(queue_action_needs_host(methods::BEGIN_QUEUED_MESSAGE_EDIT));
+        assert!(queue_action_needs_host(methods::RENEW_QUEUED_MESSAGE_EDIT));
+        assert!(queue_action_needs_host(methods::FINISH_QUEUED_MESSAGE_EDIT));
         assert!(!queue_action_needs_host(methods::QUEUE_MESSAGE));
         assert!(!queue_action_needs_host(methods::UPDATE_QUEUED_MESSAGE));
         assert!(!queue_action_needs_host(methods::MOVE_QUEUED_MESSAGE));

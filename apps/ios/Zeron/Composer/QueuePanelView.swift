@@ -38,12 +38,20 @@ struct QueuePanel: View {
 
     private func row(_ item: QueuedMessage, index: Int, count: Int) -> some View {
         let editing = editingId == item.id
-        return HStack(spacing: 8) {
+        let displayText: String = {
+            if editing { return "Editing below" }
+            switch item.deliveryGate {
+            case .editing(let owner, _): return "Editing on \(owner)"
+            case .reviewRequired: return "Needs review"
+            case nil: return MessageQueue.oneLine(item.text)
+            }
+        }()
+        let content = HStack(spacing: 8) {
             Text("\(index + 1)")
                 .font(Theme.mono(10))
                 .foregroundStyle(Theme.textFaint)
                 .frame(minWidth: 12, alignment: .trailing)
-            Text(editing ? "Editing below" : MessageQueue.oneLine(item.text))
+            Text(displayText)
                 .font(Theme.sans(12.5))
                 .foregroundStyle(editing ? Theme.textMuted : Theme.text)
                 .lineLimit(1)
@@ -61,15 +69,9 @@ struct QueuePanel: View {
                     in: RoundedRectangle(cornerRadius: 10))
         .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Theme.border, lineWidth: 1))
         .contentShape(RoundedRectangle(cornerRadius: 10))
+        return draggable(content, item: item)
         // Drag to reorder, with the arrows below doing the same thing for
         // anyone who would rather not hold a row steady on a moving list.
-        .draggable(item.id) {
-            Text(MessageQueue.oneLine(item.text))
-                .font(Theme.sans(12.5))
-                .foregroundStyle(Theme.text)
-                .lineLimit(1)
-                .padding(8)
-        }
         .dropDestination(for: String.self) { ids, _ in
             guard let dropped = ids.first, dropped != item.id else { return false }
             store.moveQueued(id: dropped, to: index)
@@ -79,17 +81,42 @@ struct QueuePanel: View {
         }
     }
 
+    /// Keep a protected row stationary while its text is being edited or
+    /// awaiting review. Other rows may still use it as a drop destination.
+    @ViewBuilder
+    private func draggable<Content: View>(_ content: Content,
+                                         item: QueuedMessage) -> some View {
+        if item.deliveryGate == nil {
+            content.draggable(item.id) {
+                Text(MessageQueue.oneLine(item.text))
+                    .font(Theme.sans(12.5))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                    .padding(8)
+            }
+        } else {
+            content
+        }
+    }
+
     private func controls(_ item: QueuedMessage, index: Int, count: Int,
                           editing: Bool) -> some View {
-        HStack(spacing: 2) {
-            iconButton("chevron.up", label: "Move up", enabled: index > 0) {
+        let gated = item.deliveryGate != nil
+        let lockedByOther: Bool = {
+            if case .editing = item.deliveryGate { return !editing }
+            return false
+        }()
+        return HStack(spacing: 2) {
+            iconButton("chevron.up", label: "Move up", enabled: index > 0 && !gated) {
                 store.moveQueued(id: item.id, by: -1)
             }
-            iconButton("chevron.down", label: "Move down", enabled: index < count - 1) {
+            iconButton("chevron.down", label: "Move down",
+                       enabled: index < count - 1 && !gated) {
                 store.moveQueued(id: item.id, by: 1)
             }
             iconButton(editing ? "xmark" : "pencil",
-                       label: editing ? "Stop editing" : "Edit") {
+                       label: editing ? "Stop editing" : "Edit",
+                       enabled: !lockedByOther) {
                 if editing {
                     onCancelEdit()
                 } else {
@@ -98,7 +125,7 @@ struct QueuePanel: View {
             }
             // Sending one now stops whatever the agent is doing to take it —
             // the row leaves the queue as a turn, not as a deletion.
-            iconButton("arrow.up.circle", label: "Send now") {
+            iconButton("arrow.up.circle", label: "Send now", enabled: !gated) {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 Task { await store.sendQueuedNow(id: item.id) }
             }

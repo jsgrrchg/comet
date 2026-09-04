@@ -29,6 +29,7 @@ enum EngineCapability {
     static let messageQueueV1 = "message-queue-v1"
     static let messageQueueActionsV1 = "message-queue-actions-v1"
     static let messageQueueAttachmentsV1 = "message-queue-attachments-v1"
+    static let messageQueueEditLeaseV1 = "message-queue-edit-lease-v1"
 }
 
 /// proto/src/lib.rs version_triple: parse a leading major.minor.patch,

@@ -60,6 +60,12 @@ pub mod methods {
     /// Retype a queued message; empty text deletes it.
     /// `{ chatId, id, text }` → `{ changed }`.
     pub const UPDATE_QUEUED_MESSAGE: &str = "UpdateQueuedMessage";
+    /// Acquire a host-authoritative edit lease for one queued row.
+    pub const BEGIN_QUEUED_MESSAGE_EDIT: &str = "BeginQueuedMessageEdit";
+    /// Renew an acquired queue edit lease.
+    pub const RENEW_QUEUED_MESSAGE_EDIT: &str = "RenewQueuedMessageEdit";
+    /// Commit, cancel, discard, or explicitly release an acquired edit.
+    pub const FINISH_QUEUED_MESSAGE_EDIT: &str = "FinishQueuedMessageEdit";
     /// Reorder. `{ chatId, id, toIndex }` → `{ changed }`.
     pub const MOVE_QUEUED_MESSAGE: &str = "MoveQueuedMessage";
     pub const REMOVE_QUEUED_MESSAGE: &str = "RemoveQueuedMessage";

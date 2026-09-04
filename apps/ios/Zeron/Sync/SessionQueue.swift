@@ -32,8 +32,24 @@ extension SessionStore {
             issuedBy: m["issuedBy"]?.stringValue ?? "",
             issuedAt: m["issuedAt"]?.i64Value ?? 0,
             editedAt: m["editedAt"]?.i64Value,
-            holdForTurnEnd: m["holdForTurnEnd"]?.boolValue ?? false
+            holdForTurnEnd: m["holdForTurnEnd"]?.boolValue ?? false,
+            deliveryGate: queueDeliveryGate(from: m["deliveryGate"])
         )
+    }
+
+    nonisolated private static func queueDeliveryGate(from value: LoroValue?) -> QueueDeliveryGate? {
+        guard let gate = value?.mapValue, let kind = gate["kind"]?.stringValue else { return nil }
+        let owner = gate["ownerDeviceId"]?.stringValue ?? "another device"
+        switch kind {
+        case "editing":
+            return .editing(ownerDeviceId: owner,
+                            expiresAtMs: gate["expiresAtMs"]?.i64Value ?? 0)
+        case "reviewRequired":
+            return .reviewRequired(ownerDeviceId: owner)
+        default:
+            // Unknown future gates fail closed in the UI too.
+            return .reviewRequired(ownerDeviceId: owner)
+        }
     }
 
     // MARK: Write
@@ -82,6 +98,96 @@ extension SessionStore {
             doc.commit()
         } catch { return }
         refreshQueue()
+    }
+
+    // MARK: Protected editing
+
+    func beginQueuedEdit(id: String, instanceId: String) async -> QueueEditStartResult {
+        struct Reply: Decodable {
+            var outcome: String
+            var leaseId: String?
+            var text: String?
+            var baseTextHash: String?
+            var expiresAtMs: Int64?
+        }
+        guard queue.contains(where: { $0.id == id }), let relay = hostRelayClient() else {
+            return .unavailable
+        }
+        do {
+            let reply: Reply = try await relay.call(
+                method: "BeginQueuedMessageEdit",
+                params: [
+                    "chatId": chatId,
+                    "id": id,
+                    "editorDeviceId": deviceId,
+                    "editorInstanceId": instanceId,
+                ]
+            )
+            switch reply.outcome {
+            case "acquired":
+                guard let leaseId = reply.leaseId,
+                      let baseTextHash = reply.baseTextHash,
+                      let expiresAtMs = reply.expiresAtMs else { return .unavailable }
+                return .acquired(QueueEditLease(
+                    rowId: id,
+                    leaseId: leaseId,
+                    text: reply.text ?? "",
+                    baseTextHash: baseTextHash,
+                    expiresAtMs: expiresAtMs
+                ))
+            case "locked": return .locked
+            default: return .missing
+            }
+        } catch {
+            roomLog.warning(
+                "chat2 \(self.chatId, privacy: .public): begin queue edit failed for \(id, privacy: .public)"
+            )
+            return .unavailable
+        }
+    }
+
+    func renewQueuedEdit(_ lease: QueueEditLease) async -> Bool {
+        struct Reply: Decodable { var outcome: String }
+        guard let relay = hostRelayClient() else { return false }
+        do {
+            let reply: Reply = try await relay.call(
+                method: "RenewQueuedMessageEdit",
+                params: ["chatId": chatId, "id": lease.rowId, "leaseId": lease.leaseId]
+            )
+            return reply.outcome == "renewed"
+        } catch {
+            return false
+        }
+    }
+
+    func finishQueuedEdit(_ lease: QueueEditLease, action: String,
+                          text: String? = nil) async -> QueueEditFinishResult {
+        struct Reply: Decodable { var outcome: String }
+        guard let relay = hostRelayClient() else { return .unavailable }
+        var params: [String: Any] = [
+            "chatId": chatId,
+            "id": lease.rowId,
+            "leaseId": lease.leaseId,
+            "action": action,
+            "expectedTextHash": lease.baseTextHash,
+        ]
+        if let text { params["text"] = text }
+        do {
+            let reply: Reply = try await relay.call(
+                method: "FinishQueuedMessageEdit", params: params
+            )
+            switch reply.outcome {
+            case "committed", "cancelled", "discarded", "released": return .finished
+            case "conflict": return .conflict
+            case "missing": return .missing
+            default: return .lost
+            }
+        } catch {
+            roomLog.warning(
+                "chat2 \(self.chatId, privacy: .public): finish queue edit failed for \(lease.rowId, privacy: .public)"
+            )
+            return .unavailable
+        }
     }
 
     /// Move a row to `to`, clamped to the queue. Same slot is a no-op.

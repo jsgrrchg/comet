@@ -22,6 +22,37 @@ struct QueuedMessage: Identifiable, Equatable, Sendable {
     /// When true, the host must wait for the current turn to end instead of
     /// opportunistically steering this row into it.
     var holdForTurnEnd: Bool = false
+    /// Host-authoritative barrier while this row is being edited or needs
+    /// review after an interrupted edit.
+    var deliveryGate: QueueDeliveryGate? = nil
+}
+
+enum QueueDeliveryGate: Equatable, Sendable {
+    case editing(ownerDeviceId: String, expiresAtMs: Int64)
+    case reviewRequired(ownerDeviceId: String)
+}
+
+struct QueueEditLease: Equatable, Sendable {
+    let rowId: String
+    let leaseId: String
+    let text: String
+    let baseTextHash: String
+    let expiresAtMs: Int64
+}
+
+enum QueueEditStartResult: Sendable {
+    case acquired(QueueEditLease)
+    case locked
+    case missing
+    case unavailable
+}
+
+enum QueueEditFinishResult: Sendable {
+    case finished
+    case conflict
+    case missing
+    case lost
+    case unavailable
 }
 
 enum MessageQueue {

@@ -111,7 +111,7 @@ icon_assets![
     // The changes pane's unified/split toggle: a rounded frame halved by a
     // centre rule (Solar Linear weight).
     (SPLIT_COLUMNS, "split-columns"),
-    // Long-line wrapping for changes and agent Markdown fences.
+    // Long-line wrapping toggle shared by changes and agent Markdown fences.
     (WRAP_TEXT, "wrap-text"),
     (ALT_ARROW_LEFT, "alt-arrow-left"),
     (ALT_ARROW_RIGHT, "alt-arrow-right"),
@@ -189,6 +189,7 @@ icon_assets![
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
+    (DEVIN_MARK, "devin-mark"),
     (GROK_MARK, "grok-mark"),
     (HERMES_MARK, "hermes-mark"),
     (PI_MARK, "pi-mark"),

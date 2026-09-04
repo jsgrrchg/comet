@@ -1155,7 +1155,6 @@ mod tests {
         let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(json.contains(r#""diffWrap": true"#));
         assert_eq!(UiSettings::load(dir.path()), settings);
-        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
         assert!(json.contains(r#""codeFencesFitContent": true"#));
     }
 

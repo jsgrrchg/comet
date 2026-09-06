@@ -669,7 +669,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.13.0",
+ "itertools 0.11.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2649,7 +2649,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.5.2"
-source = "git+https://github.com/jsgrrchg/gpui-component?rev=24783ffc46b840ecbbc4a70b7f5c8a57bd0b492a#24783ffc46b840ecbbc4a70b7f5c8a57bd0b492a"
+source = "git+https://github.com/jsgrrchg/gpui-component?rev=504351f35c7cb0683d1edbd6c446ba2be5179bd7#504351f35c7cb0683d1edbd6c446ba2be5179bd7"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -3557,7 +3557,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3599,15 +3599,6 @@ name = "itertools"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba291022dbbd398a455acf126c1e341954079855bc60dfdda641363bd6922569"
-dependencies = [
- "either",
-]
-
-[[package]]
-name = "itertools"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]

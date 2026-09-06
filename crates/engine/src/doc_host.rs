@@ -481,7 +481,7 @@ pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
     doc: Arc<SessionDoc>,
-    messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
+    messages_tx: watch::Sender<Arc<Vec<SessionMessageEntry>>>,
     /// Pending-message queue watch (WatchQueue). Cheap to rebuild — a handful
     /// of short rows — so unlike the transcript mirror it publishes on every
     /// change without a dirty flag.
@@ -557,7 +557,7 @@ impl ChatDocHandle {
     /// Attach-time refresh: the mirror is only maintained while watched, so a
     /// doc that changed unwatched materializes here, once, instead of on every
     /// commit it sat through in the background.
-    pub fn watch_messages(&self) -> watch::Receiver<Vec<SessionMessageEntry>> {
+    pub fn watch_messages(&self) -> watch::Receiver<Arc<Vec<SessionMessageEntry>>> {
         self.touch();
         // Attach is a user signal: verify a quiet room is actually alive
         // (a doc-wedged DO keeps answering pings while delivering nothing,
@@ -670,7 +670,7 @@ impl ChatDocHandle {
                 let joined = join_continuation_entries(entries);
                 // send_replace: update the watch even with no subscribers yet, so a
                 // late subscriber's first borrow sees the current transcript.
-                self.messages_tx.send_replace(joined);
+                self.messages_tx.send_replace(Arc::new(joined));
             }
             Err(err) => {
                 tracing::warn!(chat = %self.chat_id, error = %err, "transcript read failed");
@@ -685,7 +685,7 @@ impl ChatDocHandle {
         if self.messages_tx.receiver_count() == 0 {
             self.mirror_dirty.store(true, Ordering::Release);
             // Shrink the stale mirror: watch_messages rebuilds on attach.
-            self.messages_tx.send_replace(Vec::new());
+            self.messages_tx.send_replace(Arc::default());
         } else {
             self.publish_messages();
         }
@@ -1207,7 +1207,7 @@ impl DocHost {
         // The mirror starts dirty and empty: many opens (command queueing,
         // drains, nudges) never watch the transcript, and the first
         // watch_messages attach materializes it on demand.
-        let (messages_tx, _) = watch::channel(Vec::new());
+        let (messages_tx, _) = watch::channel(Arc::default());
         let (queue_tx, _) = watch::channel(doc.read_queue().unwrap_or_default());
 
         let handle = Arc::new(ChatDocHandle {

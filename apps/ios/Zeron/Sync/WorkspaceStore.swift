@@ -560,6 +560,8 @@ final class WorkspaceStore {
             var name: String
             var installed: Bool?
             var enabled: Bool?
+            var supportsSteering: Bool?
+            var steeringMode: String?
         }
         let wire: [WireHarness]? = try? await relay(for: deviceId)
             .call(method: "ListHarnesses", params: [:])
@@ -569,7 +571,8 @@ final class WorkspaceStore {
                     && (h.installed ?? true)
                     && (h.enabled ?? ["claude-code", "codex"].contains(h.id))
             }
-            .map { HarnessInfo(id: $0.id, label: $0.name) }
+            .map { HarnessInfo(id: $0.id, label: $0.name,
+                               supportsSteering: $0.supportsSteering, steeringMode: $0.steeringMode) }
         }
     }
 

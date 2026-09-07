@@ -57,6 +57,8 @@ final class SessionStore {
     /// (crates/doc/src/queue.rs). Shared with every other device on the chat:
     /// what the Mac queued shows up here, and reordering here reorders there.
     private(set) var queue: [QueuedMessage] = []
+    var queueActionsPending: Set<String> = []
+    var queueActionError: String?
     /// Local submission only; remote user entries never pull a reader to a new turn.
     private(set) var lastSubmittedMessageId: String?
     /// Presentation state survives navigation with the warm session store.

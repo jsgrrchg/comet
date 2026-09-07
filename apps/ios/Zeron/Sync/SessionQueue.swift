@@ -2,16 +2,14 @@
 // (crates/doc/src/queue.rs).
 //
 // Unlike `messages` — host-only — every device may write here, so these are
-// plain doc edits rather than commands for the host to drain: enqueue, retype,
-// reorder and drop all land straight on the `queue` MovableList and sync out
+// plain doc edits for enqueue and reorder. Protected edits and removal ask
+// the host to serialize with delivery. Local list changes sync out
 // with the next update. A MovableList because reordering is a real move op:
 // two devices dragging at once converge on one order with every row intact,
 // where a delete+insert list would duplicate or lose rows.
 //
-// The one thing the phone cannot do locally is *send*: taking a row and turning
-// it into a run (interrupting the turn to do it) is the host's job, so
-// `sendQueuedNow` asks the host over the relay and only removes the row when
-// the host says it took it.
+// Delivery, protected editing and cancellation are host-authoritative.
+// A local projection only removes a row after a successful host ACK.
 
 import Foundation
 import Loro
@@ -84,22 +82,6 @@ extension SessionStore {
         return id
     }
 
-    /// Retype a queued message. Emptying it is how you delete one — a message
-    /// edited down to nothing is a message you have decided not to send.
-    func updateQueued(id: String, text: String) {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            removeQueued(id: id)
-            return
-        }
-        guard let map = queueRowMap(id: id) else { return }
-        do {
-            try map.insert(key: "text", v: text)
-            try map.insert(key: "editedAt", v: nowMs())
-            doc.commit()
-        } catch { return }
-        refreshQueue()
-    }
-
     // MARK: Protected editing
 
     func beginQueuedEdit(id: String, instanceId: String) async -> QueueEditStartResult {
@@ -110,7 +92,8 @@ extension SessionStore {
             var baseTextHash: String?
             var expiresAtMs: Int64?
         }
-        guard queue.contains(where: { $0.id == id }), let relay = hostRelayClient() else {
+        guard !queueActionsPending.contains(id),
+              queue.contains(where: { $0.id == id }), let relay = hostRelayClient() else {
             return .unavailable
         }
         do {
@@ -192,6 +175,8 @@ extension SessionStore {
 
     /// Move a row to `to`, clamped to the queue. Same slot is a no-op.
     func moveQueued(id: String, to: Int) {
+        guard !queueActionsPending.contains(id),
+              queue.first(where: { $0.id == id })?.deliveryGate == nil else { return }
         let list = doc.getMovableList(id: "queue")
         let count = Int(list.len())
         guard count > 0, let from = queueIndex(of: id, in: list) else { return }
@@ -212,59 +197,45 @@ extension SessionStore {
         moveQueued(id: id, to: to)
     }
 
-    func removeQueued(id: String) {
-        let list = doc.getMovableList(id: "queue")
-        guard let index = queueIndex(of: id, in: list) else { return }
-        do {
-            try list.delete(pos: UInt32(index), len: 1)
-            doc.commit()
-        } catch { return }
-        refreshQueue()
-    }
-
-    /// Send one queued message now, stopping whatever the agent is doing to
-    /// take it. Only the host can do that, so this asks it over the relay and
-    /// leaves the row alone if the ask fails — a message that silently vanished
-    /// without being sent is the one outcome worth avoiding here.
+    /// The host serializes these actions with delivery. Never delete locally
+    /// before its ACK; a lost reply is uncertain and leaves sync to reconcile.
     @discardableResult
-    func sendQueuedNow(id: String) async -> Bool {
-        struct Reply: Decodable { var sent: Bool? }
-        guard queue.contains(where: { $0.id == id }), let relay = hostRelayClient() else {
-            return false
-        }
+    func performQueueAction(id: String, action: QueueAction,
+                            call: ((String, [String: String]) async throws -> QueueActionReply)? = nil) async -> Bool {
+        guard let row = queue.first(where: { $0.id == id }),
+              !queueActionsPending.contains(id) else { return false }
+        guard action == .remove || row.deliveryGate == nil else { return false }
+        queueActionsPending.insert(id)
+        queueActionError = nil
+        defer { queueActionsPending.remove(id) }
         do {
-            let reply: Reply = try await relay.call(
-                method: "SendQueuedMessageNow",
-                params: ["chatId": chatId, "id": id]
-            )
-            return reply.sent == true
+            let params = ["chatId": chatId, "id": id]
+            let reply: QueueActionReply
+            if let call {
+                reply = try await call(action.method, params)
+            } else {
+                guard let relay = hostRelayClient() else { throw RelayError.hostOffline }
+                reply = try await relay.call(method: action.method, params: params)
+            }
+            guard reply.acknowledged(action) else {
+                queueActionError = "The host did not confirm the action. The message may have already left the queue."
+                kickRoom()
+                return false
+            }
+            // Apply only a confirmed removal. Sends leave projection to sync.
+            if action == .remove {
+                let list = doc.getMovableList(id: "queue")
+                if let index = queueIndex(of: id, in: list) {
+                    try list.delete(pos: UInt32(index), len: 1)
+                    doc.commit()
+                    refreshQueue()
+                }
+            }
+            return true
         } catch {
-            roomLog.warning(
-                "chat2 \(self.chatId, privacy: .public): send-now failed for queued \(id, privacy: .public)"
-            )
-            return false
-        }
-    }
-
-    /// Feed one row into the active turn without interrupting it. Like send
-    /// now, taking the row remains host-only and a failed relay leaves it in
-    /// the shared document.
-    @discardableResult
-    func steerQueuedNow(id: String) async -> Bool {
-        struct Reply: Decodable { var sent: Bool? }
-        guard queue.contains(where: { $0.id == id }), let relay = hostRelayClient() else {
-            return false
-        }
-        do {
-            let reply: Reply = try await relay.call(
-                method: "SteerQueuedMessageNow",
-                params: ["chatId": chatId, "id": id]
-            )
-            return reply.sent == true
-        } catch {
-            roomLog.warning(
-                "chat2 \(self.chatId, privacy: .public): steer failed for queued \(id, privacy: .public)"
-            )
+            roomLog.warning("queue action \(action.method, privacy: .public) failed for \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            queueActionError = "Couldn't complete \(action.label.lowercased()). Check the connection to the chat host and the queue before retrying."
+            kickRoom()
             return false
         }
     }
@@ -277,9 +248,4 @@ extension SessionStore {
         }
     }
 
-    private func queueRowMap(id: String) -> LoroMap? {
-        let list = doc.getMovableList(id: "queue")
-        guard let index = queueIndex(of: id, in: list) else { return nil }
-        return list.get(index: UInt32(index))?.asLoroMap()
-    }
 }

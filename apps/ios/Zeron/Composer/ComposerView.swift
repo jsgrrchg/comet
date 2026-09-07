@@ -17,6 +17,7 @@ struct ComposerShell<Chips: View>: View {
     @Binding var draft: String
     var placeholder = "Message"
     var sendEnabled: Bool
+    var sendLabel = "Send message"
     /// Treat an empty box as sendable. Only the queue-edit path wants this:
     /// emptying a queued message is how you throw it away, so the button has
     /// to stay live with nothing typed.
@@ -32,6 +33,7 @@ struct ComposerShell<Chips: View>: View {
     var keepExpanded = false
     var onSend: () -> Void
     var onStop: () -> Void = {}
+    var onAdvanceQueue: () -> Void = {}
     /// Staged image attachments (attachment-ui.tsx AttachmentStrip inside the
     /// pill). Non-empty forces the expanded layout, like focus.
     var attachments: [StagedAttachment] = []
@@ -139,7 +141,17 @@ struct ComposerShell<Chips: View>: View {
 
     private var input: some View {
         ComposerEditor(text: $draft, focused: $focused, placeholder: placeholder,
-                       maxLines: compact ? 2 : 7, controller: editor)
+                       maxLines: compact ? 2 : 7, controller: editor,
+                       onModifiedSubmit: {
+                           guard !busy else { return }
+                           editor.commit()
+                           if hasContent {
+                               if sendEnabled { onSend() }
+                           } else {
+                               onAdvanceQueue()
+                           }
+                           editor.apply(text: draft)
+                       })
             .overlay(alignment: .topLeading) {
                 if draft.isEmpty {
                     Text(placeholder)
@@ -207,7 +219,7 @@ struct ComposerShell<Chips: View>: View {
             .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel(showStop && !hasContent ? "Stop response" : (showStop ? "Steer response" : "Send message"))
+        .accessibilityLabel(showStop && !hasContent ? "Stop response" : sendLabel)
         .accessibilityIdentifier("composer-send")
         .disabled(!buttonActive)
         .motionAnimation(Motion.fadeQuick, value: showStop)
@@ -228,6 +240,8 @@ struct ComposerView: View {
     let chat: Chat
     let runLive: Bool
 
+    @AppStorage("activeTurnSendBehavior") private var activeTurnBehavior: ActiveTurnSendBehavior = .queue
+    @State private var midTurnSteering: Bool?
     @State private var text = ""
     @State private var attachments: [StagedAttachment] = []
     @State private var pickerItems: [PhotosPickerItem] = []
@@ -281,8 +295,8 @@ struct ComposerView: View {
         // the graced stream (1Hz only while something is degraded/pending).
         let _ = model.connectivity.pulse
         return VStack(spacing: 6) {
-            if let uploadError {
-                Text(uploadError)
+            if let error = uploadError ?? store.queueActionError {
+                Text(error)
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.danger)
                     .lineLimit(2)
@@ -316,7 +330,10 @@ struct ComposerView: View {
                 QueuePanel(store: store,
                            editingId: editingQueuedId,
                            onEdit: { item in Task { await beginQueueEdit(item) } },
-                           onCancelEdit: { Task { await cancelQueueEdit() } })
+                           onCancelEdit: { Task { await cancelQueueEdit() } },
+                           midTurnSteering: midTurnSteering,
+                           supportsActions: supportsQueueActions,
+                           onAction: performQueueAction)
             }
             ComposerShell(
                 draft: $text,
@@ -324,12 +341,15 @@ struct ComposerView: View {
                 // Saving an edit down to nothing is how a queued message is
                 // thrown away, so the button stays live on an empty box.
                 sendEnabled: true,
+                sendLabel: editingQueuedId != nil ? "Save queued message"
+                    : (runLive && activeTurnBehavior == .queue ? "Queue message" : "Send message"),
                 allowEmptySend: editingQueuedId != nil,
                 showStop: runLive,
                 busy: uploading || queueEditBusy,
                 keepExpanded: showModelPicker || showTraitPicker || showOptionPicker != nil,
                 onSend: send,
                 onStop: { store.sendInterrupt() },
+                onAdvanceQueue: advanceQueue,
                 attachments: attachments,
                 onAttach: { showPicker = true },
                 onRemoveAttachment: { id in attachments.removeAll { $0.id == id } },
@@ -341,6 +361,20 @@ struct ComposerView: View {
                 if let branch = chat.branch?.trimmingCharacters(in: .whitespacesAndNewlines),
                    !branch.isEmpty {
                     BranchContextChip(branch: branch)
+                }
+                if model.hostSupportsMessageQueue(chat) {
+                    Menu {
+                        Picker("Messages during an active turn", selection: $activeTurnBehavior) {
+                            ForEach(ActiveTurnSendBehavior.allCases, id: \.self) { behavior in
+                                Text(behavior.label).tag(behavior)
+                            }
+                        }
+                    } label: {
+                        Text(activeTurnBehavior.label)
+                            .font(Theme.sans(12, weight: .medium))
+                            .foregroundStyle(Theme.textMuted)
+                    }
+                    .accessibilityLabel("Messages during an active turn: \(activeTurnBehavior.label)")
                 }
                 ComposerChip(label: currentModel.label, badgeHarness: harness) {
                     showModelPicker = true
@@ -396,6 +430,12 @@ struct ComposerView: View {
         .task(id: "\(chat.id)/\(harness)") {
             guard let space = model.space(for: chat) else { return }
             catalogs[harness] = await model.listModels(space: space, harness: harness)
+        }
+        .task(id: "\(chat.deviceId)/\(harness)/\(model.deviceOnline(chat.deviceId))") {
+            midTurnSteering = nil
+            let descriptors = await model.workspace?.listHarnesses(deviceId: chat.deviceId)
+            guard !Task.isCancelled else { return }
+            midTurnSteering = descriptors?.first(where: { $0.id == harness })?.midTurnSteering
         }
         .task(id: queueEditLease?.leaseId) {
             guard let lease = queueEditLease else { return }
@@ -648,7 +688,7 @@ struct ComposerView: View {
                 let queueText = model.hostSupportsCleanQueueAttachmentText(chat)
                     ? MessageQueue.visibleText(content, attachments: paths)
                     : content
-                store.enqueueMessage(text: queueText, attachments: paths, holdForTurnEnd: true)
+                store.enqueueMessage(text: queueText, attachments: paths, holdForTurnEnd: activeTurnBehavior.holdForTurnEnd)
             } else {
                 // Same-version upstream and older hosts retain the proven
                 // durable command path instead of receiving an unknown queue
@@ -658,6 +698,37 @@ struct ComposerView: View {
         } else {
             store.sendRun(prompt: content, chat: chat, attachments: paths)
         }
+    }
+
+    private var supportsQueueActions: Bool {
+        model.workspace?.deviceSupports(chat.deviceId, EngineCapability.messageQueueActionsV1) ?? false
+    }
+
+    private func advanceQueue() {
+        guard editingQueuedId == nil, !queueEditBusy, !uploading,
+              let head = store.queue.first,
+              let action = MessageQueue.primaryAction(
+                for: head, midTurnSteering: midTurnSteering,
+                supportsActions: supportsQueueActions,
+                pending: store.queueActionsPending.contains(head.id)) else { return }
+        performQueueAction(head, action)
+    }
+
+    private func performQueueAction(_ item: QueuedMessage, _ action: QueueAction) {
+        guard supportsQueueActions, !queueEditBusy else { return }
+        uploadError = nil
+        // Discard while the lease still blocks delivery; cancelling it first
+        // would open a window in which the host could send the old text.
+        if action == .remove, editingQueuedId == item.id, let lease = queueEditLease {
+            queueEditBusy = true
+            Task { @MainActor in
+                let result = await store.finishQueuedEdit(lease, action: "discard")
+                queueEditBusy = false
+                finishLocalQueueEdit(result, failure: "Couldn't remove the protected message.")
+            }
+            return
+        }
+        Task { await store.performQueueAction(id: item.id, action: action) }
     }
 
     private func clearDraft(matching submittedText: String) {

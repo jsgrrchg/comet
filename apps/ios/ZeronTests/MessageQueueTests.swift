@@ -2,6 +2,7 @@
 
 import Loro
 import XCTest
+import UIKit
 @testable import Zeron
 
 @MainActor
@@ -36,22 +37,6 @@ final class MessageQueueTests: XCTestCase {
         XCTAssertEqual(store.queue.count, 1)
     }
 
-    func testEditingToNothingDropsTheRow() {
-        let store = store()
-        guard let first = store.enqueueMessage(text: "first") else { return XCTFail("queued") }
-        store.enqueueMessage(text: "second")
-
-        store.updateQueued(id: first, text: "first, revised")
-        XCTAssertEqual(texts(store), ["first, revised", "second"])
-        XCTAssertNotNil(store.queue[0].editedAt)
-
-        store.updateQueued(id: first, text: "  ")
-        XCTAssertEqual(texts(store), ["second"])
-        // A row that is already gone is a no-op, not a crash.
-        store.updateQueued(id: first, text: "back?")
-        XCTAssertEqual(texts(store), ["second"])
-    }
-
     func testMovingByArrowsAndToAnIndex() {
         let store = store()
         let ids = ["a", "b", "c"].compactMap { store.enqueueMessage(text: $0) }
@@ -67,13 +52,126 @@ final class MessageQueueTests: XCTestCase {
         XCTAssertEqual(texts(store), ["c", "b", "a"])
     }
 
-    func testRemoveTakesOneRow() {
+    func testRemovalWaitsForHostAcknowledgementAndSuppressesCompetingActions() async throws {
         let store = store()
-        let ids = ["a", "b"].compactMap { store.enqueueMessage(text: $0) }
-        store.removeQueued(id: ids[0])
-        XCTAssertEqual(texts(store), ["b"])
-        store.removeQueued(id: ids[0])
-        XCTAssertEqual(texts(store), ["b"])
+        let id = try XCTUnwrap(store.enqueueMessage(text: "first"))
+        store.enqueueMessage(text: "second")
+        let removed = await store.performQueueAction(id: id, action: .remove) { method, params in
+            XCTAssertEqual(method, "RemoveQueuedMessage")
+            XCTAssertEqual(params, ["chatId": "chat-1", "id": id])
+            XCTAssertEqual(self.texts(store), ["first", "second"], "keep the row until ACK")
+            XCTAssertTrue(store.queueActionsPending.contains(id))
+            store.moveQueued(id: id, to: 1)
+            XCTAssertEqual(self.texts(store), ["first", "second"])
+            let duplicate = await store.performQueueAction(id: id, action: .sendNow) { _, _ in
+                XCTFail("an in-flight removal must prevent a competing send")
+                return QueueActionReply(sent: true)
+            }
+            XCTAssertFalse(duplicate)
+            return QueueActionReply(removed: true)
+        }
+        XCTAssertTrue(removed)
+        XCTAssertEqual(texts(store), ["second"])
+        XCTAssertTrue(store.queueActionsPending.isEmpty)
+    }
+
+    func testFailedAndMalformedRemovalKeepTheRowAndSurfaceError() async throws {
+        let store = store()
+        let id = try XCTUnwrap(store.enqueueMessage(text: "keep me"))
+        for reply in [QueueActionReply(removed: false), QueueActionReply(sent: true)] {
+            let removed = await store.performQueueAction(id: id, action: .remove) { _, _ in reply }
+            XCTAssertFalse(removed)
+            XCTAssertEqual(texts(store), ["keep me"])
+            XCTAssertNotNil(store.queueActionError)
+        }
+        let removed = await store.performQueueAction(id: id, action: .remove) { _, _ in
+            throw RelayError.hostOffline
+        }
+        XCTAssertFalse(removed)
+        XCTAssertEqual(texts(store), ["keep me"])
+        XCTAssertNotNil(store.queueActionError)
+        XCTAssertTrue(store.queueActionsPending.isEmpty)
+    }
+
+    func testSteerAndSendUseDistinctHostMethodsAndLeaveProjectionToSync() async throws {
+        let store = store()
+        let id = try XCTUnwrap(store.enqueueMessage(text: "hello"))
+        for (action, method) in [(QueueAction.steer, "SteerQueuedMessageNow"), (.sendNow, "SendQueuedMessageNow")] {
+            let sent = await store.performQueueAction(id: id, action: action) { actual, _ in
+                XCTAssertEqual(actual, method)
+                return QueueActionReply(sent: true)
+            }
+            XCTAssertTrue(sent)
+            XCTAssertEqual(texts(store), ["hello"])
+            XCTAssertNil(store.queueActionError)
+        }
+        let sent = await store.performQueueAction(id: id, action: .steer) { _, _ in
+            throw RelayError.hostOffline
+        }
+        XCTAssertFalse(sent)
+        XCTAssertNotNil(store.queueActionError)
+    }
+
+    func testPrimaryActionRespectsCapabilitiesAttachmentsAndDeliveryGates() {
+        var item = QueuedMessage(id: "q", text: "hello")
+        func action(_ steering: Bool?, supported: Bool = true, pending: Bool = false) -> QueueAction? {
+            MessageQueue.primaryAction(for: item, midTurnSteering: steering,
+                                       supportsActions: supported, pending: pending)
+        }
+        XCTAssertEqual(action(true), .steer)
+        XCTAssertEqual(action(false), .sendNow)
+        XCTAssertNil(action(nil))
+        XCTAssertNil(action(true, supported: false))
+        XCTAssertNil(action(true, pending: true))
+        item.attachments = ["uploads/image.png"]
+        XCTAssertEqual(action(true), .sendNow)
+        item.deliveryGate = .reviewRequired(ownerDeviceId: "mac")
+        XCTAssertNil(action(true))
+        item.deliveryGate = .editing(ownerDeviceId: "mac", expiresAtMs: 60_000)
+        XCTAssertNil(action(false))
+        XCTAssertTrue(ActiveTurnSendBehavior.queue.holdForTurnEnd)
+        XCTAssertFalse(ActiveTurnSendBehavior.steer.holdForTurnEnd)
+    }
+
+    func testProtectedRowsCannotBeDeliveredEvenThroughDirectStoreCall() async throws {
+        let store = store()
+        let id = try XCTUnwrap(store.enqueueMessage(text: "protected"))
+        let map = try XCTUnwrap(store.doc.getMovableList(id: "queue").get(index: 0)?.asLoroMap())
+        try map.insert(key: "deliveryGate", v: LoroValue.fromJSON([
+            "kind": "reviewRequired", "ownerDeviceId": "mac"
+        ]))
+        store.doc.commit()
+        store.refreshQueue()
+        for action in [QueueAction.steer, .sendNow] {
+            let sent = await store.performQueueAction(id: id, action: action) { _, _ in
+                XCTFail("protected rows must not dispatch")
+                return QueueActionReply(sent: true)
+            }
+            XCTAssertFalse(sent)
+        }
+        XCTAssertEqual(texts(store), ["protected"])
+    }
+
+    func testExternalKeyboardCommandInvokesSubmitWithoutChangingText() throws {
+        let view = ComposerTextView()
+        view.text = "draft"
+        var submitted = false
+        view.modifiedSubmit = { submitted = true }
+        let command = try XCTUnwrap(view.keyCommands?.first {
+            $0.input == "\r" && $0.modifierFlags == .command
+        })
+        XCTAssertTrue(command.wantsPriorityOverSystemBehavior)
+        view.perform(command.action, with: command)
+        XCTAssertTrue(submitted)
+        XCTAssertEqual(view.text, "draft")
+    }
+
+    func testHarnessMustAdvertiseMidTurnSteering() {
+        XCTAssertNil(HarnessInfo(id: "codex", label: "Codex").midTurnSteering)
+        XCTAssertEqual(HarnessInfo(id: "codex", label: "Codex", supportsSteering: true,
+                                   steeringMode: "step-boundary").midTurnSteering, true)
+        XCTAssertEqual(HarnessInfo(id: "other", label: "Other", supportsSteering: true,
+                                   steeringMode: "turn-boundary").midTurnSteering, false)
     }
 
     /// The Mac's rows land here — same container, same field names.

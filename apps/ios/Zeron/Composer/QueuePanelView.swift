@@ -14,6 +14,9 @@ struct QueuePanel: View {
     var editingId: String?
     var onEdit: (QueuedMessage) -> Void
     var onCancelEdit: () -> Void
+    var midTurnSteering: Bool?
+    var supportsActions: Bool
+    var onAction: (QueuedMessage, QueueAction) -> Void
 
     @State private var dragging: String?
 
@@ -39,6 +42,7 @@ struct QueuePanel: View {
     private func row(_ item: QueuedMessage, index: Int, count: Int) -> some View {
         let editing = editingId == item.id
         let displayText: String = {
+            if store.queueActionsPending.contains(item.id) { return "Updating…" }
             if editing { return "Editing below" }
             switch item.deliveryGate {
             case .editing(let owner, _): return "Editing on \(owner)"
@@ -89,7 +93,7 @@ struct QueuePanel: View {
     @ViewBuilder
     private func draggable<Content: View>(_ content: Content,
                                          item: QueuedMessage) -> some View {
-        if item.deliveryGate == nil {
+        if item.deliveryGate == nil && !store.queueActionsPending.contains(item.id) {
             content.draggable(item.id) {
                 Text(MessageQueue.oneLine(
                     MessageQueue.visibleText(item.text, attachments: item.attachments)
@@ -106,7 +110,10 @@ struct QueuePanel: View {
 
     private func controls(_ item: QueuedMessage, index: Int, count: Int,
                           editing: Bool) -> some View {
-        let gated = item.deliveryGate != nil
+        let pending = store.queueActionsPending.contains(item.id)
+        let gated = item.deliveryGate != nil || pending
+        let primary = MessageQueue.primaryAction(for: item, midTurnSteering: midTurnSteering,
+                                                 supportsActions: supportsActions, pending: pending)
         let lockedByOther: Bool = {
             if case .editing = item.deliveryGate { return !editing }
             return false
@@ -121,22 +128,22 @@ struct QueuePanel: View {
             }
             iconButton(editing ? "xmark" : "pencil",
                        label: editing ? "Stop editing" : "Edit",
-                       enabled: !lockedByOther) {
+                       enabled: !lockedByOther && !pending) {
                 if editing {
                     onCancelEdit()
                 } else {
                     onEdit(item)
                 }
             }
-            // Sending one now stops whatever the agent is doing to take it —
-            // the row leaves the queue as a turn, not as a deletion.
-            iconButton("arrow.up.circle", label: "Send now", enabled: !gated) {
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                Task { await store.sendQueuedNow(id: item.id) }
+            if let primary {
+                Button(primary.label) { onAction(item, primary) }
+                    .font(Theme.sans(11, weight: .medium))
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(primary == .steer ? "Steer without interrupting" : "Send now, interrupting the response")
             }
-            iconButton("trash", label: "Remove", tone: Theme.textFaint) {
-                if editing { onCancelEdit() }
-                store.removeQueued(id: item.id)
+            iconButton("trash", label: "Remove", enabled: supportsActions && !pending,
+                       tone: Theme.textFaint) {
+                onAction(item, .remove)
             }
         }
     }

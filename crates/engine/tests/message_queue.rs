@@ -1332,3 +1332,97 @@ async fn protected_edit_rpc_round_trips_its_camel_case_protocol() {
     let _ = harness.finish.send(());
     core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn composer_edit_commits_attachments_in_place_and_cancel_preserves_them() {
+    let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+    core.doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .unwrap();
+    wait_for(
+        || prompts.lock().unwrap().iter().any(|p| p == "opening"),
+        "opening turn",
+    )
+    .await;
+    core.doc_host
+        .queue_message(CHAT, "before", Vec::new())
+        .unwrap();
+    let id = core
+        .doc_host
+        .queue_message(CHAT, "original", vec!["old.png".into()])
+        .unwrap();
+    core.doc_host
+        .queue_message(CHAT, "after", Vec::new())
+        .unwrap();
+    let BeginQueueEditOutcome::Acquired {
+        lease_id,
+        base_text_hash,
+        attachments,
+        ..
+    } = core
+        .doc_host
+        .begin_queued_message_edit(CHAT, &id, "desktop", "composer")
+        .await
+        .unwrap()
+    else {
+        panic!("edit must be acquired");
+    };
+    assert_eq!(attachments, vec!["old.png"]);
+    let paths = vec!["new.png".to_string()];
+    assert!(matches!(
+        core.doc_host
+            .finish_queued_message_edit_with_attachments(
+                CHAT,
+                &id,
+                &lease_id,
+                FinishQueueEditAction::Commit,
+                Some("revised"),
+                Some(&base_text_hash),
+                Some(&paths),
+            )
+            .await
+            .unwrap(),
+        FinishQueueEditOutcome::Committed
+    ));
+    assert_eq!(queue_texts(&core), vec!["before", "revised", "after"]);
+    let BeginQueueEditOutcome::Acquired {
+        lease_id,
+        attachments,
+        ..
+    } = core
+        .doc_host
+        .begin_queued_message_edit(CHAT, &id, "desktop", "composer")
+        .await
+        .unwrap()
+    else {
+        panic!("second edit must be acquired");
+    };
+    assert_eq!(attachments, paths);
+    assert!(matches!(
+        core.doc_host
+            .finish_queued_message_edit_with_attachments(
+                CHAT,
+                &id,
+                &lease_id,
+                FinishQueueEditAction::Cancel,
+                None,
+                None,
+                Some(&[]),
+            )
+            .await
+            .unwrap(),
+        FinishQueueEditOutcome::Cancelled
+    ));
+    let BeginQueueEditOutcome::Acquired { attachments, .. } = core
+        .doc_host
+        .begin_queued_message_edit(CHAT, &id, "desktop", "composer")
+        .await
+        .unwrap()
+    else {
+        panic!("cancel must release the lease");
+    };
+    assert_eq!(attachments, paths);
+    assert_eq!(queue_texts(&core), vec!["before", "revised", "after"]);
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}

@@ -216,6 +216,19 @@ impl SessionDoc {
         replacement: Option<&str>,
         now_ms: i64,
     ) -> Result<bool, DocError> {
+        self.finish_queued_edit_with_attachments(id, replacement, None, now_ms)
+    }
+
+    /// Replace text and optional attachment paths in the same CRDT commit
+    /// that releases the row. `None` preserves attachments for older clients;
+    /// an empty slice explicitly removes all attachments.
+    pub fn finish_queued_edit_with_attachments(
+        &self,
+        id: &str,
+        replacement: Option<&str>,
+        attachments: Option<&[String]>,
+        now_ms: i64,
+    ) -> Result<bool, DocError> {
         if replacement.is_some_and(|text| text.trim().is_empty()) {
             return self.remove_queued(id);
         }
@@ -237,6 +250,13 @@ impl SessionDoc {
                 map.insert("text", text)?;
                 map.insert("editedAt", now_ms)?;
             }
+        }
+        if let Some(attachments) = attachments {
+            map.insert(
+                "attachments",
+                crate::schema::loro_value_from_json(&serde_json::to_value(attachments)?),
+            )?;
+            map.insert("editedAt", now_ms)?;
         }
         map.delete("deliveryGate")?;
         self.doc().commit();
@@ -488,6 +508,41 @@ mod tests {
         assert_eq!(row.text, "revised");
         assert_eq!(row.edited_at, Some(2_000));
         assert_eq!(row.delivery_gate, None);
+    }
+
+    #[test]
+    fn editing_attachments_preserves_row_identity_order_and_policy() {
+        let doc = doc();
+        doc.push_queued(&item("before", "first")).unwrap();
+        let mut edited = item("edited", "old text");
+        edited.attachments = vec!["old.png".into()];
+        edited.hold_for_turn_end = true;
+        doc.push_queued(&edited).unwrap();
+        doc.push_queued(&item("after", "last")).unwrap();
+        let paths = vec!["new.png".to_string(), "second.png".to_string()];
+        assert!(
+            doc.finish_queued_edit_with_attachments(
+                "edited",
+                Some("new text"),
+                Some(&paths),
+                2_000,
+            )
+            .unwrap()
+        );
+        let rows = doc.read_queue().unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["before", "edited", "after"]
+        );
+        assert_eq!(rows[1].text, "new text");
+        assert_eq!(rows[1].attachments, paths);
+        assert_eq!(rows[1].issued_at, edited.issued_at);
+        assert!(rows[1].hold_for_turn_end);
+        assert!(
+            doc.finish_queued_edit_with_attachments("edited", Some("text only"), Some(&[]), 3_000,)
+                .unwrap()
+        );
+        assert!(doc.read_queue().unwrap()[1].attachments.is_empty());
     }
 
     #[test]

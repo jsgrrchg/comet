@@ -430,6 +430,7 @@ pub enum BeginQueueEditOutcome {
     Acquired {
         lease_id: String,
         text: String,
+        attachments: Vec<String>,
         base_text_hash: String,
         expires_at_ms: i64,
     },
@@ -2529,6 +2530,7 @@ impl DocHost {
         Ok(BeginQueueEditOutcome::Acquired {
             lease_id,
             text: item.text,
+            attachments: item.attachments,
             base_text_hash,
             expires_at_ms,
         })
@@ -2619,6 +2621,28 @@ impl DocHost {
         text: Option<&str>,
         expected_text_hash: Option<&str>,
     ) -> Result<FinishQueueEditOutcome, EngineError> {
+        self.finish_queued_message_edit_with_attachments(
+            chat_id,
+            id,
+            lease_id,
+            action,
+            text,
+            expected_text_hash,
+            None,
+        )
+        .await
+    }
+
+    pub async fn finish_queued_message_edit_with_attachments(
+        &self,
+        chat_id: &str,
+        id: &str,
+        lease_id: &str,
+        action: FinishQueueEditAction,
+        text: Option<&str>,
+        expected_text_hash: Option<&str>,
+        attachments: Option<&[String]>,
+    ) -> Result<FinishQueueEditOutcome, EngineError> {
         if !self.is_host(chat_id) {
             return Err(EngineError::Other(format!(
                 "device {} does not host chat {chat_id}",
@@ -2673,7 +2697,16 @@ impl DocHost {
                 FinishQueueEditAction::Cancel | FinishQueueEditAction::ReleaseUnchanged => None,
                 FinishQueueEditAction::Discard => Some(""),
             };
-            if !handle.doc.finish_queued_edit(id, replacement, now_ms())? {
+            if !handle.doc.finish_queued_edit_with_attachments(
+                id,
+                replacement,
+                if action == FinishQueueEditAction::Commit {
+                    attachments
+                } else {
+                    None
+                },
+                now_ms(),
+            )? {
                 return Ok(FinishQueueEditOutcome::Missing);
             }
             handle.publish_queue();

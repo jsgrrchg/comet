@@ -4,10 +4,9 @@
 //! The rows live on the session doc ([`zeron_doc::QueuedMessage`]), so the phone
 //! shows the same queue and either device can reorder it.
 //!
-//! Each row exposes one honest primary action: `Steer` when the selected agent
-//! can accept text inside its live turn, otherwise `Send now`. Editing a row to
-//! nothing IS dropping it: emptying the box you just filled is a clear enough
-//! statement that "delete" would only be a second way to say it.
+//! Each row exposes one primary action: `Steer` when the selected agent
+//! can accept text inside its live turn, otherwise `Send now`. Editing moves
+//! the message into the composer while its leased row reserves its position.
 
 use gpui::{
     AnyElement, Context, InteractiveElement as _, IntoElement, ParentElement as _, Render,
@@ -418,9 +417,9 @@ impl Composer {
         let save = self.queue_action(
             &key,
             "save",
-            "Save",
+            "Save to queue",
             icons::QUEUE_CHECK,
-            true,
+            !self.queue_edit_finishing,
             theme,
             cx.listener(|this, _, _, cx| {
                 this.commit_queue_edit(cx);
@@ -431,7 +430,7 @@ impl Composer {
             "cancel",
             "Cancel",
             icons::QUEUE_CLOSE,
-            true,
+            !self.queue_edit_finishing,
             theme,
             cx.listener(|this, _, _, cx| {
                 this.cancel_queue_edit(cx);
@@ -507,14 +506,15 @@ impl Composer {
             .when(being_edited, |el| {
                 el.child(
                     div()
-                        .id(SharedString::from(format!("{key}-editor")))
                         .flex_1()
                         .min_w_0()
-                        .h(px(24.0))
-                        .flex()
-                        .items_center()
-                        .overflow_hidden()
-                        .child(self.queue_edit_input.clone()),
+                        .text_size(px(12.5))
+                        .text_color(theme.text_muted)
+                        .child(if self.queue_edit_finishing {
+                            "Saving…"
+                        } else {
+                            "Editing in composer"
+                        }),
                 )
             })
             // Files are why a row can sit through a steerable turn, so say so.
@@ -920,10 +920,13 @@ impl Composer {
         self.activate_queued_primary(id, action, cx);
     }
 
-    /// Turn one queue row into its inline editor. The main composer is a
-    /// separate draft and is deliberately left untouched.
+    /// Borrow the composer while the leased row reserves its queue position.
     pub(crate) fn begin_queue_edit(&mut self, id: String, cx: &mut Context<Self>) {
-        if self.queue_edit_pending_id.is_some() || self.queue_edit_finishing {
+        if self.queue_edit_pending_id.is_some()
+            || self.queue_edit_finishing
+            || self.editing_queued.is_some()
+            || !self.can_edit_queue_in_composer()
+        {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -968,6 +971,37 @@ impl Composer {
                 .client()
                 .call(methods::BEGIN_QUEUED_MESSAGE_EDIT, params)
                 .await;
+            let mut loaded_attachments = Vec::new();
+            if let Ok(reply) = &result
+                && reply.get("outcome").and_then(|v| v.as_str()) == Some("acquired")
+            {
+                let paths = reply.get("attachments")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok());
+                let mut load_failed = paths.is_none();
+                for path in paths.unwrap_or_default() {
+                    let loaded = crate::attachments::read_attachment_image(
+                        &engine, cx.background_executor(), Some(&host_device_id), &path,
+                    ).await;
+                    match loaded {
+                        Some(loaded) => loaded_attachments.push(crate::attachments::StagedAttachment {
+                            id: uuid::Uuid::new_v4().to_string(), name: loaded.name, image: loaded.image,
+                        }),
+                        None => { load_failed = true; break; }
+                    }
+                }
+                if load_failed {
+                    let _ = engine.client().call(methods::FINISH_QUEUED_MESSAGE_EDIT, serde_json::json!({
+                        "chatId": chat_id, "id": id, "leaseId": reply.get("leaseId"),
+                        "action": "cancel", "targetDeviceId": host_device_id,
+                    })).await;
+                    this.update(cx, |composer, cx| {
+                        composer.queue_edit_pending_id = None;
+                        composer.failure = Some("Couldn't load the queued attachments. Check the connection and update the chat host.".into());
+                        cx.notify();
+                    }).ok();
+                    return;
+                }
+            }
             this.update(cx, |composer, cx| {
                 composer.queue_edit_pending_id = None;
                 match result {
@@ -993,19 +1027,15 @@ impl Composer {
                             .and_then(|v| v.as_str())
                             .unwrap_or_default()
                             .to_string();
-                        let attachments = composer
-                            .state
-                            .read(cx)
-                            .queue
-                            .iter()
-                            .find(|item| item.id == id)
-                            .map(|item| item.attachments.clone())
-                            .unwrap_or_default();
+                        let attachments: Vec<String> = serde_json::from_value(reply["attachments"].clone()).unwrap_or_default();
                         let text = queue_visible_text(&raw_text, &attachments);
+                        let text = if !attachments.is_empty() && text == crate::attachments::ATTACHMENT_ONLY_TEXT {
+                            String::new()
+                        } else { text };
                         let selected_matches = composer.state.read(cx).selected_chat.as_deref()
                             == Some(chat_id.as_str());
-                        if !selected_matches {
-                            // Navigation won the race with acquisition. Release
+                        if !selected_matches || !composer.can_edit_queue_in_composer() {
+                            // Navigation or another composer action won acquisition. Release
                             // immediately; the expiry/review path is the backup.
                             let params = serde_json::json!({
                                 "chatId": chat_id,
@@ -1029,10 +1059,13 @@ impl Composer {
                         composer.queue_edit_base_text_hash = Some(base_text_hash.to_string());
                         composer.queue_edit_chat_id = Some(chat_id.clone());
                         composer.queue_edit_host_device_id = Some(host_device_id.clone());
-                        composer.queue_edit_inline_focus_pending = true;
-                        composer
-                            .queue_edit_input
-                            .update(cx, |input, cx| input.set_text(text, cx));
+                        composer.queue_edit_draft = Some((
+                            composer.input.read(cx).text().to_string(),
+                            composer.attachments.remove(&composer.current_key).unwrap_or_default(),
+                        ));
+                        composer.attachments.insert(composer.current_key.clone(), loaded_attachments);
+                        composer.queue_edit_focus_pending = true;
+                        composer.input.update(cx, |input, cx| input.set_text(text, cx));
                         composer.start_queue_edit_renewal(engine.clone(), cx);
                     }
                     Ok(reply)
@@ -1058,14 +1091,14 @@ impl Composer {
         self.queue_edit_task = Some(task);
     }
 
-    /// Commit the inline edit. Empty text removes the row — emptying a
-    /// message is how you take it back. `true` when this consumed the submit.
+    /// Save the composer into the existing row, including its attachments.
+    /// An entirely empty composer removes the row.
     pub(crate) fn commit_queue_edit(&mut self, cx: &mut Context<Self>) -> bool {
         if self.editing_queued.is_none() {
             return false;
         }
-        let text = self.queue_edit_input.read(cx).text().trim().to_string();
-        if text.is_empty() {
+        let text = self.input.read(cx).text().trim().to_string();
+        if text.is_empty() && self.staged().is_empty() {
             self.finish_queue_edit("discard", None, cx);
         } else {
             self.finish_queue_edit("commit", Some(text), cx);
@@ -1095,10 +1128,17 @@ impl Composer {
         self.queue_edit_host_device_id = None;
         self.queue_edit_pending_id = None;
         self.queue_edit_finishing = false;
+        self.input.update(cx, |input, cx| {
+            input.read_only = false;
+            cx.notify();
+        });
         self.queue_edit_task = None;
         self.queue_edit_renew_task = None;
-        self.queue_edit_input
-            .update(cx, |input, cx| input.set_text(String::new(), cx));
+        if let Some((text, attachments)) = self.queue_edit_draft.take() {
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
+            self.attachments
+                .insert(self.current_key.clone(), attachments);
+        }
         self.queue_edit_focus_pending = true;
         cx.notify();
     }
@@ -1124,7 +1164,8 @@ impl Composer {
             return;
         };
         let expected = self.queue_edit_base_text_hash.clone();
-        let params = serde_json::json!({
+        let staged = self.staged().to_vec();
+        let mut params = serde_json::json!({
             "chatId": chat_id,
             "id": id,
             "leaseId": lease_id,
@@ -1134,14 +1175,35 @@ impl Composer {
             "targetDeviceId": host_device_id,
         });
         self.queue_edit_finishing = true;
+        self.input.update(cx, |input, cx| {
+            input.read_only = true;
+            cx.notify();
+        });
         cx.notify();
         let task = cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::FINISH_QUEUED_MESSAGE_EDIT, params)
-                .await;
+            let result = async {
+                if action == "commit" {
+                    let mut paths = Vec::new();
+                    for attachment in &staged {
+                        let path = crate::attachments::upload_attachment(
+                            &engine, cx.background_executor(), Some(&host_device_id),
+                            &uuid::Uuid::new_v4().to_string(), attachment, None,
+                        ).await.map_err(|err| err.to_string())?;
+                        paths.push(path);
+                    }
+                    if params["text"].as_str().is_some_and(|text| text.trim().is_empty()) && !paths.is_empty() {
+                        params["text"] = crate::attachments::ATTACHMENT_ONLY_TEXT.into();
+                    }
+                    params["attachments"] = serde_json::json!(paths);
+                }
+                crate::attachments::call_with_timeout(
+                    &engine, cx.background_executor(), methods::FINISH_QUEUED_MESSAGE_EDIT,
+                    params, std::time::Duration::from_secs(30),
+                ).await.map_err(|err| err.to_string())
+            }.await;
             this.update(cx, |composer, cx| {
                 composer.queue_edit_finishing = false;
+                composer.input.update(cx, |input, cx| { input.read_only = false; cx.notify(); });
                 match result {
                     Ok(reply) => match reply.get("outcome").and_then(|v| v.as_str()) {
                         Some("committed" | "cancelled" | "discarded" | "released") => {

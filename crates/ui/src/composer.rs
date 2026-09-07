@@ -1506,6 +1506,7 @@ pub struct ComposerInput {
     accessibility_role: Role,
     focus_handle: FocusHandle,
     content: String,
+    pub(crate) read_only: bool,
     placeholder: SharedString,
     selected_range: Range<usize>,
     selection_reversed: bool,
@@ -1589,6 +1590,7 @@ impl ComposerInput {
             accessibility_role: Role::MultilineTextInput,
             focus_handle: cx.focus_handle(),
             content: String::new(),
+            read_only: false,
             placeholder: placeholder.into(),
             selected_range: 0..0,
             selection_reversed: false,
@@ -1723,6 +1725,9 @@ impl ComposerInput {
         is_dir: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         self.invalidate_mention_tooltip();
         let path = local_file_link(path, is_dir);
         let next = self.content[range.end..].chars().next();
@@ -1750,6 +1755,9 @@ impl ComposerInput {
     /// uses the same strict local Markdown transport and projected chip as an
     /// `@` mention selected from completion.
     fn insert_dropped_mention(&mut self, path: &str, is_dir: bool, cx: &mut Context<Self>) -> bool {
+        if self.read_only {
+            return false;
+        }
         let range = self.selected_range.clone();
         let Some((inserted, cursor_advance)) =
             dropped_file_mention(&self.content, range.clone(), path, is_dir)
@@ -1780,6 +1788,9 @@ impl ComposerInput {
         replacement: &str,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let next = self.content[range.end..].chars().next();
         let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
         let inserted = if existing_separator.is_some() {
@@ -2048,6 +2059,9 @@ impl ComposerInput {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let Some(previous) = self.undo_stack.pop() else {
             return;
         };
@@ -2056,6 +2070,9 @@ impl ComposerInput {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         let Some(next) = self.redo_stack.pop() else {
             return;
         };
@@ -2378,6 +2395,9 @@ impl ComposerInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -2961,6 +2981,9 @@ impl EntityInputHandler for ComposerInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -2994,6 +3017,9 @@ impl EntityInputHandler for ComposerInput {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.read_only {
+            return;
+        }
         let range = range_utf16
             .as_ref()
             .map(|r| self.range_from_utf16(r))
@@ -3656,10 +3682,8 @@ fn slash_error_message(err: &RpcError) -> SharedString {
 pub struct Composer {
     pub(crate) state: Entity<AppState>,
     pub(crate) input: Entity<ComposerInput>,
-    /// Dedicated text input mounted inside whichever queue row is being
-    /// edited. Keeping it separate means a half-written prompt below never
-    /// moves or changes while a queued message is corrected.
-    pub(crate) queue_edit_input: Entity<ComposerInput>,
+    /// Draft displaced while a queued message occupies the composer.
+    pub(crate) queue_edit_draft: Option<(String, Vec<StagedAttachment>)>,
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
     /// Shared with the shell's new-session canvas, which renders the
     /// device/project target selectors ([`Pickers::render_target_selectors`]).
@@ -3668,7 +3692,7 @@ pub struct Composer {
     drafts: HashMap<String, String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
-    attachments: HashMap<String, Vec<StagedAttachment>>,
+    pub(crate) attachments: HashMap<String, Vec<StagedAttachment>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it; the input
@@ -3694,7 +3718,7 @@ pub struct Composer {
     /// Shared scrollbar hover/drag state for both popups' floating rails —
     /// they never show at once (mutually exclusive by token shape).
     popup_bar: crate::popover::MenuScrollbarState,
-    current_key: String,
+    pub(crate) current_key: String,
     sending: bool,
     pub(crate) failure: Option<SharedString>,
     /// The chat key `failure` belongs to (`None` = global, e.g. "Engine not
@@ -3714,7 +3738,7 @@ pub struct Composer {
     /// another chat's request when the user navigates quickly.
     interrupting: HashSet<String>,
     interrupt_tasks: HashMap<String, Task<()>>,
-    /// The queued message being edited in its own row (see
+    /// The queued message being edited in the composer (see
     /// [`Composer::begin_queue_edit`]).
     pub(crate) editing_queued: Option<String>,
     /// Host-issued generation protecting `editing_queued` from automatic
@@ -3728,9 +3752,7 @@ pub struct Composer {
     pub(crate) queue_edit_finishing: bool,
     pub(crate) queue_edit_task: Option<Task<()>>,
     pub(crate) queue_edit_renew_task: Option<Task<()>>,
-    pub(crate) queue_edit_inline_focus_pending: bool,
-    /// Returning focus to the main composer must wait until the inline input
-    /// has been unmounted by the next render.
+    /// Apply focus on the next render after opening or closing an edit.
     pub(crate) queue_edit_focus_pending: bool,
     /// Live drag over the queue panel: which row, and where it would land.
     pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
@@ -3781,7 +3803,6 @@ pub struct Composer {
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
-    _queue_edit_input_events: Subscription,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -3820,8 +3841,6 @@ impl Composer {
             input.enable_mentions();
             input
         });
-        let queue_edit_input = cx
-            .new(|cx| ComposerInput::new("Edit queued message", cx).with_text_metrics(12.5, 16.0));
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
@@ -3868,30 +3887,11 @@ impl Composer {
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
-        let queue_edit_input_events = cx.subscribe(
-            &queue_edit_input,
-            |this: &mut Self, _, event, cx| match event {
-                ComposerInputEvent::Submitted => {
-                    this.commit_queue_edit(cx);
-                }
-                ComposerInputEvent::ModifiedSubmitted => {}
-                ComposerInputEvent::Edited
-                | ComposerInputEvent::CursorMoved
-                | ComposerInputEvent::ViewportChanged => cx.notify(),
-                // Queue rows are text-only. Their compact editor does not
-                // open composer completion UI or stage pasted files.
-                ComposerInputEvent::MentionNavigate(_)
-                | ComposerInputEvent::MentionAccept
-                | ComposerInputEvent::MentionDismiss
-                | ComposerInputEvent::PastedImages(_)
-                | ComposerInputEvent::PastedPaths(_) => {}
-            },
-        );
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
             state,
             input,
-            queue_edit_input,
+            queue_edit_draft: None,
             pickers,
             drafts: HashMap::new(),
             attachments: HashMap::new(),
@@ -3929,7 +3929,6 @@ impl Composer {
             queue_edit_finishing: false,
             queue_edit_task: None,
             queue_edit_renew_task: None,
-            queue_edit_inline_focus_pending: false,
             queue_edit_focus_pending: false,
             queue_drag: None,
             queue_removing: HashSet::new(),
@@ -3949,7 +3948,6 @@ impl Composer {
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
-            _queue_edit_input_events: queue_edit_input_events,
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
@@ -3999,10 +3997,14 @@ impl Composer {
         self.sending
     }
 
+    pub(crate) fn can_edit_queue_in_composer(&self) -> bool {
+        !self.sending && self.wizard.is_none()
+    }
+
     // ---- attachment staging (use-attachments.ts) ----
 
     /// Staged attachments for the chat the composer is showing.
-    fn staged(&self) -> &[StagedAttachment] {
+    pub(crate) fn staged(&self) -> &[StagedAttachment] {
         self.attachments
             .get(&self.current_key)
             .map(|v| v.as_slice())
@@ -4010,6 +4012,9 @@ impl Composer {
     }
 
     fn add_staged(&mut self, staged: Vec<StagedAttachment>, cx: &mut Context<Self>) {
+        if self.queue_edit_finishing {
+            return;
+        }
         if staged.is_empty() {
             return;
         }
@@ -4064,6 +4069,9 @@ impl Composer {
     }
 
     fn remove_attachment(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.queue_edit_finishing {
+            return;
+        }
         if let Some(list) = self.attachments.get_mut(&self.current_key) {
             list.retain(|a| a.id != id);
             if list.is_empty() {
@@ -5026,18 +5034,29 @@ impl Composer {
         // A queue edit belongs to exactly one visible row. Navigation or a
         // remote drain/removal cancels it instead of leaving a focused but
         // unmounted editor entity behind.
-        if !edited_row_exists && self.editing_queued.is_some() && !self.queue_edit_finishing {
-            let recovered = self.queue_edit_input.read(cx).text().to_string();
-            if self.input.read(cx).text().is_empty() && !recovered.is_empty() {
-                self.input
-                    .update(cx, |input, cx| input.set_text(recovered, cx));
-            }
-            self.failure = Some(
-                "The queued message was removed; its unsaved edit was restored to the composer"
-                    .into(),
-            );
+        if key != self.current_key && self.editing_queued.is_some() {
             self.clear_queue_edit(cx);
-        } else if key != self.current_key && self.editing_queued.is_some() {
+        } else if !edited_row_exists && self.editing_queued.is_some() && !self.queue_edit_finishing
+        {
+            self.failure =
+                Some("The queued message was removed; your edit remains in the composer".into());
+            // Recover both drafts when another device removes the reserved row.
+            if let Some((draft, mut attachments)) = self.queue_edit_draft.take() {
+                let edited = self.input.read(cx).text().to_string();
+                let text = [draft, edited]
+                    .into_iter()
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                self.input.update(cx, |input, cx| input.set_text(text, cx));
+                attachments.extend(
+                    self.attachments
+                        .remove(&self.current_key)
+                        .unwrap_or_default(),
+                );
+                self.attachments
+                    .insert(self.current_key.clone(), attachments);
+            }
             self.clear_queue_edit(cx);
         }
 
@@ -5072,6 +5091,11 @@ impl Composer {
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
         }
 
+        // A pending agent question must not take over an active queue edit.
+        if self.editing_queued.is_some() {
+            cx.notify();
+            return;
+        }
         // Question panel lifecycle (wizard state cached per request id).
         match pending {
             Some((request_id, questions)) if !self.answered_requests.contains(&request_id) => {
@@ -5135,6 +5159,9 @@ impl Composer {
     /// project-less `~`-cwd sessions are no longer mintable from the canvas.
     /// Existing chats carry their own project, so they always send.
     fn send_blocked(&self, cx: &App) -> bool {
+        if self.queue_edit_finishing {
+            return true;
+        }
         let state = self.state.read(cx);
         if state.review_comment_flush_pending(&self.current_key) {
             return true;
@@ -5150,6 +5177,9 @@ impl Composer {
     }
 
     fn button_mode(&self, cx: &App) -> SendButtonMode {
+        if self.editing_queued.is_some() {
+            return SendButtonMode::Send;
+        }
         let has_text = composer_has_content(
             self.input.read(cx).text(),
             self.staged().len(),
@@ -5159,6 +5189,9 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        if self.commit_queue_edit(cx) {
+            return;
+        }
         if self.wizard.is_some() {
             // Enter inside the panel's free-text input submits the page.
             let typed = self.input.read(cx).text().trim().to_string();
@@ -5188,6 +5221,9 @@ impl Composer {
     /// content. With a truly empty composer it instead advances the queue's
     /// first actionable row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
+        if self.commit_queue_edit(cx) {
+            return;
+        }
         let has_content = composer_has_content(
             self.input.read(cx).text(),
             self.staged().len(),
@@ -6328,11 +6364,7 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.queue_edit_inline_focus_pending {
-            self.queue_edit_inline_focus_pending = false;
-            let focus = self.queue_edit_input.focus_handle(cx);
-            window.focus(&focus, cx);
-        } else if self.queue_edit_focus_pending {
+        if self.queue_edit_focus_pending {
             self.queue_edit_focus_pending = false;
             let focus = self.input.focus_handle(cx);
             window.focus(&focus, cx);

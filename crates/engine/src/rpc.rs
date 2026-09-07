@@ -188,6 +188,8 @@ struct FinishQueuedMessageEditParams {
     text: Option<String>,
     #[serde(default)]
     expected_text_hash: Option<String>,
+    #[serde(default)]
+    attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1431,13 +1433,14 @@ impl RpcService for EngineRpc {
                 };
                 let outcome = self
                     .doc_host
-                    .finish_queued_message_edit(
+                    .finish_queued_message_edit_with_attachments(
                         &p.chat_id,
                         &p.id,
                         &p.lease_id,
                         action,
                         p.text.as_deref(),
                         p.expected_text_hash.as_deref(),
+                        p.attachments.as_deref(),
                     )
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;

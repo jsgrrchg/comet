@@ -224,15 +224,19 @@ async fn setup_with(
     // cares that the path is unique per run.
     let path = tmp.keep();
     let (harness, prompts) = built;
+    let core = assemble_at(&path.join("data"), harness.clone());
+    create_chat(&core).await;
+    (core, harness, prompts)
+}
+
+fn assemble_at(path: &std::path::Path, harness: Arc<HeldHarness>) -> EngineCore {
     let registry = HarnessRegistry::new();
-    registry.register(harness.clone());
-    let core = EngineCore::assemble(
-        &path.join("data"),
-        Arc::new(registry),
-        HarnessId::Mock,
-        None,
-    )
-    .expect("engine core assembles");
+    registry.register(harness);
+    EngineCore::assemble(path, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles")
+}
+
+async fn create_chat(core: &EngineCore) {
     let client = zeron_rpc::memory_client(core.rpc_service());
     client
         .call(
@@ -249,7 +253,6 @@ async fn setup_with(
     core.workspace
         .rename_chat(CHAT, "Pre-titled")
         .expect("rename chat");
-    (core, harness, prompts)
 }
 
 /// Nothing is running, so a queued message is just a message: it goes out at
@@ -352,6 +355,79 @@ async fn queue_holds_during_a_turn_and_flushes_in_order_at_its_end() {
 
     let _ = harness.finish.send(());
     core.shutdown().await;
+}
+
+/// Quitting the host must neither release the queue through the interrupt's
+/// Idle transition nor release it when the persisted document is reopened.
+/// An explicit queue action remains the thaw gesture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_restores_the_queue_frozen_until_an_explicit_send() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let (before_harness, before_prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+    let before = assemble_at(&data_dir, before_harness);
+    create_chat(&before).await;
+
+    before
+        .doc_host
+        .queue_message(CHAT, "opening", Vec::new())
+        .expect("queue opening");
+    wait_for(
+        || {
+            before_prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == "opening")
+        },
+        "the opening turn to start",
+    )
+    .await;
+    let queued_id = before
+        .doc_host
+        .queue_message(CHAT, "after restart", Vec::new())
+        .expect("queue recovered message");
+    wait_for(
+        || queue_texts(&before) == vec!["after restart"],
+        "the follow-up to remain queued",
+    )
+    .await;
+
+    before.shutdown().await;
+    drop(before);
+
+    let (after_harness, after_prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+    let after = assemble_at(&data_dir, after_harness);
+    // Materializing the persisted chat starts its background drain task. Give
+    // that task time to prove the restored row stays frozen.
+    assert_eq!(queue_texts(&after), vec!["after restart"]);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        after_prompts.lock().unwrap().is_empty(),
+        "startup must not dispatch a recovered queue"
+    );
+    assert_eq!(queue_texts(&after), vec!["after restart"]);
+
+    assert!(
+        after
+            .doc_host
+            .send_queued_now(CHAT, &queued_id)
+            .await
+            .expect("explicit send succeeds")
+    );
+    wait_for(
+        || {
+            after_prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|p| p == "after restart")
+        },
+        "the explicit send to thaw the recovered queue",
+    )
+    .await;
+
+    after.shutdown().await;
 }
 
 /// Cancel is not a normal turn boundary: it freezes the visible queue instead

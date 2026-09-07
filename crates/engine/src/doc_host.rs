@@ -826,6 +826,17 @@ impl DocHost {
         lock(&self.inner.sessions).take();
     }
 
+    /// Freeze every open queue before settling live runs during shutdown.
+    /// Interrupting a run publishes Idle, which normally wakes the turn-end
+    /// queue drainer; without this barrier quitting the host could promote a
+    /// queued row in the narrow window before workers are retired.
+    pub fn pause_all_queues(&self) {
+        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        for handle in handles {
+            handle.queue_paused.store(true, Ordering::Release);
+        }
+    }
+
     /// Test-only retirement sentinel: reports true once the doc-host graph
     /// has actually been freed.
     #[doc(hidden)]
@@ -1208,7 +1219,14 @@ impl DocHost {
         // drains, nudges) never watch the transcript, and the first
         // watch_messages attach materializes it on demand.
         let (messages_tx, _) = watch::channel(Arc::default());
-        let (queue_tx, _) = watch::channel(doc.read_queue().unwrap_or_default());
+        let initial_queue = doc.read_queue().unwrap_or_default();
+        // A queue already present when a handle is materialized came from a
+        // persisted snapshot (or a synced checkpoint), not from a prompt the
+        // user submitted to this live engine. Keep that recovered work frozen
+        // until an explicit prompt / Send now / Steer action thaws it. Rows
+        // appended after the handle exists retain the normal automatic drain.
+        let recovered_queue_pending = !initial_queue.is_empty();
+        let (queue_tx, _) = watch::channel(initial_queue);
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
@@ -1217,7 +1235,7 @@ impl DocHost {
             messages_tx,
             queue_tx,
             drain_lock: tokio::sync::Mutex::new(()),
-            queue_paused: AtomicBool::new(false),
+            queue_paused: AtomicBool::new(recovered_queue_pending),
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),

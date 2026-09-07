@@ -14,7 +14,7 @@ use gpui::FocusHandle;
 use std::collections::HashSet;
 use zeron_proto::{ChatIndicator, Device, DriveEntry, DriveListing, FolderListing, Space};
 
-/// Promote the locally ordered pins above the untouched activity projection.
+/// Promote the user's ordered pins above the untouched activity projection.
 /// Every unpinned id keeps exactly the relative order supplied by recency.
 pub(super) fn project_pinned_first(recency_ids: &[String], pinned_ids: &[String]) -> Vec<String> {
     let active: HashSet<&str> = recency_ids.iter().map(String::as_str).collect();
@@ -1588,10 +1588,9 @@ impl Shell {
     }
 
     /// Flat top-to-bottom chat ids exactly as [`Self::render_active_rows`]
-    /// draws them — the user's sort, device grouping, and local-device
-    /// promotion applied. The jump shortcuts and session cycling read THIS
-    /// order (not the raw recency list) so keyboard order never drifts from
-    /// the screen.
+    /// draws them: pins first, then the user's sort, device grouping,
+    /// and local-device promotion. Jump shortcuts and session cycling read
+    /// this projection so keyboard order never drifts from the screen.
     pub(super) fn sidebar_visible_order(&self, cx: &Context<Self>) -> Vec<String> {
         let filter = self.settings.space_filter.clone();
         let profile_key = self.active_sidebar_pin_profile_key(cx);
@@ -1635,9 +1634,9 @@ impl Shell {
         project_pinned_first(&ordered, pinned_order)
     }
 
-    /// The sidebar's Sessions list: every session (idle included) of the
-    /// filter space — or all spaces under "All" — attention-sorted. Rows are
-    /// keyed for the FLIP resort glide.
+    /// Pinned sessions form a manually ordered section above the configured
+    /// projection. Unpinned rows retain the selected automatic sort and any
+    /// device grouping; all rows remain keyed for the FLIP resort glide.
     pub(super) fn render_active_rows(
         &mut self,
         theme: &Theme,

@@ -4,8 +4,8 @@
 //! The rows live on the session doc ([`zeron_doc::QueuedMessage`]), so the phone
 //! shows the same queue and either device can reorder it.
 //!
-//! Each row exposes one primary action: `Steer` when the selected agent
-//! can accept text inside its live turn, otherwise `Send now`. Editing moves
+//! Each row exposes a uniform `Steer` control, with delivery semantics
+//! explained in its tooltip. Editing moves
 //! the message into the composer while its leased row reserves its position.
 
 use gpui::{
@@ -90,24 +90,10 @@ enum QueuePrimaryAction {
 }
 
 impl QueuePrimaryAction {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Steer => "Steer",
-            Self::SendNow => "Send now",
-        }
-    }
-
     fn tooltip(self) -> &'static str {
         match self {
             Self::Steer => "Steer without interrupting",
             Self::SendNow => "Send now (interrupt)",
-        }
-    }
-
-    fn glyph(self) -> Option<&'static str> {
-        match self {
-            Self::Steer => None,
-            Self::SendNow => Some(icons::QUEUE_SEND),
         }
     }
 }
@@ -632,8 +618,7 @@ impl Composer {
             .into_any_element()
     }
 
-    /// The row's only delivery control. Text and behavior are both supplied by
-    /// the same resolved enum so the label can never conceal an interrupt.
+    /// Uniform Steer control; the tooltip explains the resolved delivery behavior.
     fn queue_primary_action_button(
         &self,
         key: &SharedString,
@@ -642,7 +627,6 @@ impl Composer {
         theme: &Theme,
         on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
     ) -> AnyElement {
-        let own = SharedString::from(format!("{key}-primary-grp"));
         let tooltip = if enabled {
             action.tooltip()
         } else {
@@ -650,7 +634,6 @@ impl Composer {
         };
         div()
             .id(SharedString::from(format!("{key}-primary")))
-            .group(own.clone())
             .h(px(22.0))
             .flex_none()
             .px(px(6.0))
@@ -677,15 +660,7 @@ impl Composer {
                 .into()
             })
             .tooltip_show_delay(std::time::Duration::from_millis(350))
-            .child(action.label())
-            .when_some(action.glyph(), |el, glyph| {
-                el.child(
-                    icon(glyph)
-                        .size(px(QUEUE_ICON_SIZE))
-                        .text_color(theme.text_muted.opacity(0.72))
-                        .group_hover(own, |s| s.text_color(theme.text)),
-                )
-            })
+            .child("Steer")
             .into_any_element()
     }
 

@@ -17,6 +17,7 @@ use gpui::{
     SharedString, Subscription, Task, Window, canvas, container_query, div, img, list, point,
     prelude::*, px,
 };
+use zeron_engine::repos::git_history_matches;
 use zeron_proto::{
     GitHistoryCommit, GitHistoryComparison, GitHistoryPage, GitHistoryRef, GitHistoryRefKind,
 };
@@ -27,7 +28,7 @@ use crate::motion::AnimationExt;
 use crate::popover::{self, Popup};
 use crate::settings::{
     self, GitHistoryAuthorDisplay, GitHistoryColumn, GitHistoryColumnOrder, GitHistoryColumnWidths,
-    GitHistoryColumns, SAVE_DEBOUNCE_MS, SavePolicy,
+    GitHistoryColumns, SavePolicy,
 };
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -826,27 +827,94 @@ fn compact_commits_to_visible(
         .iter()
         .map(|commit| (commit.sha.as_str(), commit))
         .collect();
+
     fn nearest_visible_parents(
         sha: &str,
         visible: &HashSet<String>,
         by_sha: &HashMap<&str, &GitHistoryCommit>,
-        visiting: &mut HashSet<String>,
+        memo: &mut HashMap<String, Vec<String>>,
     ) -> Vec<String> {
         if visible.contains(sha) || !by_sha.contains_key(sha) {
             return vec![sha.to_string()];
         }
-        if !visiting.insert(sha.to_string()) {
-            return Vec::new();
+        if let Some(cached) = memo.get(sha) {
+            return cached.clone();
         }
-        let parents = by_sha[sha]
-            .parent_shas
-            .iter()
-            .flat_map(|parent| nearest_visible_parents(parent, visible, by_sha, visiting))
-            .collect::<Vec<_>>();
-        visiting.remove(sha);
-        parents
+
+        struct Frame {
+            sha: String,
+            next_parent: usize,
+            resolved: Vec<String>,
+            seen: HashSet<String>,
+        }
+
+        impl Frame {
+            fn new(sha: String) -> Self {
+                Self {
+                    sha,
+                    next_parent: 0,
+                    resolved: Vec::new(),
+                    seen: HashSet::new(),
+                }
+            }
+
+            fn extend(&mut self, parents: &[String]) {
+                for parent in parents {
+                    if self.seen.insert(parent.clone()) {
+                        self.resolved.push(parent.clone());
+                    }
+                }
+            }
+        }
+
+        let mut visiting = HashSet::from([sha.to_string()]);
+        let mut stack = vec![Frame::new(sha.to_string())];
+        loop {
+            let next_parent = {
+                let frame = stack.last_mut().expect("history traversal frame");
+                let parents = &by_sha[frame.sha.as_str()].parent_shas;
+                (frame.next_parent < parents.len()).then(|| {
+                    let parent = parents[frame.next_parent].clone();
+                    frame.next_parent += 1;
+                    parent
+                })
+            };
+
+            let Some(parent) = next_parent else {
+                let frame = stack.pop().expect("history traversal frame");
+                visiting.remove(&frame.sha);
+                let resolved = frame.resolved;
+                memo.insert(frame.sha, resolved.clone());
+                if let Some(caller) = stack.last_mut() {
+                    caller.extend(&resolved);
+                    continue;
+                }
+                return resolved;
+            };
+
+            let resolved = if visible.contains(&parent) || !by_sha.contains_key(parent.as_str()) {
+                Some(vec![parent.clone()])
+            } else if let Some(cached) = memo.get(&parent) {
+                Some(cached.clone())
+            } else if visiting.contains(&parent) {
+                Some(Vec::new())
+            } else {
+                None
+            };
+
+            if let Some(resolved) = resolved {
+                stack
+                    .last_mut()
+                    .expect("history traversal frame")
+                    .extend(&resolved);
+            } else {
+                visiting.insert(parent.clone());
+                stack.push(Frame::new(parent));
+            }
+        }
     }
 
+    let mut memo = HashMap::new();
     commits
         .iter()
         .filter(|commit| visible.contains(&commit.sha))
@@ -856,36 +924,12 @@ fn compact_commits_to_visible(
             commit.parent_shas = commit
                 .parent_shas
                 .iter()
-                .flat_map(|parent| {
-                    nearest_visible_parents(parent, &visible, &by_sha, &mut HashSet::new())
-                })
+                .flat_map(|parent| nearest_visible_parents(parent, visible, &by_sha, &mut memo))
                 .filter(|parent| seen.insert(parent.clone()))
                 .collect();
             commit
         })
         .collect()
-}
-
-fn history_search_matches(commit: &GitHistoryCommit, query: &str) -> bool {
-    let query = query.trim().to_ascii_lowercase();
-    if query.is_empty() {
-        return true;
-    }
-    let sha = commit.sha.to_ascii_lowercase();
-    if sha.starts_with(&query) {
-        return true;
-    }
-    let haystack = format!("{} {}", sha, commit.subject.to_ascii_lowercase());
-    query.split_whitespace().all(|term| {
-        let mut from = 0;
-        term.chars().all(|needle| {
-            let Some(offset) = haystack[from..].find(needle) else {
-                return false;
-            };
-            from += offset + needle.len_utf8();
-            true
-        })
-    })
 }
 
 fn responsive_graph_geometry(
@@ -1300,7 +1344,6 @@ pub struct GitHistory {
     graph_hover_clear_task: Option<Task<()>>,
     column_drag_anchor: Option<HistoryColumnDragAnchor>,
     column_drag: Option<HistoryColumnDragState>,
-    column_save_task: Option<Task<()>>,
     avatar_images: HashMap<String, Arc<Image>>,
     column_menu: Popup<gpui::Point<gpui::Pixels>>,
     author_menu: Popup<gpui::Point<gpui::Pixels>>,
@@ -1450,9 +1493,24 @@ impl GitHistorySearchControl {
         self.transition_epoch = self.transition_epoch.wrapping_add(1);
         self.transition_task = None;
         self.mode = GitHistorySearchMode::Expanded;
-        let focus = self.input.read(cx).focus_handle(cx);
-        window.focus(&focus, cx);
-        self.schedule_idle_dismiss(cx);
+        // The collapsed render does not mount `input`. Focusing its handle in
+        // this click cycle leaves the next focus path empty, so Shell's
+        // focus-lost fallback legitimately restores the composer. Wait until
+        // the expanded state has driven a frame, then complete the handoff.
+        let control = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            control
+                .update(cx, |control, cx| {
+                    if control.mode != GitHistorySearchMode::Expanded {
+                        return;
+                    }
+                    let focus = control.input.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
+                    control.schedule_idle_dismiss(cx);
+                    cx.notify();
+                })
+                .ok();
+        });
         cx.notify();
     }
 
@@ -1669,8 +1727,14 @@ impl Render for GitHistorySearchControl {
         let closing = self.mode == GitHistorySearchMode::Collapsing;
         let transition_epoch = self.transition_epoch;
         let status_icon = if search_loading {
-            crate::loaders::mini_gradient_spinner("history-search-spinner", 1.5, cx.entity_id(), cx)
-                .into_any_element()
+            crate::loaders::mini_glyph_spinner(
+                "history-search-spinner",
+                1.5,
+                theme.glyph,
+                cx.entity_id(),
+                cx,
+            )
+            .into_any_element()
         } else {
             crate::icons::icon(crate::icons::MAGNIFER)
                 .size(px(11.0))
@@ -1924,7 +1988,6 @@ impl GitHistory {
             graph_hover_clear_task: None,
             column_drag_anchor: None,
             column_drag: None,
-            column_save_task: None,
             avatar_images: HashMap::new(),
             column_menu: Popup::default(),
             author_menu: Popup::default(),
@@ -2100,7 +2163,7 @@ impl GitHistory {
             let source = self.search_results.as_ref().unwrap_or(&self.commits);
             let visible: HashSet<_> = source
                 .iter()
-                .filter(|commit| history_search_matches(commit, &self.search_query))
+                .filter(|commit| git_history_matches(&self.search_query, commit))
                 .map(|commit| commit.sha.clone())
                 .collect();
             self.visible_commits = compact_commits_to_visible(source, &visible);
@@ -2821,7 +2884,7 @@ impl GitHistory {
                 preferences.order.clone(),
             )
         };
-        Self::persist_column_layout(columns, widths, &order, cx);
+        Self::persist_column_layout(columns, widths, &order, SavePolicy::Immediate, cx);
         cx.refresh_windows();
         cx.notify();
     }
@@ -2836,7 +2899,7 @@ impl GitHistory {
             preferences.widths = widths;
             preferences.order = order.clone();
         }
-        Self::persist_column_layout(columns, widths, &order, cx);
+        Self::persist_column_layout(columns, widths, &order, SavePolicy::Immediate, cx);
         cx.refresh_windows();
         cx.notify();
     }
@@ -2845,37 +2908,27 @@ impl GitHistory {
         columns: GitHistoryColumns,
         widths: GitHistoryColumnWidths,
         order: &GitHistoryColumnOrder,
-        cx: &mut App,
+        policy: SavePolicy,
+        cx: &mut Context<Self>,
     ) {
-        settings::update(SavePolicy::Immediate, cx, |settings| {
+        let order = order.clone();
+        settings::update(policy, cx, move |settings| {
             settings.git_history_columns = columns;
             settings.git_history_column_widths = widths;
-            settings.git_history_column_order = order.clone();
+            settings.git_history_column_order = order;
         });
     }
 
     fn schedule_column_layout_save(&mut self, cx: &mut Context<Self>) {
-        self.column_save_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(SAVE_DEBOUNCE_MS))
-                .await;
-            this.update(cx, |_, cx| {
-                let (columns, widths, order) = {
-                    let preferences = cx.global::<HistoryColumnPreferences>();
-                    (
-                        preferences.columns,
-                        preferences.widths,
-                        preferences.order.clone(),
-                    )
-                };
-                settings::update(SavePolicy::Debounced, cx, |settings| {
-                    settings.git_history_columns = columns;
-                    settings.git_history_column_widths = widths;
-                    settings.git_history_column_order = order;
-                });
-            })
-            .ok();
-        }));
+        let (columns, widths, order) = {
+            let preferences = cx.global::<HistoryColumnPreferences>();
+            (
+                preferences.columns,
+                preferences.widths,
+                preferences.order.clone(),
+            )
+        };
+        Self::persist_column_layout(columns, widths, &order, SavePolicy::Debounced, cx);
     }
 
     fn begin_column_resize(
@@ -4445,6 +4498,44 @@ impl Render for GitHistory {
 mod tests {
     use super::*;
 
+    struct HistorySearchFocusHarness {
+        composer: Entity<ComposerInput>,
+        search: Entity<GitHistorySearchControl>,
+        _focus_lost: Subscription,
+    }
+
+    impl HistorySearchFocusHarness {
+        fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+            let state = cx.new(|_| AppState::new());
+            let history = cx.new(|cx| GitHistory::new(state, cx));
+            let search = cx.new(|cx| GitHistorySearchControl::new(history, cx));
+            let composer = cx.new(|cx| ComposerInput::new("Message", cx));
+            let focus_lost = cx.on_focus_lost(window, |this, window, cx| {
+                crate::shell::restore_focus_if_empty_on_next_frame(
+                    this.composer.read(cx).focus_handle(cx),
+                    window,
+                    cx,
+                );
+            });
+            Self {
+                composer,
+                search,
+                _focus_lost: focus_lost,
+            }
+        }
+    }
+
+    impl Render for HistorySearchFocusHarness {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(div().h(px(40.0)).child(self.composer.clone()))
+                .child(self.search.clone())
+        }
+    }
+
     fn commit(sha: &str, parents: &[&str]) -> GitHistoryCommit {
         GitHistoryCommit {
             sha: sha.into(),
@@ -4474,9 +4565,93 @@ mod tests {
         let mut candidate = commit("a1b2c3d4", &[]);
         candidate.subject = "Polish the history graph".into();
 
-        assert!(history_search_matches(&candidate, "plsh grph"));
-        assert!(history_search_matches(&candidate, "A1B2"));
-        assert!(!history_search_matches(&candidate, "terminal"));
+        assert!(git_history_matches("plsh grph", &candidate));
+        assert!(git_history_matches("A1B2", &candidate));
+        assert!(!git_history_matches("terminal", &candidate));
+    }
+
+    #[test]
+    fn history_search_keeps_unicode_engine_result_visible() {
+        let mut app = gpui::TestApp::new();
+
+        app.update(|cx| {
+            let state = cx.new(|_| AppState::new());
+            let history = cx.new(|cx| GitHistory::new(state, cx));
+            let mut candidate = commit("a1b2c3d4", &[]);
+            candidate.subject = "RÉPARER la recherche".into();
+
+            // Simulate the page returned by the engine for this query. The UI
+            // must not discard a result that the shared matcher accepted.
+            assert!(git_history_matches("réparer", &candidate));
+            history.update(cx, |history, _cx| {
+                history.search_query = "réparer".into();
+                history.search_results = Some(vec![candidate]);
+                history.recompute_view();
+
+                assert_eq!(history.visible_commits.len(), 1);
+                assert_eq!(history.visible_commits[0].subject, "RÉPARER la recherche");
+            });
+        });
+    }
+
+    #[test]
+    fn history_search_focus_survives_the_composer_fallback() {
+        let mut app = gpui::TestApp::new();
+        app.update(|cx| {
+            Theme::install(crate::theme::Appearance::Dark, cx);
+            crate::composer::init(cx, crate::settings::ComposerSendBehavior::default());
+        });
+        let mut window = app.open_window(HistorySearchFocusHarness::new);
+        window.draw();
+
+        window.update(|harness, window, cx| {
+            window.focus(&harness.composer.read(cx).focus_handle(cx), cx);
+        });
+        window.draw();
+        window.update(|harness, window, cx| {
+            assert!(
+                harness
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+            harness
+                .search
+                .update(cx, |search, cx| search.expand(window, cx));
+        });
+
+        // TestApp has no platform frame loop, so deliver the callback that a
+        // headed window runs immediately before painting the expanded input.
+        window.update(|_, window, cx| {
+            window.simulate_next_frame(cx);
+        });
+        window.draw();
+        window.update(|harness, window, cx| {
+            let search = harness.search.read(cx);
+            assert!(search.input.read(cx).focus_handle(cx).is_focused(window));
+            assert!(
+                !harness
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window)
+            );
+        });
+
+        window.simulate_input("fix");
+        window.read(|harness, cx| {
+            let search = harness.search.read(cx);
+            assert_eq!(search.input.read(cx).text(), "fix");
+            assert_eq!(search.history.read(cx).search_query, "fix");
+            assert!(search.mode == GitHistorySearchMode::Expanded);
+        });
+
+        app.advance_clock(HISTORY_SEARCH_IDLE_DISMISS + Duration::from_millis(1));
+        app.run_until_parked();
+        window.read(|harness, cx| {
+            assert!(harness.search.read(cx).mode == GitHistorySearchMode::Expanded);
+        });
     }
 
     #[test]
@@ -4498,6 +4673,34 @@ mod tests {
             vec!["tip", "base"]
         );
         assert_eq!(compact[0].parent_shas, vec!["base"]);
+        assert!(compact[1].parent_shas.is_empty());
+    }
+
+    #[test]
+    fn search_compaction_handles_a_twenty_thousand_commit_gap() {
+        const DEPTH: usize = 20_000;
+        let commits = (0..DEPTH)
+            .rev()
+            .map(|index| {
+                let sha = format!("c{index:05}");
+                if index == 0 {
+                    commit(&sha, &[])
+                } else {
+                    let parent = format!("c{:05}", index - 1);
+                    commit(&sha, &[parent.as_str()])
+                }
+            })
+            .collect::<Vec<_>>();
+        let newest = format!("c{:05}", DEPTH - 1);
+        let oldest = "c00000".to_string();
+        let visible = HashSet::from([newest.clone(), oldest.clone()]);
+
+        let compact = compact_commits_to_visible(&commits, &visible);
+
+        assert_eq!(compact.len(), 2);
+        assert_eq!(compact[0].sha, newest);
+        assert_eq!(compact[0].parent_shas, vec![oldest.clone()]);
+        assert_eq!(compact[1].sha, oldest);
         assert!(compact[1].parent_shas.is_empty());
     }
 

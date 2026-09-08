@@ -95,7 +95,7 @@ const TOOL_TEXT_SIZE: f32 = 12.0;
 ///
 /// GPUI list offsets increase toward the document bottom. The quadratic ramp
 /// keeps entry into the edge zone gentle and reaches full speed at the edge.
-fn selection_scroll_step(bounds: Bounds<Pixels>, position: Point<Pixels>) -> f32 {
+pub(crate) fn selection_scroll_step(bounds: Bounds<Pixels>, position: Point<Pixels>) -> f32 {
     let height = f32::from(bounds.size.height);
     if height <= 0.0 {
         return 0.0;
@@ -4929,6 +4929,8 @@ impl Transcript {
                 };
                 let code = self.code_uis_for(&row.id, &top.block, *block_ix, cx);
                 let opts = RenderOptions {
+                    tasks: None,
+                    media: None,
                     row_key: row.id.clone(),
                     veil: None,
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
@@ -4974,6 +4976,8 @@ impl Transcript {
                         .clone()
                 });
                 let opts = RenderOptions {
+                    tasks: None,
+                    media: None,
                     row_key: row.id.clone(),
                     veil: veil.clone(),
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),

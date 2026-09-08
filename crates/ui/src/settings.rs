@@ -555,6 +555,7 @@ const JUMP_LABELS: [&str; JUMP_SLOTS] = [
 /// rather than panicking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
+    SaveFile,
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
@@ -566,7 +567,8 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 7 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 8 + JUMP_SLOTS] = [
+        ShortcutId::SaveFile,
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
@@ -588,6 +590,7 @@ impl ShortcutId {
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
+            ShortcutId::SaveFile => "Save file",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
@@ -608,8 +611,9 @@ impl ShortcutId {
     /// this guards against only exists off macOS).
     pub fn default_combo_on(self, mac: bool) -> &'static str {
         match self {
-            ShortcutId::ToggleSidebar => "mod-s",
-            ShortcutId::ToggleChanges => "mod-b",
+            ShortcutId::SaveFile => "mod-s",
+            ShortcutId::ToggleSidebar => "mod-b",
+            ShortcutId::ToggleChanges => "mod-r",
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::NewSession => "mod-n",
             // Ctrl+Tab on every platform — but spelled the way THAT platform's
@@ -648,6 +652,7 @@ impl ShortcutId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
+    pub save_file: String,
     pub toggle_sidebar: String,
     pub toggle_changes: String,
     pub toggle_terminal: String,
@@ -706,6 +711,7 @@ pub fn sidebar_pin_profile_key(
 impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
+            save_file: ShortcutId::SaveFile.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
@@ -721,6 +727,7 @@ impl Default for KeymapConfig {
 impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
+            ShortcutId::SaveFile => &self.save_file,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
@@ -738,6 +745,7 @@ impl KeymapConfig {
 
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
+            ShortcutId::SaveFile => self.save_file = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
@@ -1012,13 +1020,71 @@ impl UiSettings {
     /// Load from `{data_dir}/ui-settings.json`; defaults on any failure.
     pub fn load(data_dir: &Path) -> Self {
         match std::fs::read_to_string(Self::path(data_dir)) {
-            Ok(text) => match serde_json::from_str::<UiSettings>(&text) {
-                Ok(settings) => settings.migrated().clamped(),
-                Err(err) => {
-                    tracing::warn!(error = %err, "ui-settings corrupt; using defaults");
-                    Self::default()
+            Ok(text) => {
+                match serde_json::from_str::<serde_json::Value>(&text).and_then(|mut value| {
+                    if let Some(keymap) = value
+                        .get_mut("keymap")
+                        .and_then(serde_json::Value::as_object_mut)
+                        && !keymap.contains_key("saveFile")
+                    {
+                        // Reserve customized chords before assigning any new defaults.
+                        // An older map may already use Cmd+S/B/R for another action.
+                        let mut migrating =
+                            vec![(ShortcutId::SaveFile, "saveFile", "", "mod-shift-s")];
+                        for (id, field, old, fallback) in [
+                            (
+                                ShortcutId::ToggleSidebar,
+                                "toggleSidebar",
+                                "mod-s",
+                                "mod-shift-b",
+                            ),
+                            (
+                                ShortcutId::ToggleChanges,
+                                "toggleChanges",
+                                "mod-b",
+                                "mod-shift-r",
+                            ),
+                        ] {
+                            if keymap
+                                .get(field)
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or(old)
+                                == old
+                            {
+                                migrating.push((id, field, old, fallback));
+                            }
+                        }
+                        for (_, field, _, _) in &migrating {
+                            keymap.insert((*field).into(), serde_json::json!(""));
+                        }
+                        let mut resolved: KeymapConfig =
+                            serde_json::from_value(serde_json::Value::Object(keymap.clone()))?;
+                        for (id, field, old, fallback) in migrating {
+                            let combo = [id.default_combo(), old, fallback]
+                                .into_iter()
+                                .find(|candidate| {
+                                    !candidate.is_empty()
+                                        && !ShortcutId::ALL.iter().any(|other| {
+                                            let existing = resolved.get(*other);
+                                            !existing.is_empty()
+                                                && platform_combo(existing)
+                                                    == platform_combo(candidate)
+                                        })
+                                })
+                                .unwrap_or("");
+                            resolved.set(id, combo.into());
+                            keymap.insert(field.into(), serde_json::json!(combo));
+                        }
+                    }
+                    serde_json::from_value::<UiSettings>(value)
+                }) {
+                    Ok(settings) => settings.migrated().clamped(),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "ui-settings corrupt; using defaults");
+                        Self::default()
+                    }
                 }
-            },
+            }
             Err(_) => Self::default(),
         }
     }
@@ -1556,10 +1622,72 @@ mod tests {
     }
 
     #[test]
+    fn legacy_panel_defaults_migrate_and_custom_shortcuts_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        for (sidebar, right, expected_sidebar, expected_right) in [
+            ("mod-s", "mod-b", "mod-b", "mod-r"),
+            ("mod-shift-x", "mod-alt-b", "mod-shift-x", "mod-alt-b"),
+        ] {
+            std::fs::write(
+                UiSettings::path(dir.path()),
+                serde_json::json!({
+                    "keymap": {"toggleSidebar": sidebar, "toggleChanges": right}
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let settings = UiSettings::load(dir.path());
+            assert_eq!(settings.keymap.toggle_sidebar, expected_sidebar);
+            assert_eq!(settings.keymap.toggle_changes, expected_right);
+            assert_eq!(settings.keymap.save_file, "mod-s");
+        }
+        // Once the new map has been saved, old chords can be assigned deliberately.
+        let mut settings = UiSettings::default();
+        settings.keymap.save_file = "mod-shift-s".into();
+        settings.keymap.toggle_sidebar = "mod-s".into();
+        settings.save(dir.path()).unwrap();
+        assert_eq!(UiSettings::load(dir.path()).keymap, settings.keymap);
+    }
+
+    #[test]
+    fn legacy_migration_reserves_custom_chords_and_survives_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        for (custom, expected_save) in [
+            ("mod-s", "mod-shift-s"),
+            ("mod-b", "mod-s"),
+            ("mod-r", "mod-s"),
+        ] {
+            std::fs::write(UiSettings::path(dir.path()), serde_json::json!({
+                "keymap": {"toggleSidebar": "mod-shift-b", "toggleChanges": "mod-b", "newSession": custom}
+            }).to_string()).unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert_eq!(loaded.keymap.new_session, custom);
+            assert_eq!(loaded.keymap.toggle_sidebar, "mod-shift-b");
+            assert_eq!(loaded.keymap.save_file, expected_save);
+            assert!(conflicted_shortcuts(&loaded.keymap).is_empty());
+            loaded.save(dir.path()).unwrap();
+            assert_eq!(UiSettings::load(dir.path()).keymap, loaded.keymap);
+        }
+        // If every candidate is already custom-bound, leave the new action
+        // unbound rather than steal a working shortcut from another action.
+        std::fs::write(UiSettings::path(dir.path()), serde_json::json!({
+            "keymap": {"toggleSidebar": "mod-shift-s", "newSession": "mod-s", "toggleChanges": "mod-r"}
+        }).to_string()).unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.keymap.save_file, "");
+        assert_eq!(loaded.keymap.new_session, "mod-s");
+        assert!(conflicted_shortcuts(&loaded.keymap).is_empty());
+    }
+
+    #[test]
     fn keymap_defaults_and_reset() {
         let mut keymap = KeymapConfig::default();
-        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-s");
-        assert_eq!(keymap.get(ShortcutId::ToggleChanges), "mod-b");
+        assert_eq!(keymap.get(ShortcutId::SaveFile), "mod-s");
+        keymap.set(ShortcutId::SaveFile, "mod-shift-s".into());
+        keymap.reset(ShortcutId::SaveFile);
+        assert_eq!(keymap.get(ShortcutId::SaveFile), "mod-s");
+        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-b");
+        assert_eq!(keymap.get(ShortcutId::ToggleChanges), "mod-r");
         assert_eq!(keymap.get(ShortcutId::ToggleTerminal), "mod-j");
         let ctrl = if cfg!(target_os = "macos") {
             "ctrl"
@@ -1576,7 +1704,7 @@ mod tests {
         keymap.set(ShortcutId::ToggleSidebar, "mod-shift-x".into());
         assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-shift-x");
         keymap.reset(ShortcutId::ToggleSidebar);
-        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-s");
+        assert_eq!(keymap.get(ShortcutId::ToggleSidebar), "mod-b");
         keymap.set(ShortcutId::ArchiveSession, "mod-shift-y".into());
         assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-y");
         keymap.reset(ShortcutId::ArchiveSession);
@@ -1686,7 +1814,7 @@ mod tests {
     fn conflict_detection() {
         let mut keymap = KeymapConfig::default();
         assert!(conflicted_shortcuts(&keymap).is_empty());
-        keymap.set(ShortcutId::ToggleChanges, "mod-s".into());
+        keymap.set(ShortcutId::ToggleChanges, "mod-b".into());
         let conflicts = conflicted_shortcuts(&keymap);
         assert!(conflicts.contains(&ShortcutId::ToggleSidebar));
         assert!(conflicts.contains(&ShortcutId::ToggleChanges));

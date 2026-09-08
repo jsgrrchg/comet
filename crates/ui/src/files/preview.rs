@@ -18,9 +18,10 @@ use zeron_proto::{
 };
 
 use super::{
-    FilesCloseDisposition, FilesEvent, FilesSurface, TOOLBAR_BUTTON_RADIUS, TOOLBAR_BUTTON_SIZE,
+    FilesCloseDisposition, FilesEvent, FilesSurface,
     client::{FilesRequestContext, WorkspaceFilesClient},
     document::{DocumentKey, DocumentPhase, FileDocument},
+    toolbar, toolbar_button,
 };
 use crate::{
     comments::{self, ReviewComment},
@@ -86,6 +87,47 @@ enum ReloadDecision {
     AwaitDiscardConfirmation,
 }
 
+/// Openness is independent of the dragged width, so resizing remains direct.
+#[derive(Default)]
+struct TreeSidebarMotion {
+    target: Option<bool>,
+    from: f32,
+    started: Option<Instant>,
+}
+
+impl TreeSidebarMotion {
+    fn sample(&mut self, visible: bool, now: Instant, reduced: bool) -> (f32, bool) {
+        let end = f32::from(visible);
+        let duration = crate::motion::RESIZE
+            .total()
+            .mul_f32(crate::motion::speed_scale());
+        // Layout and file activation changes are immediate. Only the toggle
+        // action starts a transition through animate_to.
+        if reduced || self.target != Some(visible) {
+            self.target = Some(visible);
+            self.started = None;
+            return (end, false);
+        }
+        if let Some(started) = self.started {
+            let raw = now.saturating_duration_since(started).as_secs_f32() / duration.as_secs_f32();
+            if raw < 1.0 {
+                return (
+                    crate::motion::lerp(self.from, end, crate::motion::RESIZE.progress(raw)),
+                    true,
+                );
+            }
+            self.started = None;
+        }
+        (end, false)
+    }
+
+    fn animate_to(&mut self, previous: bool, visible: bool, now: Instant) {
+        self.from = self.sample(previous, now, false).0;
+        self.target = Some(visible);
+        self.started = Some(now);
+    }
+}
+
 pub(super) struct FilePreviewState {
     documents: HashMap<String, FileDocument>,
     document_recency: VecDeque<String>,
@@ -104,6 +146,7 @@ pub(super) struct FilePreviewState {
     tree_sidebar_visible: bool,
     tree_sidebar_dismissed: bool,
     tree_width: f32,
+    tree_motion: TreeSidebarMotion,
     comment_anchors: HashMap<String, HashMap<String, EditorCommentAnchor>>,
     comment_draft: Option<EditorCommentDraft>,
     active_comment: Option<String>,
@@ -134,6 +177,7 @@ impl FilePreviewState {
             tree_sidebar_visible: false,
             tree_sidebar_dismissed: false,
             tree_width: TREE_SPLIT_DEFAULT,
+            tree_motion: TreeSidebarMotion::default(),
             comment_anchors: HashMap::new(),
             comment_draft: None,
             active_comment: None,
@@ -149,6 +193,7 @@ impl FilePreviewState {
         self.reload_confirmation = None;
         self.close_requested = false;
         self.tree_sidebar_visible = false;
+        self.tree_motion = TreeSidebarMotion::default();
         self.comment_anchors.clear();
         self.comment_draft = None;
         self.active_comment = None;
@@ -278,12 +323,15 @@ impl FilePreviewState {
     }
 
     fn toggle_tree_sidebar(&mut self) {
-        if self.tree_sidebar_visible() {
+        let previous = self.tree_sidebar_visible();
+        if previous {
             self.tree_sidebar_visible = false;
             self.tree_sidebar_dismissed = true;
         } else {
             self.show_tree_sidebar();
         }
+        self.tree_motion
+            .animate_to(previous, self.tree_sidebar_visible(), Instant::now());
     }
 
     fn word_wrap(&self) -> bool {
@@ -318,6 +366,18 @@ impl FilePreviewState {
         pending
     }
 
+    pub(super) fn tree_sidebar_frame(&mut self, window: &mut Window, cx: &App) -> f32 {
+        let (openness, active) = self.tree_motion.sample(
+            self.tree_sidebar_visible(),
+            Instant::now(),
+            crate::motion::reduced_motion(cx),
+        );
+        if active {
+            window.request_animation_frame();
+        }
+        openness
+    }
+
     pub(super) fn tree_width(&self) -> f32 {
         self.tree_width
     }
@@ -334,12 +394,10 @@ impl FilePreviewState {
             .collect()
     }
 
-    pub(super) fn autosavable_dirty_paths(&self) -> Vec<String> {
-        self.documents
-            .iter()
-            .filter(|(_, document)| document.can_autosave())
-            .map(|(path, _)| path.clone())
-            .collect()
+    pub(super) fn cancel_autosaves(&mut self) {
+        for document in self.documents.values_mut() {
+            document.autosave_task = None;
+        }
     }
 
     fn request_reload(&mut self, path: &str) -> ReloadDecision {
@@ -518,8 +576,8 @@ impl Render for PreviewDragGhost {
     }
 }
 
-struct FileEditorTooltip {
-    text: SharedString,
+pub(super) struct FileEditorTooltip {
+    pub(super) text: SharedString,
 }
 
 impl Render for FileEditorTooltip {
@@ -561,8 +619,12 @@ impl FilesSurface {
         cx.notify();
     }
 
-    fn toggle_tree_sidebar(&mut self, cx: &mut Context<Self>) {
+    fn toggle_tree_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.preview.toggle_tree_sidebar();
+        if !self.preview.tree_sidebar_visible() {
+            // A hidden search input must not keep receiving editor keystrokes.
+            self.focus_editor(window, cx);
+        }
         cx.notify();
     }
 
@@ -1207,6 +1269,9 @@ impl FilesSurface {
     }
 
     pub(super) fn save_document(&mut self, path: String, cx: &mut Context<Self>) {
+        if self.target_change_pending {
+            return;
+        }
         let Some(context) = self.request_context.clone() else {
             return;
         };
@@ -1240,6 +1305,7 @@ impl FilesSurface {
             return;
         };
         let request = WriteWorkspaceFileRequest {
+            expected_checkout_id: pending.expected_checkout_id.clone(),
             target: context.target.clone(),
             path: path.clone(),
             text: pending.text.clone(),
@@ -1694,16 +1760,8 @@ impl FilesSurface {
         cx.notify();
     }
 
-    fn retry_active_save(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.preview.active.clone() else {
-            return;
-        };
-        if self
-            .preview
-            .documents
-            .get(&path)
-            .is_some_and(|document| matches!(document.phase, DocumentPhase::SaveFailed(_)))
-        {
+    pub fn save_active_document(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.preview.active.clone() {
             self.save_document(path, cx);
         }
     }
@@ -1717,7 +1775,6 @@ impl FilesSurface {
         let Some(active) = self.preview.active.clone() else {
             return gpui::Empty.into_any_element();
         };
-        let breadcrumb = self.render_breadcrumb(&active, &theme, cx);
         let external = self.preview.documents.get(&active).is_some_and(|document| {
             matches!(
                 document.phase,
@@ -1738,33 +1795,37 @@ impl FilesSurface {
             .min_w_0()
             .flex()
             .flex_col()
-            .child(breadcrumb)
             .when(lifecycle_pending, |element| {
                 element.child(
                     div()
-                        .h(px(30.0))
+                        .min_h(px(32.0))
+                        .py(px(6.0))
                         .flex_none()
                         .px(px(10.0))
                         .flex()
+                        .flex_wrap()
                         .items_center()
-                        .gap(px(10.0))
+                        .gap(px(8.0))
                         .border_b_1()
                         .border_color(theme.warning.opacity(0.25))
                         .bg(theme.warning.opacity(0.055))
-                        .text_size(px(10.5))
+                        .text_size(px(11.0))
                         .text_color(theme.warning_muted)
-                        .child(if lifecycle_blocked {
-                            "Changes could not be saved safely."
-                        } else if self.target_change_pending {
-                            "Saving changes before switching workspace…"
-                        } else {
-                            "Saving changes before closing…"
-                        })
-                        .when(lifecycle_blocked, |banner| {
+                        .child(div().min_w_0().max_w_full().whitespace_normal().child(
+                            if self.target_change_pending {
+                                "Workspace changed. Switch back to save, or discard these edits."
+                            } else if lifecycle_blocked {
+                                "Changes could not be saved safely."
+                            } else {
+                                "Saving changes before closing…"
+                            },
+                        ))
+                        .when(lifecycle_blocked || self.target_change_pending, |banner| {
                             banner
                                 .child(
                                     div()
                                         .id("files-retry-close-save")
+                                        .when(self.target_change_pending, |button| button.hidden())
                                         .ml_auto()
                                         .cursor_pointer()
                                         .text_color(theme.text)
@@ -1803,28 +1864,33 @@ impl FilesSurface {
                 |element| {
                     element.child(
                         div()
-                            .h(px(30.0))
+                            .min_h(px(32.0))
+                            .py(px(6.0))
                             .flex_none()
                             .px(px(10.0))
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap(px(8.0))
                             .border_b_1()
                             .border_color(theme.warning.opacity(0.25))
                             .bg(theme.warning.opacity(0.055))
-                            .text_size(px(10.5))
+                            .text_size(px(11.0))
                             .text_color(theme.warning_muted)
-                            .child(if confirming_reload {
-                                "Discard unsaved changes?"
-                            } else {
-                                "This file changed outside Zeron."
-                            })
+                            .child(div().min_w_0().max_w_full().whitespace_normal().child(
+                                if confirming_reload {
+                                    "Discard unsaved changes?"
+                                } else {
+                                    "This file changed outside Zeron."
+                                },
+                            ))
                             .child(
                                 div()
                                     .ml_auto()
                                     .flex()
+                                    .flex_wrap()
                                     .items_center()
-                                    .gap(px(10.0))
+                                    .gap(px(8.0))
                                     .when(!confirming_reload, |actions| {
                                         actions
                                             .child(
@@ -1879,6 +1945,44 @@ impl FilesSurface {
             .into_any_element()
     }
 
+    pub(super) fn render_tree_toggle(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        toolbar(theme)
+            .w(px(
+                crate::surface_chrome::CONTROL_SIZE + crate::surface_chrome::EDGE_INSET
+            ))
+            .pl_0()
+            .child(
+                toolbar_button(
+                    "files-toggle-tree-sidebar",
+                    if self.preview.tree_sidebar_visible() {
+                        "Hide files sidebar"
+                    } else {
+                        "Show files sidebar"
+                    },
+                )
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_tree_sidebar(window, cx)))
+                .child(
+                    icon(icons::SIDEBAR_MINIMALISTIC)
+                        .size(px(crate::surface_chrome::ICON_SIZE))
+                        .text_color(theme.text_muted),
+                ),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn render_editor_header(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let path = self.preview.active.clone()?;
+        Some(self.render_breadcrumb(&path, theme, cx))
+    }
+
     fn render_breadcrumb(
         &mut self,
         path: &str,
@@ -1887,22 +1991,24 @@ impl FilesSurface {
     ) -> AnyElement {
         let parts = path.split('/').collect::<Vec<_>>();
         let reveal_path = path.to_string();
-        let save_path = path.to_string();
         let tooltip_path: SharedString = path.to_string().into();
-        let can_save = self
-            .preview
-            .documents
-            .get(path)
-            .is_some_and(FileDocument::can_save);
+        let can_save = !self.target_change_pending
+            && self
+                .preview
+                .documents
+                .get(path)
+                .is_some_and(FileDocument::can_save);
         let save_status =
             self.preview
                 .documents
                 .get(path)
                 .and_then(|document| match &document.phase {
-                    DocumentPhase::Saving => None,
-                    DocumentPhase::SaveFailed(error) => {
-                        Some(("Save failed", theme.danger_muted, true, Some(error.clone())))
-                    }
+                    DocumentPhase::SaveFailed(error) => Some((
+                        "Save failed",
+                        theme.danger_muted,
+                        can_save,
+                        Some(error.clone()),
+                    )),
                     DocumentPhase::Conflict { .. } => Some((
                         "Save conflict",
                         theme.warning_muted,
@@ -1919,6 +2025,14 @@ impl FilesSurface {
                             "The file was removed on disk. Your editor buffer was preserved.",
                         )),
                     )),
+                    DocumentPhase::ExternallyModified { .. } => Some((
+                        "Changed on disk",
+                        theme.warning_muted,
+                        false,
+                        Some(SharedString::from(
+                            "The file changed on disk. Review it before saving.",
+                        )),
+                    )),
                     _ => None,
                 });
         let mut crumbs = div()
@@ -1933,7 +2047,7 @@ impl FilesSurface {
                 crumbs = crumbs.child(
                     div()
                         .mx(px(4.0))
-                        .text_size(px(10.0))
+                        .text_size(px(11.0))
                         .text_color(theme.text_faint.opacity(0.65))
                         .child("›"),
                 );
@@ -1943,7 +2057,7 @@ impl FilesSurface {
                     .min_w_0()
                     .truncate()
                     .font_family(theme.font_sans.clone())
-                    .text_size(px(10.0))
+                    .text_size(px(11.0))
                     .text_color(if index + 1 == parts.len() {
                         theme.text_muted
                     } else {
@@ -1960,31 +2074,34 @@ impl FilesSurface {
                 .into()
             })
             .tooltip_show_delay(Duration::from_millis(350));
-        div()
-            .h(px(31.0))
-            .flex_none()
-            .px(px(10.0))
-            .border_t_1()
-            .border_b_1()
-            .border_color(theme.border)
-            .flex()
-            .items_center()
-            .gap(px(6.0))
+        toolbar(theme)
+            .pr(px(crate::surface_chrome::CONTROL_GAP))
             .child(crumbs)
             .when_some(save_status, |element, (label, color, retry, detail)| {
                 element.child(
                     div()
                         .id("files-save-status")
+                        .h(px(crate::surface_chrome::CONTROL_SIZE))
+                        .px(px(6.0))
+                        .rounded(px(crate::surface_chrome::CONTROL_RADIUS))
+                        .flex()
+                        .items_center()
                         .flex_none()
                         .font_family(theme.font_sans.clone())
-                        .text_size(px(9.5))
+                        .text_size(px(11.0))
                         .text_color(color)
                         .when(retry, |element| {
                             element
                                 .cursor_pointer()
                                 .role(gpui::Role::Button)
-                                .aria_label("Retry save")
-                                .on_click(cx.listener(|this, _, _, cx| this.retry_active_save(cx)))
+                                .aria_label("Save file")
+                                .hover(|style| style.bg(crate::theme::wash(0.14)))
+                                .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                                    window.prevent_default()
+                                })
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.save_active_document(cx)),
+                                )
                         })
                         .when_some(detail, |element, detail| {
                             element
@@ -2000,44 +2117,7 @@ impl FilesSurface {
                 )
             })
             .child(
-                div()
-                    .id("files-save-active")
-                    .size(px(TOOLBAR_BUTTON_SIZE))
-                    .flex_none()
-                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .role(gpui::Role::Button)
-                    .aria_label("Save file")
-                    .when(can_save, |element| {
-                        element
-                            .cursor_pointer()
-                            .hover(|style| style.bg(crate::theme::wash(0.07)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.save_document(save_path.clone(), cx)
-                            }))
-                    })
-                    .when(!can_save, |element| element.cursor_default().opacity(0.38))
-                    .child(
-                        icon(icons::FLOPPY_DISK)
-                            .size(px(11.5))
-                            .text_color(theme.text_muted),
-                    ),
-            )
-            .child(
-                div()
-                    .id("files-reveal-active")
-                    .size(px(TOOLBAR_BUTTON_SIZE))
-                    .flex_none()
-                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .role(gpui::Role::Button)
-                    .aria_label("Reveal file in tree")
-                    .hover(|style| style.bg(crate::theme::wash(0.07)))
+                toolbar_button("files-reveal-active", "Reveal file in tree")
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let name = reveal_path
                             .rsplit('/')
@@ -2056,62 +2136,32 @@ impl FilesSurface {
                     }))
                     .child(
                         icon(icons::FOLDER)
-                            .size(px(11.5))
+                            .size(px(crate::surface_chrome::ICON_SIZE))
                             .text_color(theme.text_muted),
                     ),
             )
             .child(
-                div()
-                    .id("files-toggle-word-wrap")
-                    .size(px(TOOLBAR_BUTTON_SIZE))
-                    .flex_none()
-                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .when(self.preview.word_wrap(), |element| {
-                        element.bg(crate::theme::wash(0.1))
-                    })
-                    .hover(|style| style.bg(crate::theme::wash(0.07)))
-                    .role(gpui::Role::Button)
-                    .aria_label(if self.preview.word_wrap() {
+                toolbar_button(
+                    "files-toggle-word-wrap",
+                    if self.preview.word_wrap() {
                         "Disable word wrap"
                     } else {
                         "Enable word wrap"
-                    })
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_word_wrap(window, cx)))
-                    .child(icon(icons::LIST).size(px(11.0)).text_color(
-                        if self.preview.word_wrap() {
+                    },
+                )
+                .when(self.preview.word_wrap(), |element| {
+                    element.bg(crate::theme::wash(0.1))
+                })
+                .on_click(cx.listener(|this, _, window, cx| this.toggle_word_wrap(window, cx)))
+                .child(
+                    icon(icons::LIST)
+                        .size(px(crate::surface_chrome::ICON_SIZE))
+                        .text_color(if self.preview.word_wrap() {
                             theme.text
                         } else {
                             theme.text_muted
-                        },
-                    )),
-            )
-            .child(
-                div()
-                    .id("files-toggle-tree-sidebar")
-                    .size(px(TOOLBAR_BUTTON_SIZE))
-                    .flex_none()
-                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .cursor_pointer()
-                    .hover(|style| style.bg(crate::theme::wash(0.07)))
-                    .role(gpui::Role::Button)
-                    .aria_label(if self.preview.tree_sidebar_visible() {
-                        "Hide files sidebar"
-                    } else {
-                        "Show files sidebar"
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_tree_sidebar(cx)))
-                    .child(
-                        icon(icons::SIDEBAR_MINIMALISTIC)
-                            .size(px(11.0))
-                            .text_color(theme.text_muted),
-                    ),
+                        }),
+                ),
             )
             .into_any_element()
     }
@@ -2619,9 +2669,12 @@ impl FilesSurface {
         let color = Theme::of(cx).border_strong;
         div()
             .id("files-preview-split")
-            .w(px(5.0))
-            .h_full()
-            .flex_none()
+            .absolute()
+            .left(px(-3.0))
+            .top_0()
+            .bottom_0()
+            .w(px(6.0))
+            .occlude()
             .cursor_col_resize()
             .hover(move |style| style.bg(color))
             .on_drag(
@@ -2888,6 +2941,7 @@ mod tests {
             path: path.into(),
         });
         document.set_loaded(zeron_proto::WorkspaceFileText {
+            checkout_id: "checkout-1".into(),
             path: path.into(),
             text: Some(stale_source.into()),
             content_hash: Some(disk_hash.into()),
@@ -2941,6 +2995,7 @@ mod tests {
             path: path.into(),
         });
         document.set_loaded(zeron_proto::WorkspaceFileText {
+            checkout_id: "checkout-1".into(),
             path: path.into(),
             text: Some("fn main() {}".into()),
             content_hash: Some("hash-1".into()),
@@ -2957,6 +3012,85 @@ mod tests {
         assert!(preview.set_autosave_delay_ms(600).is_empty());
         assert_eq!(preview.set_autosave_enabled(true), vec![path.to_string()]);
         assert!(preview.set_autosave_enabled(false).is_empty());
+    }
+
+    #[test]
+    fn sidebar_layout_changes_are_immediate_without_a_user_toggle() {
+        let mut preview = FilePreviewState::new(false, 900, false, 11.5);
+        let now = Instant::now();
+        assert_eq!(
+            preview
+                .tree_motion
+                .sample(preview.tree_sidebar_visible(), now, false),
+            (0.0, false)
+        );
+        // A newly opened surface measures its width after the first render.
+        preview.surface_width.set(WIDE_BREAKPOINT);
+        assert_eq!(
+            preview
+                .tree_motion
+                .sample(preview.tree_sidebar_visible(), now, false),
+            (1.0, false)
+        );
+        preview.surface_width.set(WIDE_BREAKPOINT - 1.0);
+        assert_eq!(
+            preview
+                .tree_motion
+                .sample(preview.tree_sidebar_visible(), now, false),
+            (0.0, false)
+        );
+        preview.show_tree_sidebar();
+        assert_eq!(
+            preview
+                .tree_motion
+                .sample(preview.tree_sidebar_visible(), now, false),
+            (1.0, false)
+        );
+        preview.toggle_tree_sidebar();
+        let started = preview.tree_motion.started.unwrap();
+        assert_eq!(
+            preview
+                .tree_motion
+                .sample(preview.tree_sidebar_visible(), started, false),
+            (1.0, true)
+        );
+    }
+
+    #[test]
+    fn sidebar_motion_reverses_from_its_current_width() {
+        let mut motion = TreeSidebarMotion::default();
+        let now = Instant::now();
+        assert_eq!(motion.sample(true, now, false), (1.0, false));
+        motion.animate_to(true, false, now);
+        assert_eq!(motion.sample(false, now, false), (1.0, true));
+        let midway = now
+            + crate::motion::RESIZE
+                .total()
+                .mul_f32(crate::motion::speed_scale() * 0.4);
+        let closing = motion.sample(false, midway, false).0;
+        assert!(closing > 0.0 && closing < 1.0);
+        motion.animate_to(false, true, midway);
+        assert_eq!(motion.sample(true, midway, false), (closing, true));
+        assert_eq!(
+            motion.sample(true, midway + Duration::from_secs(10), false),
+            (1.0, false)
+        );
+        motion.animate_to(true, false, midway + Duration::from_secs(10));
+        assert_eq!(
+            motion.sample(false, midway + Duration::from_secs(20), false),
+            (0.0, false)
+        );
+    }
+
+    #[test]
+    fn sidebar_motion_snaps_when_reduced_motion_is_enabled() {
+        let mut motion = TreeSidebarMotion::default();
+        let now = Instant::now();
+        motion.sample(true, now, false);
+        motion.animate_to(true, false, now);
+        assert_eq!(motion.sample(false, now, true), (0.0, false));
+        assert_eq!(motion.sample(true, now, true), (1.0, false));
+        assert_eq!(motion.sample(true, now, false), (1.0, false));
     }
 
     #[test]
@@ -3132,5 +3266,23 @@ mod tests {
 
         layout.viewport_width = 210.0;
         assert_eq!(editor_comment_overlay_horizontal(&layout), (8.0, 194.0));
+    }
+}
+
+#[cfg(test)]
+impl FilesSurface {
+    pub(crate) fn seed_pending_exit_test_document(&mut self, failed: bool) {
+        let mut document = FileDocument::loading(DocumentKey {
+            chat_id: "test".into(),
+            checkout_id: None,
+            path: "test.rs".into(),
+        });
+        document.revision = 1;
+        document.phase = if failed {
+            DocumentPhase::SaveFailed("offline".into())
+        } else {
+            DocumentPhase::Saving
+        };
+        self.preview.documents.insert("test.rs".into(), document);
     }
 }

@@ -33,8 +33,33 @@ use preview::FilePreviewState;
 use search::FileSearchState;
 
 static NEXT_REVIEW_COMMENT_FLUSH_SOURCE: AtomicU64 = AtomicU64::new(1);
-pub(super) const TOOLBAR_BUTTON_SIZE: f32 = 22.0;
-pub(super) const TOOLBAR_BUTTON_RADIUS: f32 = 5.0;
+use crate::surface_chrome::{
+    CONTROL_RADIUS as TOOLBAR_BUTTON_RADIUS, CONTROL_SIZE as TOOLBAR_BUTTON_SIZE, toolbar,
+};
+
+pub(super) fn toolbar_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .size(px(TOOLBAR_BUTTON_SIZE))
+        .flex_none()
+        .rounded(px(TOOLBAR_BUTTON_RADIUS))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .occlude()
+        .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+            window.prevent_default()
+        })
+        .hover(|style| style.bg(crate::theme::wash(0.14)))
+        .tooltip(move |_, cx| {
+            cx.new(|_| preview::FileEditorTooltip { text: label.into() })
+                .into()
+        })
+        .tooltip_show_delay(Duration::from_millis(350))
+}
 
 /// A workspace-relative file or directory dragged out of a Files surface.
 ///
@@ -222,18 +247,16 @@ impl Render for FilesSurface {
         } else {
             self.render_tree(cx)
         };
-        let header_bg = if theme.is_glass() {
-            theme.surface.opacity(0.26)
-        } else {
-            theme.surface
-        };
+        let split_editor = self.presentation.is_editor() && self.preview.has_active();
         let watch_error = self.watch_error.clone();
         let tree_pane = div()
             .size_full()
             .min_w_0()
             .flex()
             .flex_col()
-            .child(self.render_header(&theme, header_bg, cx))
+            .when(!split_editor, |pane| {
+                pane.child(self.render_header(&theme, cx))
+            })
             .when_some(watch_error, |element, error| {
                 element.child(
                     div()
@@ -278,11 +301,52 @@ impl Render for FilesSurface {
             })
             .child(content);
         let is_editor = self.presentation.is_editor();
-        let wide = is_editor
-            && self.preview.has_active()
-            && self.preview.is_wide()
-            && self.preview.tree_sidebar_visible();
-        let body = if wide {
+        let mut header = None;
+        let body = if split_editor {
+            let wide = self.preview.is_wide();
+            let tree_width = if wide {
+                self.preview.tree_width()
+            } else {
+                self.preview.narrow_tree_width()
+            };
+            let openness = self.preview.tree_sidebar_frame(window, cx);
+            // Same arrangement as the outer right-sidebar toggle: the trigger
+            // is outside the animated controls, in a permanently mounted slot.
+            let toggle_width =
+                crate::surface_chrome::CONTROL_SIZE + crate::surface_chrome::EDGE_INSET;
+            let tree_header = self
+                .render_header(&theme, cx)
+                .pr(px(crate::surface_chrome::CONTROL_GAP))
+                .border_l_1()
+                .border_color(theme.border);
+            header = Some(
+                div()
+                    .w_full()
+                    .h(px(crate::surface_chrome::HEADER_HEIGHT))
+                    .flex_none()
+                    .flex()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .children(self.render_editor_header(&theme, cx)),
+                    )
+                    .child(
+                        div()
+                            .w(px((tree_width * openness - toggle_width).max(0.0)))
+                            .h_full()
+                            .flex_none()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .w(px(tree_width - toggle_width))
+                                    .h_full()
+                                    .child(tree_header),
+                            ),
+                    )
+                    .child(self.render_tree_toggle(&theme, cx)),
+            );
+
             div()
                 .size_full()
                 .min_w_0()
@@ -293,38 +357,28 @@ impl Render for FilesSurface {
                         .min_w_0()
                         .child(self.render_preview(window, cx)),
                 )
-                .child(self.preview_split_handle(cx))
                 .child(
                     div()
-                        .w(px(self.preview.tree_width()))
+                        .w(px(tree_width * openness))
                         .h_full()
                         .flex_none()
-                        .border_l_1()
-                        .border_color(theme.border)
-                        .child(tree_pane),
+                        .relative()
+                        .child(
+                            div().size_full().overflow_hidden().child(
+                                div()
+                                    .w(px(tree_width))
+                                    .h_full()
+                                    .relative()
+                                    .border_l_1()
+                                    .border_color(theme.border)
+                                    .child(tree_pane),
+                            ),
+                        )
+                        .when(wide && self.preview.tree_sidebar_visible(), |pane| {
+                            pane.child(self.preview_split_handle(cx))
+                        }),
                 )
                 .into_any_element()
-        } else if is_editor && self.preview.has_active() {
-            let preview = self.render_preview(window, cx);
-            if self.preview.tree_sidebar_visible() {
-                div()
-                    .size_full()
-                    .min_w_0()
-                    .flex()
-                    .child(div().flex_1().min_w_0().child(preview))
-                    .child(
-                        div()
-                            .w(px(self.preview.narrow_tree_width()))
-                            .h_full()
-                            .flex_none()
-                            .border_l_1()
-                            .border_color(theme.border)
-                            .child(tree_pane),
-                    )
-                    .into_any_element()
-            } else {
-                preview
-            }
         } else {
             tree_pane.into_any_element()
         };
@@ -360,7 +414,9 @@ impl Render for FilesSurface {
                         .inset_0(),
                     )
             })
-            .child(body)
+            .flex_col()
+            .children(header)
+            .child(div().flex_1().min_h_0().w_full().child(body))
             .children(editor_context_menu)
     }
 }
@@ -820,9 +876,7 @@ impl FilesSurface {
         if self.preview.has_unsaved_changes() {
             self.target_change_pending = true;
             self.pending_request_context = next;
-            for path in self.preview.autosavable_dirty_paths() {
-                self.save_document(path, cx);
-            }
+            self.preview.cancel_autosaves();
             cx.notify();
             return false;
         }
@@ -865,43 +919,16 @@ impl FilesSurface {
             .reset_with_uniform_height(self.tree.visible_rows().len(), px(tree::TREE_ROW_HEIGHT));
     }
 
-    fn render_header(
-        &mut self,
-        theme: &crate::theme::Theme,
-        background: gpui::Hsla,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    fn render_header(&mut self, theme: &crate::theme::Theme, cx: &mut Context<Self>) -> gpui::Div {
         let include_ignored = self.tree.include_ignored();
-        let icon_button = |id: &'static str| {
-            div()
-                .id(id)
-                .size(px(TOOLBAR_BUTTON_SIZE))
-                .flex_none()
-                .rounded(px(TOOLBAR_BUTTON_RADIUS))
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|style| style.bg(crate::theme::wash(0.09)))
-        };
-        div()
-            .h(px(31.0))
-            .flex_none()
-            .px(px(8.0))
-            .flex()
-            .items_center()
-            .gap(px(5.0))
-            .border_t_1()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(background)
+        toolbar(theme)
             .child(
                 div()
                     .h(px(TOOLBAR_BUTTON_SIZE))
                     .min_w_0()
                     .flex_1()
                     .px(px(8.0))
-                    .rounded(px(7.0))
+                    .rounded(px(TOOLBAR_BUTTON_RADIUS))
                     .bg(crate::theme::ink(0.035))
                     .flex()
                     .items_center()
@@ -916,30 +943,31 @@ impl FilesSurface {
                     .child(div().min_w_0().flex_1().child(self.search.clone())),
             )
             .child(
-                icon_button("files-toggle-ignored")
-                    .role(gpui::Role::Button)
-                    .aria_label(if include_ignored {
+                toolbar_button(
+                    "files-toggle-ignored",
+                    if include_ignored {
                         "Hide hidden and ignored files"
                     } else {
                         "Show all files (even hidden)"
+                    },
+                )
+                .when(include_ignored, |element| {
+                    element.bg(crate::theme::wash(0.1))
+                })
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_ignored(cx)))
+                .child(
+                    crate::icons::icon(if include_ignored {
+                        crate::icons::EYE
+                    } else {
+                        crate::icons::EYE_CLOSED
                     })
-                    .when(include_ignored, |element| {
-                        element.bg(crate::theme::wash(0.1))
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| this.toggle_ignored(cx)))
-                    .child(
-                        crate::icons::icon(if include_ignored {
-                            crate::icons::EYE
-                        } else {
-                            crate::icons::EYE_CLOSED
-                        })
-                        .size(px(12.5))
-                        .text_color(if include_ignored {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        }),
-                    ),
+                    .size(px(crate::surface_chrome::ICON_SIZE))
+                    .text_color(if include_ignored {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    }),
+                ),
             )
     }
 }

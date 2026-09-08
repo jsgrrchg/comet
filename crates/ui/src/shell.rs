@@ -68,6 +68,7 @@ use spaces::{AddSpaceFlow, RenameSpaceDialog};
 actions!(
     shell,
     [
+        SaveFile,
         ToggleSidebar,
         ToggleChanges,
         AddSpacePalette,
@@ -305,12 +306,17 @@ pub fn apply_keymap(
     crate::app_menus::bind_keys(cx);
     cx.bind_keys([
         KeyBinding::new(
-            &valid_or_default(&keymap.toggle_sidebar, "mod-s"),
+            &valid_or_default(&keymap.save_file, "mod-s"),
+            SaveFile,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.toggle_sidebar, "mod-b"),
             ToggleSidebar,
             None,
         ),
         KeyBinding::new(
-            &valid_or_default(&keymap.toggle_changes, "mod-b"),
+            &valid_or_default(&keymap.toggle_changes, "mod-r"),
             ToggleChanges,
             None,
         ),
@@ -432,8 +438,8 @@ fn right_pane_takeover_width(viewport: f32, sidebar: f32) -> f32 {
 }
 
 /// One right-pane surface tab: a workspace browser, an individual workspace
-/// file editor, a Diff or History page backed by [`Changes`], or one embedded
-/// terminal. `Picker` is the empty state.
+/// file editor, a Git diff or history page, an embedded terminal, or a
+/// subagent transcript. `Picker` is the empty surface chooser.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RightSurface {
     #[default]
@@ -1196,11 +1202,22 @@ impl Render for SidebarPane {
     }
 }
 
+#[derive(Debug, Clone)]
+enum PendingExit {
+    CloseWindow,
+    Quit,
+    RuntimeChange,
+    InstallUpdate(PathBuf),
+}
+
 pub struct Shell {
     state: Entity<AppState>,
     sidebar_pane: Entity<SidebarPane>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
+    /// External image or workspace-path drag hovering the conversation
+    /// column; a drop stages an image or inserts a file-mention chip.
+    file_drag_active: bool,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under — written by a
     /// paint-time canvas each frame, read the NEXT frame for the fade inset,
@@ -1252,7 +1269,7 @@ pub struct Shell {
     file_surface_subs: std::collections::HashMap<u64, Subscription>,
     file_surface_seq: u64,
     pending_file_closes: std::collections::HashSet<RightSurface>,
-    window_close_pending: bool,
+    pending_exit: Option<PendingExit>,
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
@@ -1592,6 +1609,7 @@ impl Shell {
             sidebar_pane,
             transcript,
             composer,
+            file_drag_active: false,
             // Seed with the compact composer stack's rough height so the
             // first frame's clearance isn't zero (the measure corrects it).
             bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
@@ -1614,7 +1632,7 @@ impl Shell {
             file_surface_subs: std::collections::HashMap::new(),
             file_surface_seq: 0,
             pending_file_closes: std::collections::HashSet::new(),
-            window_close_pending: false,
+            pending_exit: None,
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
             subagent_tabs: std::collections::HashMap::new(),
@@ -2441,13 +2459,6 @@ impl Shell {
         self.register_diff_surface(changes, cx);
     }
 
-    /// The dedicated History surface. Keeping it as its own tab preserves its
-    /// graph/search state while Diff tabs retain their ordinary scope picker.
-    fn add_history_surface(&mut self, cx: &mut Context<Self>) {
-        let history = cx.new(|cx| Changes::for_history(self.state.clone(), cx));
-        self.register_diff_surface(history, cx);
-    }
-
     /// Files is single-instance per chat: both the picker and the `+` menu
     /// focus the existing surface instead of creating duplicate trees and
     /// duplicate workspace subscriptions.
@@ -2618,6 +2629,13 @@ impl Shell {
             .entry((panel_key.to_string(), new_path.to_string()))
             .or_insert(id);
         cx.notify();
+    }
+
+    /// The dedicated History surface. Keeping it as its own tab preserves its
+    /// graph/search state while Diff tabs retain their ordinary scope picker.
+    fn add_history_surface(&mut self, cx: &mut Context<Self>) {
+        let history = cx.new(|cx| Changes::for_history(self.state.clone(), cx));
+        self.register_diff_surface(history, cx);
     }
 
     /// A History row click: the commit opens as its own pinned diff tab
@@ -2864,17 +2882,28 @@ impl Shell {
         if self.pending_file_closes.contains(&surface) {
             self.complete_file_close(surface, panel_key, cx);
         } else {
+            if self.pending_exit.is_some() {
+                self.reveal_unsaved_file(cx);
+            }
             cx.notify();
         }
     }
 
     fn cancel_file_close(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
         self.pending_file_closes.remove(&surface);
-        self.window_close_pending = false;
+        self.pending_exit = None;
         cx.notify();
     }
 
     pub fn prepare_window_close(&mut self, cx: &mut Context<Self>) -> bool {
+        self.prepare_exit(PendingExit::CloseWindow, cx)
+    }
+
+    pub fn prepare_quit(&mut self, cx: &mut Context<Self>) -> bool {
+        self.prepare_exit(PendingExit::Quit, cx)
+    }
+
+    fn prepare_exit(&mut self, action: PendingExit, cx: &mut Context<Self>) -> bool {
         let surfaces = self
             .files
             .values()
@@ -2885,19 +2914,47 @@ impl Shell {
             .iter()
             .all(|surface| !surface.read(cx).has_unsaved_changes())
         {
-            self.window_close_pending = false;
+            self.pending_exit = None;
             return true;
         }
-        self.window_close_pending = true;
+        self.pending_exit = Some(action);
         let mut all_ready = true;
         for surface in surfaces {
             let disposition = surface.update(cx, |surface, cx| surface.prepare_close(cx));
             all_ready &= disposition == FilesCloseDisposition::Allow;
         }
         if all_ready {
-            self.window_close_pending = false;
+            self.pending_exit = None;
+        } else {
+            self.reveal_unsaved_file(cx);
         }
+        cx.notify();
         all_ready
+    }
+
+    fn reveal_unsaved_file(&mut self, cx: &mut Context<Self>) {
+        let browser = self.files.iter().filter_map(|(key, files)| {
+            files
+                .read(cx)
+                .has_unsaved_changes()
+                .then(|| (key.clone(), RightSurface::Files))
+        });
+        let editors = self.file_surface_keys.iter().filter_map(|((key, _), id)| {
+            self.file_surfaces
+                .get(id)
+                .filter(|files| files.read(cx).has_unsaved_changes())
+                .map(|_| (key.clone(), RightSurface::File(*id)))
+        });
+        let current = self.panel_key(cx);
+        let mut dirty = browser.chain(editors).collect::<Vec<_>>();
+        dirty.sort_by_key(|(key, _)| (key != &current, key.clone()));
+        if let Some((key, surface)) = dirty.into_iter().next() {
+            self.panels.update(&key, |panel| {
+                panel.changes_open = true;
+                panel.right_active = surface;
+            });
+            self.apply_nav(NavEntry::Chat(key), cx);
+        }
     }
 
     fn all_file_edits_flushed(&self, cx: &App) -> bool {
@@ -4154,13 +4211,16 @@ impl Shell {
     }
 
     fn quit_for_runtime_change(&mut self, cx: &mut Context<Self>) {
+        if !self.prepare_exit(PendingExit::RuntimeChange, cx) {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.runtime_change_error = Some("Engine not connected".into());
             cx.notify();
             return;
         };
         if engine.mode() == EngineMode::InProcess {
-            cx.quit();
+            crate::app_menus::quit_after_save(cx);
             return;
         }
         if self.runtime_change_task.is_some() {
@@ -4186,7 +4246,11 @@ impl Shell {
             this.update(cx, |shell, cx| {
                 shell.runtime_change_task = None;
                 match result {
-                    Ok(_) => cx.quit(),
+                    Ok(_) => {
+                        if shell.prepare_quit(cx) {
+                            crate::app_menus::quit_after_save(cx);
+                        }
+                    },
                     Err(err) => {
                         shell.runtime_change_error = Some(format!(
                             "Could not stop the remote engine: {err}. Run `zeron daemon stop`, then quit and reopen Zeron."
@@ -5902,13 +5966,16 @@ impl Shell {
     /// relauncher, and quit — the relauncher `open`s the new bundle once this
     /// process (and its engine lock / IPC port) is gone.
     fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
+        if !self.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
+            return;
+        }
         let zeron_update::InstallKind::MacApp { bundle } = self.install.clone() else {
             return;
         };
         match zeron_update::apply_mac_app(&staged, &bundle) {
             Ok(()) => {
                 zeron_update::relaunch_app_after_exit(&bundle);
-                cx.quit();
+                crate::app_menus::quit_after_save(cx);
             }
             Err(err) => {
                 tracing::error!(error = %err, "update apply failed");
@@ -7157,10 +7224,13 @@ impl Shell {
         };
 
         let status = self.render_status_strip(cx);
-        // Attachment dropzone over the ENTIRE conversation column. Its veil
-        // is derived directly from the active payload type, so pane resizing
-        // cannot resurrect stale hover state. External files use the upload
-        // pipeline; workspace paths and file tabs become mention chips.
+        // Attachment dropzone over the ENTIRE conversation column (transcript
+        // + composer, not just the pill). OS images keep using the upload
+        // pipeline; workspace files/directories and file tabs become the same
+        // projected file-mention chips the composer already understands.
+        // `has_active_drag` gates the veil so a drag that left the window
+        // cannot strand it.
+        let file_drag_active = self.file_drag_active && cx.has_active_drag();
         div()
             .id("chat-dropzone")
             .relative()
@@ -7169,6 +7239,59 @@ impl Shell {
             .h_full()
             .flex()
             .flex_col()
+            .on_drag_move::<gpui::ExternalPaths>(cx.listener(
+                |this, e: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                    let inside = e.bounds.contains(&e.event.position);
+                    if this.file_drag_active != inside {
+                        this.file_drag_active = inside;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
+                this.file_drag_active = false;
+                let paths = paths.paths().to_vec();
+                this.composer
+                    .update(cx, |composer, cx| composer.add_paths(paths, cx));
+                cx.notify();
+            }))
+            .on_drag_move::<WorkspacePathDrag>(cx.listener(
+                |this, e: &gpui::DragMoveEvent<WorkspacePathDrag>, _, cx| {
+                    let inside = e.bounds.contains(&e.event.position);
+                    if this.file_drag_active != inside {
+                        this.file_drag_active = inside;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop::<WorkspacePathDrag>(cx.listener(
+                |this, payload: &WorkspacePathDrag, window, cx| {
+                    this.file_drag_active = false;
+                    this.composer.update(cx, |composer, cx| {
+                        composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
+                    });
+                    cx.notify();
+                },
+            ))
+            .on_drag_move::<RightTabDrag>(cx.listener(
+                |this, e: &gpui::DragMoveEvent<RightTabDrag>, _, cx| {
+                    let inside =
+                        e.bounds.contains(&e.event.position) && e.drag(cx).workspace_path.is_some();
+                    if this.file_drag_active != inside {
+                        this.file_drag_active = inside;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop::<RightTabDrag>(cx.listener(|this, payload: &RightTabDrag, window, cx| {
+                this.file_drag_active = false;
+                if let Some(path) = &payload.workspace_path {
+                    this.composer.update(cx, |composer, cx| {
+                        composer.add_workspace_path(&path.path, path.is_directory, window, cx)
+                    });
+                }
+                cx.notify();
+            }))
             .child(
                 // Full-height underlay: the transcript viewport spans the
                 // whole column, scrolling UNDER the titlebar above and the
@@ -7243,62 +7366,20 @@ impl Shell {
                     .when(has_spaces, |el| el.child(self.composer.clone()))
                     .child(self.render_terminal_container(cx))
             })
-            .child(
-                div()
-                    .invisible()
-                    .absolute()
-                    .inset_0()
-                    .bg(theme.scrim().opacity(0.4 / 0.6))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(crate::typography::ui_rems(13.0))
-                    .text_color(theme.text)
-                    .child("Drop to attach")
-                    .drag_over::<gpui::ExternalPaths>(|style, _, _, _| style.visible())
-                    .drag_over::<WorkspacePathDrag>(|style, _, _, _| style.visible())
-                    .drag_over::<RightTabDrag>(|style, tab, _, _| {
-                        if tab.workspace_path.is_some() {
-                            style.visible()
-                        } else {
-                            style
-                        }
-                    })
-                    .on_drop(cx.listener(|this, paths: &gpui::ExternalPaths, _, cx| {
-                        let paths = paths.paths().to_vec();
-                        this.composer
-                            .update(cx, |composer, cx| composer.add_paths(paths, cx));
-                        cx.notify();
-                    }))
-                    .on_drop::<WorkspacePathDrag>(cx.listener(
-                        |this, payload: &WorkspacePathDrag, window, cx| {
-                            this.composer.update(cx, |composer, cx| {
-                                composer.add_workspace_path(
-                                    &payload.path,
-                                    payload.is_directory,
-                                    window,
-                                    cx,
-                                )
-                            });
-                            cx.notify();
-                        },
-                    ))
-                    .on_drop::<RightTabDrag>(cx.listener(
-                        |this, payload: &RightTabDrag, window, cx| {
-                            if let Some(path) = &payload.workspace_path {
-                                this.composer.update(cx, |composer, cx| {
-                                    composer.add_workspace_path(
-                                        &path.path,
-                                        path.is_directory,
-                                        window,
-                                        cx,
-                                    )
-                                });
-                            }
-                            cx.notify();
-                        },
-                    )),
-            )
+            .when(file_drag_active, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bg(theme.scrim().opacity(0.4 / 0.6))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(crate::typography::ui_rems(13.0))
+                        .text_color(theme.text)
+                        .child("Drop to attach"),
+                )
+            })
             .into_any_element()
     }
 
@@ -7562,7 +7643,7 @@ impl Shell {
     /// Right pane — the surface host (t3code RightPanelTabs): hidden by
     /// default, drag-resizable. Content is the ACTIVE surface — the Diff
     /// page (its options row + the lazy [`Changes`] viewer), workspace Files,
-    /// an embedded terminal, or the picker when no tabs exist.
+    /// an embedded terminal, or the surface picker when no tabs exist.
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let bg = theme.bg;
@@ -7599,15 +7680,7 @@ impl Shell {
                         .size_full()
                         .flex()
                         .flex_col()
-                        .child(
-                            div()
-                                .flex_none()
-                                .h(px(36.0))
-                                .px(px(8.0))
-                                .border_b_1()
-                                .border_color(theme.border)
-                                .child(controls),
-                        )
+                        .child(crate::surface_chrome::toolbar(&theme).child(controls))
                         .child(div().flex_1().min_h_0().child(changes))
                         .into_any_element()
                 }
@@ -9092,12 +9165,33 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.all_file_edits_flushed(cx)
+            && let Some(action) = self.pending_exit.take()
+        {
+            let shell = cx.weak_entity();
+            window.defer(cx, move |window, cx| {
+                if matches!(action, PendingExit::Quit) {
+                    crate::app_menus::request_quit(cx);
+                } else {
+                    shell
+                        .update(cx, |shell, cx| match action {
+                            PendingExit::CloseWindow => {
+                                if shell.prepare_window_close(cx) {
+                                    window.remove_window();
+                                }
+                            }
+                            PendingExit::RuntimeChange => shell.quit_for_runtime_change(cx),
+                            PendingExit::InstallUpdate(staged) => {
+                                shell.apply_staged_update(staged, cx)
+                            }
+                            PendingExit::Quit => unreachable!(),
+                        })
+                        .ok();
+                }
+            });
+        }
         crate::transcript::record_view_frame("shell");
         self.viewport_width = f32::from(window.viewport_size().width);
-        if self.window_close_pending && self.all_file_edits_flushed(cx) {
-            self.window_close_pending = false;
-            window.defer(cx, |window, _| window.remove_window());
-        }
         // Appearance actions persist independently of the shell. Mirror the
         // globals before any later debounced settings save can overwrite them.
         self.settings.appearance = crate::appearance::mode(cx);
@@ -9161,7 +9255,7 @@ impl Render for Shell {
             ));
         }
 
-        // Keyboard shortcuts (mod-s/b/j) dispatch through the window focus
+        // Keyboard shortcuts (mod-s/b/r/j) dispatch through the window focus
         // chain — with nothing focused they go dead. Land initial focus on the
         // composer, and whenever focus is lost with no successor (e.g. the
         // focused element unmounted), route it back there after allowing any
@@ -9215,6 +9309,18 @@ impl Render for Shell {
                     this.toggle_terminal(window, cx)
                 }
             }))
+            .on_action(cx.listener(|this, _: &SaveFile, _, cx| {
+                if matches!(this.route, Route::Chat) && this.right_pane_open(cx) {
+                    let file = match this.resolved_right_active(cx) {
+                        RightSurface::Files => this.files.get(&this.panel_key(cx)).cloned(),
+                        RightSurface::File(id) => this.file_surfaces.get(&id).cloned(),
+                        _ => None,
+                    };
+                    if let Some(file) = file {
+                        file.update(cx, |file, cx| file.save_active_document(cx));
+                    }
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             // New session works from anywhere — `open_new_session` routes back
             // to chat itself, so Settings is not a dead spot.
@@ -9228,9 +9334,14 @@ impl Render for Shell {
             // and says why.
             .on_action(cx.listener(|this, _: &NextSession, _, cx| this.cycle_session(true, cx)))
             .on_action(cx.listener(|this, _: &PrevSession, _, cx| this.cycle_session(false, cx)))
-            .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
+            .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
                 if matches!(this.route, Route::Chat) {
-                    this.toggle_right_pane(cx)
+                    this.toggle_right_pane(cx);
+                    if !this.right_pane_open(cx) {
+                        // The hidden editor can retain a focus handle after unmounting.
+                        // Restore a mounted target so the next shortcut can reopen it.
+                        window.focus(&this.composer.focus_handle(cx), cx);
+                    }
                 }
             }))
             // Chat-scoped like the panel toggles: Settings has no current
@@ -10504,5 +10615,91 @@ mod tests {
         tween.started = std::time::Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
         assert_eq!(tween.current(), 0.0);
         assert!(!tween.animating());
+    }
+}
+
+#[cfg(test)]
+mod exit_regressions {
+    use super::*;
+    use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn lifecycle_actions_keep_pending_and_failed_file_saves_alive(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        for failed in [false, true] {
+            window
+                .update(cx, |shell, window, cx| {
+                    window.activate_window();
+                    let state = shell.state.clone();
+                    let files = cx.new(|cx| {
+                        let mut files = FilesSurface::new(
+                            state,
+                            "test".into(),
+                            false,
+                            1000,
+                            13.0,
+                            false,
+                            false,
+                            cx,
+                        );
+                        files.seed_pending_exit_test_document(failed);
+                        files
+                    });
+                    shell.files.insert("test".into(), files);
+                })
+                .unwrap();
+            cx.update(|cx| cx.dispatch_action(&crate::app_menus::Quit));
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, cx| {
+                    assert!(matches!(shell.pending_exit, Some(PendingExit::Quit)));
+                    assert!(!shell.all_file_edits_flushed(cx));
+                    shell.cancel_file_close(RightSurface::Files, cx);
+                    assert!(shell.pending_exit.is_none());
+                })
+                .unwrap();
+            cx.update(|cx| cx.dispatch_action(&crate::app_menus::CloseWindow));
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, cx| {
+                    assert!(matches!(shell.pending_exit, Some(PendingExit::CloseWindow)));
+                    shell.quit_for_runtime_change(cx);
+                    assert!(matches!(
+                        shell.pending_exit,
+                        Some(PendingExit::RuntimeChange)
+                    ));
+                    assert!(shell.runtime_change_task.is_none());
+                    shell.apply_staged_update(PathBuf::from("must-not-install"), cx);
+                    assert!(matches!(
+                        shell.pending_exit,
+                        Some(PendingExit::InstallUpdate(_))
+                    ));
+                    assert!(matches!(shell.update_flow, UpdateFlow::Idle));
+                    shell.cancel_file_close(RightSurface::Files, cx);
+                    assert!(shell.pending_exit.is_none());
+                })
+                .unwrap();
+        }
     }
 }

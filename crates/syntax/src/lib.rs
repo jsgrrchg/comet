@@ -418,6 +418,20 @@ fn cached_configuration(
     )
 }
 
+fn cached_markdown_inline_configuration() -> Result<&'static HighlightConfiguration, HighlightError>
+{
+    static CONFIG: std::sync::OnceLock<Result<HighlightConfiguration, HighlightError>> =
+        std::sync::OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            let mut config = markdown_inline_configuration()?;
+            config.configure(CAPTURE_NAMES);
+            Ok(config)
+        })
+        .as_ref()
+        .map_err(Clone::clone)
+}
+
 fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
     // The upstream Rust query groups numbers and booleans as
     // `constant.builtin`. Zeron preserves those structural roles separately.
@@ -469,20 +483,6 @@ fn markdown_inline_configuration() -> Result<HighlightConfiguration, HighlightEr
         tree_sitter_md::INJECTION_QUERY_INLINE,
         "",
     )
-}
-
-fn cached_markdown_inline_configuration() -> Result<&'static HighlightConfiguration, HighlightError>
-{
-    static CONFIG: std::sync::OnceLock<Result<HighlightConfiguration, HighlightError>> =
-        std::sync::OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            let mut config = markdown_inline_configuration()?;
-            config.configure(CAPTURE_NAMES);
-            Ok(config)
-        })
-        .as_ref()
-        .map_err(Clone::clone)
 }
 
 fn make_configuration(

@@ -1426,6 +1426,7 @@ async fn workspace_file_surface_proxies_over_the_relay() {
                 "chatId": "chat-files",
                 "path": "src/remote.rs",
                 "text": "pub const REMOTE: bool = false;\n",
+                "expectedCheckoutId": read["checkoutId"],
                 "expectedContentHash": hash,
                 "encoding": "utf8",
                 "lineEnding": "lf",
@@ -1535,6 +1536,20 @@ async fn remote_target_without_links_fails_clearly() {
             .expect("offline stream closes promptly")
             .is_none(),
         "offline subscribe must not produce local terminal output"
+    );
+    let err = client
+        .call(
+            methods::LIST_WORKSPACE_DIRECTORY,
+            serde_json::json!({
+                "chatId": "missing-local-chat",
+                "targetDeviceId": "device-elsewhere",
+            }),
+        )
+        .await
+        .expect_err("workspace call must not fall back locally");
+    assert!(
+        err.to_string().contains("remote routing unavailable"),
+        "got: {err}"
     );
     let err = client
         .call(

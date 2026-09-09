@@ -86,20 +86,6 @@ impl ShortcutsPage {
         behavior: ComposerSendBehavior,
         cx: &mut Context<Self>,
     ) {
-        if behavior == ComposerSendBehavior::ModEnter
-            && let Some(owner) = modifier_send_conflict_owner(&self.keymap)
-        {
-            self.conflict_notice = Some(
-                format!(
-                    "{} is already assigned to {}. Change that shortcut first.",
-                    display_combo("mod-enter"),
-                    owner.label()
-                )
-                .into(),
-            );
-            cx.notify();
-            return;
-        }
         if self.composer_send_behavior != behavior {
             self.composer_send_behavior = behavior;
             self.conflict_notice = None;
@@ -128,11 +114,7 @@ impl ShortcutsPage {
             RecordOutcome::Set(combo) => {
                 if send_combo_is_reserved(self.composer_send_behavior, &combo) {
                     self.conflict_notice = Some(
-                        format!(
-                            "{} is already assigned to Send message.",
-                            display_combo(&combo)
-                        )
-                        .into(),
+                        format!("{} is reserved for the composer.", display_combo(&combo)).into(),
                     );
                     self.recording = None;
                     cx.notify();
@@ -279,14 +261,8 @@ pub fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Opt
         .find(|&other| other != id && keymap.get(other) == combo)
 }
 
-pub fn modifier_send_conflict_owner(keymap: &KeymapConfig) -> Option<ShortcutId> {
-    ShortcutId::ALL
-        .into_iter()
-        .find(|&id| keymap.get(id) == "mod-enter")
-}
-
-pub fn send_combo_is_reserved(behavior: ComposerSendBehavior, combo: &str) -> bool {
-    behavior == ComposerSendBehavior::ModEnter && combo == "mod-enter"
+pub fn send_combo_is_reserved(_behavior: ComposerSendBehavior, combo: &str) -> bool {
+    combo == "mod-enter"
 }
 
 pub fn modifier_send_label(is_macos: bool) -> &'static str {
@@ -298,12 +274,13 @@ pub fn modifier_send_label(is_macos: bool) -> &'static str {
 /// extends the match and appears on the page by construction
 /// (`every_shortcut_lands_in_a_rendered_group` holds the other half: its group
 /// name must be listed here).
-const GROUP_ORDER: [&str; 4] = ["Files", "Panels", "Sessions", "Jump to session"];
+const GROUP_ORDER: [&str; 5] = ["Files", "Browser", "Panels", "Sessions", "Jump to session"];
 
 /// The section a shortcut's row renders under.
 fn group(id: ShortcutId) -> &'static str {
     match id {
         ShortcutId::SaveFile => "Files",
+        ShortcutId::BrowserReload => "Browser",
         ShortcutId::ToggleSidebar | ShortcutId::ToggleChanges | ShortcutId::ToggleTerminal => {
             "Panels"
         }
@@ -320,6 +297,7 @@ fn group(id: ShortcutId) -> &'static str {
 fn description(id: ShortcutId) -> &'static str {
     match id {
         ShortcutId::SaveFile => "Save the active workspace file.",
+        ShortcutId::BrowserReload => "Reload the focused browser tab.",
         ShortcutId::ToggleSidebar => "Show or hide sessions and settings navigation.",
         ShortcutId::ToggleChanges => "Show or hide the right sidebar for the current session.",
         ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
@@ -442,13 +420,12 @@ impl Render for ShortcutsPage {
                                     .line_height(px(17.0))
                                     .text_color(theme.text_muted.opacity(0.65))
                                     .child(SharedString::from(
-                                        "Choose whether Enter sends immediately or starts a new paragraph. Shift+Enter always inserts a line break.",
+                                        "Choose whether Enter sends immediately or starts a new paragraph. Cmd/Ctrl+Enter always submits; with an empty composer it advances the queue. Shift+Enter always inserts a line break.",
                                     )),
                             ),
                     )
                     .child(send_behavior_control),
             );
-
         // One card per group, each under its small section label — the flat
         // 16-row table read as one undifferentiated wall. `ix` (the id's
         // position in ALL) keys the interactive elements, so ids stay unique
@@ -562,6 +539,8 @@ impl Render for ShortcutsPage {
                             .mt(px(12.0))
                             .px(px(4.0))
                             .min_h(px(20.0))
+                            .flex()
+                            .justify_center()
                             .text_size(crate::typography::ui_rems(12.0))
                             .text_color(theme.text_muted)
                             .child(helper),
@@ -663,8 +642,8 @@ mod tests {
     }
 
     #[test]
-    fn modifier_send_reserves_its_combo_only_while_enabled() {
-        assert!(!send_combo_is_reserved(
+    fn modifier_send_is_always_reserved_for_the_composer() {
+        assert!(send_combo_is_reserved(
             ComposerSendBehavior::Enter,
             "mod-enter"
         ));
@@ -676,16 +655,5 @@ mod tests {
             ComposerSendBehavior::ModEnter,
             "mod-shift-enter"
         ));
-    }
-
-    #[test]
-    fn existing_modifier_enter_shortcut_blocks_activation() {
-        let mut keymap = KeymapConfig::default();
-        assert_eq!(modifier_send_conflict_owner(&keymap), None);
-        keymap.set(ShortcutId::NewSession, "mod-enter".into());
-        assert_eq!(
-            modifier_send_conflict_owner(&keymap),
-            Some(ShortcutId::NewSession)
-        );
     }
 }

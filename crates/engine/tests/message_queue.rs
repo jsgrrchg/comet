@@ -5,7 +5,7 @@
 //! - idle agent → the queue drains immediately, in order;
 //! - busy agent that only takes input at a turn boundary → the queue HOLDS,
 //!   and flushes when the turn ends;
-//! - busy agent that takes input mid-turn → steered in;
+//! - busy agent, including one that takes input mid-turn → held until turn end;
 //! - "send now" → interrupts whatever is running.
 
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,7 @@ struct HeldHarness {
     steering: SteeringMode,
     finish: tokio::sync::broadcast::Sender<()>,
     prompts: Arc<Mutex<Vec<String>>>,
+    requests: Mutex<Vec<RunRequest>>,
     /// Park the first turn on a question instead of just hanging, so the chat
     /// sits in `AwaitingInput` rather than `Working`.
     asks: bool,
@@ -58,6 +59,7 @@ impl HeldHarness {
                 steering,
                 finish,
                 prompts: prompts.clone(),
+                requests: Mutex::new(Vec::new()),
                 asks,
             }),
             prompts,
@@ -91,6 +93,7 @@ impl Harness for HeldHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         self.prompts.lock().unwrap().push(request.prompt.clone());
+        self.requests.lock().unwrap().push(request.clone());
         if self.asks {
             // Only the engine can mint a request id it will honour, so the
             // question has to go through controls rather than the stream.
@@ -553,40 +556,51 @@ async fn a_steer_command_holds_for_an_agent_that_takes_no_mid_turn_prompt() {
     core.shutdown().await;
 }
 
-/// An agent that takes mid-turn input: the message goes straight into the
-/// running turn, and the queue stays empty.
+/// Even agents that support mid-turn input deliver queue rows one turn at a time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn steer_sends_into_a_live_turn_when_the_agent_takes_mid_turn_input() {
+async fn queued_text_waits_for_a_steerable_turn_even_with_legacy_policy() {
     let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
-
     core.doc_host
         .queue_message(CHAT, "opening", Vec::new())
-        .expect("queue opening");
+        .unwrap();
     wait_for(
         || prompts.lock().unwrap().iter().any(|p| p == "opening"),
-        "the first turn to start",
+        "first turn",
     )
     .await;
 
+    // Omitted and explicitly false policies from old clients must both wait.
     core.doc_host
-        .queue_message(CHAT, "mid-turn", Vec::new())
-        .expect("queue mid-turn");
+        .queue_message(CHAT, "first queued", Vec::new())
+        .unwrap();
+    core.doc_host
+        .queue_message_with_behavior(CHAT, "second queued", Vec::new(), false)
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(queue_texts(&core), vec!["first queued", "second queued"]);
+    assert_eq!(user_messages(&core), vec!["opening"]);
 
-    // Steered messages are written to the transcript by the steer path, and the
-    // queue lets go of them straight away.
+    harness.finish.send(()).unwrap();
     wait_for(
-        || user_messages(&core).iter().any(|m| m == "mid-turn"),
-        "the steered message to reach the transcript",
+        || user_messages(&core).iter().any(|m| m == "first queued"),
+        "first queued turn",
+    )
+    .await;
+    assert_eq!(queue_texts(&core), vec!["second queued"]);
+    assert!(!user_messages(&core).iter().any(|m| m == "second queued"));
+    harness.finish.send(()).unwrap();
+    wait_for(
+        || user_messages(&core).iter().any(|m| m == "second queued"),
+        "second queued turn",
     )
     .await;
     assert!(queue_texts(&core).is_empty());
-
     let _ = harness.finish.send(());
     core.shutdown().await;
 }
 
-/// The user can opt out of automatic steering even for a step-boundary agent,
-/// then explicitly steer a selected row without interrupting the turn.
+/// The legacy explicit-steer RPC remains compatible with older clients;
+/// current clients offer only Send now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn held_policy_keeps_a_steerable_message_visible_until_steer_now() {
     let (core, harness, prompts) = setup(SteeringMode::StepBoundary).await;
@@ -1425,4 +1439,74 @@ async fn composer_edit_commits_attachments_in_place_and_cancel_preserves_them() 
     assert_eq!(queue_texts(&core), vec!["before", "revised", "after"]);
     let _ = harness.finish.send(());
     core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_queue_dispatch_stays_paused_until_explicit_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (harness, prompts) = HeldHarness::new(SteeringMode::TurnBoundary);
+    let core = assemble_at(tmp.path(), harness.clone());
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let id = core
+        .doc_host
+        .queue_message(CHAT, "recover me", Vec::new())
+        .unwrap();
+    core.doc_host.drain_queue(&handle).await;
+    let version = handle.doc().doc().oplog_vv();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(handle.doc().doc().oplog_vv(), version);
+    assert_eq!(queue_texts(&core), vec!["recover me"]);
+    assert!(prompts.lock().unwrap().is_empty());
+    create_chat(&core).await;
+    core.doc_host.drain_queue(&handle).await;
+    assert_eq!(queue_texts(&core), vec!["recover me"]);
+    assert!(core.doc_host.send_queued_now(CHAT, &id).await.unwrap());
+    wait_for(|| prompts.lock().unwrap().len() == 1, "explicit recovery").await;
+    assert_eq!(user_message_id(&core, "recover me"), Some(id));
+    let _ = harness.finish.send(());
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_turn_uses_current_config_at_turn_end_and_send_now() {
+    for send_now in [false, true] {
+        let (core, harness, prompts) = setup(SteeringMode::TurnBoundary).await;
+        let mut config = zeron_proto::ChatConfig {
+            harness: HarnessId::Mock,
+            model: Some("old-model".into()),
+            reasoning: Some(ReasoningLevel::Medium),
+            model_options: Default::default(),
+            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        };
+        core.workspace.set_chat_config(CHAT, &config).unwrap();
+        core.doc_host
+            .queue_message(CHAT, "opening", Vec::new())
+            .unwrap();
+        wait_for(|| prompts.lock().unwrap().len() == 1, "first turn").await;
+        config.model = Some("new-model".into());
+        config.reasoning = None;
+        config
+            .model_options
+            .insert("contextWindow".into(), serde_json::json!("1m"));
+        core.workspace.set_chat_config(CHAT, &config).unwrap();
+        let id = core
+            .doc_host
+            .queue_message(CHAT, "follow-up", Vec::new())
+            .unwrap();
+        if send_now {
+            assert!(core.doc_host.send_queued_now(CHAT, &id).await.unwrap());
+        } else {
+            let _ = harness.finish.send(());
+        }
+        wait_for(|| prompts.lock().unwrap().len() == 2, "queued turn").await;
+        {
+            let requests = harness.requests.lock().unwrap();
+            assert_eq!(requests[0].model.as_deref(), Some("old-model"));
+            assert_eq!(requests[1].model, config.model);
+            assert_eq!(requests[1].reasoning, config.reasoning);
+            assert_eq!(requests[1].model_options, config.model_options);
+        }
+        let _ = harness.finish.send(());
+        core.shutdown().await;
+    }
 }

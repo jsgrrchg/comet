@@ -2926,8 +2926,7 @@ impl DocHost {
     /// put them.
     ///
     /// - Idle: send the head as the next turn (and loop — the agent is free).
-    /// - Working, agent takes mid-turn input: steer it in.
-    /// - Working, anything else: hold. The turn-end watcher comes back for it.
+    /// - Turn in flight: hold. The turn-end watcher comes back for it.
     ///
     /// One at a time by design: each send changes the status this reads.
     pub async fn drain_queue(&self, handle: &Arc<ChatDocHandle>) {
@@ -2982,21 +2981,10 @@ impl DocHost {
             // the turn too, and the composer queues on the same reading. Taking
             // `AwaitingInput` for idle would send the follow-up as a fresh turn
             // and abandon the question.
-            let busy = sessions.turn_in_flight(&handle.chat_id);
-            let send = if busy {
-                // Attachments never steer: the steer path carries a prompt and
-                // nothing else, so a message with files must wait for a turn
-                // that can inline them rather than lose them.
-                let steer_now = !head.hold_for_turn_end
-                    && head.attachments.is_empty()
-                    && sessions.steers_mid_turn(self.harness_for(&handle.chat_id));
-                if !steer_now {
-                    return; // held until the turn ends
-                }
-                QueueSend::Steer
-            } else {
-                QueueSend::NextTurn
-            };
+            if sessions.turn_in_flight(&handle.chat_id) {
+                return; // All queued messages wait, including rows from older clients.
+            }
+            let send = QueueSend::NextTurn;
             // Take it only once we know it is going out — a row that stays in
             // the queue on a failed send is recoverable; a vanished one is not.
             let Ok(Some(item)) = handle.doc.take_queued(&head.id) else {
@@ -3005,14 +2993,10 @@ impl DocHost {
             handle.publish_queue();
             if let Err(err) = self.dispatch_queued(handle, &item, send).await {
                 tracing::warn!(chat = %handle.chat_id, error = %err, "queued send failed");
-                // Back to the head it came from: a failed send must not reorder
-                // the queue behind the user's back.
+                handle.queue_paused.store(true, Ordering::Release);
                 let _ = handle.doc.insert_queued(0, &item);
                 handle.publish_queue();
                 return;
-            }
-            if busy {
-                return; // steered into a live turn; the rest waits for its end
             }
         }
     }
@@ -3076,9 +3060,17 @@ impl DocHost {
         if send == QueueSend::Interrupt && sessions.turn_in_flight(chat_id) {
             sessions.interrupt(chat_id).await?;
         }
-        let request = sessions
-            .last_request(chat_id)
-            .or_else(|| self.request_from_chat_row(chat_id, &prompt));
+        let previous = sessions.last_request(chat_id);
+        let request = self
+            .request_from_chat_row(chat_id, &prompt)
+            .map(|mut current| {
+                if let Some(previous) = &previous {
+                    current.auto_approve = previous.auto_approve;
+                    current.worktree = previous.worktree.clone();
+                }
+                current
+            })
+            .or(previous);
         let Some(mut request) = request else {
             return Err(EngineError::Other(
                 "no live run and no prior run config".into(),

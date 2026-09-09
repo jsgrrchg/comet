@@ -322,19 +322,6 @@ pub enum ComposerSendBehavior {
     ModEnter,
 }
 
-/// What Enter does with a message while the selected agent has a live turn.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ActiveTurnSendBehavior {
-    /// Preserve the historical behavior: steer immediately when the harness
-    /// supports it, otherwise leave the message queued for the next turn.
-    #[default]
-    Steer,
-    /// Keep the message visible and editable in the queue until the turn ends
-    /// or the user explicitly chooses the row's Steer / Send now action.
-    Queue,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SidebarOrganization {
@@ -423,10 +410,6 @@ pub struct UiSettings {
     /// Whether the message composer sends with Enter or the platform modifier
     /// plus Enter. Device-local and opt-in.
     pub composer_send_behavior: ComposerSendBehavior,
-    /// Whether messages submitted during a live turn steer immediately or
-    /// remain in the visible pending-message queue. Device-local preference;
-    /// the selected intent is copied onto each synchronized queue row.
-    pub active_turn_send_behavior: ActiveTurnSendBehavior,
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
@@ -501,7 +484,6 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
-            active_turn_send_behavior: ActiveTurnSendBehavior::default(),
             escape_stops_active_agent: false,
             appearance: crate::appearance::AppearanceMode::default(),
             ui_font_family: crate::typography::UiFontFamily::default(),
@@ -556,6 +538,7 @@ const JUMP_LABELS: [&str; JUMP_SLOTS] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
     SaveFile,
+    BrowserReload,
     ToggleSidebar,
     ToggleChanges,
     ToggleTerminal,
@@ -567,8 +550,9 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 8 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 9 + JUMP_SLOTS] = [
         ShortcutId::SaveFile,
+        ShortcutId::BrowserReload,
         ShortcutId::ToggleSidebar,
         ShortcutId::ToggleChanges,
         ShortcutId::ToggleTerminal,
@@ -591,6 +575,7 @@ impl ShortcutId {
     pub fn label(self) -> &'static str {
         match self {
             ShortcutId::SaveFile => "Save file",
+            ShortcutId::BrowserReload => "Reload browser page",
             ShortcutId::ToggleSidebar => "Toggle left sidebar",
             ShortcutId::ToggleChanges => "Toggle right sidebar",
             ShortcutId::ToggleTerminal => "Toggle terminal",
@@ -612,6 +597,7 @@ impl ShortcutId {
     pub fn default_combo_on(self, mac: bool) -> &'static str {
         match self {
             ShortcutId::SaveFile => "mod-s",
+            ShortcutId::BrowserReload => "mod-shift-r",
             ShortcutId::ToggleSidebar => "mod-b",
             ShortcutId::ToggleChanges => "mod-r",
             ShortcutId::ToggleTerminal => "mod-j",
@@ -653,6 +639,7 @@ impl ShortcutId {
 #[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
     pub save_file: String,
+    pub browser_reload: String,
     pub toggle_sidebar: String,
     pub toggle_changes: String,
     pub toggle_terminal: String,
@@ -712,6 +699,7 @@ impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
             save_file: ShortcutId::SaveFile.default_combo().into(),
+            browser_reload: ShortcutId::BrowserReload.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
             toggle_changes: ShortcutId::ToggleChanges.default_combo().into(),
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
@@ -728,6 +716,7 @@ impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
             ShortcutId::SaveFile => &self.save_file,
+            ShortcutId::BrowserReload => &self.browser_reload,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
             ShortcutId::ToggleChanges => &self.toggle_changes,
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
@@ -746,6 +735,7 @@ impl KeymapConfig {
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
             ShortcutId::SaveFile => self.save_file = combo,
+            ShortcutId::BrowserReload => self.browser_reload = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
             ShortcutId::ToggleChanges => self.toggle_changes = combo,
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
@@ -1136,6 +1126,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn composer_send_behavior_is_opt_in_for_old_and_partial_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert!(!loaded.sound_enabled);
+    }
+
+    #[test]
+    fn obsolete_steering_preference_does_not_reset_other_settings() {
+        let loaded: UiSettings = serde_json::from_str(
+            r#"{"activeTurnSendBehavior":"steer","sidebarWidth":300,"soundEnabled":false}"#,
+        )
+        .unwrap();
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert!(!loaded.sound_enabled);
+        assert!(
+            serde_json::to_value(&loaded)
+                .unwrap()
+                .get("activeTurnSendBehavior")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
@@ -1181,7 +1202,6 @@ mod tests {
                 ..KeymapConfig::default()
             },
             composer_send_behavior: ComposerSendBehavior::ModEnter,
-            active_turn_send_behavior: ActiveTurnSendBehavior::Queue,
             escape_stops_active_agent: true,
             appearance: crate::appearance::AppearanceMode::Light,
             ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
@@ -1617,7 +1637,6 @@ mod tests {
         assert_eq!(d.terminal_height, 280.0);
         assert!(!d.sidebar_collapsed && !d.right_pane_open && !d.terminal_open);
         assert_eq!(d.composer_send_behavior, ComposerSendBehavior::Enter);
-        assert_eq!(d.active_turn_send_behavior, ActiveTurnSendBehavior::Steer);
         assert!(!d.escape_stops_active_agent);
     }
 
@@ -1874,37 +1893,6 @@ mod tests {
         assert!(!loaded.escape_stops_active_agent);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
-    }
-
-    #[test]
-    fn composer_send_behavior_is_opt_in_for_old_and_partial_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            UiSettings::path(dir.path()),
-            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
-        )
-        .unwrap();
-
-        let loaded = UiSettings::load(dir.path());
-        assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
-        assert_eq!(loaded.sidebar_width, 300.0);
-        assert!(!loaded.sound_enabled);
-    }
-
-    #[test]
-    fn active_turn_send_behavior_preserves_automatic_steering_for_old_settings() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            UiSettings::path(dir.path()),
-            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
-        )
-        .unwrap();
-
-        let loaded = UiSettings::load(dir.path());
-        assert_eq!(
-            loaded.active_turn_send_behavior,
-            ActiveTurnSendBehavior::Steer
-        );
     }
 
     #[test]

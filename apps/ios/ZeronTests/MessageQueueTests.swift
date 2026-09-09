@@ -7,6 +7,41 @@ import UIKit
 
 @MainActor
 final class MessageQueueTests: XCTestCase {
+    func testEmptyQueueEditPreservesAttachmentsAndDiscardsOnlyTextOnlyRows() {
+        XCTAssertEqual(MessageQueue.editedText("  \n", hasAttachments: true), attachmentOnlyText)
+        XCTAssertNil(MessageQueue.editedText("  \n", hasAttachments: false))
+        XCTAssertEqual(MessageQueue.editedText(" updated ", hasAttachments: true), "updated")
+        XCTAssertEqual(MessageQueue.editedText(" updated ", hasAttachments: false), "updated")
+    }
+
+    func testTerminalEditFailuresRetainBothDraftsAndAllowLocalRecovery() {
+        let lease = QueueEditLease(rowId: "row", leaseId: "lease", text: "queued",
+                                   baseTextHash: "hash", expiresAtMs: 60_000)
+        for result in [QueueEditFinishResult.missing, .lost] {
+            var edit = QueueComposerEdit(lease: lease, originalDraft: "unsent draft", hasAttachments: true)
+            edit.receive(result)
+            XCTAssertTrue(edit.terminal)
+            XCTAssertEqual(edit.originalDraft, "unsent draft")
+            XCTAssertEqual(edit.textToCommit("edited text"), "edited text")
+            XCTAssertEqual(edit.textToCommit(""), attachmentOnlyText)
+            edit.receive(.unavailable)
+            XCTAssertTrue(edit.terminal, "a later network failure must not remove the local escape")
+        }
+    }
+
+    func testRetryableEditFailuresKeepProtectionAndAttachmentPolicy() {
+        let lease = QueueEditLease(rowId: "row", leaseId: "lease", text: "queued",
+                                   baseTextHash: "hash", expiresAtMs: 60_000)
+        var edit = QueueComposerEdit(lease: lease, originalDraft: "draft", hasAttachments: false)
+        for result in [QueueEditFinishResult.conflict, .unavailable] {
+            edit.receive(result)
+            XCTAssertFalse(edit.terminal)
+            XCTAssertEqual(edit.lease, lease)
+            XCTAssertEqual(edit.originalDraft, "draft")
+        }
+        XCTAssertNil(edit.textToCommit(""))
+    }
+
     private func store() -> SessionStore {
         SessionStore(chatId: "chat-1", config: AppConfig(
             edgeURL: URL(string: "https://example.test")!,
@@ -93,19 +128,17 @@ final class MessageQueueTests: XCTestCase {
         XCTAssertTrue(store.queueActionsPending.isEmpty)
     }
 
-    func testSteerAndSendUseDistinctHostMethodsAndLeaveProjectionToSync() async throws {
+    func testSendNowUsesHostMethodAndLeavesProjectionToSync() async throws {
         let store = store()
         let id = try XCTUnwrap(store.enqueueMessage(text: "hello"))
-        for (action, method) in [(QueueAction.steer, "SteerQueuedMessageNow"), (.sendNow, "SendQueuedMessageNow")] {
-            let sent = await store.performQueueAction(id: id, action: action) { actual, _ in
-                XCTAssertEqual(actual, method)
-                return QueueActionReply(sent: true)
-            }
-            XCTAssertTrue(sent)
-            XCTAssertEqual(texts(store), ["hello"])
-            XCTAssertNil(store.queueActionError)
+        let delivered = await store.performQueueAction(id: id, action: .sendNow) { method, _ in
+            XCTAssertEqual(method, "SendQueuedMessageNow")
+            return QueueActionReply(sent: true)
         }
-        let sent = await store.performQueueAction(id: id, action: .steer) { _, _ in
+        XCTAssertTrue(delivered)
+        XCTAssertEqual(texts(store), ["hello"])
+        XCTAssertNil(store.queueActionError)
+        let sent = await store.performQueueAction(id: id, action: .sendNow) { _, _ in
             throw RelayError.hostOffline
         }
         XCTAssertFalse(sent)
@@ -114,23 +147,19 @@ final class MessageQueueTests: XCTestCase {
 
     func testPrimaryActionRespectsCapabilitiesAttachmentsAndDeliveryGates() {
         var item = QueuedMessage(id: "q", text: "hello")
-        func action(_ steering: Bool?, supported: Bool = true, pending: Bool = false) -> QueueAction? {
-            MessageQueue.primaryAction(for: item, midTurnSteering: steering,
+        func action(supported: Bool = true, pending: Bool = false) -> QueueAction? {
+            MessageQueue.primaryAction(for: item,
                                        supportsActions: supported, pending: pending)
         }
-        XCTAssertEqual(action(true), .steer)
-        XCTAssertEqual(action(false), .sendNow)
-        XCTAssertNil(action(nil))
-        XCTAssertNil(action(true, supported: false))
-        XCTAssertNil(action(true, pending: true))
+        XCTAssertEqual(action(), .sendNow)
+        XCTAssertNil(action(supported: false))
+        XCTAssertNil(action(pending: true))
         item.attachments = ["uploads/image.png"]
-        XCTAssertEqual(action(true), .sendNow)
+        XCTAssertEqual(action(), .sendNow)
         item.deliveryGate = .reviewRequired(ownerDeviceId: "mac")
-        XCTAssertNil(action(true))
+        XCTAssertNil(action())
         item.deliveryGate = .editing(ownerDeviceId: "mac", expiresAtMs: 60_000)
-        XCTAssertNil(action(false))
-        XCTAssertTrue(ActiveTurnSendBehavior.queue.holdForTurnEnd)
-        XCTAssertFalse(ActiveTurnSendBehavior.steer.holdForTurnEnd)
+        XCTAssertNil(action())
     }
 
     func testProtectedRowsCannotBeDeliveredEvenThroughDirectStoreCall() async throws {
@@ -142,13 +171,11 @@ final class MessageQueueTests: XCTestCase {
         ]))
         store.doc.commit()
         store.refreshQueue()
-        for action in [QueueAction.steer, .sendNow] {
-            let sent = await store.performQueueAction(id: id, action: action) { _, _ in
-                XCTFail("protected rows must not dispatch")
-                return QueueActionReply(sent: true)
-            }
-            XCTAssertFalse(sent)
+        let sent = await store.performQueueAction(id: id, action: .sendNow) { _, _ in
+            XCTFail("protected rows must not dispatch")
+            return QueueActionReply(sent: true)
         }
+        XCTAssertFalse(sent)
         XCTAssertEqual(texts(store), ["protected"])
     }
 

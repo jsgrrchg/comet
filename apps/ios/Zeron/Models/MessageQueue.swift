@@ -55,7 +55,31 @@ enum QueueEditFinishResult: Sendable {
     case unavailable
 }
 
+struct QueueComposerEdit {
+    let lease: QueueEditLease
+    let originalDraft: String
+    let hasAttachments: Bool
+    private(set) var terminal = false
+
+    mutating func receive(_ result: QueueEditFinishResult) {
+        switch result {
+        case .missing, .lost: terminal = true
+        case .finished, .conflict, .unavailable: break
+        }
+    }
+
+    func textToCommit(_ text: String) -> String? {
+        MessageQueue.editedText(text, hasAttachments: hasAttachments)
+    }
+}
+
 enum MessageQueue {
+    static func editedText(_ text: String, hasAttachments: Bool) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return hasAttachments ? attachmentOnlyText : nil
+    }
+
     /// Queue text is user-editable and must not expose the attachment transport
     /// trailer. Strip it only for legacy rows whose parsed paths exactly match
     /// the separate attachments field.
@@ -90,25 +114,16 @@ enum MessageQueue {
     }
 }
 
-/// Preserve the phone's existing policy unless the user opts into steering.
-enum ActiveTurnSendBehavior: String, CaseIterable {
-    case queue, steer
-    var label: String { self == .queue ? "Queue" : "Steer" }
-    var holdForTurnEnd: Bool { self == .queue }
-}
-
 enum QueueAction: Equatable {
-    case steer, sendNow, remove
+    case sendNow, remove
     var method: String {
         switch self {
-        case .steer: return "SteerQueuedMessageNow"
         case .sendNow: return "SendQueuedMessageNow"
         case .remove: return "RemoveQueuedMessage"
         }
     }
     var label: String {
         switch self {
-        case .steer: return "Steer"
         case .sendNow: return "Send now"
         case .remove: return "Remove"
         }
@@ -124,10 +139,9 @@ struct QueueActionReply: Decodable {
 }
 
 extension MessageQueue {
-    static func primaryAction(for item: QueuedMessage, midTurnSteering: Bool?,
+    static func primaryAction(for item: QueuedMessage,
                               supportsActions: Bool, pending: Bool) -> QueueAction? {
-        guard supportsActions, !pending, item.deliveryGate == nil,
-              let midTurnSteering else { return nil }
-        return midTurnSteering && item.attachments.isEmpty ? .steer : .sendNow
+        guard supportsActions, !pending, item.deliveryGate == nil else { return nil }
+        return .sendNow
     }
 }

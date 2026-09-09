@@ -1331,6 +1331,7 @@ mod tests {
             last_seen_at: None,
             created_at: None,
             version: None,
+            capabilities: Vec::new(),
         }
     }
 

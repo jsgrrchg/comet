@@ -663,6 +663,7 @@ impl Shell {
     pub(super) fn land_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.cancel_pinned_session_drag(cx);
         self.set_route(Route::Chat, cx);
+        self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(String::new()));
         self.settings.space_filter = Some(space_id.clone());
         self.settings.last_space_id = Some(space_id.clone());

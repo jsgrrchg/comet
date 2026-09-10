@@ -39,17 +39,17 @@ pub fn record_key(key: &str, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> R
 pub enum ShortcutsEvent {
     /// The keymap changed — persist + re-apply.
     KeymapChanged(KeymapConfig),
-    /// The composer send behavior changed — persist + re-apply.
-    ComposerSendBehaviorChanged(ComposerSendBehavior),
     /// The Escape fallback changed — persist it locally.
     EscapeStopsActiveAgentChanged(bool),
+    /// The composer send behavior changed — persist + re-apply.
+    ComposerSendBehaviorChanged(ComposerSendBehavior),
 }
 
 pub struct ShortcutsPage {
     /// Working copy (kept in sync with the shell via change events).
     keymap: KeymapConfig,
-    composer_send_behavior: ComposerSendBehavior,
     escape_stops_active_agent: bool,
+    composer_send_behavior: ComposerSendBehavior,
     recording: Option<ShortcutId>,
     /// A rejected record attempt ("{Combo} is already assigned to {label}.") —
     /// conflicts never persist; they're refused at record time, as in zeron.
@@ -66,14 +66,14 @@ impl ShortcutsPage {
     pub fn new(
         state: Entity<AppState>,
         keymap: KeymapConfig,
-        composer_send_behavior: ComposerSendBehavior,
         escape_stops_active_agent: bool,
+        composer_send_behavior: ComposerSendBehavior,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
             keymap,
-            composer_send_behavior,
             escape_stops_active_agent,
+            composer_send_behavior,
             recording: None,
             conflict_notice: None,
             focus: cx.focus_handle(),
@@ -86,6 +86,14 @@ impl ShortcutsPage {
         cx.notify();
     }
 
+    fn set_escape_stops_active_agent(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.escape_stops_active_agent != enabled {
+            self.escape_stops_active_agent = enabled;
+            cx.emit(ShortcutsEvent::EscapeStopsActiveAgentChanged(enabled));
+            cx.notify();
+        }
+    }
+
     fn set_composer_send_behavior(
         &mut self,
         behavior: ComposerSendBehavior,
@@ -95,14 +103,6 @@ impl ShortcutsPage {
             self.composer_send_behavior = behavior;
             self.conflict_notice = None;
             cx.emit(ShortcutsEvent::ComposerSendBehaviorChanged(behavior));
-            cx.notify();
-        }
-    }
-
-    fn set_escape_stops_active_agent(&mut self, enabled: bool, cx: &mut Context<Self>) {
-        if self.escape_stops_active_agent != enabled {
-            self.escape_stops_active_agent = enabled;
-            cx.emit(ShortcutsEvent::EscapeStopsActiveAgentChanged(enabled));
             cx.notify();
         }
     }
@@ -331,11 +331,11 @@ impl Render for ShortcutsPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let recording = self.recording;
-        let send_behavior = self.composer_send_behavior;
         let escape_stops_active_agent = self.escape_stops_active_agent;
+        let send_behavior = self.composer_send_behavior;
         let customized = self.keymap != KeymapConfig::default()
-            || send_behavior != ComposerSendBehavior::default()
-            || escape_stops_active_agent;
+            || escape_stops_active_agent
+            || send_behavior != ComposerSendBehavior::default();
         let modifier_label = modifier_send_label(cfg!(target_os = "macos"));
 
         let send_behavior_control = div()
@@ -557,11 +557,11 @@ impl Render for ShortcutsPage {
                                                 this.recording = None;
                                                 this.conflict_notice = None;
                                                 this.commit(cx);
+                                                this.set_escape_stops_active_agent(false, cx);
                                                 this.set_composer_send_behavior(
                                                     ComposerSendBehavior::Enter,
                                                     cx,
                                                 );
-                                                this.set_escape_stops_active_agent(false, cx);
                                             }),
                                         )
                                     })

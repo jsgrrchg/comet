@@ -483,8 +483,8 @@ impl Default for UiSettings {
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
-            composer_send_behavior: ComposerSendBehavior::default(),
             escape_stops_active_agent: false,
+            composer_send_behavior: ComposerSendBehavior::default(),
             appearance: crate::appearance::AppearanceMode::default(),
             ui_font_family: crate::typography::UiFontFamily::default(),
             ui_font_size: crate::typography::UiFontSize::default(),
@@ -1201,8 +1201,8 @@ mod tests {
                 toggle_sidebar: "mod-shift-s".into(),
                 ..KeymapConfig::default()
             },
-            composer_send_behavior: ComposerSendBehavior::ModEnter,
             escape_stops_active_agent: true,
+            composer_send_behavior: ComposerSendBehavior::ModEnter,
             appearance: crate::appearance::AppearanceMode::Light,
             ui_font_family: crate::typography::UiFontFamily::Installed("Arial".into()),
             ui_font_size: crate::typography::UiFontSize::ALL[5],
@@ -1352,6 +1352,10 @@ mod tests {
         assert!(
             loaded.notifications_background_only,
             "pre-banner files default background-only on"
+        );
+        assert!(
+            !loaded.escape_stops_active_agent,
+            "preference files default Escape stopping off"
         );
         assert_eq!(
             loaded.git_history_columns,

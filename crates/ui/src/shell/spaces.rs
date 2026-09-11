@@ -390,6 +390,11 @@ impl Shell {
     pub(super) fn land_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.focus_composer(cx);
+        // "All" stays as-is; an explicit project filter follows the new
+        // project so the first send lands in a visible session.
+        if self.settings.space_filter.is_some() {
+            self.settings.space_filter = Some(space_id.clone());
+        }
         self.settings.last_space_id = Some(space_id.clone());
         self.state.update(cx, |s, cx| {
             s.select_space(Some(space_id), cx);

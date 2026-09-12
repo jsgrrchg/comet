@@ -30,6 +30,7 @@ pub(super) struct ImagePreview {
     error: Option<String>,
     suspended: bool,
     bounds: Bounds<Pixels>,
+    viewer: crate::image_viewer::ImageView,
 }
 
 impl ImagePreview {
@@ -52,12 +53,14 @@ impl ImagePreview {
             error: None,
             suspended: false,
             bounds: Bounds::default(),
+            viewer: Default::default(),
         };
         view.reload(cx);
         view
     }
 
     fn release(&mut self, cx: &mut gpui::App) {
+        self.viewer.reset();
         release_media(
             self.source.take().into_iter().chain(self.display.take()),
             cx,
@@ -191,15 +194,13 @@ impl Render for ImagePreview {
                     release_media([old], cx);
                 }
             }
-            let scale = (viewport.0 / source.width)
-                .min(viewport.1 / source.height)
-                .min(1.0);
-            root = root.child(
-                gpui::img(display.image)
-                    .w(px(source.width * scale))
-                    .h(px(source.height * scale))
-                    .object_fit(gpui::ObjectFit::Contain),
-            );
+            root = root.child(self.viewer.render(
+                display.image,
+                gpui::size(px(source.width), px(source.height)),
+                None,
+                window,
+                cx,
+            ));
         } else {
             root = root.child(
                 div()

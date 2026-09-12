@@ -9,7 +9,7 @@ Images initially fit the available area, preserve their aspect ratio and never u
 - The initial fit responds to viewport resizing. Manual zoom retains its scale and clamps the pan to the new viewport.
 - Escape or a plain lightbox click closes it and restores focus. Dragging, including releasing on the scrim, does not close it.
 
-Zoom normally spans 1%–3200%, allowing a smaller minimum when needed to fit a large image. Layout dimensions are capped at 131072 logical pixels for extreme SVGs. Scaling and panning reuse the current texture instead of decoding or rasterizing on each gesture. SVG detail therefore remains bounded by the raster budget at high zoom.
+Zoom normally spans 1%–3200%, allowing a smaller minimum when needed to fit a large image. Layout dimensions are capped at 131072 logical pixels for extreme SVGs. Scaling and panning reuse the current texture instead of decoding or rasterizing on each gesture. Gestures notify the owning view rather than refreshing the whole window, preserving unrelated view caches. Ctrl + wheel up increases zoom; wheel down decreases it. SVG detail therefore remains bounded by the raster budget at high zoom.
 
 ## Routing and resource lifecycle
 
@@ -19,11 +19,11 @@ The existing transport limits remain: at most 8 MiB of image bytes, 384 KiB chun
 
 `image_media.rs` is shared with Markdown. Raster decoding limits each side to 4096 pixels and decoder allocation to 64 MiB. Animated input is flattened to its first frame. SVG parsing disables embedded/external image resolution and reserializes the parsed tree, so scripts, HTML and resource URLs do not reach GPUI. Prepared SVG rasters are capped at 4096 pixels per side; enlarged variants at 2097152 pixels. Memory accounting includes the prepared source, decoded CPU pixels and GPU texture.
 
-Each Files image surface admits at most 64 MiB of retained image resources, including its panel rendering variants. A generation guard rejects obsolete work. Switching files, tabs or chats suspends image loads, clears media and schedules asset/atlas eviction. Resuming reloads from the owning workspace. Watcher updates do not reload hidden images; modifications, deletion and renaming invalidate the relevant image. Changing the target suspends the old view before clearing documents. Closing/disposal releases the image preview resources. Text documents retain their existing cache and editing lifecycle.
+Each Files image surface admits at most 64 MiB of retained image resources, including its panel rendering variants. A generation guard rejects obsolete work. Collapsing the right panel or switching files, tabs or chats suspends image loads, clears media and schedules asset/atlas eviction. Resuming reloads from the owning workspace. Watcher updates do not reload hidden images; modifications, deletion and renaming invalidate the relevant image. Changing the target suspends the old view before clearing documents. Closing/disposal releases the image preview resources. Text documents retain their existing cache and editing lifecycle. Renaming an edited text file to an image extension preserves its buffer and pending save; image conversion waits until those edits are resolved. Watcher events continue through text conflict handling while edits remain.
 
 ## Verification
 
-Automated coverage includes image format selection, owner-routed loading with and without synced checkout metadata, malformed/repeated/inconsistent/oversized chunks, bounded decoding, SVG sanitization, animation flattening, stale completion rejection, cancellation, disposal, and zoom geometry. A headless GPUI test dispatches actual wheel, pinch, drag, click and Escape events through the rendered lightbox. A rendered Files test loads through the owning-device client and verifies that clicking the image retains panel focus and that subsequent zoom still targets the file panel. Existing Markdown lightbox tests also verify opening and focus restoration.
+Automated coverage includes image format selection, owner-routed loading with and without synced checkout metadata, malformed/repeated/inconsistent/oversized chunks, bounded decoding, SVG sanitization, animation flattening, stale completion rejection, cancellation, disposal, and zoom geometry. A headless GPUI test dispatches actual wheel, pinch, drag, click and Escape events through the rendered lightbox. A rendered Files test loads through the owning-device client and verifies that clicking the image retains panel focus and that subsequent zoom still targets the file panel. Existing Markdown lightbox tests also verify opening and focus restoration. Regression coverage checks edited text renamed to an image extension across reopen, watcher and pending-save paths; suspension during panel collapse; wheel direction; and reuse of an unrelated cached view during zoom.
 
 The `workspace_file_surface_proxies_over_the_relay` integration test runs two engines through a relay. It reads an image on the owning engine, rejects an un-routed request and a wrong checkout, reconstructs a multi-chunk image, then rejects a continuation after a same-length content change.
 
@@ -38,7 +38,7 @@ Automated results recorded on 2026-09-12 (Linux):
 
 | Suite | Result |
 | --- | --- |
-| UI library, including rendered image/lightbox regressions | 850 passed |
+| UI library, including rendered image/lightbox regressions | 851 passed |
 | Engine library | 177 passed |
 | Device routing integration | 7 passed |
 | Workspace files integration | 3 passed |

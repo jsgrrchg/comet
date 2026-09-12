@@ -601,6 +601,11 @@ impl Render for FileEditorTooltip {
 }
 
 impl FilesSurface {
+    #[cfg(test)]
+    pub(crate) fn test_images_visible(&self) -> bool {
+        self.preview.images_visible
+    }
+
     pub(crate) fn suspend_images(&mut self, cx: &mut Context<Self>) {
         if !self.preview.images_visible {
             return;
@@ -1120,6 +1125,13 @@ impl FilesSurface {
     }
 
     fn read_image_file(&mut self, path: String, cx: &mut Context<Self>) {
+        // A rename can give an edited text buffer an image extension. Never
+        // discard that buffer (or an in-flight save) to create a preview.
+        if self.preview.documents.get(&path).is_some_and(|d| {
+            d.is_dirty() || d.pending_save.is_some() || matches!(d.phase, DocumentPhase::Saving)
+        }) {
+            return;
+        }
         let Some(context) = self.request_context.clone() else {
             return;
         };
@@ -1597,7 +1609,11 @@ impl FilesSurface {
     }
 
     pub(super) fn reconcile_document(&mut self, path: String, cx: &mut Context<Self>) {
-        if super::image_preview::is_image(&path) {
+        if super::image_preview::is_image(&path)
+            && !self.preview.documents.get(&path).is_some_and(|d| {
+                d.is_dirty() || d.pending_save.is_some() || matches!(d.phase, DocumentPhase::Saving)
+            })
+        {
             if self.preview.documents.contains_key(&path) {
                 if self.preview.images_visible && self.preview.active.as_deref() == Some(&path) {
                     self.read_image_file(path, cx);
@@ -3895,6 +3911,86 @@ mod markdown_buffer_tests {
             })
             .detach();
         });
+    }
+
+    #[gpui::test]
+    fn image_rename_preserves_unsaved_text_on_reopen_and_watcher(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            FilesSurface::new(state, "chat".into(), false, 1000, 13.0, false, false, cx)
+        });
+        window
+            .update(cx, |surface, window, cx| {
+                surface.request_context = Some(FilesRequestContext {
+                    target: zeron_proto::WorkspaceTarget {
+                        chat_id: Some("chat".into()),
+                        space_id: None,
+                        checkout_path: None,
+                    },
+                    target_device_id: None,
+                    cwd: "/workspace".into(),
+                    checkout_id: Some("checkout".into()),
+                });
+                let mut document = FileDocument::loading(DocumentKey {
+                    chat_id: "chat".into(),
+                    checkout_id: Some("checkout".into()),
+                    path: "drawing.txt".into(),
+                });
+                document.set_loaded(zeron_proto::WorkspaceFileText {
+                    checkout_id: "checkout".into(),
+                    path: "drawing.txt".into(),
+                    text: Some("disk text".into()),
+                    content_hash: Some("disk-hash".into()),
+                    size: 9,
+                    modified_at: None,
+                    encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                    line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                    read_only_reason: None,
+                    truncated: false,
+                });
+                let theme = Theme::of(cx).clone();
+                let editor = super::super::editor::new_file_editor(
+                    "unsaved text",
+                    "drawing.txt",
+                    false,
+                    &theme,
+                    window,
+                    cx,
+                );
+                document.editor = Some(editor.clone());
+                document.mark_user_edit();
+                surface.preview.active = Some("drawing.txt".into());
+                surface
+                    .preview
+                    .documents
+                    .insert("drawing.txt".into(), document);
+                surface.rename_documents("drawing.txt", "drawing.svg".into(), cx);
+                surface.open_file("drawing.svg".into(), cx);
+                surface.reconcile_document("drawing.svg".into(), cx);
+                let document = surface.preview.documents.get_mut("drawing.svg").unwrap();
+                assert!(document.is_dirty());
+                assert!(document.is_editable());
+                assert_eq!(document.editor.as_ref(), Some(&editor));
+                assert!(document.image.is_none());
+                assert!(matches!(
+                    document.phase,
+                    DocumentPhase::ExternallyModified { .. }
+                ));
+                // After resolving the external-change warning, saving still uses
+                // the original buffer and cannot be cancelled by preview creation.
+                document.phase = DocumentPhase::Ready;
+                assert!(document.can_save());
+                let pending = document.begin_save("unsaved text".into()).unwrap();
+                surface.read_image_file("drawing.svg".into(), cx);
+                let document = &surface.preview.documents["drawing.svg"];
+                assert_eq!(document.pending_save.as_ref(), Some(&pending));
+                assert_eq!(document.editor.as_ref(), Some(&editor));
+            })
+            .unwrap();
     }
 
     #[gpui::test]

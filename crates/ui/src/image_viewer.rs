@@ -10,6 +10,7 @@ pub(crate) struct ImageView(Rc<RefCell<ViewState>>);
 
 #[derive(Default)]
 struct ViewState {
+    owner: Option<gpui::EntityId>,
     geometry: Geometry,
     bounds: Bounds<Pixels>,
     drag: Option<(Point<f32>, Point<f32>)>,
@@ -147,7 +148,7 @@ impl ViewState {
     fn wheel(&mut self, event: &gpui::ScrollWheelEvent) -> bool {
         let delta = scroll_pixels(event.delta);
         if event.modifiers.control {
-            let scale = self.geometry.scale * (-delta.y * 0.0025).clamp(-2.0, 2.0).exp();
+            let scale = self.geometry.scale * (delta.y * 0.0025).clamp(-2.0, 2.0).exp();
             self.geometry.zoom(scale, self.local(event.position));
             true
         } else {
@@ -240,14 +241,18 @@ impl ImageView {
                 if wheel.0.borrow_mut().wheel(event) {
                     cx.stop_propagation();
                     window.prevent_default();
-                    window.refresh();
+                    if let Some(owner) = wheel.0.borrow().owner {
+                        cx.notify(owner);
+                    }
                 }
             })
             .on_pinch(move |event, window, cx| {
                 pinch.0.borrow_mut().pinch(event);
                 cx.stop_propagation();
                 window.prevent_default();
-                window.refresh();
+                if let Some(owner) = pinch.0.borrow().owner {
+                    cx.notify(owner);
+                }
             })
             .on_mouse_down(MouseButton::Left, move |event, window, _| {
                 down.0.borrow_mut().pointer_down(event.position);
@@ -291,13 +296,16 @@ impl ImageView {
                 gpui::canvas(
                     move |bounds, window, cx| {
                         let mut state = measure.0.borrow_mut();
+                        // Capture during prepaint, when GPUI knows the owning view.
+                        let owner = window.current_view();
+                        state.owner = Some(owner);
                         if state.bounds != bounds {
                             state.bounds = bounds;
                             state.geometry.resize(
                                 natural,
                                 size(f32::from(bounds.size.width), f32::from(bounds.size.height)),
                             );
-                            window.defer(cx, |window, _| window.refresh());
+                            window.defer(cx, move |_, cx| cx.notify(owner));
                         }
                     },
                     move |_, _, window, _| {
@@ -305,12 +313,14 @@ impl ImageView {
                         // other pointers. Release is handled inside and outside the hitbox.
                         let movement = movement.clone();
                         window.on_mouse_event(
-                            move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                            move |event: &gpui::MouseMoveEvent, phase, _window, cx| {
                                 if phase == gpui::DispatchPhase::Bubble
                                     && movement.0.borrow_mut().pointer_move(event)
                                 {
                                     cx.stop_propagation();
-                                    window.refresh();
+                                    if let Some(owner) = movement.0.borrow().owner {
+                                        cx.notify(owner);
+                                    }
                                 }
                             },
                         );
@@ -384,7 +394,7 @@ mod tests {
         };
         let mut event = gpui::ScrollWheelEvent {
             position: point(px(250.0), px(150.0)),
-            delta: ScrollDelta::Lines(point(0.0, -1.0)),
+            delta: ScrollDelta::Lines(point(0.0, 1.0)),
             ..Default::default()
         };
         assert!(!state.wheel(&event));
@@ -392,10 +402,17 @@ mod tests {
         event.modifiers.control = true;
         assert!(state.wheel(&event));
         let scale = state.geometry.scale;
+        assert!(scale > 0.5, "GPUI positive Y (wheel up) must zoom in");
         state.geometry.fit();
-        event.delta = ScrollDelta::Pixels(point(px(0.0), px(-40.0)));
+        event.delta = ScrollDelta::Pixels(point(px(0.0), px(40.0)));
         state.wheel(&event);
         assert_eq!(state.geometry.scale, scale);
+        event.delta = ScrollDelta::Lines(point(0.0, -1.0));
+        state.wheel(&event);
+        assert!(
+            (state.geometry.scale - 0.5).abs() < 0.0001,
+            "wheel down reverses zoom"
+        );
     }
     #[test]
     fn pinch_accumulates_native_deltas_and_a_drag_does_not_click() {
@@ -436,7 +453,15 @@ mod tests {
     #[test]
     fn rendered_lightbox_consumes_zoom_and_drag_but_allows_click_and_escape() {
         use gpui::{AppContext, Context, Render};
+        struct CachedSibling(Rc<std::cell::Cell<usize>>);
+        impl Render for CachedSibling {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.0.set(self.0.get() + 1);
+                div().size_full()
+            }
+        }
         struct Harness {
+            sibling: gpui::Entity<CachedSibling>,
             preview: crate::attachments::PreviewImage,
             focus: gpui::FocusHandle,
             closed: bool,
@@ -449,6 +474,11 @@ mod tests {
                 let weak = cx.weak_entity();
                 div()
                     .size_full()
+                    .child(
+                        self.sibling
+                            .clone()
+                            .cached(gpui::StyleRefinement::default()),
+                    )
                     .child(crate::attachments::lightbox_with_size(
                         window,
                         &self.preview,
@@ -474,7 +504,7 @@ mod tests {
             }, |window, cx| cx.new(|cx| {
                 let media = crate::image_media::decode_image("image/svg+xml", br#"<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="500"><rect width="1000" height="500"/></svg>"#.to_vec()).unwrap();
                 let focus = cx.focus_handle(); window.focus(&focus, cx);
-                Harness { preview: crate::attachments::PreviewImage::new("test.svg", media.image), focus, closed: false }
+                Harness { sibling: cx.new(|_| CachedSibling(Rc::new(std::cell::Cell::new(0)))), preview: crate::attachments::PreviewImage::new("test.svg", media.image), focus, closed: false }
             })).unwrap();
             let harness = window.entity(cx).unwrap();
             for _ in 0..3 { cx.update_window(window.into(), |_, window, cx| { window.refresh(); let _ = window.draw(cx); }).unwrap(); }
@@ -487,11 +517,16 @@ mod tests {
                 window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, ..Default::default() }), cx);
                 window.refresh(); let _ = window.draw(cx);
                 window.dispatch_event(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
-                    position, delta: ScrollDelta::Pixels(point(px(0.0), px(-200.0))), modifiers: gpui::Modifiers { control: true, ..Default::default() }, ..Default::default()
+                    position, delta: ScrollDelta::Pixels(point(px(0.0), px(200.0))), modifiers: gpui::Modifiers { control: true, ..Default::default() }, ..Default::default()
                 }), cx);
             }).unwrap();
             assert!(viewer.0.borrow().geometry.scale > initial);
             assert!(!harness.read(cx).closed);
+            let sibling_renders = harness.read(cx).sibling.read(cx).0.clone();
+            let before_draw = sibling_renders.get();
+            assert!(before_draw > 0);
+            cx.update_window(window.into(), |_, window, cx| { let _ = window.draw(cx); }).unwrap();
+            assert_eq!(sibling_renders.get(), before_draw, "zoom must preserve unrelated cached views");
             let after_wheel = viewer.0.borrow().geometry.scale;
             cx.update_window(window.into(), |_, window, cx| {
                 window.refresh(); let _ = window.draw(cx);

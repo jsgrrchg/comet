@@ -535,7 +535,7 @@ mod tests {
                         window.dispatch_event(
                             gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
                                 position,
-                                delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-100.0))),
+                                delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(100.0))),
                                 modifiers: gpui::Modifiers {
                                     control: true,
                                     ..Default::default()

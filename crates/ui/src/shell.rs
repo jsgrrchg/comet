@@ -1885,6 +1885,7 @@ impl Shell {
         // snap, no tween — the panels belong to the destination chat).
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
         if selected != self.active_chat {
+            self.suspend_file_images(cx);
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
@@ -2201,7 +2202,16 @@ impl Shell {
         }
     }
 
+    fn suspend_file_images(&mut self, cx: &mut Context<Self>) {
+        for files in self.files.values().chain(self.file_surfaces.values()) {
+            files.update(cx, |files, cx| files.suspend_images(cx));
+        }
+    }
+
     fn set_right_active(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
+        if self.resolved_right_active(cx) != surface {
+            self.suspend_file_images(cx);
+        }
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
         match surface {
@@ -3209,6 +3219,7 @@ impl Shell {
     /// points at `entry` (back/forward moved the index); the selection change
     /// this triggers dedups against `current()` in [`Self::on_state_changed`].
     fn apply_nav(&mut self, entry: NavEntry, cx: &mut Context<Self>) {
+        self.suspend_file_images(cx);
         match entry {
             NavEntry::Chat(chat_id) => {
                 self.route = Route::Chat;

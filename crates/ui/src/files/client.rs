@@ -75,7 +75,7 @@ pub struct WorkspaceFilesClient {
 }
 
 #[async_trait]
-trait WorkspaceFilesTransport: Send + Sync {
+pub(super) trait WorkspaceFilesTransport: Send + Sync {
     async fn call(&self, method: &str, params: Value) -> Result<Value, RpcError>;
     async fn subscribe(
         &self,
@@ -110,7 +110,7 @@ impl WorkspaceFilesClient {
     }
 
     #[cfg(test)]
-    fn with_transport(
+    pub(super) fn with_transport(
         transport: Arc<dyn WorkspaceFilesTransport>,
         context: FilesRequestContext,
     ) -> Self {

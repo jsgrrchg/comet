@@ -5,7 +5,7 @@ use crate::{
     theme::Theme,
 };
 use gpui::{Bounds, Context, FocusHandle, Pixels, Render, Task, Window, div, prelude::*, px};
-use std::{rc::Rc, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 const MAX_MEDIA_BYTES: usize = 64 * 1024 * 1024;
 
@@ -31,9 +31,6 @@ pub(super) struct ImagePreview {
     suspended: bool,
     bounds: Bounds<Pixels>,
     viewer: crate::image_viewer::ImageView,
-    preview_image: Option<crate::attachments::PreviewImage>,
-    preview_focus: FocusHandle,
-    lightbox_render: Option<MediaImage>,
 }
 
 impl ImagePreview {
@@ -57,33 +54,12 @@ impl ImagePreview {
             suspended: false,
             bounds: Bounds::default(),
             viewer: Default::default(),
-            preview_image: None,
-            preview_focus: cx.focus_handle(),
-            lightbox_render: None,
         };
         view.reload(cx);
         view
     }
 
-    fn close_lightbox(&mut self, cx: &mut gpui::App) {
-        self.preview_image = None;
-        if let Some(media) = self.lightbox_render.take() {
-            if !self
-                .source
-                .as_ref()
-                .is_some_and(|s| Arc::ptr_eq(&s.image, &media.image))
-                && !self
-                    .display
-                    .as_ref()
-                    .is_some_and(|s| Arc::ptr_eq(&s.image, &media.image))
-            {
-                release_media([media], cx);
-            }
-        }
-    }
-
     fn release(&mut self, cx: &mut gpui::App) {
-        self.close_lightbox(cx);
         self.viewer.reset();
         release_media(
             self.source.take().into_iter().chain(self.display.take()),
@@ -218,71 +194,13 @@ impl Render for ImagePreview {
                     release_media([old], cx);
                 }
             }
-            let weak = cx.weak_entity();
             root = root.child(self.viewer.render(
                 display.image,
                 gpui::size(px(source.width), px(source.height)),
-                Some(Rc::new(move |window, cx| {
-                    let _ = weak.update(cx, |view, cx| {
-                        if let Some(source) = &view.source {
-                            view.preview_image = Some(crate::attachments::PreviewImage::new(
-                                view.path.clone(),
-                                source.image.clone(),
-                            ));
-                            window.focus(&view.preview_focus, cx);
-                            cx.notify();
-                        }
-                    });
-                })),
+                None,
                 window,
                 cx,
             ));
-            if self.preview_image.is_some() {
-                let used = source.bytes
-                    + self
-                        .display
-                        .as_ref()
-                        .filter(|d| !Arc::ptr_eq(&d.image, &source.image))
-                        .map_or(0, |d| d.bytes);
-                let viewport = window.viewport_size();
-                let enlarged = source.enlarged(
-                    (
-                        f32::from(viewport.width) * 0.9,
-                        f32::from(viewport.height) * 0.85,
-                    ),
-                    window.scale_factor(),
-                    MAX_MEDIA_BYTES.saturating_sub(used),
-                    self.lightbox_render.as_ref(),
-                );
-                if let Some(old) = self.lightbox_render.replace(enlarged.clone()) {
-                    if !Arc::ptr_eq(&old.image, &enlarged.image)
-                        && !Arc::ptr_eq(&old.image, &source.image)
-                        && !self
-                            .display
-                            .as_ref()
-                            .is_some_and(|d| Arc::ptr_eq(&d.image, &old.image))
-                    {
-                        release_media([old], cx);
-                    }
-                }
-                let preview = self.preview_image.as_mut().unwrap();
-                preview.image = enlarged.image;
-                let weak = cx.weak_entity();
-                root = root.child(crate::attachments::lightbox_with_size(
-                    window,
-                    preview,
-                    &self.preview_focus,
-                    Some(gpui::size(px(source.width), px(source.height))),
-                    move |window, cx| {
-                        let _ = weak.update(cx, |view, cx| {
-                            view.close_lightbox(cx);
-                            window.focus(&view.focus, cx);
-                            cx.notify();
-                        });
-                    },
-                    cx,
-                ));
-            }
         } else {
             root = root.child(
                 div()
@@ -501,7 +419,7 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[test]
-    fn rendered_workspace_image_opens_zoomable_lightbox_and_restores_focus() {
+    fn rendered_workspace_image_click_keeps_zoom_in_the_file_panel() {
         use gpui::{AppContext, point, size};
         gpui_platform::headless().run(|cx| {
             cx.set_global(Theme::dark());
@@ -593,7 +511,6 @@ mod tests {
                         );
                     })
                     .unwrap();
-                    assert!(view.read(cx).preview_image.is_some());
                     for _ in 0..3 {
                         cx.update_window(window.into(), |_, window, cx| {
                             window.refresh();
@@ -602,7 +519,10 @@ mod tests {
                         .unwrap();
                     }
                     cx.update_window(window.into(), |_, window, cx| {
-                        assert!(view.read(cx).preview_focus.is_focused(window));
+                        assert!(
+                            view.read(cx).focus.is_focused(window),
+                            "click keeps focus in the file panel"
+                        );
                         window.dispatch_event(
                             gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
                                 position,
@@ -627,33 +547,9 @@ mod tests {
                     })
                     .unwrap();
                     assert!(
-                        view.read(cx)
-                            .preview_image
-                            .as_ref()
-                            .unwrap()
-                            .viewer
-                            .test_scale()
-                            > 1.0
+                        view.read(cx).viewer.test_scale() > 1.0,
+                        "zoom still targets the file panel after clicking the image"
                     );
-                    assert_eq!(
-                        view.read(cx).viewer.test_scale(),
-                        1.0,
-                        "overlay zoom does not reach the panel"
-                    );
-                    cx.update_window(window.into(), |_, window, cx| {
-                        window.dispatch_event(
-                            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
-                                keystroke: gpui::Keystroke::parse("escape").unwrap(),
-                                is_held: false,
-                                prefer_character_input: false,
-                            }),
-                            cx,
-                        );
-                        assert!(view.read(cx).focus.is_focused(window));
-                    })
-                    .unwrap();
-                    assert!(view.read(cx).preview_image.is_none());
-                    assert!(view.read(cx).lightbox_render.is_none());
                     cx.quit();
                 });
             })

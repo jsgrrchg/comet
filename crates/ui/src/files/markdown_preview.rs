@@ -879,10 +879,7 @@ impl MarkdownPreview {
         weak: gpui::WeakEntity<Self>,
     ) -> AnyElement {
         use gpui::StyledImage as _;
-        let preview = crate::attachments::PreviewImage {
-            name: name.into(),
-            image: loaded.image.clone(),
-        };
+        let preview = crate::attachments::PreviewImage::new(name, loaded.image.clone());
         let source = loaded.clone();
         div()
             .id(id)
@@ -899,6 +896,7 @@ impl MarkdownPreview {
                 let _ = weak.update(cx, |view, cx| {
                     view.close_media_preview(cx);
                     view.zoom_source = Some(source.clone());
+                    preview.viewer.reset();
                     view.preview_image = Some(preview.clone());
                     window.focus(&view.preview_focus, cx);
                     cx.notify();
@@ -1272,15 +1270,12 @@ impl Render for MarkdownPreview {
             );
         if let Some(preview) = &self.preview_image {
             let weak = cx.weak_entity();
-            let display_size = self.zoom_source.as_ref().map(|source| {
-                let viewport = window.viewport_size();
-                let scale = (f32::from(viewport.width) * 0.9 / source.width)
-                    .min(f32::from(viewport.height) * 0.85 / source.height)
-                    .min(1.0);
-                gpui::size(px(source.width * scale), px(source.height * scale))
-            });
+            let display_size = self
+                .zoom_source
+                .as_ref()
+                .map(|source| gpui::size(px(source.width), px(source.height)));
             root = root.child(crate::attachments::lightbox_with_size(
-                window.viewport_size(),
+                window,
                 preview,
                 &self.preview_focus,
                 display_size,
@@ -1291,6 +1286,7 @@ impl Render for MarkdownPreview {
                         cx.notify();
                     });
                 },
+                cx,
             ));
         }
         root

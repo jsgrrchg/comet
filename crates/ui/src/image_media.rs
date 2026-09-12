@@ -82,7 +82,9 @@ impl MediaImage {
             image: Arc::new(Image::from_bytes(ImageFormat::Svg, wrapper.into_bytes())),
             width: self.width,
             height: self.height,
-            bytes: self.bytes,
+            bytes: self
+                .bytes
+                .max(svg.len() * 2 + 1024 + size.0 as usize * size.1 as usize * 8),
             svg: self.svg.clone(),
             raster_size: Some(size),
         }
@@ -269,6 +271,11 @@ mod tests {
                 ] {
                     let (w, h) = variant.raster_size.unwrap();
                     assert!(w <= 4096 && h <= 4096 && w as usize * h as usize <= limit);
+                    assert!(
+                        variant.bytes
+                            >= w as usize * h as usize * 8
+                                + variant.svg.as_ref().unwrap().len() * 2
+                    );
                     let raster = variant
                         .image
                         .to_image_data(gpui::SvgRenderer::new(Arc::new(crate::icons::Assets)))

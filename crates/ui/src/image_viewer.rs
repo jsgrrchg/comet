@@ -466,4 +466,95 @@ mod tests {
         state.pointer_down(point(px(200.0), px(150.0)));
         assert!(!state.dragged);
     }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rendered_lightbox_consumes_zoom_and_drag_but_allows_click_and_escape() {
+        use gpui::{AppContext, Context, Render};
+        struct Harness {
+            preview: crate::attachments::PreviewImage,
+            focus: gpui::FocusHandle,
+            closed: bool,
+        }
+        impl Render for Harness {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                if self.closed {
+                    return div().into_any_element();
+                }
+                let weak = cx.weak_entity();
+                div()
+                    .size_full()
+                    .child(crate::attachments::lightbox_with_size(
+                        window,
+                        &self.preview,
+                        &self.focus,
+                        Some(size(px(1000.0), px(500.0))),
+                        move |_, cx| {
+                            weak.update(cx, |view, cx| {
+                                view.closed = true;
+                                cx.notify();
+                            })
+                            .unwrap();
+                        },
+                        cx,
+                    ))
+                    .into_any_element()
+            }
+        }
+        gpui_platform::headless().run(|cx| {
+            cx.set_global(crate::theme::Theme::dark());
+            let window = cx.open_window(gpui::WindowOptions {
+                window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(Point::default(), size(px(600.0), px(400.0))))),
+                ..Default::default()
+            }, |window, cx| cx.new(|cx| {
+                let media = crate::image_media::decode_image("image/svg+xml", br#"<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="500"><rect width="1000" height="500"/></svg>"#.to_vec()).unwrap();
+                let focus = cx.focus_handle(); window.focus(&focus, cx);
+                Harness { preview: crate::attachments::PreviewImage::new("test.svg", media.image), focus, closed: false }
+            })).unwrap();
+            let harness = window.entity(cx).unwrap();
+            for _ in 0..3 { cx.update_window(window.into(), |_, window, cx| { window.refresh(); let _ = window.draw(cx); }).unwrap(); }
+            let viewer = harness.read(cx).preview.viewer.clone();
+            let bounds = viewer.0.borrow().bounds;
+            assert!(bounds.size.width > px(100.0));
+            let position = bounds.center();
+            let initial = viewer.0.borrow().geometry.scale;
+            cx.update_window(window.into(), |_, window, cx| {
+                window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, ..Default::default() }), cx);
+                window.refresh(); let _ = window.draw(cx);
+                window.dispatch_event(gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                    position, delta: ScrollDelta::Pixels(point(px(0.0), px(-200.0))), modifiers: gpui::Modifiers { control: true, ..Default::default() }, ..Default::default()
+                }), cx);
+            }).unwrap();
+            assert!(viewer.0.borrow().geometry.scale > initial);
+            assert!(!harness.read(cx).closed);
+            let after_wheel = viewer.0.borrow().geometry.scale;
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh(); let _ = window.draw(cx);
+                for (phase, delta) in [(TouchPhase::Started, 0.0), (TouchPhase::Moved, 0.5), (TouchPhase::Ended, 0.0)] {
+                    window.dispatch_event(gpui::PlatformInput::Pinch(gpui::PinchEvent { position, phase, delta, ..Default::default() }), cx);
+                }
+                window.refresh(); let _ = window.draw(cx);
+                window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { position, button: MouseButton::Left, click_count: 1, ..Default::default() }), cx);
+                let moved = position + point(px(50.0), px(0.0));
+                window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position: moved, pressed_button: Some(MouseButton::Left), ..Default::default() }), cx);
+                window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position: moved, button: MouseButton::Left, click_count: 1, ..Default::default() }), cx);
+            }).unwrap();
+            assert!((viewer.0.borrow().geometry.scale - after_wheel * 1.5).abs() < 0.001);
+            assert!(!harness.read(cx).closed, "drag must not close the lightbox");
+            assert_ne!(viewer.0.borrow().geometry.pan, point(0.0, 0.0));
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh(); let _ = window.draw(cx);
+                window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, ..Default::default() }), cx);
+                window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { position, button: MouseButton::Left, click_count: 1, ..Default::default() }), cx);
+                window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position, button: MouseButton::Left, click_count: 1, ..Default::default() }), cx);
+            }).unwrap();
+            assert!(harness.read(cx).closed, "a plain click closes");
+            harness.update(cx, |view, cx| { view.closed = false; view.preview.viewer.reset(); cx.notify(); });
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh(); let _ = window.draw(cx);
+                window.dispatch_event(gpui::PlatformInput::KeyDown(gpui::KeyDownEvent { keystroke: gpui::Keystroke::parse("escape").unwrap(), is_held: false, prefer_character_input: false }), cx);
+            }).unwrap();
+            assert!(harness.read(cx).closed);
+            cx.spawn(async move |cx| { cx.update(|cx| cx.quit()); }).detach();
+        });
+    }
 }

@@ -5,7 +5,7 @@ use crate::{
     theme::Theme,
 };
 use gpui::{Bounds, Context, FocusHandle, Pixels, Render, Task, Window, div, prelude::*, px};
-use std::{sync::Arc, time::Duration};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
 const MAX_MEDIA_BYTES: usize = 64 * 1024 * 1024;
 
@@ -31,6 +31,9 @@ pub(super) struct ImagePreview {
     suspended: bool,
     bounds: Bounds<Pixels>,
     viewer: crate::image_viewer::ImageView,
+    preview_image: Option<crate::attachments::PreviewImage>,
+    preview_focus: FocusHandle,
+    lightbox_render: Option<MediaImage>,
 }
 
 impl ImagePreview {
@@ -54,12 +57,33 @@ impl ImagePreview {
             suspended: false,
             bounds: Bounds::default(),
             viewer: Default::default(),
+            preview_image: None,
+            preview_focus: cx.focus_handle(),
+            lightbox_render: None,
         };
         view.reload(cx);
         view
     }
 
+    fn close_lightbox(&mut self, cx: &mut gpui::App) {
+        self.preview_image = None;
+        if let Some(media) = self.lightbox_render.take() {
+            if !self
+                .source
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(&s.image, &media.image))
+                && !self
+                    .display
+                    .as_ref()
+                    .is_some_and(|s| Arc::ptr_eq(&s.image, &media.image))
+            {
+                release_media([media], cx);
+            }
+        }
+    }
+
     fn release(&mut self, cx: &mut gpui::App) {
+        self.close_lightbox(cx);
         self.viewer.reset();
         release_media(
             self.source.take().into_iter().chain(self.display.take()),
@@ -176,7 +200,7 @@ impl Render for ImagePreview {
             .flex()
             .items_center()
             .justify_center();
-        if let Some(source) = &self.source {
+        if let Some(source) = self.source.clone() {
             let viewport = (
                 f32::from(self.bounds.size.width).max(1.0),
                 f32::from(self.bounds.size.height).max(1.0),
@@ -194,13 +218,71 @@ impl Render for ImagePreview {
                     release_media([old], cx);
                 }
             }
+            let weak = cx.weak_entity();
             root = root.child(self.viewer.render(
                 display.image,
                 gpui::size(px(source.width), px(source.height)),
-                None,
+                Some(Rc::new(move |window, cx| {
+                    let _ = weak.update(cx, |view, cx| {
+                        if let Some(source) = &view.source {
+                            view.preview_image = Some(crate::attachments::PreviewImage::new(
+                                view.path.clone(),
+                                source.image.clone(),
+                            ));
+                            window.focus(&view.preview_focus, cx);
+                            cx.notify();
+                        }
+                    });
+                })),
                 window,
                 cx,
             ));
+            if self.preview_image.is_some() {
+                let used = source.bytes
+                    + self
+                        .display
+                        .as_ref()
+                        .filter(|d| !Arc::ptr_eq(&d.image, &source.image))
+                        .map_or(0, |d| d.bytes);
+                let viewport = window.viewport_size();
+                let enlarged = source.enlarged(
+                    (
+                        f32::from(viewport.width) * 0.9,
+                        f32::from(viewport.height) * 0.85,
+                    ),
+                    window.scale_factor(),
+                    MAX_MEDIA_BYTES.saturating_sub(used),
+                    self.lightbox_render.as_ref(),
+                );
+                if let Some(old) = self.lightbox_render.replace(enlarged.clone()) {
+                    if !Arc::ptr_eq(&old.image, &enlarged.image)
+                        && !Arc::ptr_eq(&old.image, &source.image)
+                        && !self
+                            .display
+                            .as_ref()
+                            .is_some_and(|d| Arc::ptr_eq(&d.image, &old.image))
+                    {
+                        release_media([old], cx);
+                    }
+                }
+                let preview = self.preview_image.as_mut().unwrap();
+                preview.image = enlarged.image;
+                let weak = cx.weak_entity();
+                root = root.child(crate::attachments::lightbox_with_size(
+                    window,
+                    preview,
+                    &self.preview_focus,
+                    Some(gpui::size(px(source.width), px(source.height))),
+                    move |window, cx| {
+                        let _ = weak.update(cx, |view, cx| {
+                            view.close_lightbox(cx);
+                            window.focus(&view.focus, cx);
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                ));
+            }
         } else {
             root = root.child(
                 div()

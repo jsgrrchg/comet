@@ -422,4 +422,242 @@ mod tests {
         cx.run_until_parked();
         assert!(weak.upgrade().is_none());
     }
+    #[derive(Default)]
+    struct ImageTransport {
+        calls: std::sync::Mutex<Vec<(String, serde_json::Value)>>,
+    }
+    #[async_trait::async_trait]
+    impl super::super::client::WorkspaceFilesTransport for ImageTransport {
+        async fn call(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<serde_json::Value, zeron_rpc::RpcError> {
+            use base64::Engine as _;
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params.clone()));
+            assert_eq!(params["targetDeviceId"], "owner");
+            assert_eq!(params["chatId"], "chat");
+            assert_eq!(params["path"], "remote.svg");
+            if method == zeron_rpc::methods::READ_WORKSPACE_FILE {
+                return Ok(
+                    serde_json::json!({ "checkoutId": "checkout", "path": "remote.svg", "size": 0, "encoding": "binary", "truncated": false }),
+                );
+            }
+            assert_eq!(method, zeron_rpc::methods::READ_WORKSPACE_IMAGE);
+            assert_eq!(params["expectedCheckoutId"], "checkout");
+            let bytes = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50"><rect width="100" height="50" fill="red"/></svg>"#;
+            Ok(
+                serde_json::json!({ "checkoutId": "checkout", "contentHash": "version", "mimeType": "image/svg+xml", "data": base64::engine::general_purpose::STANDARD.encode(bytes), "nextOffset": bytes.len(), "size": bytes.len(), "done": true }),
+            )
+        }
+        async fn subscribe(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+        ) -> Result<tokio::sync::mpsc::Receiver<serde_json::Value>, zeron_rpc::RpcError> {
+            unreachable!()
+        }
+    }
+    #[gpui::test]
+    fn image_preview_loads_through_owner_and_resolves_legacy_identity(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+        for checkout_id in [Some("checkout".to_string()), None] {
+            let legacy = checkout_id.is_none();
+            let transport = Arc::new(ImageTransport::default());
+            let view = cx.new(|cx| {
+                let context = FilesRequestContext {
+                    target: zeron_proto::WorkspaceTarget {
+                        chat_id: Some("chat".into()),
+                        space_id: None,
+                        checkout_path: None,
+                    },
+                    target_device_id: Some("owner".into()),
+                    cwd: "/not/on/ui/device".into(),
+                    checkout_id,
+                };
+                let client =
+                    WorkspaceFilesClient::with_transport(transport.clone(), context.clone());
+                ImagePreview::new("remote.svg".into(), context, client, cx)
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.error.is_none(), "{:?}", view.error);
+                let source = view.source.as_ref().expect("remote image loaded");
+                assert_eq!((source.width, source.height), (100.0, 50.0));
+                assert!(view.task.is_none());
+            });
+            let calls = transport.calls.lock().unwrap();
+            assert_eq!(calls.len(), if legacy { 2 } else { 1 });
+            assert_eq!(
+                calls.last().unwrap().0,
+                zeron_rpc::methods::READ_WORKSPACE_IMAGE
+            );
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rendered_workspace_image_opens_zoomable_lightbox_and_restores_focus() {
+        use gpui::{AppContext, point, size};
+        gpui_platform::headless().run(|cx| {
+            cx.set_global(Theme::dark());
+            let window = cx
+                .open_window(
+                    gpui::WindowOptions {
+                        window_bounds: Some(gpui::WindowBounds::Windowed(Bounds::new(
+                            Default::default(),
+                            size(px(600.0), px(400.0)),
+                        ))),
+                        ..Default::default()
+                    },
+                    |window, cx| {
+                        cx.new(|cx| {
+                            let context = FilesRequestContext {
+                                target: zeron_proto::WorkspaceTarget {
+                                    chat_id: Some("chat".into()),
+                                    space_id: None,
+                                    checkout_path: None,
+                                },
+                                target_device_id: Some("owner".into()),
+                                cwd: "/not/on/ui/device".into(),
+                                checkout_id: Some("checkout".into()),
+                            };
+                            let client = WorkspaceFilesClient::with_transport(
+                                Arc::new(ImageTransport::default()),
+                                context.clone(),
+                            );
+                            let view = ImagePreview::new("remote.svg".into(), context, client, cx);
+                            window.focus(&view.focus, cx);
+                            view
+                        })
+                    },
+                )
+                .unwrap();
+            let view = window.entity(cx).unwrap();
+            cx.spawn(async move |cx| {
+                for _ in 0..100 {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(10))
+                        .await;
+                    if cx.update(|cx| view.read(cx).source.is_some()) {
+                        break;
+                    }
+                }
+                cx.update(|cx| {
+                    assert!(view.read(cx).source.is_some(), "owner-routed image loads");
+                    for _ in 0..3 {
+                        cx.update_window(window.into(), |_, window, cx| {
+                            window.refresh();
+                            let _ = window.draw(cx);
+                        })
+                        .unwrap();
+                    }
+                    assert!(view.read(cx).bounds.size.width > px(100.0));
+                    assert_eq!(
+                        view.read(cx).viewer.test_scale(),
+                        1.0,
+                        "small image is not upscaled"
+                    );
+                    let position = view.read(cx).bounds.center() - point(px(0.0), px(16.0));
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.dispatch_event(
+                            gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                                position,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                        window.refresh();
+                        let _ = window.draw(cx);
+                        window.dispatch_event(
+                            gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                                position,
+                                button: gpui::MouseButton::Left,
+                                click_count: 1,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                        window.dispatch_event(
+                            gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                                position,
+                                button: gpui::MouseButton::Left,
+                                click_count: 1,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                    })
+                    .unwrap();
+                    assert!(view.read(cx).preview_image.is_some());
+                    for _ in 0..3 {
+                        cx.update_window(window.into(), |_, window, cx| {
+                            window.refresh();
+                            let _ = window.draw(cx);
+                        })
+                        .unwrap();
+                    }
+                    cx.update_window(window.into(), |_, window, cx| {
+                        assert!(view.read(cx).preview_focus.is_focused(window));
+                        window.dispatch_event(
+                            gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                                position,
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                        window.refresh();
+                        let _ = window.draw(cx);
+                        window.dispatch_event(
+                            gpui::PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
+                                position,
+                                delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(-100.0))),
+                                modifiers: gpui::Modifiers {
+                                    control: true,
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }),
+                            cx,
+                        );
+                    })
+                    .unwrap();
+                    assert!(
+                        view.read(cx)
+                            .preview_image
+                            .as_ref()
+                            .unwrap()
+                            .viewer
+                            .test_scale()
+                            > 1.0
+                    );
+                    assert_eq!(
+                        view.read(cx).viewer.test_scale(),
+                        1.0,
+                        "overlay zoom does not reach the panel"
+                    );
+                    cx.update_window(window.into(), |_, window, cx| {
+                        window.dispatch_event(
+                            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                                keystroke: gpui::Keystroke::parse("escape").unwrap(),
+                                is_held: false,
+                                prefer_character_input: false,
+                            }),
+                            cx,
+                        );
+                        assert!(view.read(cx).focus.is_focused(window));
+                    })
+                    .unwrap();
+                    assert!(view.read(cx).preview_image.is_none());
+                    assert!(view.read(cx).lightbox_render.is_none());
+                    cx.quit();
+                });
+            })
+            .detach();
+        });
+    }
 }

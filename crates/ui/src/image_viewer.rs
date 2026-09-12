@@ -182,6 +182,21 @@ impl ViewState {
 pub(crate) type ImageClick = Rc<dyn Fn(&mut Window, &mut App)>;
 
 impl ImageView {
+    pub fn begin_click(&self) {
+        let mut state = self.0.borrow_mut();
+        state.drag = None;
+        state.dragged = false;
+    }
+
+    #[cfg(test)]
+    pub fn test_scale(&self) -> f32 {
+        self.0.borrow().geometry.scale
+    }
+
+    pub fn dragged(&self) -> bool {
+        self.0.borrow().dragged
+    }
+
     pub fn reset(&self) {
         *self.0.borrow_mut() = ViewState::default();
     }
@@ -541,6 +556,17 @@ mod tests {
             assert!((viewer.0.borrow().geometry.scale - after_wheel * 1.5).abs() < 0.001);
             assert!(!harness.read(cx).closed, "drag must not close the lightbox");
             assert_ne!(viewer.0.borrow().geometry.pan, point(0.0, 0.0));
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh(); let _ = window.draw(cx);
+                window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, ..Default::default() }), cx);
+                window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent { position, button: MouseButton::Left, click_count: 1, ..Default::default() }), cx);
+                let outside = point(bounds.right() + px(5.0), position.y);
+                window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position: outside, pressed_button: Some(MouseButton::Left), ..Default::default() }), cx);
+                window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent { position: outside, button: MouseButton::Left, click_count: 1, ..Default::default() }), cx);
+            }).unwrap();
+            assert!(!harness.read(cx).closed, "a drag ending on the scrim must not close");
+            let position = point(px(5.0), px(5.0));
+
             cx.update_window(window.into(), |_, window, cx| {
                 window.refresh(); let _ = window.draw(cx);
                 window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent { position, ..Default::default() }), cx);

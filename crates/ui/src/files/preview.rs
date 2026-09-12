@@ -1027,13 +1027,11 @@ impl FilesSurface {
                 FileDocument::loading(document_key(context, path.clone())),
             );
             self.read_file(path, cx);
-        } else if super::image_preview::is_image(&path)
-            && self
-                .preview
-                .documents
-                .get(&path)
-                .is_some_and(|d| d.image.is_none())
-        {
+        } else if self.preview.documents.get(&path).is_some_and(|d| {
+            d.image.is_none()
+                && (super::image_preview::is_image(&path)
+                    || (d.file.is_none() && d.read_task.is_none()))
+        }) {
             self.read_file(path, cx);
         } else {
             self.sync_preview_list();
@@ -1522,6 +1520,7 @@ impl FilesSurface {
     pub fn prepare_close(&mut self, cx: &mut Context<Self>) -> FilesCloseDisposition {
         let dirty_paths = self.preview.dirty_paths();
         if dirty_paths.is_empty() {
+            self.suspend_images(cx);
             return FilesCloseDisposition::Allow;
         }
         self.preview.close_requested = true;
@@ -1759,6 +1758,13 @@ impl FilesSurface {
                     .map(|renamed| (path.clone(), renamed))
             })
             .collect::<Vec<_>>();
+        let image_renames: HashSet<_> = renames
+            .iter()
+            .filter(|(old, new)| {
+                super::image_preview::is_image(old) || super::image_preview::is_image(new)
+            })
+            .map(|(_, new)| new.clone())
+            .collect();
         for (old_document_path, new_document_path) in &renames {
             let Some(mut document) = self.preview.documents.remove(old_document_path) else {
                 continue;
@@ -1823,7 +1829,8 @@ impl FilesSurface {
                 .insert(new_document_path.clone(), document);
         }
         for (_, path) in &renames {
-            if self.preview.active.as_deref() == Some(path)
+            if image_renames.contains(path)
+                && self.preview.active.as_deref() == Some(path)
                 && !self
                     .preview
                     .documents

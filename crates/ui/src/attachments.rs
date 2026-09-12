@@ -822,6 +822,8 @@ pub(crate) fn lightbox_with_size(
     };
     let on_close = std::rc::Rc::new(on_close);
     let close_on_key = on_close.clone();
+    let press_state = preview.viewer.clone();
+    let click_state = preview.viewer.clone();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -844,9 +846,16 @@ pub(crate) fn lightbox_with_size(
                             close_on_key(window, cx);
                         }
                     })
+                    .capture_any_mouse_down(move |event, _, _| {
+                        if event.button == gpui::MouseButton::Left {
+                            press_state.begin_click();
+                        }
+                    })
                     .on_click(move |_, window, cx| {
                         cx.stop_propagation();
-                        on_close(window, cx);
+                        if !click_state.dragged() {
+                            on_close(window, cx);
+                        }
                     })
                     .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
                     .child(div().w(max_w).h(max_h).child(content))

@@ -305,4 +305,69 @@ mod tests {
             assert!(size.0 as usize * size.1 as usize <= 16);
         }
     }
+    #[test]
+    fn encoded_input_and_decode_dimensions_are_bounded() {
+        assert!(
+            decode_image(
+                "image/png",
+                vec![0; zeron_proto::MAX_WORKSPACE_IMAGE_BYTES + 1]
+            )
+            .is_err()
+        );
+        for (width, height) in [(4097, 1), (1, 4097)] {
+            let mut png = Cursor::new(Vec::new());
+            image::RgbaImage::new(width, height)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            assert!(decode_image("image/png", png.into_inner()).is_err());
+        }
+    }
+
+    #[test]
+    fn svg_scripts_html_and_embedded_or_external_images_never_reach_gpui() {
+        let source = br#"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50">
+          <script>alert('unsafe-script')</script>
+          <foreignObject width="50" height="50"><div xmlns="http://www.w3.org/1999/xhtml">unsafe-html</div></foreignObject>
+          <image href="https://example.invalid/unsafe-network.png" width="10" height="10"/>
+          <image href="file:///unsafe-local.png" width="10" height="10"/>
+          <image href="data:image/svg+xml;base64,PHN2Zy8+" width="10" height="10"/>
+          <rect width="100" height="50" fill="red"/>
+        </svg>"#;
+        let media = decode_image("image/svg+xml", source.to_vec()).unwrap();
+        let sanitized = media.svg.unwrap();
+        for forbidden in [
+            "<script",
+            "foreignObject",
+            "unsafe-",
+            "data:image",
+            "<image",
+        ] {
+            assert!(!sanitized.contains(forbidden), "{forbidden}");
+        }
+        assert!(sanitized.contains("#ff0000"));
+    }
+
+    #[test]
+    fn animated_images_are_flattened_to_one_bounded_frame() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut encoded);
+            for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                        2,
+                        2,
+                        image::Rgba(color),
+                    )))
+                    .unwrap();
+            }
+        }
+        let media = decode_image("image/gif", encoded).unwrap();
+        assert_eq!(media.image.format, ImageFormat::Png);
+        let decoded = image::load_from_memory(&media.image.bytes)
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(decoded.dimensions(), (2, 2));
+        assert_eq!(decoded.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
 }

@@ -924,6 +924,7 @@ impl FilesSurface {
     }
 
     fn apply_target(&mut self, next: Option<FilesRequestContext>, cx: &mut Context<Self>) {
+        self.suspend_images(cx);
         self.cancel_review_comment_flush(cx);
         self.loads.clear();
         self.watch_task = None;

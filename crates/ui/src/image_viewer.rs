@@ -206,8 +206,8 @@ impl ImageView {
         image: Arc<Image>,
         natural: Size<Pixels>,
         on_image_click: Option<ImageClick>,
-        window: &mut Window,
-        cx: &mut App,
+        _window: &mut Window,
+        _cx: &mut App,
     ) -> AnyElement {
         let natural = size(f32::from(natural.width), f32::from(natural.height));
         {
@@ -228,53 +228,6 @@ impl ImageView {
         let up = self.clone();
         let up_out = self.clone();
         let click = self.clone();
-        let fit = self.clone();
-        let actual = self.clone();
-        let theme = crate::theme::Theme::of(cx);
-        let text_color = theme.text_muted;
-        let control = |id, label: &str| {
-            div()
-                .id(id)
-                .px(px(8.0))
-                .py(px(4.0))
-                .cursor_pointer()
-                .role(gpui::Role::Button)
-                .aria_label(label.to_string())
-                .child(label.to_string())
-        };
-        let toolbar = div()
-            .id("image-zoom-controls")
-            .h(px(32.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(px(8.0))
-            .text_size(px(11.0))
-            .text_color(text_color)
-            .on_mouse_down(MouseButton::Left, |_, window, cx| {
-                window.prevent_default();
-                cx.stop_propagation();
-            })
-            .on_click(|_, _, cx| cx.stop_propagation())
-            .child(control("image-fit", "Fit").on_click(move |_, window, cx| {
-                fit.0.borrow_mut().geometry.fit();
-                cx.stop_propagation();
-                window.refresh();
-            }))
-            .child(
-                control("image-actual-size", "100 %").on_click(move |_, window, cx| {
-                    let mut state = actual.0.borrow_mut();
-                    let viewport = state.geometry.viewport;
-                    state
-                        .geometry
-                        .zoom(1.0, point(viewport.width / 2.0, viewport.height / 2.0));
-                    state.geometry.pan = point(0.0, 0.0);
-                    cx.stop_propagation();
-                    window.refresh();
-                }),
-            )
-            .child(format!("{:.0} %", geometry.scale * 100.0));
         let viewport = div()
             .id("image-viewport")
             .flex_1()
@@ -366,7 +319,6 @@ impl ImageView {
                 .absolute()
                 .inset_0(),
             );
-        let _ = window;
         div()
             .size_full()
             .min_w_0()
@@ -374,7 +326,6 @@ impl ImageView {
             .flex()
             .flex_col()
             .child(viewport)
-            .child(toolbar)
             .into_any_element()
     }
 }

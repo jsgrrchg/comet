@@ -562,7 +562,7 @@ mod tests {
                         1.0,
                         "small image is not upscaled"
                     );
-                    let position = view.read(cx).bounds.center() - point(px(0.0), px(16.0));
+                    let position = view.read(cx).bounds.center();
                     cx.update_window(window.into(), |_, window, cx| {
                         window.dispatch_event(
                             gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {

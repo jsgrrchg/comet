@@ -2,15 +2,14 @@
 
 Files opens PNG, JPEG (`jpg`/`jpeg`), GIF, WebP, SVG, BMP and TIFF (`tif`/`tiff`) in a read-only image surface. Extension matching is case-insensitive. Loading, transfer/decode errors and size or memory limits are displayed in the surface. Other files retain the existing text or unsupported/binary preview. Images do not create editor buffers, syntax highlights or autosave work.
 
-Images initially fit the available area, preserve their aspect ratio and never upscale a small image automatically. Click the image to open the shared lightbox. Files, Markdown/diagram lightboxes and attachment lightboxes share these controls:
+Images initially fit the available area, preserve their aspect ratio and never upscale a small image automatically. Click the image to open the shared lightbox. Files, Markdown/diagram lightboxes and attachment lightboxes share these gestures:
 
 - Pinch on the trackpad or hold **Ctrl** while scrolling the mouse wheel to zoom around the pointer.
 - Drag the image, or scroll without Ctrl, to pan when the image exceeds the viewport.
-- **Fit** restores the initial fit; **100 %** selects natural size; the indicator displays the current scale.
-- Fit mode responds to viewport resizing. Manual zoom retains its scale and clamps the pan to the new viewport.
-- Escape or a plain lightbox click closes it and restores focus. Dragging, including releasing on the scrim, and clicking zoom controls do not close it.
+- The initial fit responds to viewport resizing. Manual zoom retains its scale and clamps the pan to the new viewport.
+- Escape or a plain lightbox click closes it and restores focus. Dragging, including releasing on the scrim, does not close it.
 
-Zoom normally spans 1%–3200%, allowing a smaller minimum when needed to fit a large image. Layout dimensions are capped at 131072 logical pixels for extreme SVGs; this can also cap the 100% action. Scaling and panning reuse the current texture instead of decoding or rasterizing on each gesture. SVG detail therefore remains bounded by the raster budget at high zoom.
+Zoom normally spans 1%–3200%, allowing a smaller minimum when needed to fit a large image. Layout dimensions are capped at 131072 logical pixels for extreme SVGs. Scaling and panning reuse the current texture instead of decoding or rasterizing on each gesture. SVG detail therefore remains bounded by the raster budget at high zoom.
 
 ## Routing and resource lifecycle
 
@@ -49,7 +48,7 @@ Physical-device validation is separate from these automated tests. This implemen
 
 - macOS trackpad: pinch in/out at an off-center point, successive gestures and dragging; Escape restores focus.
 - Linux Wayland and X11 trackpads: the same checks, on a compositor/server that exposes native pinch events.
-- Physical mouse: Ctrl + wheel zooms; unmodified wheel pans; zoom controls and releasing a drag outside the image do not close the lightbox.
+- Physical mouse: Ctrl + wheel zooms; unmodified wheel pans; releasing a drag outside the image does not close the lightbox.
 - A second physical remote device: open images, switch files during loading, modify/rename/delete them, and switch workspace/device while requests are pending.
 
 No zui dependency changes are required. Zeron uses `on_pinch` and `on_scroll_wheel` from its existing pinned revision.

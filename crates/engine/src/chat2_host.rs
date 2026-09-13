@@ -227,10 +227,7 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
             // the last one stopped. Attempt count bounds a flapping link;
             // the ChatClient's own deadline bounds wall clock.
             for _attempt in 0..4 {
-                let bearer = edge
-                    .bearer()
-                    .await
-                    .ok_or_else(|| SyncError::Auth("signed out".into()))?;
+                let bearer = edge.bearer().await.map_err(SyncError::from)?;
                 let mut req = http.get(&url).bearer_auth(&bearer);
                 if !got.is_empty() {
                     req = req.header("range", format!("bytes={}-", got.len()));
@@ -332,10 +329,7 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
         let url = self.rows_url();
         let device = self.device_id.clone();
         Box::pin(async move {
-            let bearer = edge
-                .bearer()
-                .await
-                .ok_or_else(|| SyncError::Auth("signed out".into()))?;
+            let bearer = edge.bearer().await.map_err(SyncError::from)?;
             let res = http
                 .get(&url)
                 .query(&[("after", after.to_string()), ("device", device)])
@@ -367,10 +361,7 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
         let url = self.rows_url();
         let device = self.device_id.clone();
         Box::pin(async move {
-            let bearer = edge
-                .bearer()
-                .await
-                .ok_or_else(|| SyncError::Auth("signed out".into()))?;
+            let bearer = edge.bearer().await.map_err(SyncError::from)?;
             let res = http
                 .post(&url)
                 .query(&[("batchId", batch_id), ("device", device)])

@@ -71,6 +71,8 @@ pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error(transparent)]
+    Token(#[from] zeron_rpc::TokenError),
     #[error("doc: {0}")]
     Doc(#[from] zeron_doc::DocError),
     #[error("journal: {0}")]

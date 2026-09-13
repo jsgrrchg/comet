@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use crate::EngineError;
+use zeron_rpc::TokenError;
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
 /// Refresh when the cached token has less than this much life left.
@@ -388,22 +389,37 @@ impl Auth {
         self.state().user().map(|u| u.id.clone())
     }
 
-    /// Current bearer for edge rooms / the device relay — `None` when signed out.
+    /// Current bearer. Network failures preserve the session and return
+    /// `TemporarilyUnavailable`; only absent/revoked credentials are `SignedOut`.
     /// Dev mode: the configured user id. WorkOS: cached access token, refreshed when
     /// it has under 30s left.
-    pub async fn access_token(&self) -> Option<String> {
+    pub async fn access_token(&self) -> Result<String, TokenError> {
         if self.inner.workos.is_none() {
-            return Some(self.inner.config.dev_user_id.clone());
+            return Ok(self.inner.config.dev_user_id.clone());
         }
         if let Some(entry) = &*lock(&self.inner.access)
             && entry.remaining() > TOKEN_SLACK
         {
-            return Some(entry.token.clone());
+            return Ok(entry.token.clone());
         }
-        match self.refresh(None).await {
-            Ok(token) => token,
-            Err(_) => None,
+        let result = self.refresh(None).await;
+        // Sign-in/out may replace the session while a shared request is in
+        // flight. Report the current credentials, never a discarded response's
+        // `None` as a revocation of the replacement session.
+        let _session = lock(&self.inner.sign_in);
+        if lock(&self.inner.stored).is_none() {
+            return Err(TokenError::SignedOut);
         }
+        if let Some(entry) = &*lock(&self.inner.access)
+            && entry.remaining() > TOKEN_SLACK
+        {
+            return Ok(entry.token.clone());
+        }
+        result
+            .map_err(|e| TokenError::TemporarilyUnavailable(e.to_string()))?
+            .ok_or_else(|| {
+                TokenError::TemporarilyUnavailable("session changed during refresh; retry".into())
+            })
     }
 
     /// Allow one fresh attempt after a connectivity hint or an explicit Retry.
@@ -861,7 +877,8 @@ impl Auth {
             }
         };
         let status = res.status().as_u16();
-        if (400..500).contains(&status) && organization_id.is_none() {
+        if (400..500).contains(&status) && !matches!(status, 408 | 429) && organization_id.is_none()
+        {
             let mut sign_in = lock(&self.inner.sign_in);
             if sign_in.generation != generation
                 || lock(&self.inner.stored)
@@ -870,7 +887,8 @@ impl Auth {
             {
                 return Ok(None);
             }
-            // A definitive 4xx means the refresh token itself is dead (revoked session,
+            // Timeouts/rate limits are retryable. Other 4xx responses mean a
+            // rejected refresh (revoked session,
             // deleted user) — it can NEVER succeed again. Degrade to SignedOut so every
             // downstream retry loop quiets down. (Org-switch refreshes are exempt: a 4xx
             // there means "not a member", not a dead session.)
@@ -956,10 +974,7 @@ impl Auth {
         path: &str,
         body: Option<serde_json::Value>,
     ) -> Result<T, EngineError> {
-        let token = self
-            .access_token()
-            .await
-            .ok_or_else(|| EngineError::Other("not signed in".into()))?;
+        let token = self.access_token().await?;
         let url = format!(
             "{}{}",
             self.inner.config.edge_url.trim_end_matches('/'),
@@ -1030,9 +1045,9 @@ fn state_for(user: AuthUser, org_id: Option<String>) -> AuthState {
 /// and link cache always dial with a fresh bearer after refreshes.
 #[async_trait::async_trait]
 impl zeron_rpc::TokenSource for Auth {
-    async fn token(&self) -> Option<String> {
+    async fn token(&self) -> Result<String, TokenError> {
         if self.inner.workos.is_some() && !self.state().is_signed_in() {
-            return None;
+            return Err(TokenError::SignedOut);
         }
         self.access_token().await
     }
@@ -1343,7 +1358,7 @@ mod tests {
 
 #[async_trait::async_trait]
 impl zeron_preview::signaling::TokenSource for Auth {
-    async fn token(&self) -> Option<String> {
-        self.access_token().await
+    async fn token(&self) -> anyhow::Result<String> {
+        Ok(self.access_token().await?)
     }
 }

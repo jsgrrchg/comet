@@ -90,7 +90,7 @@ pub(crate) async fn token_changed(changes: &mut Option<tokio::sync::watch::Recei
 
 async fn token_revoked(token: &Option<Arc<dyn zeron_rpc::TokenSource>>) -> bool {
     match token {
-        Some(token) => token.token().await.is_none(),
+        Some(token) => matches!(token.token().await, Err(zeron_rpc::TokenError::SignedOut)),
         // Fixed test/dev URLs have no revocable credential source.
         None => false,
     }
@@ -1339,8 +1339,8 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
         if stale.is_empty() {
             continue;
         }
-        let Some(bearer) = edge.bearer().await else {
-            continue; // signed out
+        let Ok(bearer) = edge.bearer().await else {
+            continue; // no usable token yet
         };
         let mut refreshed = false;
         for device_id in stale {

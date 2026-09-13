@@ -59,6 +59,9 @@ struct StubState {
     release_exchange: tokio::sync::Notify,
     refreshes: AtomicUsize,
     drop_refresh: AtomicBool,
+    block_refresh: AtomicBool,
+    refresh_started: tokio::sync::Notify,
+    release_refresh: tokio::sync::Notify,
     /// Refresh tokens seen by /auth/refresh, in order.
     refresh_tokens: Mutex<Vec<String>>,
     /// TTL (seconds) for minted access tokens.
@@ -196,6 +199,10 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
                 .lock()
                 .expect("lock")
                 .push(refresh_token.to_string());
+            if state.block_refresh.load(Ordering::SeqCst) {
+                state.refresh_started.notify_one();
+                state.release_refresh.notified().await;
+            }
             if state.drop_refresh.load(Ordering::SeqCst) {
                 state.refreshes.fetch_add(1, Ordering::SeqCst);
                 return;
@@ -205,7 +212,10 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
                 return;
             }
             let n = state.refreshes.fetch_add(1, Ordering::SeqCst) + 1;
-            let org = parsed.get("organizationId").and_then(|v| v.as_str());
+            let org = parsed
+                .get("organizationId")
+                .and_then(|v| v.as_str())
+                .or(Some("org_1"));
             let response = serde_json::json!({
                 "accessToken": fake_jwt(ttl, org),
                 "refreshToken": format!("rotated-{n}"),
@@ -461,6 +471,145 @@ async fn offline_refresh_loop_backs_off_without_revoking_session() {
     assert!(auth.state().is_signed_in());
     assert!(session_file.exists(), "offline must not revoke the session");
     refresh_loop.abort();
+}
+
+fn persisted_auth(edge: &StubEdge, dir: &std::path::Path) -> Auth {
+    std::fs::write(
+        dir.join("session.json"),
+        r#"{"refreshToken":"offline","user":{"id":"user_1","email":"w@example.com"},"orgId":"org_1"}"#,
+    ).expect("seed session");
+    Auth::new(workos_config(&edge.url(), dir))
+}
+
+async fn twenty_consumers(auth: &Auth) -> Vec<Option<String>> {
+    let barrier = Arc::new(tokio::sync::Barrier::new(20));
+    let mut consumers = tokio::task::JoinSet::new();
+    for _ in 0..20 {
+        let auth = auth.clone();
+        let barrier = barrier.clone();
+        consumers.spawn(async move {
+            barrier.wait().await;
+            auth.access_token().await
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut results = Vec::new();
+        while let Some(result) = consumers.join_next().await {
+            results.push(result.expect("consumer task"));
+        }
+        results
+    })
+    .await
+    .expect("consumers finish")
+}
+
+#[tokio::test]
+async fn twenty_consumers_and_background_loop_share_a_failed_refresh() {
+    let edge = StubEdge::start().await;
+    edge.state.drop_refresh.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = persisted_auth(&edge, dir.path());
+    let refresh_loop = auth.spawn_refresh_loop();
+
+    assert!(twenty_consumers(&auth).await.iter().all(Option::is_none));
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 1);
+    assert!(twenty_consumers(&auth).await.iter().all(Option::is_none));
+    assert_eq!(
+        edge.state.refreshes.load(Ordering::SeqCst),
+        1,
+        "new consumers must also respect the shared cooldown"
+    );
+    assert!(auth.state().is_signed_in());
+    assert!(dir.path().join("session.json").exists());
+    refresh_loop.abort();
+}
+
+#[tokio::test]
+async fn refresh_recovers_after_cooldown_without_a_network_event() {
+    let edge = StubEdge::start().await;
+    edge.state.drop_refresh.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = persisted_auth(&edge, dir.path());
+    assert!(auth.access_token().await.is_none());
+    edge.state.drop_refresh.store(false, Ordering::SeqCst);
+    let mut tokens = auth.subscribe().unwrap();
+    let refresh_loop = auth.spawn_refresh_loop();
+
+    tokio::time::timeout(Duration::from_secs(3), tokens.changed())
+        .await
+        .expect("automatic recovery must remain prompt")
+        .unwrap();
+    assert!(auth.access_token().await.is_some());
+    assert!(auth.state().is_signed_in());
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+    refresh_loop.abort();
+}
+
+#[tokio::test]
+async fn explicit_retry_allows_one_shared_attempt_before_cooldown_expires() {
+    let edge = StubEdge::start().await;
+    edge.state.drop_refresh.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = persisted_auth(&edge, dir.path());
+    assert!(auth.access_token().await.is_none());
+    edge.state.drop_refresh.store(false, Ordering::SeqCst);
+
+    auth.retry_refresh();
+    assert!(twenty_consumers(&auth).await.iter().all(Option::is_some));
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn cancelling_a_consumer_does_not_cancel_the_shared_refresh() {
+    let edge = StubEdge::start().await;
+    edge.state.block_refresh.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = persisted_auth(&edge, dir.path());
+    let first = tokio::spawn({
+        let auth = auth.clone();
+        async move { auth.access_token().await }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        edge.state.refresh_started.notified(),
+    )
+    .await
+    .unwrap();
+    first.abort();
+    edge.state.block_refresh.store(false, Ordering::SeqCst);
+    edge.state.release_refresh.notify_one();
+
+    assert!(auth.access_token().await.is_some());
+    assert_eq!(edge.state.refreshes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        edge.state.refresh_tokens.lock().unwrap().as_slice(),
+        ["offline"]
+    );
+}
+
+#[tokio::test]
+async fn sign_out_during_shared_refresh_does_not_restore_credentials() {
+    let edge = StubEdge::start().await;
+    edge.state.block_refresh.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().unwrap();
+    let auth = persisted_auth(&edge, dir.path());
+    let pending = tokio::spawn({
+        let auth = auth.clone();
+        async move { auth.access_token().await }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        edge.state.refresh_started.notified(),
+    )
+    .await
+    .unwrap();
+    auth.sign_out();
+    edge.state.release_refresh.notify_one();
+
+    assert!(pending.await.unwrap().is_none());
+    assert!(auth.access_token().await.is_none());
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert!(!dir.path().join("session.json").exists());
 }
 
 #[tokio::test]

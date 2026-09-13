@@ -421,9 +421,11 @@ struct ChatRow: View {
     /// space has been renamed, or when the session runs in a worktree off to
     /// the side. No offline marker: the dropdown carries device liveness.
     private var location: String {
-        let space = model.space(for: chat)?.displayName
-            ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
-            ?? "?"
+        let space = chat.spaceId == nil ? "No project" : (
+            model.space(for: chat)?.displayName
+                ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
+                ?? "?"
+        )
         return "\(space) @ \(model.deviceName(chat.deviceId))"
     }
 }

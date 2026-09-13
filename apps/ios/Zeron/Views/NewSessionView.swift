@@ -143,10 +143,12 @@ struct NewSessionView: View {
                             focused = false
                             showCheckoutPicker = true
                         }
+                        .accessibilityIdentifier("session-checkout")
                         chip(icon: .gitBranch, label: refLabel) {
                             focused = false
                             showRefPicker = true
                         }
+                        .accessibilityIdentifier("session-ref")
                     }
                     .padding(.horizontal, 16)
                 }

@@ -94,6 +94,17 @@ final class AppModel {
         }
         if args.contains("-demo") {
             enterDemoMode()
+            // Simulator fixtures for both empty-workspace and viewer-only
+            // accounts. Apply before Home resolves its initial destination.
+            override("-sethomefilter") { UserDefaults.standard.set($0, forKey: "homeSpaceFilter") }
+            if args.contains("-no-projects") {
+                demo?.spaces = []
+                demo?.chats = []
+                demo?.sessions = [:]
+            }
+            if args.contains("-ios-only") {
+                demo?.devices = [DeviceRow(id: "ios-demo", name: "iPhone", platform: "ios")]
+            }
             if let ix = args.firstIndex(of: "-route"), ix + 1 < args.count {
                 let spec = args[ix + 1]
                 if spec.hasPrefix("chat:") {

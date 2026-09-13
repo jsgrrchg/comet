@@ -37,6 +37,7 @@ use zeron_doc::{
 use zeron_proto::{ConversationSourceContext, HarnessId, UserInputAnswer, UserInputQuestion};
 use zeron_sync::DocsStore;
 
+use crate::http_error::describe_http_error;
 use crate::sessions::{SessionsEngine, SteerOutcome};
 use crate::workspace_host::WorkspaceHost;
 use crate::{EngineError, new_id, now_ms};
@@ -1704,7 +1705,7 @@ impl DocHost {
             .body(snapshot.clone())
             .send()
             .await
-            .map_err(|e| format!("seed checkpoint POST: {e}"))?;
+            .map_err(|e| format!("seed checkpoint POST: {}", describe_http_error(e)))?;
         if !res.status().is_success() {
             return Err(format!("seed checkpoint HTTP {}", res.status()));
         }
@@ -2022,6 +2023,7 @@ impl DocHost {
                         "chat2 checkpoint rejected");
                 }
                 Err(err) => {
+                    let err = describe_http_error(err);
                     tracing::warn!(chat = %chat_id, error = %err, "chat2 checkpoint POST failed");
                 }
             }
@@ -3180,6 +3182,7 @@ impl DocHost {
                 Ok(res) => tracing::warn!(chat = %chat, device = %host_device,
                     status = res.status().as_u16(), "nudge rejected"),
                 Err(err) => {
+                    let err = describe_http_error(err);
                     tracing::warn!(chat = %chat, error = %err, "nudge failed (best-effort)")
                 }
             }
@@ -3728,6 +3731,7 @@ impl DocHost {
                     Ok(res) => tracing::warn!(url, status = res.status().as_u16(),
                         "tool sidecar upload rejected"),
                     Err(err) => {
+                        let err = describe_http_error(err);
                         tracing::warn!(url, error = %err, "tool sidecar upload failed (best-effort)")
                     }
                 }
@@ -3776,16 +3780,21 @@ impl DocHost {
             .bearer_auth(&bearer)
             .send()
             .await
-            .map_err(|e| EngineError::Other(format!("sidecar fetch failed: {e}")))?;
+            .map_err(|e| {
+                EngineError::Other(format!("sidecar fetch failed: {}", describe_http_error(e)))
+            })?;
         if !res.status().is_success() {
             return Err(EngineError::Other(format!(
                 "sidecar fetch: HTTP {}",
                 res.status().as_u16()
             )));
         }
-        res.text()
-            .await
-            .map_err(|e| EngineError::Other(format!("sidecar body read failed: {e}")))
+        res.text().await.map_err(|e| {
+            EngineError::Other(format!(
+                "sidecar body read failed: {}",
+                describe_http_error(e)
+            ))
+        })
     }
 
     /// §2.2 writer discipline: we host a chat iff its workspace row's `deviceId` is

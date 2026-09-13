@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 
 use crate::EngineError;
+use crate::http_error::describe_http_error;
 use zeron_rpc::TokenError;
 
 const SIGN_IN_TTL: Duration = Duration::from_secs(15 * 60);
@@ -681,17 +682,24 @@ impl Auth {
             .json(&serde_json::json!({ "code": code }))
             .send()
             .await
-            .map_err(|e| EngineError::Other(format!("the edge is unreachable: {e}")))?;
+            .map_err(|e| {
+                EngineError::Other(format!(
+                    "the edge is unreachable: {}",
+                    describe_http_error(e)
+                ))
+            })?;
         if !res.status().is_success() {
             return Err(EngineError::Other(format!(
                 "sign-in failed during token exchange ({}) — the code may have expired; start again",
                 res.status().as_u16()
             )));
         }
-        let body: Exchange = res
-            .json()
-            .await
-            .map_err(|e| EngineError::Other(format!("malformed exchange response: {e}")))?;
+        let body: Exchange = res.json().await.map_err(|e| {
+            EngineError::Other(format!(
+                "malformed exchange response: {}",
+                describe_http_error(e)
+            ))
+        })?;
         let name = [body.user.first_name, body.user.last_name]
             .into_iter()
             .flatten()
@@ -872,7 +880,8 @@ impl Auth {
                 // Network failure is transient: keep the session, but surface the
                 // error so the background loop applies its retry delay.
                 return Err(EngineError::Other(format!(
-                    "could not reach the edge during refresh: {err}"
+                    "could not reach the edge during refresh: {}",
+                    describe_http_error(err)
                 )));
             }
         };
@@ -908,10 +917,12 @@ impl Auth {
             access_token: String,
             refresh_token: String,
         }
-        let tokens: Tokens = res
-            .json()
-            .await
-            .map_err(|e| EngineError::Other(format!("malformed refresh response: {e}")))?;
+        let tokens: Tokens = res.json().await.map_err(|e| {
+            EngineError::Other(format!(
+                "malformed refresh response: {}",
+                describe_http_error(e)
+            ))
+        })?;
         let sign_in = lock(&self.inner.sign_in);
         if sign_in.generation != generation
             || lock(&self.inner.stored)
@@ -984,19 +995,21 @@ impl Auth {
         if let Some(body) = body {
             req = req.json(&body);
         }
-        let res = req
-            .send()
-            .await
-            .map_err(|e| EngineError::Other(format!("the edge is unreachable: {e}")))?;
+        let res = req.send().await.map_err(|e| {
+            EngineError::Other(format!(
+                "the edge is unreachable: {}",
+                describe_http_error(e)
+            ))
+        })?;
         if !res.status().is_success() {
             return Err(EngineError::Other(format!(
                 "workspace request failed ({})",
                 res.status().as_u16()
             )));
         }
-        res.json::<T>()
-            .await
-            .map_err(|e| EngineError::Other(format!("malformed response: {e}")))
+        res.json::<T>().await.map_err(|e| {
+            EngineError::Other(format!("malformed response: {}", describe_http_error(e)))
+        })
     }
 
     // -- loopback callback server ------------------------------------------
@@ -1274,6 +1287,62 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_dns_failure_is_shared_with_http_and_room_consumers() {
+        use crate::http_error::test_support::FailingDns;
+        use std::sync::atomic::Ordering;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"refreshToken":"refresh-secret","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
+        ).unwrap();
+        let mut config = AuthConfig::new("https://edge.invalid", dir.path());
+        config.workos_client_id = Some("client_test".into());
+        let mut auth = Auth::new(config);
+        let dns = Arc::new(FailingDns::default());
+        Arc::get_mut(&mut auth.inner).unwrap().http = dns.client();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(20));
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let auth = auth.clone();
+            let barrier = barrier.clone();
+            tasks.spawn(async move {
+                barrier.wait().await;
+                auth.access_token().await
+            });
+        }
+        let mut failures = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            match result.unwrap() {
+                Err(TokenError::TemporarilyUnavailable(reason)) => failures.push(reason),
+                other => panic!("DNS failure misclassified: {other:?}"),
+            }
+        }
+        let reason = &failures[0];
+        assert!(reason.contains("injected DNS lookup failure"), "{reason}");
+        assert!(!reason.contains("refresh-secret"));
+        assert!(failures.iter().all(|failure| failure == reason));
+
+        let edge = crate::EdgeConfig::new("https://edge.invalid", Arc::new(auth.clone()));
+        assert!(matches!(
+            edge.room_url("/registry/org_1/ws").url().await,
+            Err(zeron_sync::SyncError::TemporarilyUnavailable(message)) if &message == reason
+        ));
+        assert!(matches!(
+            auth.list_orgs().await,
+            Err(EngineError::Token(TokenError::TemporarilyUnavailable(message))) if &message == reason
+        ));
+        assert_eq!(
+            dns.calls.load(Ordering::SeqCst),
+            1,
+            "cooldown must cover all consumers"
+        );
+        assert!(auth.state().is_signed_in());
+        assert!(dir.path().join("session.json").exists());
+    }
 
     #[test]
     fn base64url_round_trips_jwt_payload() {

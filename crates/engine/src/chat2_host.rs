@@ -16,6 +16,7 @@ use zeron_sync::chat_client::{ChatDocSink, CheckpointFetcher, RowImportOutcome};
 use zeron_sync::{DocsStore, SyncError};
 
 use crate::doc_host::EdgeConfig;
+use crate::http_error::describe_http_error;
 
 /// Doc epoch stamped on every chat2-synced snapshot (docs/chat2-sync.md M1:
 /// thin docs are lineage epoch 2; M3 readers discard-and-adopt below it).
@@ -223,6 +224,7 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
         Box::pin(async move {
             let mut got: Vec<u8> = Vec::new();
             let mut seen_seq: Option<String> = None;
+            let mut last_failure = None;
             // Range-resume loop: each attempt continues at the byte where
             // the last one stopped. Attempt count bounds a flapping link;
             // the ChatClient's own deadline bounds wall clock.
@@ -235,7 +237,9 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
                 let res = match req.send().await {
                     Ok(res) => res,
                     Err(err) => {
+                        let err = describe_http_error(err);
                         tracing::warn!(error = %err, "chat2 checkpoint fetch attempt failed");
+                        last_failure = Some(err);
                         continue;
                     }
                 };
@@ -275,16 +279,21 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
                         Ok(None) => return Ok(got),
                         Err(err) => {
                             // Mid-body drop: keep the bytes, resume via Range.
+                            let err = describe_http_error(err);
                             tracing::warn!(error = %err, resumed_at = got.len(),
                                 "chat2 checkpoint stream dropped; resuming");
+                            last_failure = Some(err);
                             break;
                         }
                     }
                 }
             }
-            Err(SyncError::Protocol(
-                "checkpoint fetch exhausted resume attempts".into(),
-            ))
+            let mut message = "checkpoint fetch exhausted resume attempts".to_string();
+            if let Some(failure) = last_failure {
+                message.push_str(": ");
+                message.push_str(&failure);
+            }
+            Err(SyncError::Protocol(message))
         })
     }
 }
@@ -336,7 +345,7 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
                 .bearer_auth(&bearer)
                 .send()
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+                .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             if !res.status().is_success() {
                 return Err(SyncError::Protocol(format!(
                     "chat pull http {}",
@@ -346,7 +355,7 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
             let bytes = res
                 .bytes()
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+                .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             Ok(bytes.to_vec())
         })
     }
@@ -369,7 +378,7 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
                 .body(bytes)
                 .send()
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+                .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             if !res.status().is_success() {
                 return Err(SyncError::Protocol(format!(
                     "chat push http {}",
@@ -378,7 +387,7 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
             }
             res.text()
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))
+                .map_err(|e| SyncError::WebSocket(describe_http_error(e)))
         })
     }
 }
@@ -388,6 +397,26 @@ mod frontier_tests {
     use super::*;
     use std::sync::Arc;
 
+    #[tokio::test]
+    async fn http_sync_and_exhausted_checkpoint_retries_retain_dns_cause() {
+        use crate::http_error::test_support::FailingDns;
+        use zeron_sync::chat_client::ChatTransport;
+
+        let dns = Arc::new(FailingDns::default());
+        let edge = EdgeConfig::with_static_token("https://edge.invalid", "token-secret");
+        let transport = EdgeChatTransport::new(dns.client(), edge.clone(), "chat", "device");
+        let pull = transport.fetch_rows(0).await.unwrap_err();
+        let push = transport.push("batch".into(), vec![]).await.unwrap_err();
+        let checkpoint = EdgeCheckpointFetcher::new(dns.client(), edge, "chat")
+            .fetch()
+            .await
+            .unwrap_err();
+        for error in [pull, push, checkpoint] {
+            let message = error.to_string();
+            assert!(message.contains("injected DNS lookup failure"), "{message}");
+            assert!(!message.contains("token-secret"), "{message}");
+        }
+    }
     /// The empty-frontier-means-contained shortcut skipped the chat's
     /// founding ops for every fresh reader of a room whose checkpoint
     /// carries an empty frontier label, parking all dependent rows

@@ -1372,6 +1372,8 @@ pub struct Shell {
     remote_desktop_subs: std::collections::HashMap<u64, Subscription>,
     remote_desktop_owners: std::collections::HashMap<u64, String>,
     remote_desktop_seq: u64,
+    remote_desktop_context: Option<String>,
+    remote_desktop_retire: std::collections::HashSet<u64>,
     browser_context: crate::browser::BrowserContext,
     browser_profile: Option<String>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
@@ -1750,6 +1752,8 @@ impl Shell {
             remote_desktop_subs: Default::default(),
             remote_desktop_owners: Default::default(),
             remote_desktop_seq: 0,
+            remote_desktop_context: None,
+            remote_desktop_retire: Default::default(),
             browser_context: crate::browser::BrowserContext::default(),
             browser_profile: None,
             right_tabs: std::collections::HashMap::new(),
@@ -2751,11 +2755,62 @@ impl Shell {
         });
     }
 
+    fn retire_remote_desktop_owner(&mut self, owner: &str, cx: &mut Context<Self>) {
+        for (id, key) in &self.remote_desktop_owners {
+            if key == owner {
+                self.remote_desktop_retire.insert(*id);
+                if let Some(view) = self.remote_desktops.get(id) {
+                    view.update(cx, |view, cx| view.stop(cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+    fn reconcile_remote_desktops(
+        &mut self,
+        context: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if context != self.remote_desktop_context {
+            self.remote_desktop_retire
+                .extend(self.remote_desktops.keys().copied());
+            self.remote_desktop_context = context;
+        }
+        let state = self.state.read(cx);
+        if state.chats_synced {
+            let live: std::collections::HashSet<&str> =
+                state.visible_chats().map(|chat| chat.id.as_str()).collect();
+            self.remote_desktop_retire.extend(
+                self.remote_desktop_owners
+                    .iter()
+                    .filter_map(|(id, owner)| (!live.contains(owner.as_str())).then_some(*id)),
+            );
+        }
+        for id in self.remote_desktop_retire.drain() {
+            if let Some(view) = self.remote_desktops.remove(&id) {
+                view.update(cx, |view, cx| view.close(window, cx));
+            }
+            self.remote_desktop_subs.remove(&id);
+            if let Some(owner) = self.remote_desktop_owners.remove(&id)
+                && let Some(tabs) = self.right_tabs.get_mut(&owner)
+            {
+                tabs.retain(|s| *s != RightSurface::RemoteDesktop(id));
+            }
+        }
+    }
+
     fn add_remote_desktop_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_chat.is_empty() {
             return;
         }
         let owner = self.panel_key(cx);
+        let state = self.state.read(cx);
+        self.remote_desktop_context = crate::links::workspace_locator(
+            state.workspace_scope,
+            state.auth.as_ref(),
+            state.local_device_id.as_deref(),
+        );
         self.remote_desktop_seq += 1;
         let id = self.remote_desktop_seq;
         let view = cx.new(|cx| {
@@ -2781,7 +2836,7 @@ impl Shell {
                                 && view.read(cx).profile_id() == Some(*profile)
                         })
                         .map(|(id, _)| *id);
-                    if let Some(existing) = existing {
+                    if let Some(existing) = existing.filter(|existing| *existing != id) {
                         this.set_right_active(RightSurface::RemoteDesktop(existing), cx);
                     } else if let Some(view) = this.remote_desktops.get(&id).cloned() {
                         view.update(cx, |view, cx| view.open_profile(*profile, window, cx));
@@ -4058,6 +4113,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.close_chat_menu(cx);
+        if archived {
+            self.retire_remote_desktop_owner(&chat_id, cx);
+        }
         self.mutate(
             serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": archived }),
             cx,
@@ -4124,6 +4182,7 @@ impl Shell {
 
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
+        self.retire_remote_desktop_owner(&chat_id, cx);
         if let Some(tabs) = self.right_tabs.get(&chat_id) {
             for surface in tabs {
                 if let RightSurface::Browser(id) = surface {
@@ -9676,6 +9735,7 @@ impl Render for Shell {
                 state.local_device_id.as_deref(),
             )
         };
+        self.reconcile_remote_desktops(browser_profile.clone(), window, cx);
         if browser_profile.is_some() && browser_profile != self.browser_profile {
             if self.browser_profile.is_some() {
                 for browser in self.browsers.values() {
@@ -9718,12 +9778,22 @@ impl Render for Shell {
             });
         }
 
-        let resize_paused=self.tween_active(self.right_tween) || cx.has_active_drag();
+        let resize_paused = self.tween_active(self.right_tween) || cx.has_active_drag();
+        let remote_modal = self.overlay_owns_keyboard(cx)
+            || self.right_plus.get().is_some()
+            || self.user_menu.get().is_some()
+            || self.chat_menu.get().is_some()
+            || self.rename_dialog.is_some()
+            || self.delete_confirm.is_some();
         for (id, view) in &self.remote_desktops {
             let visible = browser_active
+                && !remote_modal
                 && selected_surface == RightSurface::RemoteDesktop(*id)
                 && window.is_window_active();
-            view.update(cx, |view, cx| {view.set_resize_paused(resize_paused);view.set_visible(visible, window, cx);});
+            view.update(cx, |view, cx| {
+                view.set_resize_paused(resize_paused);
+                view.set_visible(visible, window, cx);
+            });
         }
 
         // Fullscreen hides the macOS traffic lights — reflow the control
@@ -12690,6 +12760,21 @@ mod remote_desktop_tests {
                 assert!(shell.remote_desktops.is_empty());
                 assert!(shell.remote_desktop_subs.is_empty());
                 assert!(shell.remote_desktop_owners.is_empty());
+                // Archiving retires the owner immediately; reconciliation removes
+                // its tabs/entities even when that owner is no longer selected.
+                shell.active_chat = "owner-c".into();
+                shell.add_remote_desktop_surface(window, cx);
+                shell.retire_remote_desktop_owner("owner-c", cx);
+                shell.reconcile_remote_desktops(shell.remote_desktop_context.clone(), window, cx);
+                assert!(shell.remote_desktops.is_empty());
+                assert!(shell.remote_desktop_subs.is_empty());
+                shell.add_remote_desktop_surface(window, cx);
+                shell.reconcile_remote_desktops(Some("different-workspace".into()), window, cx);
+                assert!(shell.remote_desktops.is_empty());
+                shell.add_remote_desktop_surface(window, cx);
+                shell.remote_desktop_context = Some("old-workspace".into());
+                shell.reconcile_remote_desktops(None, window, cx);
+                assert!(shell.remote_desktops.is_empty());
                 weak
             })
             .unwrap();

@@ -14,3 +14,5 @@ mod input;
 mod resize;
 
 pub mod clipboard;
+
+mod display_control;

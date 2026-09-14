@@ -113,6 +113,36 @@ impl RemoteDesktopSurface {
                     ),
                 );
             }
+            let layout = form.original.keyboard_layout;
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(px(5.))
+                    .child("Keyboard layout")
+                    .children(
+                        [
+                            ("rdp-layout-us", "English (US)", 0x0409),
+                            ("rdp-layout-es", "Spanish (Spain)", 0x040a),
+                            ("rdp-layout-latam", "Spanish (Latin America)", 0x080a),
+                        ]
+                        .into_iter()
+                        .map(|(id, label, value)| {
+                            action(
+                                id,
+                                format!("{}{}", if layout == value { "● " } else { "" }, label),
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    if let Some(form) = &mut this.form {
+                                        form.original.keyboard_layout = value;
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                        }),
+                    ),
+            );
             let remember = form.remember;
             body = body.child(
                 action(

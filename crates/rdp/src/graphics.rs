@@ -22,6 +22,9 @@ impl Publisher {
             dirty: false,
         }
     }
+    pub fn wait_for_graphics(&mut self) {
+        self.dirty = false;
+    }
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }

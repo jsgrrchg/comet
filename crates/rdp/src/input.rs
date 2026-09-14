@@ -6,8 +6,15 @@ use ironrdp::{
 #[derive(Default)]
 pub(crate) struct InputState {
     database: Database,
+    keyboard_layout: u32,
 }
 impl InputState {
+    pub fn new(keyboard_layout: u32) -> Self {
+        Self {
+            database: Database::new(),
+            keyboard_layout,
+        }
+    }
     pub fn apply(&mut self, event: InputEvent) -> Vec<FastPathInputEvent> {
         let operations = match event {
             InputEvent::ScanCode { code, down } => vec![if down {
@@ -17,13 +24,7 @@ impl InputState {
             }],
             InputEvent::Text(text) => text
                 .chars()
-                .take(4096)
-                .flat_map(|c| {
-                    [
-                        Operation::UnicodeKeyPressed(c),
-                        Operation::UnicodeKeyReleased(c),
-                    ]
-                })
+                .flat_map(|c| text_operations(c, self.keyboard_layout))
                 .collect(),
             InputEvent::Button { button, down, x, y } => {
                 let button = match button {
@@ -97,6 +98,18 @@ mod tests {
         assert!(state.release().is_empty());
     }
     #[test]
+    fn spanish_dead_keys_emit_one_composition_and_leave_no_modifiers() {
+        let mut state = InputState::new(0x040a);
+        let events = state.apply(InputEvent::Text("áÜ".into()));
+        assert!(
+            events
+                .iter()
+                .all(|e| matches!(e, FastPathInputEvent::KeyboardEvent(..)))
+        );
+        assert_eq!(events.len(), 12);
+        assert!(state.release().is_empty());
+    }
+    #[test]
     fn unicode_is_utf16_with_paired_edges_and_no_scancodes() {
         let mut state = InputState::default();
         let events = state.apply(InputEvent::Text("ñá🦀".into()));
@@ -111,4 +124,50 @@ mod tests {
         );
         assert!(state.release().is_empty());
     }
+}
+
+/// xrdp maps Unicode events through the negotiated keymap. Spanish accented
+/// vowels are dead-key compositions there, so emit their actual key sequence
+/// once. Other characters continue to use Unicode input, including IME text.
+fn text_operations(c: char, layout: u32) -> Vec<Operation> {
+    if matches!(layout, 0x040a | 0x080a) {
+        let lower = c.to_lowercase().next().unwrap_or(c);
+        let base: Option<u16> = match lower {
+            'á' => Some(30),
+            'é' => Some(18),
+            'í' => Some(23),
+            'ó' => Some(24),
+            'ú' | 'ü' => Some(22),
+            _ => None,
+        };
+        if let Some(base) = base {
+            let dead: u16 = if layout == 0x080a { 0x1a } else { 0x28 };
+            let mut ops = Vec::new();
+            if lower == 'ü' {
+                ops.push(Operation::KeyPressed(42u16.into()));
+            }
+            ops.extend([
+                Operation::KeyPressed(dead.into()),
+                Operation::KeyReleased(dead.into()),
+            ]);
+            if lower == 'ü' {
+                ops.push(Operation::KeyReleased(42u16.into()));
+            }
+            if c.is_uppercase() {
+                ops.push(Operation::KeyPressed(42u16.into()));
+            }
+            ops.extend([
+                Operation::KeyPressed(base.into()),
+                Operation::KeyReleased(base.into()),
+            ]);
+            if c.is_uppercase() {
+                ops.push(Operation::KeyReleased(42u16.into()));
+            }
+            return ops;
+        }
+    }
+    vec![
+        Operation::UnicodeKeyPressed(c),
+        Operation::UnicodeKeyReleased(c),
+    ]
 }

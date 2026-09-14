@@ -48,6 +48,7 @@ pub struct ConnectConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
+    pub keyboard_layout: u32,
     pub domain: Option<String>,
     pub password: Password,
     pub width: u16,
@@ -261,6 +262,21 @@ impl SessionHandle {
         )
     }
     pub fn send(&self, command: Command) -> Result<(), SessionError> {
+        match &command {
+            Command::Input(InputEvent::Text(text)) if text.len() > 16 * 1024 => {
+                return Err(SessionError::new(
+                    ErrorStage::Input,
+                    "Text input exceeds 16 KiB; use Send local clipboard for longer text",
+                ));
+            }
+            Command::SendClipboard(text) if text.len() > MAX_CLIPBOARD_BYTES => {
+                return Err(SessionError::new(
+                    ErrorStage::Clipboard,
+                    "Clipboard text exceeds 1 MiB",
+                ));
+            }
+            _ => {}
+        }
         self.commands.try_send(command).map_err(|_| {
             // A lost release could leave the server holding a key. Terminate the
             // transport on congestion; the task performs releases during shutdown.
@@ -281,16 +297,24 @@ impl SessionHandle {
         });
     }
     pub fn move_pointer(&self, x: u16, y: u16) {
-        self.presentation.send_modify(|p| p.pointer = Some((x, y)));
+        self.presentation.send_if_modified(|p| {
+            let changed = p.pointer != Some((x, y));
+            p.pointer = Some((x, y));
+            changed
+        });
     }
     pub fn resize(&self, width: u16, height: u16) -> Result<(), SessionError> {
         validate_size(width, height)?;
-        self.presentation
-            .send_modify(|p| p.resize = Some((width, height)));
+        self.presentation.send_if_modified(|p| {
+            let changed = p.resize != Some((width, height));
+            p.resize = Some((width, height));
+            changed
+        });
         Ok(())
     }
     pub fn clear_resize(&self) {
-        self.presentation.send_modify(|p| p.resize = None);
+        self.presentation
+            .send_if_modified(|p| p.resize.take().is_some());
     }
     pub fn disconnect(&self) {
         self.cancellation.cancel();

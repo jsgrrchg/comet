@@ -9,6 +9,7 @@ fn config(port: u16) -> ConnectConfig {
         host: "127.0.0.1".into(),
         port,
         username: "test-user".into(),
+        keyboard_layout: 0x0409,
         domain: None,
         password: Password::new("test-secret".into()),
         width: 800,

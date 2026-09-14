@@ -152,3 +152,58 @@ pub(crate) async fn upgrade(
 fn tls_error(error: impl std::fmt::Display) -> SessionError {
     SessionError::new(ErrorStage::Certificate, error.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn certificate_pins_still_require_handshake_signatures_and_changed_pins_prompt() {
+        use rustls::internal::msgs::codec::{Codec, Reader};
+        let rcgen::CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let fingerprint = format!("{:x}", Sha256::digest(cert.der()));
+        let issue = Arc::new(Mutex::new(None));
+        let mut verifier = Verifier {
+            standard: None,
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            pin: Some(fingerprint),
+            issue: issue.clone(),
+        };
+        let name = ServerName::try_from("localhost").unwrap();
+        verifier
+            .verify_server_cert(cert.der(), &[], &name, &[], UnixTime::now())
+            .unwrap();
+        assert!(issue.lock().unwrap().is_none());
+        // ECDSA_NISTP256_SHA256 with an invalid one-byte signature.
+        let invalid =
+            rustls::DigitallySignedStruct::read(&mut Reader::init(&[4, 3, 0, 1, 0])).unwrap();
+        assert!(
+            verifier
+                .verify_tls12_signature(b"handshake", cert.der(), &invalid)
+                .is_err()
+        );
+        assert!(
+            verifier
+                .verify_tls13_signature(b"handshake", cert.der(), &invalid)
+                .is_err()
+        );
+        verifier.pin = Some("00".repeat(32));
+        verifier
+            .verify_server_cert(cert.der(), &[], &name, &[], UnixTime::now())
+            .unwrap();
+        assert!(
+            issue
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .1
+                .contains("changed")
+        );
+        verifier.pin = None;
+        verifier
+            .verify_server_cert(cert.der(), &[], &name, &[], UnixTime::now())
+            .unwrap();
+        assert!(issue.lock().unwrap().is_some());
+    }
+}

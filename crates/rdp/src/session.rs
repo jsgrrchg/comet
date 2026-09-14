@@ -28,6 +28,9 @@ use tokio::{
 pub fn connect(config: ConnectConfig, generation: u64) -> Result<SessionHandle, SessionError> {
     validate_size(config.width, config.height)?;
     let (handle, mut channels) = SessionHandle::channel(generation);
+    channels
+        .snapshots
+        .send_modify(|s| s.state = SessionState::Connecting);
     std::thread::Builder::new()
         .name(format!("rdp-{generation}"))
         .spawn(move || {
@@ -50,12 +53,7 @@ pub fn connect(config: ConnectConfig, generation: u64) -> Result<SessionHandle, 
                 channels
                     .snapshots
                     .send_modify(|s| s.state = SessionState::Connecting);
-                let cancellation = channels.cancellation.clone();
-                let result = tokio::select! {
-                    biased;
-                    _ = cancellation.cancelled() => Ok(()),
-                    result = run(config, &mut channels) => result,
-                };
+                let result = run(config, &mut channels).await;
                 channels.snapshots.send_modify(|s| {
                     s.frame = None;
                     s.cursor = RemoteCursor::Default;
@@ -109,7 +107,7 @@ pub(crate) fn connector_config(config: &ConnectConfig) -> connector::Config {
         enable_credssp: true,
         keyboard_type: KeyboardType::IbmEnhanced,
         keyboard_subtype: 0,
-        keyboard_layout: 0x0409,
+        keyboard_layout: config.keyboard_layout,
         keyboard_functional_keys_count: 12,
         ime_file_name: String::new(),
         dig_product_id: String::new(),
@@ -142,7 +140,17 @@ pub(crate) fn connector_config(config: &ConnectConfig) -> connector::Config {
         work_dir: String::new(),
     }
 }
-async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<(), SessionError> {
+type Transport = TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>;
+struct Established {
+    framed: Transport,
+    result: connector::ConnectionResult,
+    clipboard: crate::clipboard::SharedClipboard,
+    server_area: Arc<AtomicU64>,
+}
+async fn establish(
+    config: &ConnectConfig,
+    channels: &mut SessionChannels,
+) -> Result<Established, SessionError> {
     let addresses: Vec<_> = limited(
         config.timeout,
         ErrorStage::Dns,
@@ -171,13 +179,10 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
         crate::clipboard::Backend(clipboard.clone()),
     )));
     let server_area = Arc::new(AtomicU64::new(0));
-    let area = server_area.clone();
-    connector.attach_static_channel(ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
-        ironrdp::displaycontrol::client::DisplayControlClient::new(move |caps| {
-            area.store(caps.max_monitor_area(), Ordering::Relaxed);
-            Ok(Vec::new())
-        }),
-    ));
+    connector.attach_static_channel(
+        ironrdp::dvc::DrdynvcClient::new()
+            .with_dynamic_channel(crate::display_control::DisplayControl(server_area.clone())),
+    );
     let mut framed = TokioFramed::new(stream);
     let upgrade = limited(
         config.timeout,
@@ -237,6 +242,25 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
         ),
     )
     .await?;
+    Ok(Established {
+        framed,
+        result,
+        clipboard,
+        server_area,
+    })
+}
+async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<(), SessionError> {
+    let cancellation = channels.cancellation.clone();
+    let Established {
+        mut framed,
+        result,
+        clipboard,
+        server_area,
+    } = tokio::select! {
+        biased;
+        _=cancellation.cancelled()=>return Ok(()),
+        result=establish(&config,channels)=>result?,
+    };
     validate_size(result.desktop_size.width, result.desktop_size.height)?;
     let mut image = DecodedImage::new(
         ironrdp::graphics::image_processing::PixelFormat::BgrA32,
@@ -261,13 +285,29 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
     let mut publisher = crate::graphics::Publisher::new(channels.snapshots.borrow().generation);
     let mut tick = tokio::time::interval(Duration::from_millis(34));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut input = crate::input::InputState::default();
+    let mut input = crate::input::InputState::new(config.keyboard_layout);
     let mut resize = crate::resize::ResizeDebounce::default();
     let mut last_pointer = None;
     let mut visible = true;
+    let mut received_graphics = false;
+    let started = Instant::now();
+    let mut graphics_started = Instant::now();
+    let mut last_diagnostic = Instant::now();
+    let mut pdus = 0u64;
+    let mut bytes_received = 0u64;
+    let mut publications = 0u64;
     loop {
         pump_clipboard(&clipboard, &mut active, &mut framed, channels).await?;
         tokio::select! {
+            _=cancellation.cancelled()=>{
+                channels.snapshots.send_modify(|s|s.state=SessionState::Closing);
+                let _=timeout(Duration::from_millis(250),async {
+                    send_input(&mut active,&mut image,&mut framed,&input.release()).await?;
+                    use tokio::io::AsyncWriteExt;
+                    framed.get_inner_mut().0.shutdown().await.map_err(|e|error(ErrorStage::Network,e))
+                }).await;
+                return Ok(());
+            }
             command = channels.commands.recv() => {
                 let events = match command {
                     Some(Command::Input(event)) => input.apply(event),
@@ -307,14 +347,22 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
                 send_input(&mut active, &mut image, &mut framed, &events).await?;
             }
             _ = tick.tick() => {
-                let area=server_area.load(Ordering::Relaxed);
+                if !received_graphics && graphics_started.elapsed()>config.timeout {return Err(error(ErrorStage::Protocol,"Server connected but did not provide a desktop image"));}
+                if last_diagnostic.elapsed()>Duration::from_secs(10) {
+                    if std::env::var_os("ZERON_RDP_DIAGNOSTICS").is_some() {tracing::info!(generation=channels.snapshots.borrow().generation,pdus,bytes_received,publications,visible,elapsed_ms=started.elapsed().as_millis() as u64,"Local RDP session statistics");}
+                    last_diagnostic=Instant::now();
+                }
+                let area=if received_graphics {server_area.load(Ordering::Relaxed)} else {0};
                 if area>0 && !channels.snapshots.borrow().capabilities.resize {channels.snapshots.send_modify(|s|s.capabilities.resize=true);}
                 if let Some((width,height))=resize.take_ready(Instant::now(),area,(image.width(),image.height())) {
-                    if let Some(Ok(bytes))=active.encode_resize(width.into(),height.into(),None,None) {
+                    let encoded=crate::display_control::encode_resize(&mut active,width,height)?;
+                    tracing::debug!(width,height,server_area=area,available=encoded.is_some(),"Remote desktop resize requested");
+                    if let Some(bytes)=encoded {
                         limited(Duration::from_secs(2),ErrorStage::Network,framed.write_all(&bytes)).await?;
                     }
                 }
                 if let Some(frame) = publisher.publish(&image, channels.presentation.borrow().visible, Instant::now())? {
+                    publications+=1;
                     channels.snapshots.send_modify(|s| {s.frame = Some(frame);s.reactivating=false;});
                 }
             }
@@ -334,31 +382,36 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
             }
             packet = framed.read_pdu() => {
                 let (action, packet) = packet.map_err(|e| error(ErrorStage::Session, e))?;
+                pdus+=1;bytes_received+=packet.len() as u64;
                 let outputs = active.process(&mut image, action, &packet).map_err(|e| error(ErrorStage::Protocol, e))?;
                 for output in outputs {
                     match output {
                         ActiveStageOutput::ResponseFrame(bytes) => { if !bytes.is_empty() { limited(Duration::from_secs(5), ErrorStage::Network, framed.write_all(&bytes)).await?; } }
-                        ActiveStageOutput::GraphicsUpdate(_) => publisher.mark_dirty(),
-                        ActiveStageOutput::PointerDefault => channels.snapshots.send_modify(|s| s.cursor = RemoteCursor::Default),
-                        ActiveStageOutput::PointerHidden => channels.snapshots.send_modify(|s| s.cursor = RemoteCursor::Hidden),
+                        ActiveStageOutput::GraphicsUpdate(_) => {received_graphics=true;publisher.mark_dirty();},
+                        ActiveStageOutput::PointerDefault => {channels.snapshots.send_if_modified(|s| {s.cursor = RemoteCursor::Default;visible});},
+                        ActiveStageOutput::PointerHidden => {channels.snapshots.send_if_modified(|s| {s.cursor = RemoteCursor::Hidden;visible});},
                         ActiveStageOutput::PointerBitmap(pointer) => {
                             let cursor = RemoteCursor::Bitmap { width: pointer.width, height: pointer.height, hotspot_x: pointer.hotspot_x, hotspot_y: pointer.hotspot_y, rgba: Arc::from(pointer.bitmap_data.as_slice()) };
-                            channels.snapshots.send_modify(|s| s.cursor = cursor);
+                            channels.snapshots.send_if_modified(|s| {s.cursor = cursor;visible});
                         }
                         ActiveStageOutput::Terminate(_) => return Ok(()),
                         ActiveStageOutput::DeactivateAll => {
+                            tracing::debug!("Remote desktop reactivation started");
                             send_input(&mut active,&mut image,&mut framed,&input.release()).await?;
                             channels.snapshots.send_modify(|s|{s.frame=None;s.reactivating=true;});
                             let mut sequence=activation_factory.create();
                             let mut buf=ironrdp::core::WriteBuf::new();
-                            let (desktop_size,share_id,enable_server_pointer)=limited(config.timeout,ErrorStage::Protocol,async {
+                            let reactivation=limited(config.timeout,ErrorStage::Protocol,async {
                                 loop {
                                     ironrdp_tokio::single_sequence_step(&mut framed,&mut sequence,&mut buf).await?;
+                                    tracing::debug!(state=?sequence.connection_activation_state(),"Remote desktop activation step");
                                     if let connector::connection_activation::ConnectionActivationState::Finalized {desktop_size,share_id,enable_server_pointer,..}=sequence.connection_activation_state() {
                                         break Ok::<_,connector::ConnectorError>((desktop_size,share_id,enable_server_pointer));
                                     }
                                 }
-                            }).await?;
+                            });
+                            let (desktop_size,share_id,enable_server_pointer)=tokio::select! { _=cancellation.cancelled()=>return Ok(()), result=reactivation=>result? };
+                            tracing::debug!(width=desktop_size.width,height=desktop_size.height,"Remote desktop reactivation completed");
                             validate_size(desktop_size.width,desktop_size.height)?;
                             image=DecodedImage::new(ironrdp::graphics::image_processing::PixelFormat::BgrA32,desktop_size.width,desktop_size.height);
                             active.set_share_id(share_id);active.set_enable_server_pointer(enable_server_pointer);
@@ -366,7 +419,7 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
                                 io_channel_id:activation_factory.io_channel_id(),user_channel_id:activation_factory.user_channel_id(),share_id,
                                 enable_server_pointer,pointer_software_rendering:false,bulk_decompressor:None,
                             }.build());
-                            publisher.mark_dirty();
+                            received_graphics=false;graphics_started=Instant::now();publisher.wait_for_graphics();
 
                         }
                         _ => {},

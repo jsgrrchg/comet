@@ -154,6 +154,7 @@ pub struct Snapshot {
     pub capabilities: Capabilities,
     pub frame: Option<Arc<Frame>>,
     pub cursor: RemoteCursor,
+    pub reactivating: bool,
     pub clipboard: Option<(u64, Result<String, SessionError>)>,
 }
 impl Snapshot {
@@ -166,6 +167,7 @@ impl Snapshot {
             capabilities: Capabilities::default(),
             frame: None,
             cursor: RemoteCursor::Default,
+            reactivating: false,
             clipboard: None,
         }
     }
@@ -286,6 +288,9 @@ impl SessionHandle {
         self.presentation
             .send_modify(|p| p.resize = Some((width, height)));
         Ok(())
+    }
+    pub fn clear_resize(&self) {
+        self.presentation.send_modify(|p| p.resize = None);
     }
     pub fn disconnect(&self) {
         self.cancellation.cancel();

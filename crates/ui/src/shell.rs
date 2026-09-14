@@ -385,6 +385,7 @@ pub fn apply_keymap(
             None,
         ))
     }));
+    crate::remote_desktop::input::bind_keys(cx);
 }
 
 /// The settings sections (feature-inventory §1.5 routes).

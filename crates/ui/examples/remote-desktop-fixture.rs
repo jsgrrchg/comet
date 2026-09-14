@@ -8,7 +8,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let desktop = cx.new(Desktop::new);
+        let desktop = cx.new(|cx| Desktop::new(window, cx));
         let output = desktop.clone();
         let task = cx.spawn_in(window, async move |_, cx| {
             let mut sequence = 0;

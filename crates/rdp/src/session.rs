@@ -242,8 +242,21 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
     let mut publisher = crate::graphics::Publisher::new(channels.snapshots.borrow().generation);
     let mut tick = tokio::time::interval(Duration::from_millis(34));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut input = crate::input::InputState::default();
+    let mut last_pointer = None;
+    let mut visible = true;
     loop {
         tokio::select! {
+            command = channels.commands.recv() => {
+                let events = match command {
+                    Some(Command::Input(event)) => input.apply(event),
+                    Some(Command::ReleaseAll) => input.release(),
+                    Some(Command::CtrlAltDelete) => input.ctrl_alt_delete(),
+                    None => return Ok(()),
+                    _ => Vec::new(),
+                };
+                send_input(&mut active, &mut image, &mut framed, &events).await?;
+            }
             _ = tick.tick() => {
                 if let Some(frame) = publisher.publish(&image, channels.presentation.borrow().visible, Instant::now())? {
                     channels.snapshots.send_modify(|s| s.frame = Some(frame));
@@ -251,8 +264,16 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
             }
             changed = channels.presentation.changed() => {
                 if changed.is_err() { return Ok(()); }
-                if channels.presentation.borrow().visible { publisher.mark_dirty(); }
-                else { channels.snapshots.send_modify(|s| s.frame = None); }
+                let presentation = channels.presentation.borrow_and_update().clone();
+                if visible != presentation.visible {
+                    visible = presentation.visible;
+                    if visible { publisher.mark_dirty(); }
+                    else { send_input(&mut active,&mut image,&mut framed,&input.release()).await?; channels.snapshots.send_modify(|s| s.frame = None); }
+                }
+                if visible && presentation.pointer != last_pointer {
+                    last_pointer = presentation.pointer;
+                    if let Some((x,y)) = last_pointer { send_input(&mut active,&mut image,&mut framed,&input.pointer(x,y)).await?; }
+                }
             }
             packet = framed.read_pdu() => {
                 let (action, packet) = packet.map_err(|e| error(ErrorStage::Session, e))?;
@@ -275,4 +296,28 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
             }
         }
     }
+}
+
+async fn send_input(
+    active: &mut ironrdp::session::ActiveStage,
+    image: &mut DecodedImage,
+    framed: &mut TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>,
+    events: &[ironrdp::pdu::input::fast_path::FastPathInputEvent],
+) -> Result<(), SessionError> {
+    for batch in events.chunks(64) {
+        for output in active
+            .process_fastpath_input(image, batch)
+            .map_err(|e| error(ErrorStage::Input, e))?
+        {
+            if let ActiveStageOutput::ResponseFrame(bytes) = output {
+                limited(
+                    Duration::from_secs(2),
+                    ErrorStage::Network,
+                    framed.write_all(&bytes),
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
 }

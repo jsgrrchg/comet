@@ -7,6 +7,7 @@ publish.workspace = true
 
 [features]
 browser-fixture = []
+remote-desktop-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
 
@@ -95,3 +96,7 @@ gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 mimalloc.workspace = true
 tracing-subscriber.workspace = true
+
+[[example]]
+name = "remote-desktop-fixture"
+required-features = ["remote-desktop-fixture"]

@@ -141,3 +141,29 @@ async fn untrusted_tls_waits_for_decision_before_credentials_and_rejection_close
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn cancellation_during_a_stalled_tls_handshake_closes_the_peer() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut cfg = config(listener.local_addr().unwrap().port());
+    cfg.timeout = Duration::from_secs(20);
+    let mut handle = connect(cfg, 99).unwrap();
+    let (mut peer, _) = listener.accept().await.unwrap();
+    let mut header = [0; 4];
+    peer.read_exact(&mut header).await.unwrap();
+    let len = u16::from_be_bytes([header[2], header[3]]) as usize;
+    peer.read_exact(&mut vec![0; len - 4]).await.unwrap();
+    peer.write_all(&[3, 0, 0, 19, 14, 0xd0, 0, 0, 0, 0, 0, 2, 0, 8, 0, 2, 0, 0, 0])
+        .await
+        .unwrap();
+    let mut hello = [0; 5];
+    peer.read_exact(&mut hello).await.unwrap();
+    assert_eq!(hello[0], 22);
+    handle.disconnect();
+    assert_eq!(terminal(&mut handle).await, SessionState::Disconnected);
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(1), peer.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+}

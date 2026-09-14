@@ -12164,6 +12164,13 @@ mod exit_regressions {
                 cx,
             )
         });
+        let remote = window
+            .update(cx, |shell, window, cx| {
+                shell.active_chat = "test".into();
+                shell.add_remote_desktop_surface(window, cx);
+                shell.remote_desktops[&shell.remote_desktop_seq].downgrade()
+            })
+            .unwrap();
         for failed in [false, true] {
             window
                 .update(cx, |shell, window, cx| {
@@ -12194,6 +12201,11 @@ mod exit_regressions {
                     assert!(!shell.all_file_edits_flushed(cx));
                     shell.cancel_file_close(RightSurface::Files, cx);
                     assert!(shell.pending_exit.is_none());
+                    // CloseWindow normally closes an active pane first. Hide it
+                    // to exercise actual window closure and its dirty-file guard.
+                    if shell.right_pane_open(cx) {
+                        shell.toggle_right_pane(cx);
+                    }
                 })
                 .unwrap();
             cx.update(|cx| cx.dispatch_action(&crate::app_menus::CloseWindow));
@@ -12201,6 +12213,11 @@ mod exit_regressions {
             window
                 .update(cx, |shell, _, cx| {
                     assert!(matches!(shell.pending_exit, Some(PendingExit::CloseWindow)));
+                    assert!(
+                        remote.upgrade().is_some(),
+                        "A pending file confirmation must retain the desktop"
+                    );
+                    assert_eq!(shell.remote_desktops.len(), 1);
                     shell.quit_for_runtime_change(cx);
                     assert!(matches!(
                         shell.pending_exit,
@@ -12479,6 +12496,99 @@ impl Shell {
 #[cfg(test)]
 mod remote_desktop_tests {
     use super::*;
+    #[gpui::test]
+    fn remote_desktop_open_events_deduplicate_only_within_the_owning_chat(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = crate::remote_desktop::profiles::Profile {
+            name: "Lab".into(),
+            host: "127.0.0.1".into(),
+            username: "test".into(),
+            ..Default::default()
+        };
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(Default::default(), dir.path(), cx);
+            settings::update(settings::SavePolicy::Immediate, cx, |s| {
+                s.remote_desktop_profiles = vec![profile.clone()]
+            });
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        let first = window
+            .update(cx, |shell, w, cx| {
+                shell.active_chat = "a".into();
+                shell.add_remote_desktop_surface(w, cx);
+                let first = shell.remote_desktop_seq;
+                shell.remote_desktops[&first]
+                    .clone()
+                    .update(cx, |view, cx| view.open_profile(profile.id, w, cx));
+                shell.add_remote_desktop_surface(w, cx);
+                let next = shell.remote_desktop_seq;
+                shell.remote_desktops[&next].clone().update(cx, |_, cx| {
+                    cx.emit(crate::remote_desktop::SurfaceEvent::OpenProfile(profile.id))
+                });
+                first
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, w, cx| {
+                assert_eq!(
+                    shell.resolved_right_active(cx),
+                    RightSurface::RemoteDesktop(first)
+                );
+                assert_eq!(
+                    shell
+                        .remote_desktops
+                        .values()
+                        .filter(|v| v.read(cx).profile_id() == Some(profile.id))
+                        .count(),
+                    1
+                );
+                shell.active_chat = "b".into();
+                shell.add_remote_desktop_surface(w, cx);
+                let second = shell.remote_desktop_seq;
+                shell.remote_desktops[&second].clone().update(cx, |_, cx| {
+                    cx.emit(crate::remote_desktop::SurfaceEvent::OpenProfile(profile.id))
+                });
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, cx| {
+                assert_ne!(
+                    shell.resolved_right_active(cx),
+                    RightSurface::RemoteDesktop(first)
+                );
+                assert_eq!(
+                    shell
+                        .remote_desktops
+                        .values()
+                        .filter(|v| v.read(cx).profile_id() == Some(profile.id))
+                        .count(),
+                    2
+                );
+            })
+            .unwrap();
+    }
     #[gpui::test]
     fn remote_desktop_tabs_are_local_owned_and_close_without_retained_entities(
         cx: &mut gpui::TestAppContext,

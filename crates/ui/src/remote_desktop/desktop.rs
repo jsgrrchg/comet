@@ -194,7 +194,10 @@ impl Desktop {
         if self.enabled {
             window.handle_input(
                 &self.focus,
-                ElementInputHandler::new(bounds, cx.entity()),
+                super::input::WeakInputHandler {
+                    view: cx.entity().downgrade(),
+                    bounds,
+                },
                 cx,
             );
         }

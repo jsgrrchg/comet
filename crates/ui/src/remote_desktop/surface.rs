@@ -276,6 +276,7 @@ impl RemoteDesktopSurface {
         if self.closed || snapshot.generation != self.generation {
             return;
         }
+        let state_changed = self.snapshot.state != snapshot.state;
         if let Some(pin) = &snapshot.accepted_pin
             && let Some(profile) = &mut self.profile
             && profile.trusted_certificate_sha256.as_ref() != Some(pin)
@@ -337,7 +338,9 @@ impl RemoteDesktopSurface {
         snapshot.frame = None;
         self.snapshot = snapshot;
         self.request_resize();
-        cx.emit(SurfaceEvent::Changed);
+        if state_changed {
+            cx.emit(SurfaceEvent::Changed);
+        }
         cx.notify();
     }
     pub(super) fn send(&mut self, command: Command, cx: &mut Context<Self>) {
@@ -670,5 +673,26 @@ mod tests {
                 }
             })
             .unwrap();
+    }
+}
+
+#[cfg(feature = "remote-desktop-fixture")]
+impl RemoteDesktopSurface {
+    pub fn fixture_connect(
+        &mut self,
+        profile: Profile,
+        password: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        settings::update(SavePolicy::Immediate, cx, |s| {
+            s.remote_desktop_profiles = vec![profile.clone()]
+        });
+        self.password
+            .update(cx, |p, cx| p.set_value(password, window, cx));
+        self.open_profile(profile.id, window, cx);
+    }
+    pub fn fixture_has_frame(&self, cx: &App) -> bool {
+        self.snapshot.state == SessionState::Connected && self.desktop.read(cx).dimensions.0 > 0
     }
 }

@@ -99,3 +99,99 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use ironrdp::{
+        core::{WriteBuf, encode_vec},
+        pdu::{
+            bitmap::{BitmapData, BitmapUpdateData, Compression},
+            fast_path::{
+                EncryptionFlags, FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode,
+            },
+            geometry::InclusiveRectangle,
+        },
+        session::fast_path::ProcessorBuilder,
+    };
+    #[test]
+    fn hidden_incremental_bitmaps_keep_color_origin_and_all_prior_deltas() {
+        let mut decoder = ProcessorBuilder {
+            io_channel_id: 1003,
+            user_channel_id: 1001,
+            share_id: 1,
+            enable_server_pointer: false,
+            pointer_software_rendering: false,
+            bulk_decompressor: None,
+        }
+        .build();
+        let mut image = DecodedImage::new(
+            ironrdp::graphics::image_processing::PixelFormat::BgrA32,
+            200,
+            200,
+        );
+        let mut publisher = Publisher::new(3);
+        for (x, y, top, bottom) in [
+            (10, 12, [0, 0, 255], [255, 0, 0]),
+            (100, 110, [0, 255, 0], [255, 255, 255]),
+        ] {
+            // RDP bitmap rows are bottom-up, BGR24, with a four-pixel stride.
+            let data = [bottom.repeat(4), top.repeat(4)].concat();
+            let bitmap = encode_vec(&BitmapUpdateData {
+                rectangles: vec![BitmapData {
+                    rectangle: InclusiveRectangle {
+                        left: x,
+                        top: y,
+                        right: x + 3,
+                        bottom: y + 1,
+                    },
+                    width: 4,
+                    height: 2,
+                    bits_per_pixel: 24,
+                    compression_flags: Compression::empty(),
+                    compressed_data_header: None,
+                    bitmap_data: &data,
+                }],
+            })
+            .unwrap();
+            let update = encode_vec(&FastPathUpdatePdu {
+                fragmentation: Fragmentation::Single,
+                update_code: UpdateCode::Bitmap,
+                compression_flags: None,
+                compression_type: None,
+                data: &bitmap,
+            })
+            .unwrap();
+            let mut packet =
+                encode_vec(&FastPathHeader::new(EncryptionFlags::empty(), update.len())).unwrap();
+            packet.extend(update);
+            assert!(
+                !decoder
+                    .process(&mut image, &packet, &mut WriteBuf::new())
+                    .unwrap()
+                    .is_empty()
+            );
+            publisher.mark_dirty();
+            assert!(
+                publisher
+                    .publish(&image, false, Instant::now())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let frame = publisher
+            .publish(&image, true, Instant::now())
+            .unwrap()
+            .unwrap();
+        for (x, y, bgra) in [
+            (10, 12, [0, 0, 255, 255]),
+            (10, 13, [255, 0, 0, 255]),
+            (100, 110, [0, 255, 0, 255]),
+            (100, 111, [255, 255, 255, 255]),
+        ] {
+            let offset = (y * 200 + x) * 4;
+            assert_eq!(&frame.bgra[offset..offset + 4], &bgra);
+        }
+        assert_eq!(frame.sequence, 1);
+    }
+}

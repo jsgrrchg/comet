@@ -77,3 +77,46 @@ mod tests {
         );
     }
 }
+
+/// MS-RDPBCGR permits Deactivate All with only the six-byte Share Control
+/// header. xrdp emits this form; ironrdp-pdu 0.9 expects a shareId as well.
+/// Match only this exact IO-channel message; all other PDUs use the decoder.
+pub(crate) fn short_deactivation(
+    action: ironrdp::pdu::Action,
+    packet: &[u8],
+    io_channel: u16,
+) -> bool {
+    if !matches!(action, ironrdp::pdu::Action::X224) {
+        return false;
+    }
+    ironrdp::pdu::mcs::decode_send_data_indication(packet).is_ok_and(|ctx| {
+        ctx.channel_id == io_channel
+            && ctx.user_data.len() == 6
+            && ctx.user_data[..4] == [6, 0, 0x16, 0]
+    })
+}
+
+#[cfg(test)]
+mod wire_tests {
+    #[test]
+    fn xrdp_short_deactivation_is_accepted_only_on_the_io_channel() {
+        use ironrdp::{
+            core::encode_vec,
+            pdu::{Action, mcs::SendDataIndication, x224::X224},
+        };
+        let pdu = SendDataIndication {
+            initiator_id: 1001,
+            channel_id: 1003,
+            user_data: (&[6, 0, 0x16, 0, 0xea, 3][..]).into(),
+        };
+        let bytes = encode_vec(&X224(pdu)).unwrap();
+        assert!(super::short_deactivation(Action::X224, &bytes, 1003));
+        assert!(!super::short_deactivation(Action::X224, &bytes, 1004));
+        assert!(!super::short_deactivation(Action::FastPath, &bytes, 1003));
+        assert!(!super::short_deactivation(
+            Action::X224,
+            &bytes[..bytes.len() - 1],
+            1003
+        ));
+    }
+}

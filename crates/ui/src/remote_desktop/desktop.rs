@@ -66,6 +66,11 @@ impl Transform {
 
 pub struct Desktop {
     pub focus: FocusHandle,
+    pub enabled: bool,
+    pub(super) pressed: std::collections::HashMap<String, u16>,
+    pub(super) buttons: std::collections::HashSet<MouseButton>,
+    pub(super) modifiers: Modifiers,
+    pub(super) composition: String,
     pub(super) frame: Option<Arc<RenderImage>>,
     pub(super) cursor: Option<Arc<RenderImage>>,
     pub(super) remote_cursor: RemoteCursor,
@@ -78,7 +83,10 @@ pub struct Desktop {
     pub(super) pointer: Option<(u16, u16)>,
 }
 impl Desktop {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        cx.on_blur(&focus, window, |this, _, cx| this.release_input(cx))
+            .detach();
         cx.on_release(|view, cx| {
             for image in [view.frame.take(), view.cursor.take()]
                 .into_iter()
@@ -89,7 +97,12 @@ impl Desktop {
         })
         .detach();
         Self {
-            focus: cx.focus_handle(),
+            focus,
+            enabled: false,
+            pressed: Default::default(),
+            buttons: Default::default(),
+            modifiers: Default::default(),
+            composition: String::new(),
             frame: None,
             cursor: None,
             remote_cursor: RemoteCursor::Default,
@@ -175,7 +188,14 @@ impl Desktop {
         self.dimensions = (0, 0);
         cx.notify();
     }
-    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, _: &mut Context<Self>) {
+    fn paint(&mut self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.enabled {
+            window.handle_input(
+                &self.focus,
+                ElementInputHandler::new(bounds, cx.entity()),
+                cx,
+            );
+        }
         self.bounds = bounds;
         self.transform = Transform::new(
             (bounds.size.width.into(), bounds.size.height.into()),
@@ -229,21 +249,39 @@ impl Desktop {
 impl Render for Desktop {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity().downgrade();
-        div()
+        let mut element = div()
             .id("remote-desktop-canvas")
+            .track_focus(&self.focus)
+            .key_context("RemoteDesktop")
+            .on_action(
+                cx.listener(|this, _: &super::input::ReleaseCapture, w, cx| {
+                    this.release_capture(w, cx)
+                }),
+            )
+            .on_key_down(cx.listener(Self::key_down))
+            .on_key_up(cx.listener(Self::key_up))
+            .on_modifiers_changed(cx.listener(Self::modifiers_changed))
+            .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_scroll_wheel(cx.listener(Self::scroll))
             .size_full()
             .min_h_0()
             .overflow_hidden()
-            .bg(rgb(0x111318))
-            .child(
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, cx| {
-                        let _ = view.update(cx, |view, cx| view.paint(bounds, window, cx));
-                    },
-                )
-                .size_full(),
+            .bg(rgb(0x111318));
+        for button in MouseButton::all() {
+            element = element
+                .on_mouse_down(button, cx.listener(Self::mouse_down))
+                .on_mouse_up(button, cx.listener(Self::mouse_up))
+                .on_mouse_up_out(button, cx.listener(Self::mouse_up));
+        }
+        element.child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, cx| {
+                    let _ = view.update(cx, |view, cx| view.paint(bounds, window, cx));
+                },
             )
+            .size_full(),
+        )
     }
 }
 impl Focusable for Desktop {

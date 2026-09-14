@@ -5027,6 +5027,8 @@ impl Transcript {
                     .child(
                         gpui::img(loaded.image)
                             .size_full()
+                            // The frame's overflow clip is rectangular; round the image itself.
+                            .rounded(px(12.0))
                             .object_fit(gpui::ObjectFit::Contain),
                     )
                     .into_any_element()

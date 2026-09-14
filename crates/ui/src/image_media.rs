@@ -171,6 +171,15 @@ pub(crate) fn decode_image(mime: &str, bytes: Vec<u8>) -> Result<MediaImage, Str
         };
         return Ok(media.preview_for_view((900.0, 480.0), 2.0));
     }
+    decode_raster_image(bytes, zeron_proto::MAX_WORKSPACE_IMAGE_BYTES)
+}
+
+/// Shared raster decoder for generated attachments, with the caller's intake cap.
+/// Dimensions, allocation and animation limits stay identical to workspace previews.
+pub(crate) fn decode_raster_image(bytes: Vec<u8>, max_bytes: usize) -> Result<MediaImage, String> {
+    if bytes.len() > max_bytes {
+        return Err("Image exceeds preview size limit".into());
+    }
     let mut reader = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| e.to_string())?;

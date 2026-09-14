@@ -1023,6 +1023,16 @@ pub enum RowKind {
     },
 }
 
+fn generated_image_devices(owner: &str, fallback: &[String]) -> Vec<String> {
+    let mut devices = Vec::new();
+    for device in std::iter::once(owner).chain(fallback.iter().map(String::as_str)) {
+        if !device.is_empty() && !devices.iter().any(|id| id == device) {
+            devices.push(device.to_owned());
+        }
+    }
+    devices
+}
+
 /// A transcript row: stable id + content version (diff key) + block payload.
 #[derive(Clone)]
 pub struct Row {
@@ -4578,9 +4588,18 @@ impl Transcript {
         if self.doc_override.is_some() {
             return;
         }
+        crate::attachments::protect_attachments(self.protected_attachment_keys(cx));
+    }
+
+    fn protected_attachment_keys(&self, cx: &Context<Self>) -> HashSet<(String, String)> {
         let devices = self.attachment_device_ids(cx);
         let mut keys = std::collections::HashSet::new();
         for row in &self.rows {
+            if let RowKind::GeneratedImage { owner, path, .. } = &row.kind {
+                for device in self.generated_attachment_device_ids(owner, cx) {
+                    keys.insert((device, path.clone()));
+                }
+            }
             if let RowKind::User { attachments, .. } = &row.kind {
                 for att in attachments.iter() {
                     for dev in &devices {
@@ -4589,7 +4608,7 @@ impl Transcript {
                 }
             }
         }
-        crate::attachments::protect_attachments(keys);
+        keys
     }
 
     /// Devices that may own a user message's attachment files: the chat's host
@@ -4615,6 +4634,14 @@ impl Transcript {
         ids
     }
 
+    fn generated_attachment_device_ids(&self, owner: &str, cx: &Context<Self>) -> Vec<String> {
+        let mut fallback = self.attachment_device_ids(cx);
+        if let Some(local) = &self.state.read(cx).local_device_id {
+            fallback.push(local.clone());
+        }
+        generated_image_devices(owner, &fallback)
+    }
+
     /// Effective load state for one attachment across its candidate devices:
     /// first Loaded source wins; otherwise loads are (re)claimed and the
     /// snapshot degrades Loading → Error with a scheduled retry wake-up.
@@ -4622,6 +4649,7 @@ impl Transcript {
         &mut self,
         device_ids: &[String],
         path: &str,
+        expected_raster_mime: Option<&str>,
         cx: &mut Context<Self>,
     ) -> crate::attachments::AttachmentSnapshot {
         use crate::attachments::{AttachmentSnapshot, attachment_snapshot, begin_load};
@@ -4634,11 +4662,23 @@ impl Transcript {
         let mut min_retry: Option<Duration> = None;
         for dev in device_ids {
             if begin_load(dev, path) {
-                self.spawn_attachment_load(dev.clone(), path.to_string(), cx);
+                self.spawn_attachment_load(
+                    dev.clone(),
+                    path.to_string(),
+                    expected_raster_mime.map(str::to_owned),
+                    cx,
+                );
             }
             match attachment_snapshot(dev, path) {
                 AttachmentSnapshot::Loaded(image) => return AttachmentSnapshot::Loaded(image),
-                AttachmentSnapshot::Loading => any_loading = true,
+                AttachmentSnapshot::Loading => {
+                    // Generated assets try the owner first, falling back only
+                    // after failure. Repainting never launches duplicate reads.
+                    if expected_raster_mime.is_some() {
+                        return AttachmentSnapshot::Loading;
+                    }
+                    any_loading = true;
+                }
                 AttachmentSnapshot::Error { retry_in } => {
                     min_retry = Some(min_retry.map_or(retry_in, |m| m.min(retry_in)));
                 }
@@ -4661,7 +4701,13 @@ impl Transcript {
         }
     }
 
-    fn spawn_attachment_load(&mut self, device_id: String, path: String, cx: &mut Context<Self>) {
+    fn spawn_attachment_load(
+        &mut self,
+        device_id: String,
+        path: String,
+        expected_raster_mime: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         use crate::attachments::{read_attachment_image, store_error, store_loaded};
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             store_error(&device_id, &path);
@@ -4672,9 +4718,17 @@ impl Transcript {
         // files are served directly.
         let target = (local.as_deref() != Some(device_id.as_str())).then(|| device_id.clone());
         let key = (device_id.clone(), path.clone());
+        let claim = crate::attachments::AttachmentLoadGuard(device_id.clone(), path.clone());
         let task = cx.spawn(async move |this, cx| {
-            match read_attachment_image(&engine, cx.background_executor(), target.as_deref(), &path)
-                .await
+            let _claim = claim;
+            match read_attachment_image(
+                &engine,
+                cx.background_executor(),
+                target.as_deref(),
+                &path,
+                expected_raster_mime.as_deref(),
+            )
+            .await
             {
                 Some(loaded) => store_loaded(&device_id, &path, loaded.name.into(), loaded.image),
                 None => store_error(&device_id, &path),
@@ -4921,6 +4975,73 @@ impl Transcript {
             .into_any_element()
     }
 
+    fn render_generated_image(
+        &mut self,
+        row_id: &SharedString,
+        owner: &str,
+        path: &str,
+        name: &str,
+        mime_type: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::attachments::AttachmentSnapshot;
+        let devices = self.generated_attachment_device_ids(owner, cx);
+        let state = self.attachment_state(&devices, path, Some(mime_type), cx);
+        let theme = Theme::of(cx).clone();
+        let frame = div()
+            .id(SharedString::from(format!("{row_id}-generated")))
+            .w(px(512.0))
+            .max_w_full()
+            .h(px(320.0))
+            .max_h(px(420.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(12.0))
+            .overflow_hidden()
+            .bg(crate::theme::ink(0.045));
+        match state {
+            AttachmentSnapshot::Loaded(loaded) => {
+                let dimensions =
+                    crate::appshots::png_dimensions(&loaded.image.bytes).unwrap_or((512, 320));
+                let scale = (512.0 / dimensions.0 as f32)
+                    .min(420.0 / dimensions.1 as f32)
+                    .min(1.0);
+                let preview =
+                    crate::attachments::PreviewImage::new(name.to_owned(), loaded.image.clone());
+                frame
+                    .w(px(dimensions.0 as f32 * scale))
+                    .h(px(dimensions.1 as f32 * scale))
+                    .role(gpui::Role::Button)
+                    .aria_label("Preview generated image")
+                    .tab_index(0)
+                    .cursor_pointer()
+                    .focus_visible(move |style| style.border_2().border_color(theme.accent))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.attachment_preview_return_focus = window.focused(cx);
+                        preview.viewer.reset();
+                        this.attachment_preview = Some(preview.clone());
+                        window.focus(&this.attachment_preview_focus, cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        gpui::img(loaded.image)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain),
+                    )
+                    .into_any_element()
+            }
+            AttachmentSnapshot::Loading => frame
+                .text_color(theme.text_muted)
+                .child("Loading generated image…")
+                .into_any_element(),
+            AttachmentSnapshot::Error { .. } => frame
+                .text_color(theme.text_muted)
+                .child("Generated image unavailable")
+                .into_any_element(),
+        }
+    }
+
     /// The right-aligned thumbnail strip above a user bubble.
     fn render_user_attachments(
         &mut self,
@@ -4946,7 +5067,7 @@ impl Transcript {
             .pt(px(4.0))
             .pb(px(6.0));
         for (aix, att) in atts.iter().enumerate() {
-            let state = self.attachment_state(&device_ids, &att.path, cx);
+            let state = self.attachment_state(&device_ids, &att.path, None, cx);
             // The in-flight send's progress belongs ON the thumbnail
             // (2026-08-18 user request). Two ref shapes mean "still
             // crossing": the queued flow's `pending://` (bytes ship
@@ -5595,9 +5716,12 @@ impl Transcript {
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
-            RowKind::GeneratedImage { .. } => {
-                error_chip("Generated image unavailable".into(), &theme)
-            }
+            RowKind::GeneratedImage {
+                owner,
+                path,
+                name,
+                mime_type,
+            } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
         };
 
@@ -7492,6 +7616,7 @@ fn subagent_chip(
 fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
     let mut acc: Vec<u8> = Vec::with_capacity(entry.parts.len() * 8 + 16);
     acc.extend_from_slice(entry.id.as_bytes());
+    acc.extend_from_slice(entry.device_id.as_bytes());
     acc.push(match entry.status {
         None => 0,
         Some(MessageStatus::Streaming) => 1,
@@ -7527,6 +7652,18 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
             );
             if let Some(tail) = subagent_tail {
                 acc.extend_from_slice(tail.as_bytes());
+            }
+        }
+        if let MessagePart::Image {
+            path,
+            name,
+            mime_type,
+            ..
+        } = part
+        {
+            for field in [path, name, mime_type] {
+                acc.extend_from_slice(field.as_bytes());
+                acc.push(0);
             }
         }
         if let MessagePart::Input { resolved, .. } = part {
@@ -8623,6 +8760,194 @@ mod tests {
             id: id.into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn generated_image_owner_candidates_and_same_length_corrections() {
+        assert_eq!(
+            generated_image_devices("owner", &["host".into(), "local".into(), "owner".into()]),
+            vec!["owner", "host", "local"]
+        );
+        assert_eq!(
+            generated_image_devices("", &["host".into(), "host".into(), "".into()]),
+            vec!["host"]
+        );
+        let entries: Vec<SessionMessageEntry> =
+            serde_json::from_str(include_str!("../tests/fixtures/generated-images.json")).unwrap();
+        let entry = &entries[0];
+        let original = entry_fingerprint(entry, false);
+        let row_version = rows_for_entry(entry, false, &mut parse)[0].version;
+        for field in 0..4 {
+            let mut changed = entry.clone();
+            if field == 0 {
+                changed.device_id = "another-owner".into();
+            } else if let MessagePart::Image {
+                path,
+                name,
+                mime_type,
+                ..
+            } = &mut changed.parts[0]
+            {
+                match field {
+                    1 => *path = path.replace("loaded", "edited"),
+                    2 => *name = "corrected.png".into(),
+                    _ => *mime_type = "image/gif".into(),
+                }
+            }
+            assert_ne!(entry_fingerprint(&changed, false), original);
+            assert_ne!(
+                rows_for_entry(&changed, false, &mut parse)[0].version,
+                row_version
+            );
+        }
+        for entry in entries {
+            let rows = rows_for_entry(&entry, false, &mut parse);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].turn_start);
+            assert_eq!(
+                rows[0].timestamp.is_some(),
+                entry.status == Some(MessageStatus::Complete)
+            );
+            assert!(rows[0].copy_text.is_none());
+        }
+    }
+
+    #[gpui::test]
+    fn generated_image_click_opens_lightbox_and_escape_restores_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+        });
+        let state = cx.new(|_| AppState::new());
+        let transcript = cx.new(|cx| Transcript::new(state, cx));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(64, 48)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        crate::attachments::seed_attachment(
+            "preview-owner",
+            "/fixture/preview.png",
+            "generated.png",
+            Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                bytes.into_inner(),
+            )),
+        );
+        struct PreviewFixture(Entity<Transcript>);
+        impl Render for PreviewFixture {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                if self.0.read(cx).attachment_preview.is_some() {
+                    self.0.clone().into_any_element()
+                } else {
+                    self.0.update(cx, |this, cx| {
+                        this.render_generated_image(
+                            &"preview".into(),
+                            "preview-owner",
+                            "/fixture/preview.png",
+                            "generated.png",
+                            "image/png",
+                            cx,
+                        )
+                    })
+                }
+            }
+        }
+        let (fixture, cx) = cx.add_window_view(|_, _| PreviewFixture(transcript.clone()));
+        cx.run_until_parked();
+        cx.simulate_click(gpui::point(px(20.0), px(20.0)), gpui::Modifiers::default());
+        let return_focus = transcript.read_with(cx, |this, _| {
+            assert!(this.attachment_preview.is_some());
+            this.attachment_preview_return_focus
+                .clone()
+                .expect("preview remembers the image button focus")
+        });
+        // Paint the production transcript, including its shared lightbox and
+        // close callback, so Escape exercises actual focus restoration.
+        fixture.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        transcript.read_with(cx, |this, _| assert!(this.attachment_preview.is_none()));
+        cx.update(|window, _| assert!(return_focus.is_focused(window)));
+    }
+
+    #[gpui::test]
+    fn generated_image_fixture_uses_cache_and_retries(cx: &mut gpui::TestAppContext) {
+        use crate::attachments::*;
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(crate::settings::UiSettings::default(), dir.path(), cx);
+            let state = cx.new(|_| AppState::new());
+            let transcript = cx.new(|cx| Transcript::new(state, cx));
+            let entries: Vec<SessionMessageEntry> =
+                serde_json::from_str(include_str!("../tests/fixtures/generated-images.json"))
+                    .unwrap();
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(64, 48)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let image = Arc::new(gpui::Image::from_bytes(
+                gpui::ImageFormat::Png,
+                bytes.into_inner(),
+            ));
+            seed_attachment(
+                "fixture-owner",
+                "/fixture/generated-loaded.png",
+                "generated.png",
+                image,
+            );
+            assert!(begin_load(
+                "fixture-owner",
+                "/fixture/generated-loading.png"
+            ));
+            store_error("fixture-owner", "/fixture/generated-unavailable.png");
+            transcript.update(cx, |this, cx| {
+                this.rows = entries
+                    .iter()
+                    .flat_map(|entry| rows_for_entry(entry, false, &mut parse))
+                    .collect();
+                for (ix, expected) in ["loaded", "loading", "error"].into_iter().enumerate() {
+                    let RowKind::GeneratedImage {
+                        owner,
+                        path,
+                        mime_type,
+                        ..
+                    } = &this.rows[ix].kind
+                    else {
+                        panic!("image row")
+                    };
+                    let (owner, path, mime_type) = (owner.clone(), path.clone(), mime_type.clone());
+                    let devices = this.generated_attachment_device_ids(&owner, cx);
+                    let snapshot = this.attachment_state(&devices, &path, Some(&mime_type), cx);
+                    match expected {
+                        "loaded" => assert!(matches!(snapshot, AttachmentSnapshot::Loaded(_))),
+                        "loading" => assert!(matches!(snapshot, AttachmentSnapshot::Loading)),
+                        _ => assert!(matches!(snapshot, AttachmentSnapshot::Error { .. })),
+                    }
+                }
+                assert!(
+                    this.attachment_loads.is_empty(),
+                    "cache repaint must not fetch"
+                );
+                assert_eq!(this.attachment_retries.len(), 1);
+                let keys = this.protected_attachment_keys(cx);
+                for entry in &entries {
+                    let MessagePart::Image { path, .. } = &entry.parts[0] else {
+                        unreachable!()
+                    };
+                    assert!(keys.contains(&("fixture-owner".into(), path.clone())));
+                }
+                this.refresh_protected_attachments(cx);
+                this.rows.clear();
+                assert!(this.protected_attachment_keys(cx).is_empty());
+                this.refresh_protected_attachments(cx);
+            });
+        });
     }
 
     #[test]

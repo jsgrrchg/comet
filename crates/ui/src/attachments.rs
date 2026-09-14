@@ -469,6 +469,7 @@ pub async fn read_attachment_image(
     executor: &BackgroundExecutor,
     target_device_id: Option<&str>,
     path: &str,
+    expected_raster_mime: Option<&str>,
 ) -> Option<LoadedAttachmentImage> {
     let mut name = String::new();
     let mut mime = String::new();
@@ -491,7 +492,14 @@ pub async fn read_attachment_image(
         .ok()?;
         name = chunk.get("name")?.as_str()?.to_string();
         mime = chunk.get("mimeType")?.as_str()?.to_string();
-        b64.push_str(chunk.get("data")?.as_str()?);
+        let data = chunk.get("data")?.as_str()?;
+        if expected_raster_mime.is_some()
+            && b64.len().saturating_add(data.len())
+                > (MAX_ATTACHMENT_BYTES as usize).div_ceil(3) * 4
+        {
+            return None;
+        }
+        b64.push_str(data);
         done = chunk.get("done")?.as_bool()?;
         if done {
             break;
@@ -506,14 +514,33 @@ pub async fn read_attachment_image(
         return None;
     }
     let bytes = BASE64.decode(b64.as_bytes()).ok()?;
-    let format = ImageFormat::from_mime_type(&mime).unwrap_or(ImageFormat::Png);
+    let image = if let Some(expected) = expected_raster_mime {
+        if expected != mime
+            || !matches!(
+                mime.as_str(),
+                "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+            )
+        {
+            return None;
+        }
+        executor
+            .spawn(async move {
+                crate::image_media::decode_raster_image(bytes, MAX_ATTACHMENT_BYTES as usize)
+                    .ok()
+                    .map(|media| media.image)
+            })
+            .await?
+    } else {
+        let format = ImageFormat::from_mime_type(&mime).unwrap_or(ImageFormat::Png);
+        Arc::new(Image::from_bytes(format, bytes))
+    };
     Some(LoadedAttachmentImage {
         name: if name.is_empty() {
             name_from_path(path)
         } else {
             name
         },
-        image: Arc::new(Image::from_bytes(format, bytes)),
+        image,
     })
 }
 
@@ -597,7 +624,15 @@ struct ImageCache {
 
 impl ImageCache {
     fn insert_loaded(&mut self, key: (String, String), image: CachedAttachmentImage) {
-        let bytes = image.image.bytes.len();
+        // Generated rasters are normalized to PNG; account for their decoded
+        // CPU/GPU copies as well as encoded bytes in the existing cache budget.
+        let pixels = crate::appshots::png_dimensions(&image.image.bytes)
+            .map_or(0, |(w, h)| (w as usize).saturating_mul(h as usize));
+        let bytes = image
+            .image
+            .bytes
+            .len()
+            .saturating_add(pixels.saturating_mul(8));
         self.tick += 1;
         if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.insert(
             key.clone(),
@@ -610,7 +645,7 @@ impl ImageCache {
             self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
             self.pending_free.push(image.image);
         }
-        self.loaded_bytes += bytes;
+        self.loaded_bytes = self.loaded_bytes.saturating_add(bytes);
         let shielded = protected().lock().unwrap().clone();
         while self.loaded_bytes > IMAGE_CACHE_BUDGET_BYTES {
             let oldest = self
@@ -753,6 +788,26 @@ pub fn begin_load(device_id: &str, path: &str) -> bool {
             }
             _ => false,
         },
+    }
+}
+
+/// A cancelled view/task must release its claim so reopening can retry it.
+/// Completed loads are left alone, including completions waiting on a UI notify.
+pub(crate) struct AttachmentLoadGuard(pub String, pub String);
+
+impl Drop for AttachmentLoadGuard {
+    fn drop(&mut self) {
+        let mut cache = cache().lock().unwrap();
+        if let Some(entry @ CacheEntry::Loading { .. }) = cache.map.get_mut(&key(&self.0, &self.1))
+        {
+            let CacheEntry::Loading { attempts } = entry else {
+                unreachable!()
+            };
+            *entry = CacheEntry::Error {
+                attempts: attempts.saturating_add(1),
+                at: Instant::now(),
+            };
+        }
     }
 }
 
@@ -1103,5 +1158,104 @@ mod tests {
         assert_eq!(attachment_deadline(1), Duration::from_secs(135));
         // A max-size upload is still bounded.
         assert_eq!(attachment_deadline(1_000), Duration::from_secs(900));
+    }
+}
+
+#[cfg(test)]
+mod generated_image_tests {
+    use super::*;
+
+    struct ImageRpc {
+        calls: Arc<Mutex<Vec<serde_json::Value>>>,
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeron_rpc::RpcService for ImageRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            params: serde_json::Value,
+        ) -> Result<zeron_rpc::RpcReply, zeron_rpc::RpcError> {
+            assert_eq!(method, methods::READ_ATTACHMENT_CHUNK);
+            self.calls.lock().unwrap().push(params);
+            zeron_rpc::RpcReply::value(
+                &serde_json::json!({"name":"generated.png", "mimeType":"image/png", "data":BASE64.encode(&self.bytes), "nextOffset": self.bytes.len(), "done":true}),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_image_chunk_reader_targets_owner_and_bounds_decode() {
+        let executor = gpui_platform::background_executor();
+        for (width, target, expected, succeeds) in [
+            (64, Some("remote-owner"), "image/png", true),
+            (64, None, "image/png", true),
+            (4097, None, "image/png", false),
+            (64, None, "image/gif", false),
+        ] {
+            let mut png = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(width, 1)
+                .write_to(&mut png, image::ImageFormat::Png)
+                .unwrap();
+            let calls = Arc::new(Mutex::new(vec![]));
+            let engine =
+                EngineHandle::from_test_client(zeron_rpc::memory_client(Arc::new(ImageRpc {
+                    calls: calls.clone(),
+                    bytes: png.into_inner(),
+                })));
+            let loaded = read_attachment_image(
+                &engine,
+                &executor,
+                target,
+                "/profile/uploads/image.png",
+                Some(expected),
+            )
+            .await;
+            assert_eq!(loaded.is_some(), succeeds);
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0]["path"], "/profile/uploads/image.png");
+            assert_eq!(
+                calls[0].get("targetDeviceId").and_then(|v| v.as_str()),
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn generated_image_cancelled_load_releases_claim_without_losing_completed_images() {
+        let owner = "cancelled-generated-owner";
+        let path = "/fixture/cancelled-generated.png";
+        assert!(begin_load(owner, path));
+        drop(AttachmentLoadGuard(owner.into(), path.into()));
+        assert!(matches!(
+            attachment_snapshot(owner, path),
+            AttachmentSnapshot::Error { .. }
+        ));
+        let image = Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new()));
+        store_loaded(owner, path, "generated.png".into(), image);
+        drop(AttachmentLoadGuard(owner.into(), path.into()));
+        assert!(matches!(
+            attachment_snapshot(owner, path),
+            AttachmentSnapshot::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn generated_image_decode_accepts_attachment_byte_cap_but_rejects_excess() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(1, 1)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let mut bytes = png.into_inner();
+        // Padding represents a large source with small dimensions; the intake
+        // cap is 24 MiB, independent of the workspace preview's 8 MiB cap.
+        bytes.resize(9 * 1024 * 1024, 0);
+        assert!(
+            crate::image_media::decode_raster_image(bytes.clone(), MAX_ATTACHMENT_BYTES as usize)
+                .is_ok()
+        );
+        assert!(crate::image_media::decode_raster_image(bytes, 8 * 1024 * 1024).is_err());
     }
 }

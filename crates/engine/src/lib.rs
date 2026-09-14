@@ -270,7 +270,10 @@ impl EngineCore {
         // against this store and pushes staged bytes to remote hosts.
         doc_host.set_uploads(uploads.clone());
         let agent_accounts_config = AgentAccountsConfig::detect(data_dir);
-        sessions.set_generated_images(uploads.clone(), agent_accounts_config.codex_home.join("generated_images"));
+        sessions.set_generated_images(
+            uploads.clone(),
+            agent_accounts_config.codex_home.join("generated_images"),
+        );
         let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
             local_import::LocalImporter::new(
                 data_dir,

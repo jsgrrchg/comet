@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fromDocParts, toDocParts, splitMessageEntry, joinContinuations } from "./messages";
+import { type DocMessagePart, fromDocParts, toDocParts, splitMessageEntry, joinContinuations } from "./messages";
 import { toRenderParts } from "./render-parts";
 
 describe("generated image parts", () => {
@@ -14,7 +14,7 @@ describe("generated image parts", () => {
     expect(joinContinuations(split)).toEqual([entry]);
   });
   it("degrades malformed references without rendering paths as text", () => {
-    for (const part of [{ kind: "image" as const, id: "i" }, { ...image, mimeType: "image/svg+xml" }]) {
+    for (const part of [{ kind: "image" as const, id: "i" }, { ...image, mimeType: "image/svg+xml" }, { ...image, path: 42 } as unknown as DocMessagePart]) {
       expect(fromDocParts([part])).toEqual([{ kind: "error", id: part.id, message: "Generated image unavailable" }]);
     }
   });

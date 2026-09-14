@@ -1587,6 +1587,8 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
+            remote_desktop_profiles: Vec::new(),
+            remote_desktop_credential_cleanup: Vec::new(),
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,

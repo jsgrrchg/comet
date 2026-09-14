@@ -359,6 +359,48 @@ impl RemoteDesktopSurface {
                     ),
                 );
             }
+            if connected {
+                let resize = self.profile.as_ref().is_some_and(|p| p.resize_remote);
+                root = root.child(
+                    div()
+                        .px(px(8.))
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(5.))
+                        .child(
+                            action(
+                                "rdp-resize",
+                                if resize {
+                                    "Resolution: follow panel"
+                                } else {
+                                    "Resolution: fixed"
+                                },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_resize(cx))),
+                        )
+                        .when(resize && !self.snapshot.capabilities.resize, |el| {
+                            el.child("Server resize unavailable; scaling locally")
+                        }),
+                );
+                if self.desktop.read(cx).mode == ViewMode::ActualSize {
+                    root = root.child(
+                        div().px(px(8.)).flex().gap(px(6.)).child("Pan").children(
+                            [
+                                ("rdp-pan-left", "←", -160., 0.),
+                                ("rdp-pan-right", "→", 160., 0.),
+                                ("rdp-pan-up", "↑", 0., -160.),
+                                ("rdp-pan-down", "↓", 0., 160.),
+                            ]
+                            .into_iter()
+                            .map(|(id, label, x, y)| {
+                                action(id, label).on_click(
+                                    cx.listener(move |this, _, _, cx| this.pan_desktop(x, y, cx)),
+                                )
+                            }),
+                        ),
+                    );
+                }
+            }
             root = root.child(div().flex_1().min_h_0().child(self.desktop.clone()));
         }
         if let Some(notice) = &self.notice {

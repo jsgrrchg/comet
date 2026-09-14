@@ -10,3 +10,5 @@ mod tls;
 pub use session::connect;
 
 mod input;
+
+mod resize;

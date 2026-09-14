@@ -11,7 +11,13 @@ use ironrdp::{
     session::{ActiveStageBuilder, ActiveStageOutput, image::DecodedImage},
 };
 use ironrdp_tokio::{FramedWrite, NetworkClient, TokioFramed};
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 use tokio::{
     net::{TcpStream, lookup_host},
     time::{Duration, timeout},
@@ -160,6 +166,14 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
         .local_addr()
         .map_err(|e| error(ErrorStage::Network, e))?;
     let mut connector = connector::ClientConnector::new(connector_config(&config), local);
+    let server_area = Arc::new(AtomicU64::new(0));
+    let area = server_area.clone();
+    connector.attach_static_channel(ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
+        ironrdp::displaycontrol::client::DisplayControlClient::new(move |caps| {
+            area.store(caps.max_monitor_area(), Ordering::Relaxed);
+            Ok(Vec::new())
+        }),
+    ));
     let mut framed = TokioFramed::new(stream);
     let upgrade = limited(
         config.timeout,
@@ -225,6 +239,7 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
         result.desktop_size.width,
         result.desktop_size.height,
     );
+    let activation_factory = result.activation_factory;
     let mut active = ActiveStageBuilder {
         static_channels: result.static_channels,
         user_channel_id: result.user_channel_id,
@@ -243,6 +258,7 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
     let mut tick = tokio::time::interval(Duration::from_millis(34));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut input = crate::input::InputState::default();
+    let mut resize = crate::resize::ResizeDebounce::default();
     let mut last_pointer = None;
     let mut visible = true;
     loop {
@@ -258,13 +274,21 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
                 send_input(&mut active, &mut image, &mut framed, &events).await?;
             }
             _ = tick.tick() => {
+                let area=server_area.load(Ordering::Relaxed);
+                if area>0 && !channels.snapshots.borrow().capabilities.resize {channels.snapshots.send_modify(|s|s.capabilities.resize=true);}
+                if let Some((width,height))=resize.take_ready(Instant::now(),area,(image.width(),image.height())) {
+                    if let Some(Ok(bytes))=active.encode_resize(width.into(),height.into(),None,None) {
+                        limited(Duration::from_secs(2),ErrorStage::Network,framed.write_all(&bytes)).await?;
+                    }
+                }
                 if let Some(frame) = publisher.publish(&image, channels.presentation.borrow().visible, Instant::now())? {
-                    channels.snapshots.send_modify(|s| s.frame = Some(frame));
+                    channels.snapshots.send_modify(|s| {s.frame = Some(frame);s.reactivating=false;});
                 }
             }
             changed = channels.presentation.changed() => {
                 if changed.is_err() { return Ok(()); }
                 let presentation = channels.presentation.borrow_and_update().clone();
+                resize.update(presentation.resize,presentation.visible,Instant::now());
                 if visible != presentation.visible {
                     visible = presentation.visible;
                     if visible { publisher.mark_dirty(); }
@@ -289,7 +313,29 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
                             channels.snapshots.send_modify(|s| s.cursor = cursor);
                         }
                         ActiveStageOutput::Terminate(_) => return Ok(()),
-                        ActiveStageOutput::DeactivateAll => return Err(error(ErrorStage::Protocol, "Server requested reactivation")),
+                        ActiveStageOutput::DeactivateAll => {
+                            send_input(&mut active,&mut image,&mut framed,&input.release()).await?;
+                            channels.snapshots.send_modify(|s|{s.frame=None;s.reactivating=true;});
+                            let mut sequence=activation_factory.create();
+                            let mut buf=ironrdp::core::WriteBuf::new();
+                            let (desktop_size,share_id,enable_server_pointer)=limited(config.timeout,ErrorStage::Protocol,async {
+                                loop {
+                                    ironrdp_tokio::single_sequence_step(&mut framed,&mut sequence,&mut buf).await?;
+                                    if let connector::connection_activation::ConnectionActivationState::Finalized {desktop_size,share_id,enable_server_pointer,..}=sequence.connection_activation_state() {
+                                        break Ok::<_,connector::ConnectorError>((desktop_size,share_id,enable_server_pointer));
+                                    }
+                                }
+                            }).await?;
+                            validate_size(desktop_size.width,desktop_size.height)?;
+                            image=DecodedImage::new(ironrdp::graphics::image_processing::PixelFormat::BgrA32,desktop_size.width,desktop_size.height);
+                            active.set_share_id(share_id);active.set_enable_server_pointer(enable_server_pointer);
+                            active.set_fastpath_processor(ironrdp::session::fast_path::ProcessorBuilder {
+                                io_channel_id:activation_factory.io_channel_id(),user_channel_id:activation_factory.user_channel_id(),share_id,
+                                enable_server_pointer,pointer_software_rendering:false,bulk_decompressor:None,
+                            }.build());
+                            publisher.mark_dirty();
+
+                        }
                         _ => {},
                     }
                 }

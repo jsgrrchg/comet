@@ -32,6 +32,8 @@ pub struct RemoteDesktopSurface {
     cleanup_task: Option<Task<()>>,
     _input_subscription: Subscription,
     visible: bool,
+    resize_paused: bool,
+    geometry: Option<(u16, u16)>,
     closed: bool,
 }
 impl RemoteDesktopSurface {
@@ -46,6 +48,10 @@ impl RemoteDesktopSurface {
                     if let Some(handle) = &this.session {
                         handle.move_pointer(*x, *y);
                     }
+                }
+                DesktopEvent::Geometry(w, h) => {
+                    this.geometry = Some((*w, *h));
+                    this.request_resize();
                 }
                 DesktopEvent::Release => {
                     if let Some(handle) = &this.session {
@@ -69,6 +75,8 @@ impl RemoteDesktopSurface {
             cleanup_task: None,
             _input_subscription: input_subscription,
             visible: true,
+            resize_paused: false,
+            geometry: None,
             closed: false,
         }
     }
@@ -259,7 +267,10 @@ impl RemoteDesktopSurface {
         }
         let connected = snapshot.state == SessionState::Connected;
         self.desktop.update(cx, |desktop, cx| {
-            desktop.enabled = connected && self.visible;
+            desktop.enabled = connected && self.visible && !snapshot.reactivating;
+            if snapshot.reactivating {
+                desktop.clear(window, cx);
+            }
             if self.visible {
                 if let Some(frame) = &snapshot.frame {
                     desktop.update_frame(frame, window, cx);
@@ -275,6 +286,7 @@ impl RemoteDesktopSurface {
         // GPUI's visible image and state, avoiding another retained full frame.
         snapshot.frame = None;
         self.snapshot = snapshot;
+        self.request_resize();
         cx.emit(SurfaceEvent::Changed);
         cx.notify();
     }
@@ -327,6 +339,47 @@ impl RemoteDesktopSurface {
         });
         cx.notify();
     }
+    pub fn set_resize_paused(&mut self, paused: bool) {
+        if self.resize_paused != paused {
+            self.resize_paused = paused;
+            self.request_resize();
+        }
+    }
+    fn request_resize(&self) {
+        if let Some(handle) = &self.session {
+            if self.visible
+                && !self.resize_paused
+                && self.profile.as_ref().is_some_and(|p| p.resize_remote)
+            {
+                if let Some((width, height)) = self.geometry {
+                    let _ = handle.resize(width, height);
+                }
+            } else {
+                handle.clear_resize();
+            }
+        }
+    }
+    pub(super) fn toggle_resize(&mut self, cx: &mut Context<Self>) {
+        if let Some(profile) = &mut self.profile {
+            profile.resize_remote = !profile.resize_remote;
+            let id = profile.id;
+            let value = profile.resize_remote;
+            settings::update(SavePolicy::Immediate, cx, |s| {
+                if let Some(p) = s.remote_desktop_profiles.iter_mut().find(|p| p.id == id) {
+                    p.resize_remote = value;
+                }
+            });
+        }
+        self.request_resize();
+        cx.notify();
+    }
+    pub(super) fn pan_desktop(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.desktop.update(cx, |d, cx| {
+            d.pan = ((d.pan.0 + x).max(0.), (d.pan.1 + y).max(0.));
+            cx.notify();
+        });
+    }
+
     pub(super) fn toggle_view(&mut self, cx: &mut Context<Self>) {
         self.desktop.update(cx, |d, cx| {
             d.mode = if d.mode == ViewMode::Fit {

@@ -9662,11 +9662,12 @@ impl Render for Shell {
             });
         }
 
+        let resize_paused=self.tween_active(self.right_tween) || cx.has_active_drag();
         for (id, view) in &self.remote_desktops {
             let visible = browser_active
                 && selected_surface == RightSurface::RemoteDesktop(*id)
                 && window.is_window_active();
-            view.update(cx, |view, cx| view.set_visible(visible, window, cx));
+            view.update(cx, |view, cx| {view.set_resize_paused(resize_paused);view.set_visible(visible, window, cx);});
         }
 
         // Fullscreen hides the macOS traffic lights — reflow the control

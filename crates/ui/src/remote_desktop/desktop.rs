@@ -76,6 +76,7 @@ pub struct Desktop {
     pub(super) remote_cursor: RemoteCursor,
     pub(super) frame_key: Option<(u64, u64)>,
     pub(super) dimensions: (u16, u16),
+    last_geometry: Option<(u16, u16)>,
     pub(super) bounds: Bounds<Pixels>,
     pub(super) transform: Transform,
     pub mode: ViewMode,
@@ -108,6 +109,7 @@ impl Desktop {
             remote_cursor: RemoteCursor::Default,
             frame_key: None,
             dimensions: (0, 0),
+            last_geometry: None,
             bounds: Bounds::default(),
             transform: Transform::default(),
             mode: ViewMode::Fit,
@@ -203,6 +205,16 @@ impl Desktop {
         {
             super::cursor::hide(cx);
         }
+        let geometry = (
+            (f32::from(bounds.size.width) * window.scale_factor()).round() as u16,
+            (f32::from(bounds.size.height) * window.scale_factor()).round() as u16,
+        );
+        if self.last_geometry != Some(geometry)
+            && zeron_rdp::validate_size(geometry.0, geometry.1).is_ok()
+        {
+            self.last_geometry = Some(geometry);
+            cx.emit(super::input::DesktopEvent::Geometry(geometry.0, geometry.1));
+        }
         self.bounds = bounds;
         self.transform = Transform::new(
             (bounds.size.width.into(), bounds.size.height.into()),
@@ -269,7 +281,12 @@ impl Render for Desktop {
             .on_key_up(cx.listener(Self::key_up))
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
             .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_hover(cx.listener(|this,hovered,_,cx|{ if !hovered {this.pointer=None;cx.notify();} }))
+            .on_hover(cx.listener(|this, hovered, _, cx| {
+                if !hovered {
+                    this.pointer = None;
+                    cx.notify();
+                }
+            }))
             .on_scroll_wheel(cx.listener(Self::scroll))
             .size_full()
             .min_h_0()

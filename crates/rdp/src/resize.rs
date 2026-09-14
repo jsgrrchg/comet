@@ -13,6 +13,9 @@ impl ResizeDebounce {
         let candidate = size
             .filter(|(w, h)| visible && validate_size(*w, *h).is_ok())
             .map(|(w, h)| (w & !1, h));
+        if candidate.is_none() {
+            self.sent = None;
+        }
         if self.candidate != candidate {
             self.candidate = candidate;
             self.since = candidate.map(|_| now);

@@ -119,9 +119,18 @@ impl RemoteDesktopSurface {
         if self.closed || self.snapshot.state.is_running() {
             return;
         }
-        let Some(profile) = self.profile.clone() else {
+        let Some(id) = self.profile_id() else { return };
+        let Some(profile) = settings::current(cx)
+            .remote_desktop_profiles
+            .into_iter()
+            .find(|p| p.id == id)
+        else {
+            self.notice =
+                Some("This connection was deleted. Choose another saved connection".into());
+            cx.notify();
             return;
         };
+        self.profile = Some(profile.clone());
         if let Err(e) = profile.validate() {
             self.notice = Some(e);
             cx.notify();
@@ -165,6 +174,18 @@ impl RemoteDesktopSurface {
                 if this.closed || this.generation != generation {
                     return;
                 }
+                if !settings::current(cx)
+                    .remote_desktop_profiles
+                    .iter()
+                    .any(|p| p.id == profile.id && p.same_identity(&profile) && p.remember_password)
+                {
+                    this.snapshot.state = SessionState::Idle;
+                    this.notice = Some(
+                        "Connection settings changed. Reconnect to use the current settings".into(),
+                    );
+                    cx.notify();
+                    return;
+                }
                 match result {
                     Ok(Some((account, bytes))) if key.matches(&account) => {
                         match String::from_utf8(bytes) {
@@ -206,6 +227,7 @@ impl RemoteDesktopSurface {
             host: profile.host.clone(),
             port: profile.port,
             username: profile.username.clone(),
+            keyboard_layout: profile.keyboard_layout,
             domain: profile.domain.clone(),
             password: Password::new(password),
             width: profile.desktop_width,
@@ -347,6 +369,20 @@ impl RemoteDesktopSurface {
             .update(cx, |p, cx| p.set_value("", window, cx));
         cx.notify();
     }
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
+        self.generation = self.generation.wrapping_add(1);
+        self.session = None;
+        self.observer = None;
+        self.credentials_task = None;
+        self.pending_clipboard = None;
+        self.desktop.update(cx, |desktop, cx| {
+            desktop.enabled = false;
+            desktop.release_input(cx);
+        });
+        self.snapshot = Snapshot::new(self.generation);
+        self.snapshot.state = SessionState::Disconnected;
+        cx.notify();
+    }
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.disconnect(window, cx);
         self.closed = true;
@@ -363,7 +399,9 @@ impl RemoteDesktopSurface {
             handle.set_visible(visible);
         }
         self.desktop.update(cx, |d, cx| {
-            d.enabled = visible && self.snapshot.state == SessionState::Connected;
+            d.enabled = visible
+                && self.snapshot.state == SessionState::Connected
+                && !self.snapshot.reactivating;
             if !visible {
                 d.release_capture(window, cx);
                 d.clear(window, cx);
@@ -443,7 +481,14 @@ impl RemoteDesktopSurface {
     }
     pub(super) fn pan_desktop(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         self.desktop.update(cx, |d, cx| {
-            d.pan = ((d.pan.0 + x).max(0.), (d.pan.1 + y).max(0.));
+            let scale = d.transform.scale.max(f32::EPSILON);
+            let max_x = (d.transform.width as f32 - f32::from(d.bounds.size.width) / scale).max(0.);
+            let max_y =
+                (d.transform.height as f32 - f32::from(d.bounds.size.height) / scale).max(0.);
+            d.pan = (
+                (d.pan.0 + x).clamp(0., max_x),
+                (d.pan.1 + y).clamp(0., max_y),
+            );
             cx.notify();
         });
     }
@@ -518,8 +563,13 @@ impl RemoteDesktopSurface {
             {
                 let write = key.write(password.as_bytes(), cx);
                 // Keep save completion separate from the cancellable connection lookup.
+                let timer = cx.background_executor().timer(Duration::from_secs(10));
                 cx.spawn_in(window,async move |this,cx|{
-                    if write.await.is_err(){let _=this.update_in(cx,|this,_,cx|{this.notice=Some("Connection saved, but the system keyring could not save its password".into());cx.notify();});}
+                    let failed=match futures::future::select(write,timer).await {
+                        futures::future::Either::Left((result,_))=>result.is_err(),
+                        futures::future::Either::Right(_)=>true,
+                    };
+                    if failed{let _=this.update_in(cx,|this,_,cx|{this.notice=Some("Connection saved, but the system keyring could not confirm its password. You can use a temporary password".into());cx.notify();});}
                 }).detach();
             } else {
                 self.notice=Some("Connection saved. Remove the previous keyring entry before remembering a new password".into());
@@ -561,9 +611,16 @@ impl RemoteDesktopSurface {
             })
             .collect();
         self.cleanup_task=Some(cx.spawn_in(window,async move |this,cx| {
-            for (service,task) in operations {
-                let result=task.await;
-                let _=this.update_in(cx,|this,_,cx|{if result.is_ok(){credentials::finish_delete(&service,cx);}else{this.notice=Some("Could not remove a password from the system keyring. Use Retry removing saved credentials".into());}cx.notify();});
+            for (_,task) in operations {
+                let timer=cx.background_executor().timer(Duration::from_secs(10));
+                let result=match futures::future::select(task,timer).await {
+                    futures::future::Either::Left((result,_))=>result,
+                    futures::future::Either::Right((_,task))=>{
+                        let _=this.update_in(cx,|this,_,cx|{this.notice=Some("System keyring did not respond. Password cleanup remains pending".into());cx.notify();});
+                        task.await
+                    }
+                };
+                if result.is_err(){let _=this.update_in(cx,|this,_,cx|{this.notice=Some("Could not remove a password from the system keyring. Use Retry removing saved credentials".into());cx.notify();});}
             }
         }));
     }

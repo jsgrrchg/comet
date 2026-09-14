@@ -3508,6 +3508,8 @@ impl Shell {
         self.settings.terminal_font_size = current.terminal_font_size;
         self.settings.code_font_family = current.code_font_family;
         self.settings.code_font_size = current.code_font_size;
+        self.settings.remote_desktop_profiles = current.remote_desktop_profiles;
+        self.settings.remote_desktop_credential_cleanup = current.remote_desktop_credential_cleanup;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -11315,6 +11317,11 @@ mod exit_regressions {
                         settings.terminal_font_size = terminal_size;
                         settings.code_font_family = code_family.clone();
                         settings.code_font_size = code_size;
+                        settings.remote_desktop_profiles =
+                            vec![crate::remote_desktop::profiles::Profile {
+                                name: format!("Desktop {index}"),
+                                ..Default::default()
+                            }];
                     });
                     for step in 0..3 {
                         shell.settings.sidebar_width = 290.0 + step as f32;
@@ -11337,6 +11344,10 @@ mod exit_regressions {
                     assert_eq!(loaded.terminal_font_size, terminal_size);
                     assert_eq!(loaded.code_font_family, code_family);
                     assert_eq!(loaded.code_font_size, code_size);
+                    assert_eq!(
+                        loaded.remote_desktop_profiles[0].name,
+                        format!("Desktop {index}")
+                    );
                     assert_eq!(loaded.sidebar_width, 292.0);
                     assert_eq!(loaded.right_pane_width, 542.0);
                     assert_eq!(loaded.terminal_height, 302.0);

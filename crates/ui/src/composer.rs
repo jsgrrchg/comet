@@ -7712,7 +7712,7 @@ impl Render for Composer {
         } else {
             theme.border
         };
-        // Let the backdrop blur supply the glass surface without a color wash.
+        // Compensate for the transcript canvas beneath the frosted surface.
         // Keep the opaque fallback when frost is disabled or unsupported.
         let pill = div()
             .on_mouse_down(
@@ -7728,6 +7728,7 @@ impl Render for Composer {
             .rounded(px(surface_radius))
             .border_1()
             .border_color(pill_border)
+            .when(theme.is_frost(), |el| el.bg(theme.composer_sidebar_tint()))
             .when(!theme.is_frost(), |el| {
                 el.bg(theme.input_glass_bg()).shadow_lg()
             });

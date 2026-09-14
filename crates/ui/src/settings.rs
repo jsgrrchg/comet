@@ -499,6 +499,9 @@ pub enum SidebarSort {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    pub remote_desktop_profiles: Vec<crate::remote_desktop::profiles::Profile>,
+    /// Retryable keyring deletions; contains identifiers, never passwords.
+    pub remote_desktop_credential_cleanup: Vec<String>,
     /// Submit using Enter or the platform modifier plus Enter.
     pub composer_send_behavior: ComposerSendBehavior,
     pub sidebar_width: f32,
@@ -632,6 +635,8 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            remote_desktop_profiles: Vec::new(),
+            remote_desktop_credential_cleanup: Vec::new(),
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
             sidebar_grouped: false,
@@ -1250,7 +1255,12 @@ impl UiSettings {
                     }
                     serde_json::from_value::<UiSettings>(value)
                 }) {
-                    Ok(settings) => settings.migrated().clamped(),
+                    Ok(mut settings) => {
+                        crate::remote_desktop::profiles::repair_duplicate_ids(
+                            &mut settings.remote_desktop_profiles,
+                        );
+                        settings.migrated().clamped()
+                    }
                     Err(err) => {
                         tracing::warn!(error = %err, "ui-settings corrupt; using defaults");
                         Self::default()

@@ -46,6 +46,7 @@ pub mod pickers;
 pub mod popover;
 pub mod queue;
 pub mod rail;
+pub mod remote_desktop;
 pub mod settings;
 pub mod shell;
 pub mod sound;

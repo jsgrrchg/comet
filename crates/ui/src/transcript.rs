@@ -969,6 +969,12 @@ pub fn diff_to_file(diff: &zeron_proto::ToolDiff) -> crate::changes::FileDiff {
 
 #[derive(Clone)]
 pub enum RowKind {
+    GeneratedImage {
+        owner: String,
+        path: String,
+        name: String,
+        mime_type: String,
+    },
     User {
         /// Visible prompt (attachment-ref trailer already stripped). When the
         /// prompt carries file mentions this is the *projected* display text —
@@ -1419,6 +1425,30 @@ pub fn rows_for_entry(
                                 },
                             });
                         }
+                    }
+                    MessagePart::Image {
+                        id: part_id,
+                        path,
+                        name,
+                        mime_type,
+                    } => {
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(
+                                format!("{}\0{path}\0{name}\0{mime_type}", entry.device_id)
+                                    .as_bytes(),
+                            ),
+                            turn_start: false,
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            kind: RowKind::GeneratedImage {
+                                owner: entry.device_id.clone(),
+                                path: path.clone(),
+                                name: name.clone(),
+                                mime_type: mime_type.clone(),
+                            },
+                        });
                     }
                     MessagePart::Input {
                         id: part_id,
@@ -5565,6 +5595,9 @@ impl Transcript {
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
+            RowKind::GeneratedImage { .. } => {
+                error_chip("Generated image unavailable".into(), &theme)
+            }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
         };
 
@@ -8590,6 +8623,36 @@ mod tests {
             id: id.into(),
             text: text.into(),
         }
+    }
+
+    #[test]
+    fn generated_image_builds_one_row_outside_tools_and_copy() {
+        let image = MessagePart::Image {
+            id: "i:image".into(),
+            path: "/uploads/i.png".into(),
+            name: "generated.png".into(),
+            mime_type: "image/png".into(),
+        };
+        let entry = assistant("a", MessageStatus::Complete, vec![image.clone()]);
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].turn_start);
+        assert!(rows[0].copy_text.is_none());
+        assert!(matches!(&rows[0].kind, RowKind::GeneratedImage { owner, .. } if owner == "dev"));
+        let entry = assistant(
+            "a",
+            MessageStatus::Complete,
+            vec![
+                text_part("t", "before"),
+                tool_part("i", "generate"),
+                image,
+                text_part("t2", "after"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        assert_eq!(rows.len(), 4);
+        assert!(matches!(rows[1].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(rows[2].kind, RowKind::GeneratedImage { .. }));
     }
 
     #[test]

@@ -196,6 +196,13 @@ impl Desktop {
                 cx,
             );
         }
+        if self.enabled
+            && bounds.contains(&window.mouse_position())
+            && self.pointer.is_some()
+            && !matches!(self.remote_cursor, RemoteCursor::Default)
+        {
+            super::cursor::hide(cx);
+        }
         self.bounds = bounds;
         self.transform = Transform::new(
             (bounds.size.width.into(), bounds.size.height.into()),
@@ -262,6 +269,7 @@ impl Render for Desktop {
             .on_key_up(cx.listener(Self::key_up))
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
             .on_mouse_move(cx.listener(Self::mouse_move))
+            .on_hover(cx.listener(|this,hovered,_,cx|{ if !hovered {this.pointer=None;cx.notify();} }))
             .on_scroll_wheel(cx.listener(Self::scroll))
             .size_full()
             .min_h_0()

@@ -276,6 +276,12 @@ impl Desktop {
         cx: &mut Context<Self>,
     ) {
         let next = self.position(e.position, !self.buttons.is_empty());
+        if self.enabled
+            && next.is_some()
+            && !matches!(self.remote_cursor, zeron_rdp::RemoteCursor::Default)
+        {
+            super::cursor::hide(cx);
+        }
         if self.pointer != next {
             self.pointer = next;
             cx.notify();

@@ -319,13 +319,13 @@ impl RemoteDesktopSurface {
                         .child("Verify the remote server certificate")
                         .child(challenge.endpoint.clone())
                         .child(challenge.reason.clone())
-                        .child(format!("SHA-256: {}", challenge.sha256))
-                        .children(
-                            challenge
-                                .previous_sha256
-                                .as_ref()
-                                .map(|old| div().child(format!("Previous SHA-256: {old}"))),
-                        )
+                        .child(format!(
+                            "SHA-256: {}",
+                            display_fingerprint(&challenge.sha256)
+                        ))
+                        .children(challenge.previous_sha256.as_ref().map(|old| {
+                            div().child(format!("Previous SHA-256: {}", display_fingerprint(old)))
+                        }))
                         .child(
                             div().flex().flex_wrap().gap(px(8.)).children(
                                 [
@@ -476,4 +476,14 @@ pub(super) fn action(id: impl Into<ElementId>, label: impl Into<SharedString>) -
         .cursor_pointer()
         .hover(|s| s.bg(crate::theme::ink(0.08)))
         .child(label.into())
+}
+
+fn display_fingerprint(value: &str) -> String {
+    value
+        .chars()
+        .collect::<Vec<_>>()
+        .chunks(8)
+        .map(|part| part.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
 }

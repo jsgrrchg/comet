@@ -116,7 +116,9 @@ pub(crate) fn connector_config(config: &ConnectConfig) -> connector::Config {
             height: config.height,
         },
         bitmap: None,
-        client_build: 0,
+        // xrdp treats build <=419 as a legacy client and silently skips the
+        // reactivation sequence, even after advertising Display Control.
+        client_build: 6000,
         client_name: "Zeron".into(),
         client_dir: String::new(),
         platform: if cfg!(target_os = "macos") {
@@ -383,7 +385,9 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
             packet = framed.read_pdu() => {
                 let (action, packet) = packet.map_err(|e| error(ErrorStage::Session, e))?;
                 pdus+=1;bytes_received+=packet.len() as u64;
-                let outputs = active.process(&mut image, action, &packet).map_err(|e| error(ErrorStage::Protocol, e))?;
+                let outputs = if crate::resize::short_deactivation(action,&packet,activation_factory.io_channel_id()) {
+                    vec![ActiveStageOutput::DeactivateAll]
+                } else {active.process(&mut image, action, &packet).map_err(|e| error(ErrorStage::Protocol,e))?};
                 for output in outputs {
                     match output {
                         ActiveStageOutput::ResponseFrame(bytes) => { if !bytes.is_empty() { limited(Duration::from_secs(5), ErrorStage::Network, framed.write_all(&bytes)).await?; } }

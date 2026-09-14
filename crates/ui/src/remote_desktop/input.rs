@@ -309,6 +309,9 @@ impl Desktop {
     }
 }
 impl EntityInputHandler for Desktop {
+    fn accepts_text_input(&self, window: &mut Window, _: &mut Context<Self>) -> bool {
+        self.enabled && self.focus.is_focused(window)
+    }
     fn text_for_range(
         &mut self,
         range: Range<usize>,
@@ -316,8 +319,11 @@ impl EntityInputHandler for Desktop {
         _: &mut Window,
         _: &mut Context<Self>,
     ) -> Option<String> {
-        *actual = Some(range);
-        Some(self.composition.clone())
+        let utf16: Vec<_> = self.composition.encode_utf16().collect();
+        let start = range.start.min(utf16.len());
+        let end = range.end.min(utf16.len()).max(start);
+        *actual = Some(start..end);
+        Some(String::from_utf16_lossy(&utf16[start..end]))
     }
     fn selected_text_range(
         &mut self,
@@ -437,5 +443,126 @@ mod tests {
         });
         cx.simulate_input(window.into(), "ñá");
         assert_eq!(events.borrow().concat(), "ñá");
+    }
+}
+
+/// Native IME handlers may outlive the last rendered frame on window closure.
+/// Retain only a weak view, upgrading for a single callback, so a focused
+/// desktop and its image cannot survive the owning surface/window.
+pub(super) struct WeakInputHandler {
+    pub view: WeakEntity<Desktop>,
+    pub bounds: Bounds<Pixels>,
+}
+impl WeakInputHandler {
+    fn handler(&self) -> Option<ElementInputHandler<Desktop>> {
+        Some(ElementInputHandler::new(self.bounds, self.view.upgrade()?))
+    }
+}
+impl InputHandler for WeakInputHandler {
+    fn selected_text_range(
+        &mut self,
+        ignore: bool,
+        w: &mut Window,
+        cx: &mut App,
+    ) -> Option<UTF16Selection> {
+        self.handler()?.selected_text_range(ignore, w, cx)
+    }
+    fn marked_text_range(&mut self, w: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        self.handler()?.marked_text_range(w, cx)
+    }
+    fn text_for_range(
+        &mut self,
+        r: Range<usize>,
+        actual: &mut Option<Range<usize>>,
+        w: &mut Window,
+        cx: &mut App,
+    ) -> Option<String> {
+        self.handler()?.text_for_range(r, actual, w, cx)
+    }
+    fn replace_text_in_range(
+        &mut self,
+        r: Option<Range<usize>>,
+        text: &str,
+        w: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(mut h) = self.handler() {
+            h.replace_text_in_range(r, text, w, cx);
+        }
+    }
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        r: Option<Range<usize>>,
+        text: &str,
+        selected: Option<Range<usize>>,
+        w: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(mut h) = self.handler() {
+            h.replace_and_mark_text_in_range(r, text, selected, w, cx);
+        }
+    }
+    fn unmark_text(&mut self, w: &mut Window, cx: &mut App) {
+        if let Some(mut h) = self.handler() {
+            h.unmark_text(w, cx);
+        }
+    }
+    fn bounds_for_range(
+        &mut self,
+        r: Range<usize>,
+        w: &mut Window,
+        cx: &mut App,
+    ) -> Option<Bounds<Pixels>> {
+        self.handler()?.bounds_for_range(r, w, cx)
+    }
+    fn character_index_for_point(
+        &mut self,
+        p: Point<Pixels>,
+        w: &mut Window,
+        cx: &mut App,
+    ) -> Option<usize> {
+        self.handler()?.character_index_for_point(p, w, cx)
+    }
+    fn set_selected_text_range(&mut self, r: Range<usize>, w: &mut Window, cx: &mut App) {
+        if let Some(mut h) = self.handler() {
+            h.set_selected_text_range(r, w, cx);
+        }
+    }
+    fn element_bounds(&mut self, w: &mut Window, cx: &mut App) -> Option<Bounds<Pixels>> {
+        self.handler()?.element_bounds(w, cx)
+    }
+    fn text_length_utf16(&mut self, w: &mut Window, cx: &mut App) -> Option<usize> {
+        self.handler()?.text_length_utf16(w, cx)
+    }
+    fn accepts_text_input(&mut self, w: &mut Window, cx: &mut App) -> bool {
+        self.handler()
+            .is_some_and(|mut h| h.accepts_text_input(w, cx))
+    }
+    fn prefers_ime_for_printable_keys(&mut self, w: &mut Window, cx: &mut App) -> bool {
+        self.accepts_text_input(w, cx)
+    }
+}
+
+#[cfg(test)]
+mod native_lifetime_tests {
+    use super::{Desktop, WeakInputHandler};
+    use gpui::{Bounds, TestAppContext};
+    #[gpui::test]
+    fn remote_desktop_native_input_handler_does_not_retain_a_closed_window(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|w, cx| Desktop::new(w, cx));
+        let handler = window
+            .update(cx, |_, w, cx| {
+                let h = WeakInputHandler {
+                    view: cx.entity().downgrade(),
+                    bounds: Bounds::default(),
+                };
+                w.remove_window();
+                h
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(handler.handler().is_none());
     }
 }

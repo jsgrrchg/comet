@@ -12,3 +12,5 @@ pub use session::connect;
 mod input;
 
 mod resize;
+
+pub mod clipboard;

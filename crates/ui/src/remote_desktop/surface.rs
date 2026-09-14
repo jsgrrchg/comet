@@ -34,6 +34,8 @@ pub struct RemoteDesktopSurface {
     visible: bool,
     resize_paused: bool,
     geometry: Option<(u16, u16)>,
+    clipboard_seq: u64,
+    pending_clipboard: Option<(u64, Option<FocusHandle>)>,
     closed: bool,
 }
 impl RemoteDesktopSurface {
@@ -54,6 +56,7 @@ impl RemoteDesktopSurface {
                     this.request_resize();
                 }
                 DesktopEvent::Release => {
+                    this.pending_clipboard = None;
                     if let Some(handle) = &this.session {
                         let _ = handle.send(Command::ReleaseAll);
                     }
@@ -77,6 +80,8 @@ impl RemoteDesktopSurface {
             visible: true,
             resize_paused: false,
             geometry: None,
+            clipboard_seq: 0,
+            pending_clipboard: None,
             closed: false,
         }
     }
@@ -265,6 +270,29 @@ impl RemoteDesktopSurface {
                 }
             });
         }
+        if let Some((id, result)) = &snapshot.clipboard {
+            if *id == 0 {
+                if let Err(e) = result {
+                    self.notice = Some(e.to_string());
+                }
+            } else if self
+                .pending_clipboard
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == id)
+            {
+                let (_, focus) = self.pending_clipboard.take().unwrap();
+                if self.visible && window.is_window_active() && window.focused(cx) == focus {
+                    match result {
+                        Ok(text) => {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
+                            self.notice = Some("Remote text copied to your clipboard".into());
+                        }
+                        Err(e) => self.notice = Some(e.to_string()),
+                    }
+                }
+            }
+        }
+        snapshot.clipboard = None;
         let connected = snapshot.state == SessionState::Connected;
         self.desktop.update(cx, |desktop, cx| {
             desktop.enabled = connected && self.visible && !snapshot.reactivating;
@@ -308,6 +336,7 @@ impl RemoteDesktopSurface {
             let _ = handle.send(Command::ReleaseAll);
             handle.disconnect();
         }
+        self.pending_clipboard = None;
         self.generation = self.generation.wrapping_add(1);
         self.session = None;
         self.observer = None;
@@ -327,6 +356,9 @@ impl RemoteDesktopSurface {
             return;
         }
         self.visible = visible;
+        if !visible {
+            self.pending_clipboard = None;
+        }
         if let Some(handle) = &self.session {
             handle.set_visible(visible);
         }
@@ -359,6 +391,42 @@ impl RemoteDesktopSurface {
             }
         }
     }
+    pub(super) fn send_clipboard(&mut self, cx: &mut Context<Self>) {
+        if !self.visible || !self.snapshot.capabilities.clipboard_text {
+            self.notice = Some("Remote clipboard channel is unavailable".into());
+            cx.notify();
+            return;
+        }
+        match cx.read_from_clipboard().and_then(|item| item.text()) {
+            Some(text) => {
+                match zeron_rdp::clipboard::normalize_send(&text) {
+                    Ok(_) => {
+                        self.send(Command::SendClipboard(text), cx);
+                        self.notice=Some("Clipboard text offered to the remote desktop. Paste it there to use it".into());
+                    }
+                    Err(e) => self.notice = Some(e.to_string()),
+                }
+            }
+            None => self.notice = Some("Your clipboard does not contain text".into()),
+        }
+        cx.notify();
+    }
+    pub(super) fn copy_remote_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.visible || !self.snapshot.capabilities.clipboard_text {
+            self.notice = Some("Remote clipboard channel is unavailable".into());
+            cx.notify();
+            return;
+        }
+        if self.pending_clipboard.is_some() {
+            return;
+        }
+        self.clipboard_seq = self.clipboard_seq.wrapping_add(1).max(1);
+        self.pending_clipboard = Some((self.clipboard_seq, window.focused(cx)));
+        self.send(Command::RequestClipboard(self.clipboard_seq), cx);
+        self.notice = Some("Requesting remote clipboard text…".into());
+        cx.notify();
+    }
+
     pub(super) fn toggle_resize(&mut self, cx: &mut Context<Self>) {
         if let Some(profile) = &mut self.profile {
             profile.resize_remote = !profile.resize_remote;
@@ -503,5 +571,47 @@ impl RemoteDesktopSurface {
 impl Render for RemoteDesktopSurface {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.render_content(window, cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RemoteDesktopSurface, SessionState, Snapshot};
+    use gpui::{ClipboardItem, TestAppContext};
+    #[gpui::test]
+    fn remote_desktop_clipboard_discards_old_generation_hidden_and_focus_changed(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(crate::theme::Theme::default());
+            cx.write_to_clipboard(ClipboardItem::new_string("keep local".into()));
+        });
+        let window = cx.add_window(|w, cx| RemoteDesktopSurface::new(std::env::temp_dir(), w, cx));
+        window
+            .update(cx, |view, w, cx| {
+                view.generation = 2;
+                for (generation, visible, change_focus) in
+                    [(1, true, false), (2, false, false), (2, true, true)]
+                {
+                    view.visible = visible;
+                    view.pending_clipboard = Some((7, w.focused(cx)));
+                    let mut snapshot = Snapshot::new(generation);
+                    snapshot.state = SessionState::Connected;
+                    snapshot.clipboard = Some((7, Ok("remote text".into())));
+                    let focus = cx.focus_handle();
+                    if change_focus {
+                        w.focus(&focus, cx);
+                    }
+                    view.apply_snapshot(snapshot, w, cx);
+                    assert_eq!(
+                        cx.read_from_clipboard()
+                            .and_then(|item| item.text())
+                            .as_deref(),
+                        Some("keep local")
+                    );
+                }
+            })
+            .unwrap();
     }
 }

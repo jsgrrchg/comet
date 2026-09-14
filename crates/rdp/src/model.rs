@@ -155,7 +155,7 @@ pub struct Snapshot {
     pub frame: Option<Arc<Frame>>,
     pub cursor: RemoteCursor,
     pub reactivating: bool,
-    pub clipboard: Option<(u64, Result<String, SessionError>)>,
+    pub clipboard: Option<(u64, Result<Arc<str>, SessionError>)>,
 }
 impl Snapshot {
     pub fn new(generation: u64) -> Self {

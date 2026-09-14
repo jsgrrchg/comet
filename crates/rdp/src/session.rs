@@ -129,7 +129,7 @@ pub(crate) fn connector_config(config: &ConnectConfig) -> connector::Config {
         enable_server_pointer: true,
         pointer_software_rendering: false,
         request_data: None,
-        autologon: false,
+        autologon: true,
         enable_audio_playback: false,
         compression_type: None,
         multitransport_flags: None,
@@ -166,6 +166,10 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
         .local_addr()
         .map_err(|e| error(ErrorStage::Network, e))?;
     let mut connector = connector::ClientConnector::new(connector_config(&config), local);
+    let clipboard = crate::clipboard::SharedClipboard::default();
+    connector.attach_static_channel(ironrdp::cliprdr::CliprdrClient::new(Box::new(
+        crate::clipboard::Backend(clipboard.clone()),
+    )));
     let server_area = Arc::new(AtomicU64::new(0));
     let area = server_area.clone();
     connector.attach_static_channel(ironrdp::dvc::DrdynvcClient::new().with_dynamic_channel(
@@ -262,12 +266,41 @@ async fn run(config: ConnectConfig, channels: &mut SessionChannels) -> Result<()
     let mut last_pointer = None;
     let mut visible = true;
     loop {
+        pump_clipboard(&clipboard, &mut active, &mut framed, channels).await?;
         tokio::select! {
             command = channels.commands.recv() => {
                 let events = match command {
                     Some(Command::Input(event)) => input.apply(event),
                     Some(Command::ReleaseAll) => input.release(),
                     Some(Command::CtrlAltDelete) => input.ctrl_alt_delete(),
+                    Some(Command::SendClipboard(text)) => {
+                        let offered=clipboard.lock().unwrap().offer(text);
+                        match offered {
+                            Ok(()) => {
+                                if let Some(channel)=active.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>() {
+                                    let messages=channel.initiate_copy(&[ironrdp::cliprdr::pdu::ClipboardFormat::new(ironrdp::cliprdr::pdu::ClipboardFormatId::CF_UNICODETEXT)]).map_err(|e|error(ErrorStage::Clipboard,e))?;
+                                    let bytes=active.process_svc_processor_messages(messages).map_err(|e|error(ErrorStage::Clipboard,e))?;
+                                    limited(Duration::from_secs(2),ErrorStage::Network,framed.write_all(&bytes)).await?;
+                                }
+                            }
+                            Err(e)=>channels.snapshots.send_modify(|s|s.clipboard=Some((0,Err(e)))),
+                        }
+                        Vec::new()
+                    }
+                    Some(Command::RequestClipboard(id)) => {
+                        let requested=clipboard.lock().unwrap().request(id);
+                        match requested {
+                            Ok(()) => {
+                                if let Some(channel)=active.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>() {
+                                    let messages=channel.initiate_paste(ironrdp::cliprdr::pdu::ClipboardFormatId::CF_UNICODETEXT).map_err(|e|error(ErrorStage::Clipboard,e))?;
+                                    let bytes=active.process_svc_processor_messages(messages).map_err(|e|error(ErrorStage::Clipboard,e))?;
+                                    limited(Duration::from_secs(2),ErrorStage::Network,framed.write_all(&bytes)).await?;
+                                }
+                            }
+                            Err(e)=>channels.snapshots.send_modify(|s|s.clipboard=Some((id,Err(e)))),
+                        }
+                        Vec::new()
+                    }
                     None => return Ok(()),
                     _ => Vec::new(),
                 };
@@ -364,6 +397,69 @@ async fn send_input(
                 .await?;
             }
         }
+    }
+    Ok(())
+}
+
+async fn pump_clipboard(
+    clipboard: &crate::clipboard::SharedClipboard,
+    active: &mut ironrdp::session::ActiveStage,
+    framed: &mut TokioFramed<tokio_rustls::client::TlsStream<TcpStream>>,
+    channels: &mut SessionChannels,
+) -> Result<(), SessionError> {
+    let (initialize, replies, completed, ready, failure) = {
+        let mut state = clipboard.lock().unwrap();
+        state.tick();
+        (
+            std::mem::take(&mut state.initialize),
+            state.replies(),
+            state.completed.take(),
+            state.ready,
+            state.failure.take(),
+        )
+    };
+    if ready && !channels.snapshots.borrow().capabilities.clipboard_text {
+        channels
+            .snapshots
+            .send_modify(|s| s.capabilities.clipboard_text = true);
+    }
+    if let Some(result) = completed {
+        channels
+            .snapshots
+            .send_modify(|s| s.clipboard = Some(result));
+    }
+    if let Some(e) = failure {
+        channels
+            .snapshots
+            .send_modify(|s| s.clipboard = Some((0, Err(e))));
+    }
+    let mut batches = Vec::new();
+    if let Some(channel) = active.get_svc_processor_mut::<ironrdp::cliprdr::CliprdrClient>() {
+        if initialize {
+            batches.push(
+                channel
+                    .initiate_copy(&[])
+                    .map_err(|e| error(ErrorStage::Clipboard, e))?,
+            );
+        }
+        for reply in replies {
+            batches.push(
+                channel
+                    .submit_format_data(reply)
+                    .map_err(|e| error(ErrorStage::Clipboard, e))?,
+            );
+        }
+    }
+    for messages in batches {
+        let bytes = active
+            .process_svc_processor_messages(messages)
+            .map_err(|e| error(ErrorStage::Clipboard, e))?;
+        limited(
+            Duration::from_secs(2),
+            ErrorStage::Network,
+            framed.write_all(&bytes),
+        )
+        .await?;
     }
     Ok(())
 }

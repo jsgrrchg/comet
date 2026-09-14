@@ -401,6 +401,24 @@ impl RemoteDesktopSurface {
                     );
                 }
             }
+            if connected && self.snapshot.capabilities.clipboard_text {
+                root = root.child(
+                    div()
+                        .px(px(8.))
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(5.))
+                        .child(
+                            action("rdp-send-clipboard", "Send clipboard text")
+                                .on_click(cx.listener(|this, _, _, cx| this.send_clipboard(cx))),
+                        )
+                        .child(
+                            action("rdp-copy-clipboard", "Copy remote text").on_click(
+                                cx.listener(|this, _, w, cx| this.copy_remote_text(w, cx)),
+                            ),
+                        ),
+                );
+            }
             root = root.child(div().flex_1().min_h_0().child(self.desktop.clone()));
         }
         if let Some(notice) = &self.notice {

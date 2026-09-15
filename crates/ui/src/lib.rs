@@ -40,6 +40,7 @@ pub mod motion;
 mod new_thread_background_effects;
 mod new_thread_background_image;
 mod new_thread_background_mask;
+mod notice;
 pub mod notify;
 pub mod pickers;
 pub mod popover;
@@ -154,6 +155,10 @@ pub fn run_app(config: UiConfig) {
         typography::init(
             settings.ui_font_family.clone(),
             settings.ui_font_size,
+            settings.terminal_font_family.clone(),
+            settings.terminal_font_size,
+            settings.code_font_family.clone(),
+            settings.code_font_size,
             font_availability,
             cx,
         );

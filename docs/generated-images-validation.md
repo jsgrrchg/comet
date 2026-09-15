@@ -8,7 +8,14 @@ journal or session document. Source files remain owned by Codex.
 The transcript reads through the existing attachment RPC/cache. It tries the
 message's device first, then the chat host and local device, without duplicate
 candidates. Raster decoding accepts at most 4096 × 4096 pixels and 64 MiB of
-allocation, and retains one static frame. The lightbox is shared with user
+allocation, verifies the actual raster MIME type, and retains one static 8-bit
+frame downsampled to at most 2048 pixels on either axis. The lightbox uses this
+same bounded preview; the original file remains on the host. Generated cache
+entries and in-flight loads are keyed by device, path and declared MIME policy,
+separately from generic attachments and upload aliases. Their LRU budget is
+64 MiB including encoded bytes and estimated CPU/GPU copies, independent of
+the legacy attachment budget. Generated history is never shielded from eviction.
+The lightbox is shared with user
 attachments. Media bytes stay on the host; an offline host shows an unavailable
 placeholder and uses the existing 2–15 second retry ladder.
 
@@ -132,3 +139,11 @@ an iPhone. Verify inline display, tap-to-preview, returning to the chat, and scr
 position during loading. Reopen on a client without cached bytes while the host
 is offline, then reconnect the host and verify retry recovery. Also check light
 and dark appearances and a portrait image whose displayed height reaches the cap.
+
+## Desktop security regressions
+
+`cargo test --locked -p zeron-ui --lib generated_image -- --test-threads=1`
+includes policy/alias/load-claim isolation, MIME corrections, actual format
+validation, static-frame downsampling, and a 100-image cache-history budget test.
+Existing transcript tests verify that generated history is not protected from
+eviction, while ordinary user attachment protection remains unchanged.

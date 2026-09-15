@@ -492,6 +492,9 @@ pub async fn read_attachment_image(
         .ok()?;
         name = chunk.get("name")?.as_str()?.to_string();
         mime = chunk.get("mimeType")?.as_str()?.to_string();
+        if expected_raster_mime.is_some_and(|expected| expected != mime) {
+            return None;
+        }
         let data = chunk.get("data")?.as_str()?;
         if expected_raster_mime.is_some()
             && b64.len().saturating_add(data.len())
@@ -523,11 +526,16 @@ pub async fn read_attachment_image(
         {
             return None;
         }
+        let expected = expected.to_owned();
         executor
             .spawn(async move {
-                crate::image_media::decode_raster_image(bytes, MAX_ATTACHMENT_BYTES as usize)
-                    .ok()
-                    .map(|media| media.image)
+                crate::image_media::decode_generated_image(
+                    bytes,
+                    &expected,
+                    MAX_ATTACHMENT_BYTES as usize,
+                )
+                .ok()
+                .map(|media| media.image)
             })
             .await?
     } else {
@@ -606,24 +614,43 @@ fn retry_delay(attempts: u32) -> Duration {
     Duration::from_millis((2_000u64 << attempts.min(3)).min(15_000))
 }
 
-/// Byte budget for retained encoded images. The decoded copies gpui holds are
-/// proportional (and usually larger), so bounding the encoded side bounds both
-/// — this cache previously grew for the process lifetime with no eviction.
+/// Retained encoded bytes plus estimated CPU/GPU pixels for normalized PNGs.
+/// Generated images are always evictable and individually fit this budget.
+/// Legacy user attachments retain their existing protection behavior.
 const IMAGE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Validation policy is part of identity, including in-flight loads and errors.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct AttachmentKey {
+    device: String,
+    path: String,
+    raster_mime: Option<String>,
+}
+
+impl AttachmentKey {
+    pub(crate) fn new(device: &str, path: &str, mime: Option<&str>) -> Self {
+        Self {
+            device: device.into(),
+            path: path.into(),
+            raster_mime: mime.map(str::to_owned),
+        }
+    }
+}
 
 #[derive(Default)]
 struct ImageCache {
-    map: HashMap<(String, String), CacheEntry>,
+    map: HashMap<AttachmentKey, CacheEntry>,
     /// Monotonic access clock for LRU ordering.
     tick: u64,
     loaded_bytes: usize,
+    generated_bytes: usize,
     /// Evicted images awaiting `flush_evicted` (freeing needs `&mut App`,
     /// which eviction sites — async load completions — don't always have).
     pending_free: Vec<Arc<Image>>,
 }
 
 impl ImageCache {
-    fn insert_loaded(&mut self, key: (String, String), image: CachedAttachmentImage) {
+    fn insert_loaded(&mut self, key: AttachmentKey, image: CachedAttachmentImage) {
         // Generated rasters are normalized to PNG; account for their decoded
         // CPU/GPU copies as well as encoded bytes in the existing cache budget.
         let pixels = crate::appshots::png_dimensions(&image.image.bytes)
@@ -633,6 +660,7 @@ impl ImageCache {
             .bytes
             .len()
             .saturating_add(pixels.saturating_mul(8));
+        let generated = key.raster_mime.is_some();
         self.tick += 1;
         if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.insert(
             key.clone(),
@@ -643,23 +671,44 @@ impl ImageCache {
             },
         ) {
             self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
+            if generated {
+                self.generated_bytes = self.generated_bytes.saturating_sub(bytes);
+            }
             self.pending_free.push(image.image);
         }
         self.loaded_bytes = self.loaded_bytes.saturating_add(bytes);
+        if generated {
+            self.generated_bytes = self.generated_bytes.saturating_add(bytes);
+        }
         let shielded = protected().lock().unwrap().clone();
-        while self.loaded_bytes > IMAGE_CACHE_BUDGET_BYTES {
+        // Separate budgets prevent protected legacy attachments from repeatedly
+        // evicting visible generated previews, or vice versa.
+        while (if generated {
+            self.generated_bytes
+        } else {
+            self.loaded_bytes.saturating_sub(self.generated_bytes)
+        }) > IMAGE_CACHE_BUDGET_BYTES
+        {
             let oldest = self
                 .map
                 .iter()
-                .filter(|(k, _)| **k != key && !shielded.contains(*k))
+                .filter(|(k, _)| {
+                    **k != key
+                        && k.raster_mime.is_some() == generated
+                        && (k.raster_mime.is_some()
+                            || !shielded.contains(&(k.device.clone(), k.path.clone())))
+                })
                 .filter_map(|(k, e)| match e {
                     CacheEntry::Loaded { last_used, .. } => Some((*last_used, k.clone())),
                     _ => None,
                 })
-                .min();
+                .min_by_key(|(tick, _)| *tick);
             let Some((_, evict_key)) = oldest else { break };
             if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.remove(&evict_key) {
                 self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
+                if generated {
+                    self.generated_bytes = self.generated_bytes.saturating_sub(bytes);
+                }
                 self.pending_free.push(image.image);
             }
         }
@@ -688,17 +737,22 @@ pub fn protect_attachments(keys: std::collections::HashSet<(String, String)>) {
     *protected().lock().unwrap() = keys;
 }
 
-fn key(device_id: &str, path: &str) -> (String, String) {
-    (device_id.to_string(), path.to_string())
+fn key(device_id: &str, path: &str) -> AttachmentKey {
+    AttachmentKey::new(device_id, path, None)
 }
 
 pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
+    attachment_snapshot_for(&key(device_id, path))
+}
+
+pub(crate) fn attachment_snapshot_for(source: &AttachmentKey) -> AttachmentSnapshot {
+    let (device_id, path) = (source.device.as_str(), source.path.as_str());
     let mut cache = cache().lock().unwrap();
     let tick = {
         cache.tick += 1;
         cache.tick
     };
-    match cache.map.get_mut(&key(device_id, path)) {
+    match cache.map.get_mut(source) {
         Some(CacheEntry::Loaded {
             image, last_used, ..
         }) => {
@@ -718,12 +772,16 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
             // resolves the rewritten ref instantly instead of blanking the
             // thumbnail into a skeleton while the bytes round-trip
             // (2026-08-19 "photo disappears after it finishes sending").
-            if let Some(image) = upload_alias_id8(path).and_then(|id8| {
-                match cache.map.get(&alias_key(device_id, &id8)) {
+            if let Some(image) = source
+                .raster_mime
+                .is_none()
+                .then(|| upload_alias_id8(path))
+                .flatten()
+                .and_then(|id8| match cache.map.get(&alias_key(device_id, &id8)) {
                     Some(CacheEntry::Loaded { image, .. }) => Some(image.clone()),
                     _ => None,
-                }
-            }) {
+                })
+            {
                 cache.insert_loaded(key(device_id, path), image.clone());
                 return AttachmentSnapshot::Loaded(image);
             }
@@ -742,7 +800,7 @@ fn upload_alias_id8(path: &str) -> Option<String> {
         .then(|| id8.to_string())
 }
 
-fn alias_key(device_id: &str, id8: &str) -> (String, String) {
+fn alias_key(device_id: &str, id8: &str) -> AttachmentKey {
     key(device_id, &format!("upload-alias://{id8}"))
 }
 
@@ -751,8 +809,8 @@ fn alias_key(device_id: &str, id8: &str) -> (String, String) {
 /// local bytes — see the alias fallback in [`attachment_snapshot`].
 pub fn seed_attachment_alias(device_id: &str, upload_id: &str, name: &str, image: Arc<Image>) {
     let id8: String = upload_id.chars().take(8).collect();
-    let (device, path) = alias_key(device_id, &id8);
-    store_loaded(&device, &path, name.to_string().into(), image);
+    let source = alias_key(device_id, &id8);
+    store_loaded_for(&source, name.to_string().into(), image);
 }
 
 /// Release gpui's decoded copies of evicted images: the asset-system entry
@@ -771,8 +829,12 @@ pub fn flush_evicted(mut window: Option<&mut gpui::Window>, cx: &mut gpui::App) 
 /// (the entry is marked Loading so concurrent renders don't double-fetch).
 /// Errored sources hand out a retry only after their backoff has elapsed.
 pub fn begin_load(device_id: &str, path: &str) -> bool {
+    begin_load_for(&key(device_id, path))
+}
+
+pub(crate) fn begin_load_for(source: &AttachmentKey) -> bool {
     let mut cache = cache().lock().unwrap();
-    let entry = cache.map.entry(key(device_id, path));
+    let entry = cache.map.entry(source.clone());
     match entry {
         std::collections::hash_map::Entry::Vacant(v) => {
             v.insert(CacheEntry::Loading { attempts: 0 });
@@ -793,13 +855,12 @@ pub fn begin_load(device_id: &str, path: &str) -> bool {
 
 /// A cancelled view/task must release its claim so reopening can retry it.
 /// Completed loads are left alone, including completions waiting on a UI notify.
-pub(crate) struct AttachmentLoadGuard(pub String, pub String);
+pub(crate) struct AttachmentLoadGuard(pub AttachmentKey);
 
 impl Drop for AttachmentLoadGuard {
     fn drop(&mut self) {
         let mut cache = cache().lock().unwrap();
-        if let Some(entry @ CacheEntry::Loading { .. }) = cache.map.get_mut(&key(&self.0, &self.1))
-        {
+        if let Some(entry @ CacheEntry::Loading { .. }) = cache.map.get_mut(&self.0) {
             let CacheEntry::Loading { attempts } = entry else {
                 unreachable!()
             };
@@ -812,21 +873,29 @@ impl Drop for AttachmentLoadGuard {
 }
 
 pub fn store_loaded(device_id: &str, path: &str, name: SharedString, image: Arc<Image>) {
+    store_loaded_for(&key(device_id, path), name, image);
+}
+
+pub(crate) fn store_loaded_for(source: &AttachmentKey, name: SharedString, image: Arc<Image>) {
     cache()
         .lock()
         .unwrap()
-        .insert_loaded(key(device_id, path), CachedAttachmentImage { name, image });
+        .insert_loaded(source.clone(), CachedAttachmentImage { name, image });
 }
 
 pub fn store_error(device_id: &str, path: &str) {
+    store_error_for(&key(device_id, path));
+}
+
+pub(crate) fn store_error_for(source: &AttachmentKey) {
     let mut cache = cache().lock().unwrap();
-    let attempts = match cache.map.get(&key(device_id, path)) {
+    let attempts = match cache.map.get(source) {
         Some(CacheEntry::Loading { attempts }) => attempts + 1,
         Some(CacheEntry::Error { attempts, .. }) => *attempts,
         _ => 1,
     };
     cache.map.insert(
-        key(device_id, path),
+        source.clone(),
         CacheEntry::Error {
             attempts,
             at: Instant::now(),
@@ -1165,6 +1234,148 @@ mod tests {
 mod generated_image_tests {
     use super::*;
 
+    #[test]
+    fn generated_image_cache_isolates_policy_aliases_and_load_claims() {
+        let owner = "policy-audit-owner";
+        let path = "/uploads/policy01-image.png";
+        let png = AttachmentKey::new(owner, path, Some("image/png"));
+        let gif = AttachmentKey::new(owner, path, Some("image/gif"));
+        let raw = Arc::new(Image::from_bytes(ImageFormat::Gif, b"GIF89a".to_vec()));
+        seed_attachment(owner, path, "image.gif", raw.clone());
+        seed_attachment_alias(owner, "policy01", "image.gif", raw.clone());
+        assert!(matches!(
+            attachment_snapshot_for(&png),
+            AttachmentSnapshot::Loading
+        ));
+        let alias = AttachmentKey::new(owner, "/another/policy01-image.png", Some("image/png"));
+        assert!(matches!(
+            attachment_snapshot_for(&alias),
+            AttachmentSnapshot::Loading
+        ));
+        assert!(begin_load_for(&png));
+        assert!(!begin_load_for(&png));
+        assert!(begin_load_for(&gif));
+        drop(AttachmentLoadGuard(png.clone()));
+        assert!(matches!(
+            attachment_snapshot_for(&png),
+            AttachmentSnapshot::Error { .. }
+        ));
+        assert!(matches!(
+            attachment_snapshot_for(&gif),
+            AttachmentSnapshot::Loading
+        ));
+        store_loaded_for(&gif, "image.gif".into(), raw);
+        assert!(matches!(
+            attachment_snapshot_for(&png),
+            AttachmentSnapshot::Error { .. }
+        ));
+        assert!(matches!(
+            attachment_snapshot_for(&gif),
+            AttachmentSnapshot::Loaded(_)
+        ));
+        let changed = AttachmentKey::new(owner, path, Some("image/jpeg"));
+        assert!(matches!(
+            attachment_snapshot_for(&changed),
+            AttachmentSnapshot::Loading
+        ));
+    }
+
+    #[test]
+    fn generated_image_history_is_evicted_with_decoded_memory_accounting() {
+        let mut cache = ImageCache::default();
+        // Cache accounting reads only IHDR. No large allocations are needed
+        // to exercise the production eviction policy across a long history.
+        for i in 0..100 {
+            let mut bytes = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+            bytes.extend_from_slice(&2048_u32.to_be_bytes());
+            bytes.extend_from_slice(&2048_u32.to_be_bytes());
+            cache.insert_loaded(
+                AttachmentKey::new("bounded-history", &format!("/{i}.png"), Some("image/png")),
+                CachedAttachmentImage {
+                    name: "generated.png".into(),
+                    image: Arc::new(Image::from_bytes(ImageFormat::Png, bytes)),
+                },
+            );
+            assert!(cache.loaded_bytes <= IMAGE_CACHE_BUDGET_BYTES);
+            // The real render loop calls flush_evicted to release these CPU/GPU assets.
+            cache.pending_free.clear();
+        }
+        assert!(!cache.map.contains_key(&AttachmentKey::new(
+            "bounded-history",
+            "/0.png",
+            Some("image/png")
+        )));
+        assert!(cache.map.contains_key(&AttachmentKey::new(
+            "bounded-history",
+            "/99.png",
+            Some("image/png")
+        )));
+    }
+
+    #[test]
+    fn generated_image_decoder_checks_actual_type_and_downsamples() {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(3072, 16)
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        let bytes = png.into_inner();
+        assert!(
+            crate::image_media::decode_generated_image(
+                bytes.clone(),
+                "image/jpeg",
+                MAX_ATTACHMENT_BYTES as usize
+            )
+            .is_err()
+        );
+        let decoded = crate::image_media::decode_generated_image(
+            bytes,
+            "image/png",
+            MAX_ATTACHMENT_BYTES as usize,
+        )
+        .unwrap();
+        assert_eq!(decoded.width, 2048.0);
+        assert!(decoded.bytes < IMAGE_CACHE_BUDGET_BYTES);
+        assert!(
+            crate::image_media::decode_generated_image(
+                b"GIF89a".to_vec(),
+                "image/gif",
+                MAX_ATTACHMENT_BYTES as usize
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn generated_image_animation_retains_only_first_static_frame() {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut bytes);
+            for color in [[255, 0, 0, 255], [0, 0, 255, 255]] {
+                encoder
+                    .encode_frame(image::Frame::new(image::RgbaImage::from_pixel(
+                        16,
+                        16,
+                        image::Rgba(color),
+                    )))
+                    .unwrap();
+            }
+        }
+        let decoded = crate::image_media::decode_generated_image(
+            bytes,
+            "image/gif",
+            MAX_ATTACHMENT_BYTES as usize,
+        )
+        .unwrap();
+        assert_eq!(
+            image::guess_format(&decoded.image.bytes).unwrap(),
+            image::ImageFormat::Png
+        );
+        let pixels = image::load_from_memory(&decoded.image.bytes)
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(pixels.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
     struct ImageRpc {
         calls: Arc<Mutex<Vec<serde_json::Value>>>,
         bytes: Vec<u8>,
@@ -1228,14 +1439,14 @@ mod generated_image_tests {
         let owner = "cancelled-generated-owner";
         let path = "/fixture/cancelled-generated.png";
         assert!(begin_load(owner, path));
-        drop(AttachmentLoadGuard(owner.into(), path.into()));
+        drop(AttachmentLoadGuard(key(owner, path)));
         assert!(matches!(
             attachment_snapshot(owner, path),
             AttachmentSnapshot::Error { .. }
         ));
         let image = Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new()));
         store_loaded(owner, path, "generated.png".into(), image);
-        drop(AttachmentLoadGuard(owner.into(), path.into()));
+        drop(AttachmentLoadGuard(key(owner, path)));
         assert!(matches!(
             attachment_snapshot(owner, path),
             AttachmentSnapshot::Loaded(_)

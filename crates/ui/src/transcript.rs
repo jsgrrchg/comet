@@ -2761,9 +2761,9 @@ pub struct Transcript {
     /// Focused while the lightbox is open so Escape reaches it.
     attachment_preview_focus: gpui::FocusHandle,
     attachment_preview_return_focus: Option<gpui::FocusHandle>,
-    /// In-flight ReadAttachmentChunk loads, keyed `(deviceId, path)` — one per
-    /// source; results land in the global attachment cache.
-    attachment_loads: HashMap<(String, String), Task<()>>,
+    /// In-flight ReadAttachmentChunk loads, keyed by device, path and validation
+    /// policy; results land in the global attachment cache.
+    attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
     /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
@@ -4595,11 +4595,7 @@ impl Transcript {
         let devices = self.attachment_device_ids(cx);
         let mut keys = std::collections::HashSet::new();
         for row in &self.rows {
-            if let RowKind::GeneratedImage { owner, path, .. } = &row.kind {
-                for device in self.generated_attachment_device_ids(owner, cx) {
-                    keys.insert((device, path.clone()));
-                }
-            }
+            // Generated images use bounded LRU retention, not history-wide protection.
             if let RowKind::User { attachments, .. } = &row.kind {
                 for att in attachments.iter() {
                     for dev in &devices {
@@ -4652,16 +4648,20 @@ impl Transcript {
         expected_raster_mime: Option<&str>,
         cx: &mut Context<Self>,
     ) -> crate::attachments::AttachmentSnapshot {
-        use crate::attachments::{AttachmentSnapshot, attachment_snapshot, begin_load};
+        use crate::attachments::{
+            AttachmentKey, AttachmentSnapshot, attachment_snapshot_for, begin_load_for,
+        };
         for dev in device_ids {
-            if let AttachmentSnapshot::Loaded(image) = attachment_snapshot(dev, path) {
+            if let AttachmentSnapshot::Loaded(image) =
+                attachment_snapshot_for(&AttachmentKey::new(dev, path, expected_raster_mime))
+            {
                 return AttachmentSnapshot::Loaded(image);
             }
         }
         let mut any_loading = false;
         let mut min_retry: Option<Duration> = None;
         for dev in device_ids {
-            if begin_load(dev, path) {
+            if begin_load_for(&AttachmentKey::new(dev, path, expected_raster_mime)) {
                 self.spawn_attachment_load(
                     dev.clone(),
                     path.to_string(),
@@ -4669,7 +4669,7 @@ impl Transcript {
                     cx,
                 );
             }
-            match attachment_snapshot(dev, path) {
+            match attachment_snapshot_for(&AttachmentKey::new(dev, path, expected_raster_mime)) {
                 AttachmentSnapshot::Loaded(image) => return AttachmentSnapshot::Loaded(image),
                 AttachmentSnapshot::Loading => {
                     // Generated assets try the owner first, falling back only
@@ -4708,17 +4708,20 @@ impl Transcript {
         expected_raster_mime: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        use crate::attachments::{read_attachment_image, store_error, store_loaded};
+        use crate::attachments::{
+            AttachmentKey, read_attachment_image, store_error_for, store_loaded_for,
+        };
+        let key = AttachmentKey::new(&device_id, &path, expected_raster_mime.as_deref());
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            store_error(&device_id, &path);
+            store_error_for(&key);
             return;
         };
         let local = self.state.read(cx).local_device_id.clone();
         // Relay-forward only for a genuinely remote owner; the local device's
         // files are served directly.
         let target = (local.as_deref() != Some(device_id.as_str())).then(|| device_id.clone());
-        let key = (device_id.clone(), path.clone());
-        let claim = crate::attachments::AttachmentLoadGuard(device_id.clone(), path.clone());
+        let claim = crate::attachments::AttachmentLoadGuard(key.clone());
+        let task_key = key.clone();
         let task = cx.spawn(async move |this, cx| {
             let _claim = claim;
             match read_attachment_image(
@@ -4730,13 +4733,11 @@ impl Transcript {
             )
             .await
             {
-                Some(loaded) => store_loaded(&device_id, &path, loaded.name.into(), loaded.image),
-                None => store_error(&device_id, &path),
+                Some(loaded) => store_loaded_for(&task_key, loaded.name.into(), loaded.image),
+                None => store_error_for(&task_key),
             }
             this.update(cx, |transcript, cx| {
-                transcript
-                    .attachment_loads
-                    .remove(&(device_id.clone(), path.clone()));
+                transcript.attachment_loads.remove(&task_key);
                 cx.notify();
             })
             .ok();
@@ -8830,10 +8831,13 @@ mod tests {
         image::DynamicImage::new_rgba8(64, 48)
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
-        crate::attachments::seed_attachment(
-            "preview-owner",
-            "/fixture/preview.png",
-            "generated.png",
+        crate::attachments::store_loaded_for(
+            &crate::attachments::AttachmentKey::new(
+                "preview-owner",
+                "/fixture/preview.png",
+                Some("image/png"),
+            ),
+            "generated.png".into(),
             Arc::new(gpui::Image::from_bytes(
                 gpui::ImageFormat::Png,
                 bytes.into_inner(),
@@ -8897,17 +8901,25 @@ mod tests {
                 gpui::ImageFormat::Png,
                 bytes.into_inner(),
             ));
-            seed_attachment(
-                "fixture-owner",
-                "/fixture/generated-loaded.png",
-                "generated.png",
+            store_loaded_for(
+                &AttachmentKey::new(
+                    "fixture-owner",
+                    "/fixture/generated-loaded.png",
+                    Some("image/png"),
+                ),
+                "generated.png".into(),
                 image,
             );
-            assert!(begin_load(
+            assert!(begin_load_for(&AttachmentKey::new(
                 "fixture-owner",
-                "/fixture/generated-loading.png"
+                "/fixture/generated-loading.png",
+                Some("image/png")
+            )));
+            store_error_for(&AttachmentKey::new(
+                "fixture-owner",
+                "/fixture/generated-unavailable.png",
+                Some("image/png"),
             ));
-            store_error("fixture-owner", "/fixture/generated-unavailable.png");
             transcript.update(cx, |this, cx| {
                 this.rows = entries
                     .iter()
@@ -8942,7 +8954,7 @@ mod tests {
                     let MessagePart::Image { path, .. } = &entry.parts[0] else {
                         unreachable!()
                     };
-                    assert!(keys.contains(&("fixture-owner".into(), path.clone())));
+                    assert!(!keys.contains(&("fixture-owner".into(), path.clone())));
                 }
                 this.refresh_protected_attachments(cx);
                 this.rows.clear();

@@ -143,7 +143,16 @@ fn main() -> anyhow::Result<()> {
             zeron_ui::settings::init(Default::default(), data.path(), cx);
             let settings = zeron_ui::settings::current(cx);
             let fonts = zeron_ui::typography::register_fonts(cx);
-            zeron_ui::typography::init(settings.ui_font_family, settings.ui_font_size, fonts, cx);
+            zeron_ui::typography::init(
+                settings.ui_font_family,
+                settings.ui_font_size,
+                settings.terminal_font_family,
+                settings.terminal_font_size,
+                settings.code_font_family,
+                settings.code_font_size,
+                fonts,
+                cx,
+            );
             let window = cx
                 .open_window(
                     WindowOptions {

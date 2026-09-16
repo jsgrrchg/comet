@@ -192,7 +192,8 @@ pub fn run_app(config: UiConfig) {
         app_menus::init(cx);
         cx.register_url_scheme("zeron").detach();
 
-        let state = app_runtime::init(config.boot(), cx);
+        let owner = app_runtime::init(config.boot(), cx);
+        let state = cx.new(|cx| state::AppState::for_window(owner, cx));
         shell::apply_keymap(cx, &ui_settings.keymap, ui_settings.composer_send_behavior);
         let url_state = state.clone();
         cx.spawn(async move |cx| {

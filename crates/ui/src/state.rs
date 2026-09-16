@@ -675,6 +675,11 @@ pub struct AppState {
     pending_sends: Rc<RefCell<HashMap<String, PendingSend>>>,
     optimistic_revision: Rc<Cell<u64>>,
     use_shared_conversations: bool,
+    application: Option<Entity<AppState>>,
+    application_subscription: Option<gpui::Subscription>,
+    optimistic_subscription: Option<gpui::Subscription>,
+    observed_optimistic_revision: u64,
+    pub(crate) runtime_epoch: u64,
     is_conversation_source: bool,
     conversation: Option<crate::chat_store::ConversationBinding>,
     /// The in-flight send's attachment upload, when it has one.
@@ -764,6 +769,11 @@ impl AppState {
             pending_sends: Default::default(),
             optimistic_revision: Default::default(),
             use_shared_conversations: false,
+            application: None,
+            application_subscription: None,
+            optimistic_subscription: None,
+            observed_optimistic_revision: 0,
+            runtime_epoch: 0,
             is_conversation_source: false,
             conversation: None,
             upload_progress: None,
@@ -791,6 +801,110 @@ impl AppState {
         }
     }
 
+    /// Window-local navigation and rendering projection of the application.
+    /// The application owns standing subscriptions; the selected chat leases a
+    /// shared conversation feed. Child views can keep the existing reducer API.
+    pub(crate) fn for_window(owner: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let mut state = Self::new();
+        state.use_shared_conversations = true;
+        state.application = Some(owner.clone());
+        state.application_subscription = Some(cx.observe(&owner, |this, owner, cx| {
+            this.sync_application(&owner, cx);
+        }));
+        state.optimistic_subscription = Some(cx.observe_self(Self::publish_optimistic_changes));
+        state.sync_application(&owner, cx);
+        state
+    }
+
+    fn publish_optimistic_changes(&mut self, cx: &mut Context<Self>) {
+        let revision = self.optimistic_revision.get();
+        if self.observed_optimistic_revision == revision {
+            return;
+        }
+        self.observed_optimistic_revision = revision;
+        let owner = cx
+            .try_global::<crate::app_runtime::AppRuntime>()
+            .map(|runtime| runtime.state.clone());
+        if let Some(owner) = owner.filter(|owner| *owner != cx.entity()) {
+            owner.update(cx, |owner, cx| {
+                if owner.observed_optimistic_revision != revision {
+                    owner.observed_optimistic_revision = revision;
+                    cx.notify();
+                }
+            });
+        }
+    }
+
+    fn sync_application(&mut self, owner: &Entity<AppState>, cx: &mut Context<Self>) {
+        let source = owner.read(cx);
+        let replaced = self.runtime_epoch != source.runtime_epoch;
+        let engine_changed = match (&self.engine, &source.engine) {
+            (Some(a), Some(b)) => !Arc::ptr_eq(&a.inner, &b.inner),
+            (None, None) => false,
+            _ => true,
+        };
+        if replaced {
+            self.selected_chat = None;
+            self.selected_space = None;
+            self.selected_device = None;
+            self.no_project = false;
+            self.auto_selected = false;
+            self.review_comments.clear();
+            self.review_comment_flushes.clear();
+            self.sub_transcripts.clear();
+            self.sub_watch_tasks.clear();
+            self.upload_progress = None;
+        }
+        if replaced || engine_changed {
+            self.conversation = None;
+            self.transcript_task = None;
+            self.queue_task = None;
+            self.transcript.clear();
+            self.queue.clear();
+            self.context_usage = None;
+            self.transcript_replayed = false;
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        }
+        self.runtime_epoch = source.runtime_epoch;
+        self.connection = source.connection.clone();
+        self.workspace_scope = source.workspace_scope;
+        self.auth = source.auth.clone();
+        self.devices = source.devices.clone();
+        self.sessions = source.sessions.clone();
+        self.connectivity = source.connectivity.clone();
+        self.connectivity_observed = source.connectivity_observed;
+        self.local_device_id = source.local_device_id.clone();
+        self.update = source.update.clone();
+        self.data_dir = source.data_dir.clone();
+        self.engine = source.engine.clone();
+        self.change_requests = source.change_requests.clone();
+        self.transfers = source.transfers.clone();
+        self.echoes = source.echoes.clone();
+        self.pending_sends = source.pending_sends.clone();
+        self.optimistic_revision = source.optimistic_revision.clone();
+        if self.observed_optimistic_revision != self.optimistic_revision.get() {
+            self.observed_optimistic_revision = self.optimistic_revision.get();
+            self.transcript_revision = self.transcript_revision.wrapping_add(1);
+        }
+        if source.chats_synced {
+            self.apply_chats(source.chats.clone());
+        } else {
+            self.chats.clear();
+            self.chats_synced = false;
+        }
+        if source.spaces_synced {
+            self.apply_spaces(source.spaces.clone());
+        } else {
+            self.spaces.clear();
+            self.spaces_synced = false;
+        }
+        self.apply_pending_deep_link(cx);
+        if self.engine.is_some() && self.selected_chat.is_some() && self.conversation.is_none() {
+            self.bind_shared_conversation(cx);
+        }
+        cx.notify();
+    }
+
     pub(crate) fn conversation_source(
         chat_id: String,
         engine: Option<EngineHandle>,
@@ -798,6 +912,7 @@ impl AppState {
     ) -> Self {
         let mut state = Self::new();
         state.is_conversation_source = true;
+        state.optimistic_subscription = Some(cx.observe_self(Self::publish_optimistic_changes));
         state.selected_chat = Some(chat_id.clone());
         if let Some(runtime) = cx.try_global::<crate::app_runtime::AppRuntime>() {
             let owner = runtime.state.read(cx);
@@ -1727,6 +1842,12 @@ impl AppState {
     /// stopped. The next bootstrap must never render rows from the previous
     /// account while the local profile is opening.
     pub fn prepare_runtime_replacement(&mut self, cx: &mut Context<Self>) {
+        if let Some(owner) = self.application.clone() {
+            owner.update(cx, |owner, cx| owner.prepare_runtime_replacement(cx));
+            return;
+        }
+        self.runtime_epoch = self.runtime_epoch.wrapping_add(1);
+        crate::chat_store::clear(cx);
         self.engine = None;
         self.bootstrap_task = None;
         self.watch_tasks.clear();
@@ -1811,6 +1932,7 @@ impl AppState {
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        crate::chat_store::clear(cx);
         // The attachment notification precedes the first connectivity frame.
         // Make that bootstrap gap explicit so the shell resets its alert
         // baseline instead of comparing the new runtime with the old one.
@@ -1927,6 +2049,12 @@ impl AppState {
     }
 
     pub fn set_change_requests_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if let Some(owner) = self.application.clone() {
+            owner.update(cx, |owner, cx| {
+                owner.set_change_requests_visible(visible, cx)
+            });
+            return;
+        }
         if self.change_requests_visible != visible {
             self.change_requests_visible = visible;
             self.reconcile_change_request_watches(cx);
@@ -2099,6 +2227,10 @@ impl AppState {
     }
 
     pub fn mark_chat_seen(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if let Some(owner) = self.application.clone() {
+            owner.update(cx, |owner, cx| owner.mark_chat_seen(chat_id, cx));
+            return;
+        }
         let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
             return;
         };
@@ -3886,6 +4018,48 @@ mod tests {
             },
         );
         assert!(state.pending_echoes().is_empty());
+    }
+
+    #[gpui::test]
+    fn window_navigation_is_independent_while_catalogs_and_profile_changes_are_shared(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (owner, a, b) = cx.update(|cx| {
+            let owner = cx.new(|_| AppState::new());
+            owner.update(cx, |owner, cx| {
+                owner.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
+                cx.notify();
+            });
+            let a = cx.new(|cx| AppState::for_window(owner.clone(), cx));
+            let b = cx.new(|cx| AppState::for_window(owner.clone(), cx));
+            a.update(cx, |a, cx| a.select_chat(Some("a".into()), cx));
+            b.update(cx, |b, cx| b.select_chat(Some("b".into()), cx));
+            (owner, a, b)
+        });
+        cx.update(|cx| {
+            assert_eq!(a.read(cx).selected_chat.as_deref(), Some("a"));
+            assert_eq!(b.read(cx).selected_chat.as_deref(), Some("b"));
+            assert!(owner.read(cx).selected_chat.is_none());
+            owner.update(cx, |owner, cx| {
+                let mut rows = owner.chats.clone();
+                rows[0].title = Some("Renamed everywhere".into());
+                owner.apply_chats(rows);
+                cx.notify();
+            });
+        });
+        cx.update(|cx| {
+            assert_eq!(a.read(cx).chats, b.read(cx).chats);
+            assert_eq!(a.read(cx).selected_chat.as_deref(), Some("a"));
+            a.update(cx, |a, cx| a.prepare_runtime_replacement(cx));
+        });
+        cx.update(|cx| {
+            for view in [&a, &b] {
+                assert!(view.read(cx).chats.is_empty());
+                assert!(view.read(cx).selected_chat.is_none());
+                assert!(view.read(cx).conversation.is_none());
+                assert_eq!(view.read(cx).runtime_epoch, owner.read(cx).runtime_epoch);
+            }
+        });
     }
 
     #[gpui::test]

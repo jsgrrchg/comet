@@ -31,6 +31,7 @@ pub mod edge_fade;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
+pub mod gui_instance;
 pub mod history;
 pub mod icons;
 pub(crate) mod image_media;
@@ -103,6 +104,8 @@ pub struct UiConfig {
     pub default_harness: HarnessId,
     /// Conversation URL passed by the OS on a cold launch.
     pub initial_url: Option<String>,
+    /// A cold `--new-window` launch starts on the blank canvas.
+    pub initial_new_window: bool,
 }
 
 impl UiConfig {
@@ -122,7 +125,8 @@ impl UiConfig {
 /// Run the headed app: tokio bridge up, engine bootstrap kicked off (probe →
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
-pub fn run_app(config: UiConfig) {
+pub fn run_app(config: UiConfig, mut instance: gui_instance::GuiInstance) {
+    let mut launches = instance.incoming.take().expect("GUI launch receiver");
     let app = gpui_platform::application().with_assets(icons::Assets);
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
     let callback_tx = url_tx.clone();
@@ -179,6 +183,20 @@ pub fn run_app(config: UiConfig) {
         cx.register_url_scheme("zeron").detach();
 
         let owner = app_runtime::init(config.boot(), cx);
+        cx.spawn(async move |cx| {
+            while let Some(request) = launches.next().await {
+                let _ = cx.update(|cx| match request {
+                    gui_instance::LaunchRequest::Activate => {
+                        window_manager::activate(cx);
+                    }
+                    gui_instance::LaunchRequest::NewWindow => {
+                        window_manager::open(window_manager::Open::Blank, cx);
+                    }
+                    gui_instance::LaunchRequest::OpenUrl(url) => window_manager::deep_link(url, cx),
+                });
+            }
+        })
+        .detach();
         lifecycle::init(cx);
         window_manager::init(cx);
         shell::apply_keymap(cx, &ui_settings.keymap, ui_settings.composer_send_behavior);
@@ -201,7 +219,14 @@ pub fn run_app(config: UiConfig) {
         })
         .detach();
         state::AppState::bootstrap(owner, config.boot(), cx);
-        window_manager::open(window_manager::Open::Restore, cx);
+        window_manager::open(
+            if config.initial_new_window {
+                window_manager::Open::Blank
+            } else {
+                window_manager::Open::Restore
+            },
+            cx,
+        );
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         start_appshot_service(config.boot().data_dir, cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
@@ -214,6 +239,7 @@ pub fn run_app(config: UiConfig) {
         cx.set_menus(app_menus::app_menus());
         cx.activate(true);
     });
+    drop(instance);
 }
 
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the

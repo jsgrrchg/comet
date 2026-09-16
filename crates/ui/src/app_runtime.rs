@@ -25,6 +25,7 @@ pub(crate) fn init(boot: EngineBootConfig, cx: &mut App) -> Entity<AppState> {
         state: state.clone(),
         boot,
     });
+    crate::notification_service::init(state.clone(), cx);
     let owner = state.clone();
     cx.on_app_quit(move |cx| {
         crate::settings::flush(cx);

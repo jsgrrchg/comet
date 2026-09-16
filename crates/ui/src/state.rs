@@ -1545,6 +1545,10 @@ impl AppState {
         Some(((done.min(total) * 100) / total).min(99) as u8)
     }
 
+    pub(crate) fn pending_chat_ids(&self) -> Vec<String> {
+        self.pending_sends.borrow().keys().cloned().collect()
+    }
+
     /// Is a send still in flight for this chat (unacked)? Inside the grace
     /// window normally; while the chat's delivery path is degraded the
     /// overlay holds indefinitely — the truth IS "Queued", and silently

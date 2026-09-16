@@ -62,6 +62,8 @@ pub mod theme;
 pub mod theme_library;
 pub mod transcript;
 pub mod typography;
+#[cfg(feature = "multi-window-fixture")]
+mod window_fixture;
 mod window_manager;
 mod workspace_links;
 
@@ -125,7 +127,15 @@ impl UiConfig {
 /// Run the headed app: tokio bridge up, engine bootstrap kicked off (probe →
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
-pub fn run_app(config: UiConfig, mut instance: gui_instance::GuiInstance) {
+pub fn run_app(config: UiConfig, instance: gui_instance::GuiInstance) {
+    run_application(config, instance, None);
+}
+
+fn run_application(
+    config: UiConfig,
+    mut instance: gui_instance::GuiInstance,
+    on_start: Option<Box<dyn FnOnce(&mut App)>>,
+) {
     let mut launches = instance.incoming.take().expect("GUI launch receiver");
     let app = gpui_platform::application().with_assets(icons::Assets);
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
@@ -180,7 +190,9 @@ pub fn run_app(config: UiConfig, mut instance: gui_instance::GuiInstance) {
         appshots::set_enabled(ui_settings.appshots_enabled);
         terminal::panel::init(cx);
         app_menus::init(cx);
-        cx.register_url_scheme("zeron").detach();
+        if on_start.is_none() {
+            cx.register_url_scheme("zeron").detach();
+        }
 
         let owner = app_runtime::init(config.boot(), cx);
         cx.spawn(async move |cx| {
@@ -228,7 +240,9 @@ pub fn run_app(config: UiConfig, mut instance: gui_instance::GuiInstance) {
             cx,
         );
         #[cfg(any(target_os = "macos", target_os = "linux"))]
-        start_appshot_service(config.boot().data_dir, cx);
+        if on_start.is_none() {
+            start_appshot_service(config.boot().data_dir, cx);
+        }
         // Native menu bar — macOS gets the standard app menu (About/Services/
         // Hide/Quit ⌘Q), Edit clipboard verbs routed to the focused input, and
         // a Window menu (⌘M/⌘W). Without this, `NSApp.mainMenu` stays nil: no
@@ -238,6 +252,9 @@ pub fn run_app(config: UiConfig, mut instance: gui_instance::GuiInstance) {
         // equivalents (gpui snapshots the keymap at set time).
         cx.set_menus(app_menus::app_menus());
         cx.activate(true);
+        if let Some(on_start) = on_start {
+            on_start(cx);
+        }
     });
     drop(instance);
 }
@@ -468,4 +485,31 @@ fn deliver_appshot(
     if captured {
         appshots::foreground_after_capture();
     }
+}
+
+/// Native regression fixture; absent from production builds.
+#[cfg(feature = "multi-window-fixture")]
+pub fn run_multi_window_fixture(data_dir: PathBuf, output: PathBuf) -> anyhow::Result<()> {
+    let gui_instance::Launch::Primary(instance) =
+        gui_instance::GuiInstance::acquire(&data_dir, gui_instance::LaunchRequest::Activate)?
+    else {
+        anyhow::bail!("fixture profile already has a GUI");
+    };
+    let config = UiConfig {
+        data_dir,
+        ipc_port: 0,
+        edge_url: "http://127.0.0.1:1".into(),
+        edge_token: None,
+        org_id: None,
+        workos_client_id: None,
+        default_harness: HarnessId::Mock,
+        initial_url: None,
+        initial_new_window: false,
+    };
+    run_application(
+        config,
+        instance,
+        Some(Box::new(move |cx| window_fixture::start(output, cx))),
+    );
+    Ok(())
 }

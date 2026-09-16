@@ -5905,6 +5905,9 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        if crate::lifecycle::blocks_commands(cx) {
+            return;
+        }
         if self.commit_queue_edit(cx) {
             return;
         }
@@ -5937,6 +5940,9 @@ impl Composer {
     /// content. With a truly empty composer it instead activates the most
     /// recently queued row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
+        if crate::lifecycle::blocks_commands(cx) {
+            return;
+        }
         if self.commit_queue_edit(cx) {
             return;
         }
@@ -6223,7 +6229,11 @@ impl Composer {
         let restore_text = typed;
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
+        // Keep a submitted send alive through upload and command adoption,
+        // even when its native window closes. Completion releases the lease.
+        let send_owner = cx.entity();
         self.send_task = Some(cx.spawn(async move |this, cx| {
+            let _send_owner = send_owner;
             let result: Result<Option<String>, String> = async {
                 // Attachments stage FIRST — before the chat row or anything
                 // else exists. Staging is chat-independent (keyed by

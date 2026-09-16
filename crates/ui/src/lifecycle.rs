@@ -1,7 +1,7 @@
 //! Serializes application operations and keeps their task owner alive even
 //! when its native window closes. Dirty-file decisions remain in each view.
 
-use gpui::{App, AppContext, Entity, EntityId, Global, SharedString};
+use gpui::{App, Entity, EntityId, Global, SharedString};
 
 use crate::shell::{Shell, SyncFlow, UpdateFlow};
 
@@ -56,6 +56,11 @@ pub(crate) fn claim(owner: Entity<Shell>, progress: Progress, cx: &mut App) -> b
     true
 }
 
+pub(crate) fn active_owner(except: EntityId, cx: &App) -> Option<Entity<Shell>> {
+    let owner = cx.try_global::<Operations>()?.lease.as_ref()?;
+    (owner.entity_id() != except).then(|| owner.clone())
+}
+
 pub(crate) fn is_owner(id: EntityId, cx: &App) -> bool {
     cx.try_global::<Operations>()
         .is_none_or(|operations| operations.owner.is_none_or(|owner| owner == id))
@@ -73,16 +78,25 @@ pub(crate) fn publish(owner: Entity<Shell>, progress: Progress, cx: &mut App) {
         return;
     }
     let operations = cx.global_mut::<Operations>();
-    if operations.owner != Some(owner.entity_id())
-        || operations.progress.as_ref() == Some(&progress)
-    {
+    if operations.progress.as_ref() == Some(&progress) {
         return;
+    }
+    if operations.owner != Some(owner.entity_id()) {
+        if operations.progress.as_ref().is_some_and(|p| p.busy) {
+            return;
+        }
+        operations.owner = Some(owner.entity_id());
     }
     operations.lease = progress.busy.then_some(owner);
     let replacing = progress.replacing;
     operations.progress = Some(progress);
     cx.defer(move |cx| lock_views(replacing, cx));
     cx.refresh_windows();
+}
+
+pub(crate) fn replacing(cx: &App) -> bool {
+    cx.try_global::<Operations>()
+        .is_some_and(|operations| operations.progress.as_ref().is_some_and(|p| p.replacing))
 }
 
 pub(crate) fn blocks_commands(cx: &App) -> bool {

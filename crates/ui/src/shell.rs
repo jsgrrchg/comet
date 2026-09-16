@@ -1560,6 +1560,7 @@ pub struct Shell {
     _state_observation: Subscription,
     _operations_observation: Subscription,
     runtime_epoch: u64,
+    application_locked: bool,
     _composer_events: Subscription,
     /// The primary transcript's spawn-chip events (subagent tabs).
     _transcript_events: Subscription,
@@ -1567,6 +1568,17 @@ pub struct Shell {
 }
 
 impl Shell {
+    pub(crate) fn open_conversation_link(&mut self, url: &str, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
+        self.state
+            .update(cx, |state, cx| state.open_deep_link(url, cx));
+        self.composer.update(cx, |composer, cx| {
+            composer.focus_pending = true;
+            cx.notify();
+        });
+        cx.notify();
+    }
+
     pub fn new(state: Entity<AppState>, boot: EngineBootConfig, cx: &mut Context<Self>) -> Self {
         let observation = cx.observe(&state, |this: &mut Shell, state, cx| {
             this.on_state_changed(&state, cx);
@@ -1715,8 +1727,16 @@ impl Shell {
             shell: shell.downgrade(),
             _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
         });
+        // A second window can attach after bootstrap has already finished.
+        // It may never receive another connection notification, so only show
+        // the startup overlay while this window's initial state is connecting.
+        let splash = match state.read(cx).connection {
+            ConnectionStatus::Connecting => SplashPhase::Visible,
+            ConnectionStatus::Ready | ConnectionStatus::Failed(_) => SplashPhase::Gone,
+        };
         Self {
             runtime_epoch: state.read(cx).runtime_epoch,
+            application_locked: false,
             _operations_observation: cx.observe_self(|shell, cx| {
                 crate::lifecycle::publish(cx.entity(), shell.application_progress(), cx);
             }),
@@ -1846,7 +1866,7 @@ impl Shell {
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
             render_time: None,
-            splash: SplashPhase::Visible,
+            splash,
             splash_task: None,
             focus_sub: None,
             shortcut_focus: cx.focus_handle(),
@@ -1915,6 +1935,11 @@ impl Shell {
 
     // ---- splash ----
 
+    #[cfg(feature = "multi-window-fixture")]
+    pub(crate) fn startup_overlay_visible(&self) -> bool {
+        self.splash != SplashPhase::Gone
+    }
+
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         self.sync_application_progress(cx);
         let epoch = state.read(cx).runtime_epoch;
@@ -1930,6 +1955,13 @@ impl Shell {
             self.diff_subs.clear();
             self.subagent_tabs.clear();
             self.right_tabs.clear();
+            self.panels = SessionPanels::default();
+            self.org = None;
+            self.accounts_page = None;
+            self.devices_page = None;
+            self.archived_page = None;
+            self.harnesses_page = None;
+            self.last_appshot_chat = None;
             self.terminal = None;
             self.right_terminal = None;
             for browser in self.browsers.values() {
@@ -3203,19 +3235,18 @@ impl Shell {
     }
 
     pub(crate) fn lock_application_editors(&mut self, locked: bool, cx: &mut Context<Self>) {
+        self.application_locked = locked;
         for files in self.files.values().chain(self.file_surfaces.values()) {
             files.update(cx, |files, cx| files.lock_application_editors(locked, cx));
         }
-        self.composer
-            .read(cx)
-            .input
-            .clone()
-            .update(cx, |input, cx| {
-                if input.read_only != locked {
-                    input.read_only = locked;
-                    cx.notify();
-                }
-            });
+        let composer = self.composer.read(cx);
+        let readonly = locked || composer.queue_edit_finishing;
+        composer.input.clone().update(cx, |input, cx| {
+            if input.read_only != readonly {
+                input.read_only = readonly;
+                cx.notify();
+            }
+        });
     }
 
     fn application_progress(&self) -> crate::lifecycle::Progress {
@@ -4200,6 +4231,10 @@ impl Shell {
     }
 
     fn cancel_auth_setup(&mut self, cx: &mut Context<Self>) {
+        if let Some(owner) = crate::lifecycle::active_owner(cx.entity_id(), cx) {
+            cx.defer(move |cx| owner.update(cx, |shell, cx| shell.cancel_auth_setup(cx)));
+            return;
+        }
         if !self.claim_application_operation(cx) {
             return;
         }
@@ -9656,6 +9691,10 @@ fn header_icon_button(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_application_progress(cx);
+        let locked = crate::lifecycle::replacing(cx);
+        if self.application_locked != locked {
+            self.lock_application_editors(locked, cx);
+        }
         let title = self
             .state
             .read(cx)
@@ -9665,8 +9704,30 @@ impl Render for Shell {
             .map(|title| format!("{title} — Zeron"))
             .unwrap_or_else(|| "Zeron".into());
         window.set_window_title(&title);
+        window.set_rem_size(px(crate::typography::font_size(cx).pixels()));
         if self.window_key.is_some() {
-            self.settings = settings::windows::current(self.window_key.as_deref(), cx);
+            let previous = &self.settings;
+            let current = settings::windows::current(self.window_key.as_deref(), cx);
+            for surface in self.files.values().chain(self.file_surfaces.values()) {
+                surface.update(cx, |surface, cx| {
+                    if previous.files_autosave_enabled != current.files_autosave_enabled {
+                        surface.set_autosave_enabled(current.files_autosave_enabled, cx);
+                    }
+                    if previous.files_autosave_delay_ms != current.files_autosave_delay_ms {
+                        surface.set_autosave_delay_ms(current.files_autosave_delay_ms, cx);
+                    }
+                    if previous.files_word_wrap != current.files_word_wrap {
+                        surface.set_word_wrap(current.files_word_wrap, window, cx);
+                    }
+                    if previous.files_show_all != current.files_show_all {
+                        surface.set_show_all_files(current.files_show_all, cx);
+                    }
+                    if previous.code_font_size != current.code_font_size {
+                        surface.set_editor_font_size(current.code_font_size, cx);
+                    }
+                });
+            }
+            self.settings = current;
             self.settings_base = self.settings.clone();
         }
         if self.bounds_sub.is_none() {
@@ -11317,6 +11378,57 @@ mod exit_regressions {
     use gpui::{AppContext, TestAppContext};
 
     #[gpui::test]
+    fn windows_attaching_to_settled_runtime_do_not_cover_content(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        for (connection, expected) in [
+            (ConnectionStatus::Connecting, SplashPhase::Visible),
+            (ConnectionStatus::Ready, SplashPhase::Gone),
+            (
+                ConnectionStatus::Failed("unavailable".into()),
+                SplashPhase::Gone,
+            ),
+        ] {
+            let window = cx.add_window(|_, cx| {
+                let owner = cx.new(|_| {
+                    let mut state = AppState::new();
+                    state.connection = connection;
+                    state
+                });
+                let view = cx.new(|cx| AppState::for_window(owner, cx));
+                Shell::new(
+                    view,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                )
+            });
+            window.update(cx, |shell, _, _| {
+                assert_eq!(shell.splash, expected, "the initial runtime snapshot must determine splash visibility without a later notification");
+            }).unwrap();
+        }
+    }
+
+    #[gpui::test]
     fn appshot_destinations_retain_last_session_and_use_new_canvas_defaults(
         cx: &mut TestAppContext,
     ) {
@@ -12181,6 +12293,143 @@ mod exit_regressions {
                 assert!(!shell.close_active_surface(window, cx));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn multi_window_navigation_drafts_notifications_and_operation_lifetime(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::window_manager::{self, Open};
+        let dir = tempfile::tempdir().unwrap();
+        let owner = cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            let settings = settings::UiSettings::default();
+            crate::history::init(
+                settings.git_history_columns,
+                settings.git_history_column_widths,
+                settings.git_history_column_order.clone(),
+                settings.git_history_author_display,
+                cx,
+            );
+            settings::init(settings, dir.path(), cx);
+            crate::app_menus::init(cx);
+            crate::lifecycle::init(cx);
+            window_manager::init(cx);
+            crate::app_runtime::init(
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        owner.update(cx, |state, cx| {
+            state.workspace_scope = Some(WorkspaceScope::Local);
+            state.local_device_id = Some("local".into());
+            state.apply_chats(
+                ["a", "b"]
+                    .into_iter()
+                    .map(|id| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "deviceId": "local", "title": id, "archived": false,
+                            "createdAt": "2026-09-16T00:00:00Z"
+                        }))
+                        .unwrap()
+                    })
+                    .collect(),
+            );
+            cx.notify();
+        });
+        let a = cx.update(|cx| window_manager::open(Open::Chat("a".into()), cx).unwrap());
+        let b = cx.update(|cx| window_manager::open(Open::Chat("a".into()), cx).unwrap());
+        let c = cx.update(|cx| window_manager::open(Open::Blank, cx).unwrap());
+        cx.run_until_parked();
+        c.read_with(cx, |shell, cx| {
+            assert!(shell.state.read(cx).selected_chat.is_none())
+        })
+        .unwrap();
+        for (window, text) in [(a, "draft A"), (b, "draft B")] {
+            window
+                .update(cx, |shell, _, cx| {
+                    shell
+                        .composer
+                        .read(cx)
+                        .input
+                        .clone()
+                        .update(cx, |input, cx| input.set_text(text, cx));
+                })
+                .unwrap();
+        }
+        c.update(cx, |shell, _, cx| shell.open_chat("b".into(), cx))
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            window_manager::activated(a.window_id(), cx);
+            assert_eq!(window_manager::chat_window("a", cx), Some(a));
+            window_manager::notified_chat("a".into(), cx);
+        });
+        for (window, text) in [(a, "draft A"), (b, "draft B")] {
+            window
+                .read_with(cx, |shell, cx| {
+                    assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("a"));
+                    assert_eq!(shell.composer.read(cx).input.read(cx).text(), text);
+                })
+                .unwrap();
+        }
+        c.read_with(cx, |shell, cx| {
+            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("b"))
+        })
+        .unwrap();
+        a.update(cx, |shell, _, _| {
+            shell.route = Route::Settings(SettingsSection::Devices)
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let locator =
+                crate::links::workspace_locator(Some(WorkspaceScope::Local), None, Some("local"))
+                    .unwrap();
+            window_manager::deep_link(crate::links::zeron_conversation_link("a", &locator), cx);
+        });
+        a.read_with(cx, |shell, _| assert!(matches!(shell.route, Route::Chat)))
+            .unwrap();
+        b.update(cx, |shell, _, cx| {
+            assert!(shell.claim_application_operation(cx));
+            shell.update_flow = UpdateFlow::Downloading;
+            cx.notify();
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let closed = b
+            .update(cx, |_, window, cx| {
+                let weak = cx.weak_entity();
+                window.remove_window();
+                weak
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            closed.upgrade().is_some(),
+            "the application retains an operation after its window closes"
+        );
+        closed
+            .update(cx, |shell, cx| {
+                shell.update_flow = UpdateFlow::Idle;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(
+            closed.upgrade().is_none(),
+            "a finished operation releases its closed view"
+        );
+        cx.update(|cx| assert_eq!(window_manager::views(cx).len(), 2));
+        assert_eq!(owner.read_with(cx, |state, _| state.chats.len()), 2);
     }
 
     #[gpui::test]

@@ -162,9 +162,7 @@ pub(crate) fn deep_link(url: String, cx: &mut App) {
     if let Some(window) = existing.or_else(|| activate(cx)) {
         let _ = window.update(cx, |shell, window, cx| {
             window.activate_window();
-            shell
-                .state
-                .update(cx, |state, cx| state.open_deep_link(&url, cx));
+            shell.open_conversation_link(&url, cx);
         });
     }
 }

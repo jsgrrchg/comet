@@ -88,6 +88,9 @@ impl ShortcutsPage {
     fn sync_preferences(&mut self, cx: &gpui::App) {
         if cx.has_global::<crate::app_runtime::AppRuntime>() {
             let settings = crate::settings::current(cx);
+            self.appshots_enabled = settings.appshots_enabled;
+            self.appshot_sound_enabled = settings.appshot_sound_enabled;
+            self.appshot_destination = settings.appshot_destination;
             self.keymap = settings.keymap;
             self.composer_send_behavior = settings.composer_send_behavior;
             self.escape_stops_active_agent = settings.escape_stops_active_agent;

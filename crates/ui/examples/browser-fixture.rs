@@ -1,3 +1,5 @@
+#[path = "browser-fixture/transcript_links.rs"]
+mod transcript_links;
 #[cfg(target_os = "linux")]
 #[path = "browser-fixture/linux.rs"]
 mod linux;
@@ -166,7 +168,7 @@ fn main() -> anyhow::Result<()> {
         let settings = settings::UiSettings::default();
         settings::init(settings.clone(), data.clone(), cx);
         let fonts = typography::register_fonts(cx);
-        typography::init(settings.ui_font_family.clone(), settings.ui_font_size, fonts, cx);
+        typography::init(settings.ui_font_family.clone(), settings.ui_font_size, settings.terminal_font_family.clone(), settings.terminal_font_size, settings.code_font_family.clone(), settings.code_font_size, fonts, cx);
         theme_library::init(data.clone(), cx);
         appearance::init(appearance::AppearanceMode::Dark, settings.theme_selection, settings.accent, settings.surface, cx);
         history::init(settings.git_history_columns, settings.git_history_column_widths,
@@ -196,6 +198,9 @@ fn main() -> anyhow::Result<()> {
         cx.spawn(async move |cx| {
             let run: anyhow::Result<()> = async {
                 pause(cx, 1200).await;
+                if std::env::var_os("ZERON_TRANSCRIPT_LINK_FIXTURE_ONLY").is_some() {
+                    return transcript_links::exercise(window, state.clone(), &_origin, &output, cx).await;
+                }
                 state.update(cx, |s, cx| {
                     let entries = serde_json::from_value(serde_json::json!([
                         {"id":"fixture-user","role":"user","parts":[{"id":"text","kind":"text","text":"Build a calm, thoughtful workspace for Fieldnotes. Let’s preview the landing page beside this conversation."}],"createdAt":1788900000000_i64,"deviceId":"local"},
@@ -353,11 +358,13 @@ fn main() -> anyhow::Result<()> {
                     let (left,top)=first.read_with(cx,|b,_|b.fixture_origin());
                     // Real resize-handle drag, including crossing into the native page.
                     eprintln!("Browser fixture: starting resize drag");
-                    // Both halves must reach GPUI before a drag exists.
-                    for offset in [-6., -2., 0., 3., 4.5] {
+                    // The 20px shell target overlaps the native browser by 9px
+                    // after its one-point panel border. That full overlap must
+                    // reach GPUI, while content beyond it stays native.
+                    for offset in [-6., -2., 0., 3., 6., 8.5] {
                         anyhow::ensure!(!first.read_with(cx,|b,_|b.fixture_page_hit((left+offset) as f64,(top+120.) as f64)),"native page stole the resize target at offset {offset}");
                     }
-                    anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_page_hit((left+6.) as f64,(top+120.) as f64)),"resize target blocked adjacent page content");
+                    anyhow::ensure!(first.read_with(cx,|b,_|b.fixture_page_hit((left+10.) as f64,(top+120.) as f64)),"resize target blocked adjacent page content");
                     let start=gpui::point(px(left+3.),px(top+120.));
                     gpui::AnyWindowHandle::from(window).update(cx,|_,w,cx| {w.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent{position:start,button:gpui::MouseButton::Left,click_count:1,..Default::default()}),cx);})?;
                     let mut widths=Vec::new();

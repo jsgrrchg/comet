@@ -26,7 +26,7 @@ pub mod shortcuts;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
-pub const SIDEBAR_MIN: f32 = 208.0;
+pub const SIDEBAR_MIN: f32 = 224.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
@@ -52,11 +52,59 @@ pub const SAVE_DEBOUNCE_MS: u64 = 400;
 pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 900;
 pub const FILES_AUTOSAVE_DELAY_MIN_MS: u64 = 100;
 pub const FILES_AUTOSAVE_DELAY_MAX_MS: u64 = 10_000;
-pub const FILES_EDITOR_FONT_SIZE_DEFAULT: f32 = 13.0;
-pub const FILES_EDITOR_FONT_SIZE_MIN: f32 = 9.0;
-pub const FILES_EDITOR_FONT_SIZE_MAX: f32 = 24.0;
 
 const FILE_NAME: &str = "ui-settings.json";
+const NEW_THREAD_BACKGROUND_DIR: &str = "new-thread-backgrounds";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewThreadComposerBackground {
+    /// Managed copy inside Zeron's device-local data directory.
+    pub path: String,
+    /// Original file name shown in Appearance settings.
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NewThreadBackgroundEffect {
+    #[default]
+    None,
+    Dither,
+    Ascii,
+    Halftone,
+    Scanlines,
+}
+
+impl NewThreadBackgroundEffect {
+    pub const ALL: [Self; 5] = [
+        Self::None,
+        Self::Dither,
+        Self::Ascii,
+        Self::Halftone,
+        Self::Scanlines,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Dither => "Dither",
+            Self::Ascii => "ASCII",
+            Self::Halftone => "Halftone",
+            Self::Scanlines => "Scanlines",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::None => "Shows the original artwork.",
+            Self::Dither => "Rebuilds the artwork with a dithered color palette.",
+            Self::Ascii => "Recreates the artwork with colored characters on black.",
+            Self::Halftone => "Recreates the artwork with colored print dots on black.",
+            Self::Scanlines => "Adds a pronounced horizontal display-line texture.",
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -222,6 +270,115 @@ pub fn current(cx: &App) -> UiSettings {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.clone())
         .unwrap_or_default()
+}
+
+/// Copy a selected image into Zeron's device-local data directory and make it
+/// the new-thread canvas background. A unique file name avoids stale image
+/// caches when the background is replaced.
+pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Result<(), String> {
+    let staged = crate::attachments::stage_file(source)?;
+    // Do not persist the candidate or retire the old managed file until the
+    // renderer's decoder has accepted the exact bytes we are about to save.
+    crate::new_thread_background_image::decode(staged.bytes()).map_err(|_| {
+        "This background image is unsupported or damaged. Choose a valid image such as PNG or JPEG.".to_string()
+    })?;
+    let data_dir = cx
+        .try_global::<SettingsStore>()
+        .map(|store| store.data_dir.clone())
+        .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
+    let backgrounds_dir = data_dir.join(NEW_THREAD_BACKGROUND_DIR);
+    std::fs::create_dir_all(&backgrounds_dir).map_err(|_| {
+        "Unable to save the image. Check folder permissions and try again.".to_string()
+    })?;
+
+    let extension = Path::new(&staged.name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("png");
+    let destination = backgrounds_dir.join(format!(
+        "new-thread-background-{}.{}",
+        uuid::Uuid::new_v4(),
+        extension
+    ));
+    let temporary = destination.with_extension(format!("{extension}.tmp"));
+    if std::fs::write(&temporary, staged.bytes())
+        .and_then(|_| std::fs::rename(&temporary, &destination))
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(
+            "Unable to save the image. Check folder permissions and try again.".to_string(),
+        );
+    }
+
+    let replacement = NewThreadComposerBackground {
+        path: destination.to_string_lossy().into_owned(),
+        name: staged.name,
+    };
+    let mut next = current(cx);
+    let previous = next
+        .new_thread_composer_background
+        .replace(replacement.clone());
+    // Persist the pointer before retiring the old file. `update(Immediate)`
+    // updates memory first and only logs an I/O failure; for a file-backed
+    // setting that order can leave disk pointing at an image we just deleted.
+    if next.save(&data_dir).is_err() {
+        let _ = std::fs::remove_file(&destination);
+        return Err(
+            "Unable to save the image. Check folder permissions and try again.".to_string(),
+        );
+    }
+    replace(next, SavePolicy::Immediate, cx);
+    remove_managed_new_thread_background(previous.as_ref(), &backgrounds_dir);
+    cx.refresh_windows();
+    Ok(())
+}
+
+pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String> {
+    let data_dir = cx
+        .try_global::<SettingsStore>()
+        .map(|store| store.data_dir.clone())
+        .ok_or_else(|| "Unable to remove the image. Restart Zeron and try again.".to_string())?;
+    let mut next = current(cx);
+    let previous = next.new_thread_composer_background.take();
+    if previous.is_none() {
+        return Ok(());
+    }
+    if next.save(&data_dir).is_err() {
+        return Err(
+            "Unable to remove the image. Check folder permissions and try again.".to_string(),
+        );
+    }
+    replace(next, SavePolicy::Immediate, cx);
+    remove_managed_new_thread_background(
+        previous.as_ref(),
+        &data_dir.join(NEW_THREAD_BACKGROUND_DIR),
+    );
+    cx.refresh_windows();
+    Ok(())
+}
+
+pub fn set_new_thread_background_effect(effect: NewThreadBackgroundEffect, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.new_thread_background_effect = effect;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+fn remove_managed_new_thread_background(
+    background: Option<&NewThreadComposerBackground>,
+    backgrounds_dir: &Path,
+) {
+    let Some(background) = background else {
+        return;
+    };
+    let path = Path::new(&background.path);
+    // Never delete an arbitrary legacy or hand-edited path. Only files copied
+    // directly into the directory owned by this setting are disposable.
+    if path.parent() == Some(backgrounds_dir) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// Monotonic id of the global code-fence layout choice. Every transcript
@@ -428,9 +585,15 @@ pub struct UiSettings {
     pub git_history_author_display: GitHistoryAuthorDisplay,
     /// Interface and conversational-prose family. Device-local by design.
     pub ui_font_family: crate::typography::UiFontFamily,
-    /// Base size for interface and conversational prose. Code-related surfaces
-    /// retain their fixed metrics.
+    /// Base size for interface and conversational prose.
     pub ui_font_size: crate::typography::UiFontSize,
+    /// Terminal family and absolute pixel size. Only fixed-width families
+    /// qualify, including compatible Nerd Fonts.
+    pub terminal_font_family: crate::typography::UiFontFamily,
+    pub terminal_font_size: f32,
+    /// Family and absolute pixel size for code, diffs, and file editors.
+    pub code_font_family: crate::typography::UiFontFamily,
+    pub code_font_size: f32,
     /// Independently selected light and dark theme variants.
     pub theme_selection: zeron_theme::ThemeSelection,
     /// Changes pane: side-by-side diffs instead of the unified stack.
@@ -440,20 +603,26 @@ pub struct UiSettings {
     /// Agent-sent Markdown fences: wrap long lines to the chat width instead
     /// of exposing their horizontal scroll plane.
     pub code_fences_fit_content: bool,
+    /// Open a normal web-link activation in the session Browser. Explicit
+    /// context-menu actions remain available regardless of this preference.
+    pub open_web_links_in_zeron: bool,
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
     pub files_word_wrap: bool,
-    /// Font size used by editable workspace-file buffers.
-    pub files_editor_font_size: f32,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
     pub surface: zeron_theme::SurfacePreference,
+    /// Optional device-local artwork behind the blank new-thread composer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_thread_composer_background: Option<NewThreadComposerBackground>,
+    /// Non-destructive treatment composited inside the artwork's fade mask.
+    pub new_thread_background_effect: NewThreadBackgroundEffect,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -499,17 +668,23 @@ impl Default for UiSettings {
             git_history_author_display: GitHistoryAuthorDisplay::default(),
             ui_font_family: crate::typography::UiFontFamily::default(),
             ui_font_size: crate::typography::UiFontSize::default(),
+            terminal_font_family: crate::typography::UiFontFamily::GeistMono,
+            terminal_font_size: crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
+            code_font_family: crate::typography::UiFontFamily::GeistMono,
+            code_font_size: crate::typography::CODE_FONT_SIZE_DEFAULT,
             theme_selection: zeron_theme::ThemeSelection::default(),
             diff_split: false,
             diff_wrap: false,
             code_fences_fit_content: false,
+            open_web_links_in_zeron: true,
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
-            files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
+            new_thread_composer_background: None,
+            new_thread_background_effect: NewThreadBackgroundEffect::None,
             legacy_accent_color: None,
         }
     }
@@ -972,11 +1147,17 @@ impl UiSettings {
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
-        self.files_editor_font_size = clamp_or(
-            self.files_editor_font_size,
-            FILES_EDITOR_FONT_SIZE_MIN,
-            FILES_EDITOR_FONT_SIZE_MAX,
-            FILES_EDITOR_FONT_SIZE_DEFAULT,
+        self.terminal_font_size = clamp_or(
+            self.terminal_font_size,
+            crate::typography::FONT_SIZE_MIN,
+            crate::typography::FONT_SIZE_MAX,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT,
+        );
+        self.code_font_size = clamp_or(
+            self.code_font_size,
+            crate::typography::FONT_SIZE_MIN,
+            crate::typography::FONT_SIZE_MAX,
+            crate::typography::CODE_FONT_SIZE_DEFAULT,
         );
         self.git_history_column_widths = self.git_history_column_widths.clamped();
         self.git_history_column_order = self.git_history_column_order.normalized();
@@ -999,6 +1180,11 @@ impl UiSettings {
                         settings
                             .entry("appshotSoundEnabled")
                             .or_insert(serde_json::Value::Bool(previous_sound));
+                        // The files-editor size was the first user-facing code
+                        // size; it now drives every code surface.
+                        if let Some(legacy) = settings.remove("filesEditorFontSize") {
+                            settings.entry("codeFontSize").or_insert(legacy);
+                        }
                     }
                     if let Some(keymap) = value
                         .get_mut("keymap")
@@ -1124,6 +1310,12 @@ mod tests {
 
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.composer_send_behavior, ComposerSendBehavior::Enter);
+        assert!(loaded.open_web_links_in_zeron);
+        assert!(loaded.new_thread_composer_background.is_none());
+        assert_eq!(
+            loaded.new_thread_background_effect,
+            NewThreadBackgroundEffect::None
+        );
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
         for sound in [
@@ -1133,6 +1325,34 @@ mod tests {
         ] {
             assert!(!loaded.session_sound_enabled(sound));
         }
+    }
+
+    #[test]
+    fn unknown_keys_from_a_newer_build_are_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth":300.0,"someFutureKey":"whatever","anotherOne":{"nested":1}}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert_eq!(
+            loaded.terminal_font_family,
+            crate::typography::UiFontFamily::GeistMono
+        );
+        assert_eq!(
+            loaded.terminal_font_size,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(
+            loaded.code_font_family,
+            crate::typography::UiFontFamily::GeistMono
+        );
+        assert_eq!(
+            loaded.code_font_size,
+            crate::typography::CODE_FONT_SIZE_DEFAULT
+        );
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1214,6 +1434,130 @@ mod tests {
     }
 
     #[test]
+    fn background_cleanup_only_removes_files_owned_by_the_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let backgrounds = dir.path().join(NEW_THREAD_BACKGROUND_DIR);
+        std::fs::create_dir(&backgrounds).unwrap();
+        let managed = backgrounds.join("new-thread-background-owned.png");
+        let unrelated = dir.path().join("keep.png");
+        std::fs::write(&managed, b"managed").unwrap();
+        std::fs::write(&unrelated, b"unrelated").unwrap();
+
+        remove_managed_new_thread_background(
+            Some(&NewThreadComposerBackground {
+                path: unrelated.to_string_lossy().into_owned(),
+                name: "keep.png".into(),
+            }),
+            &backgrounds,
+        );
+        assert!(unrelated.exists());
+        remove_managed_new_thread_background(
+            Some(&NewThreadComposerBackground {
+                path: managed.to_string_lossy().into_owned(),
+                name: "owned.png".into(),
+            }),
+            &backgrounds,
+        );
+        assert!(!managed.exists());
+    }
+
+    #[gpui::test]
+    fn invalid_background_replacement_preserves_previous_image_and_settings(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("original.png");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([20, 100, 200, 255]))
+            .save(&original)
+            .unwrap();
+        cx.update(|cx| {
+            init(UiSettings::default(), dir.path(), cx);
+            install_new_thread_composer_background(&original, cx).unwrap();
+            let before = current(cx);
+            let previous = PathBuf::from(&before.new_thread_composer_background.as_ref().unwrap().path);
+            let saved = std::fs::read(UiSettings::path(dir.path())).unwrap();
+            let previous_bytes = std::fs::read(&previous).unwrap();
+            for (name, bytes) in [
+                ("replacement.svg", br#"<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="red"/></svg>"#.as_slice()),
+                ("corrupt.png", b"not a PNG".as_slice()),
+                ("truncated.png", &previous_bytes[..previous_bytes.len() / 2]),
+            ] {
+                let candidate = dir.path().join(name);
+                std::fs::write(&candidate, bytes).unwrap();
+                let result = install_new_thread_composer_background(&candidate, cx);
+                assert!(result.is_err(), "accepted invalid replacement: {name}");
+                assert_eq!(current(cx), before);
+                assert_eq!(std::fs::read(UiSettings::path(dir.path())).unwrap(), saved);
+                assert_eq!(std::fs::read(&previous).unwrap(), previous_bytes);
+                assert_eq!(std::fs::read_dir(dir.path().join(NEW_THREAD_BACKGROUND_DIR)).unwrap().count(), 1);
+                assert!(candidate.exists(), "source files must never be deleted");
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn valid_background_replacement_persists_renderable_image_before_retiring_previous(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.png");
+        let second = dir.path().join("second.jpg");
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([20, 100, 200, 255]))
+            .save(&first)
+            .unwrap();
+        image::RgbImage::from_pixel(12, 10, image::Rgb([200, 100, 20]))
+            .save(&second)
+            .unwrap();
+        cx.update(|cx| {
+            let initial = UiSettings {
+                new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
+                ..Default::default()
+            };
+            init(initial, dir.path(), cx);
+            install_new_thread_composer_background(&first, cx).unwrap();
+            let old_path = current(cx).new_thread_composer_background.unwrap().path;
+            install_new_thread_composer_background(&second, cx).unwrap();
+            let settings = current(cx);
+            let replacement = settings.new_thread_composer_background.as_ref().unwrap();
+            assert_ne!(replacement.path, old_path);
+            let saved_image = std::fs::read(&replacement.path).unwrap();
+            assert_eq!(saved_image, std::fs::read(&second).unwrap());
+            let decoded = crate::new_thread_background_image::decode(&saved_image).unwrap();
+            assert_eq!((decoded.width(), decoded.height()), (12, 10));
+            assert_eq!(UiSettings::load(dir.path()), settings);
+            assert_eq!(
+                settings.new_thread_background_effect,
+                NewThreadBackgroundEffect::Ascii
+            );
+            assert!(!Path::new(&old_path).exists());
+            assert!(first.exists() && second.exists());
+            assert_eq!(
+                std::fs::read_dir(dir.path().join(NEW_THREAD_BACKGROUND_DIR))
+                    .unwrap()
+                    .count(),
+                1
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn invalid_initial_background_import_does_not_create_managed_files_or_settings(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join("corrupt.png");
+        std::fs::write(&candidate, b"not a PNG").unwrap();
+        cx.update(|cx| {
+            init(UiSettings::default(), dir.path(), cx);
+            assert!(install_new_thread_composer_background(&candidate, cx).is_err());
+            assert!(current(cx).new_thread_composer_background.is_none());
+            assert!(!dir.path().join(NEW_THREAD_BACKGROUND_DIR).exists());
+            assert!(!UiSettings::path(dir.path()).exists());
+            assert!(candidate.exists());
+        });
+    }
+
+    #[test]
     fn obsolete_steering_preference_does_not_reset_other_settings() {
         let loaded: UiSettings = serde_json::from_str(
             r#"{"activeTurnSendBehavior":"steer","sidebarWidth":300,"soundEnabled":false}"#,
@@ -1267,7 +1611,14 @@ mod tests {
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             appshots_enabled: false,
             appshot_sound_enabled: true,
-            appshot_destination: crate::appshots::AppshotDestination::NewSession,
+            // The destination is only persisted where Appshots exist (macOS and
+            // Linux); elsewhere the field is `serde(skip)` and reloads as the
+            // default, so the round trip must expect exactly that.
+            appshot_destination: if cfg!(any(target_os = "macos", target_os = "linux")) {
+                crate::appshots::AppshotDestination::NewSession
+            } else {
+                crate::appshots::AppshotDestination::Automatic
+            },
             appearance: crate::appearance::AppearanceMode::Light,
             git_history_columns: GitHistoryColumns {
                 author: false,
@@ -1294,13 +1645,22 @@ mod tests {
             diff_split: true,
             diff_wrap: true,
             code_fences_fit_content: true,
+            open_web_links_in_zeron: false,
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
-            files_editor_font_size: 15.0,
+            terminal_font_family: crate::typography::UiFontFamily::Installed("Menlo".into()),
+            terminal_font_size: 15.0,
+            code_font_family: crate::typography::UiFontFamily::Geist,
+            code_font_size: 11.0,
             files_show_all: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
+            new_thread_composer_background: Some(NewThreadComposerBackground {
+                path: "/tmp/zeron/new-thread-background.png".into(),
+                name: "background.png".into(),
+            }),
+            new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
@@ -1308,6 +1668,12 @@ mod tests {
         assert!(json.contains(r#""diffWrap": true"#));
         assert_eq!(UiSettings::load(dir.path()), settings);
         assert!(json.contains(r#""codeFencesFitContent": true"#));
+        assert!(json.contains(r#""openWebLinksInZeron": false"#));
+        assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
+        assert!(json.contains(r#""terminalFontFamily": "installed:Menlo""#));
+        assert!(json.contains(r#""terminalFontSize": 15.0"#));
+        assert!(json.contains(r#""codeFontFamily": "geist""#));
+        assert!(json.contains(r#""codeFontSize": 11.0"#));
     }
 
     #[test]
@@ -1408,8 +1774,12 @@ mod tests {
         assert!(!loaded.files_autosave_enabled);
         assert!(!loaded.files_word_wrap);
         assert_eq!(
-            loaded.files_editor_font_size,
-            FILES_EDITOR_FONT_SIZE_DEFAULT
+            loaded.code_font_size,
+            crate::typography::CODE_FONT_SIZE_DEFAULT
+        );
+        assert_eq!(
+            loaded.terminal_font_size,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT
         );
         assert!(!loaded.files_show_all);
         assert!(
@@ -1557,6 +1927,15 @@ mod tests {
         assert!(!loaded.code_fences_fit_content);
         assert_eq!(
             UiSettings {
+                sidebar_width: 1.0,
+                ..Default::default()
+            }
+            .clamped()
+            .sidebar_width,
+            SIDEBAR_MIN
+        );
+        assert_eq!(
+            UiSettings {
                 files_autosave_delay_ms: 1,
                 ..Default::default()
             }
@@ -1566,12 +1945,46 @@ mod tests {
         );
         assert_eq!(
             UiSettings {
-                files_editor_font_size: 100.0,
+                code_font_size: 100.0,
                 ..Default::default()
             }
             .clamped()
-            .files_editor_font_size,
-            FILES_EDITOR_FONT_SIZE_MAX
+            .code_font_size,
+            crate::typography::FONT_SIZE_MAX
+        );
+        assert_eq!(
+            UiSettings {
+                terminal_font_size: 1.0,
+                ..Default::default()
+            }
+            .clamped()
+            .terminal_font_size,
+            crate::typography::FONT_SIZE_MIN
+        );
+        assert_eq!(
+            UiSettings {
+                code_font_size: f32::NAN,
+                ..Default::default()
+            }
+            .clamped()
+            .code_font_size,
+            crate::typography::CODE_FONT_SIZE_DEFAULT
+        );
+    }
+
+    #[test]
+    fn legacy_files_editor_font_size_becomes_the_code_font_size() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"filesEditorFontSize": 15.0}"#,
+        )
+        .unwrap();
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.code_font_size, 15.0);
+        assert_eq!(
+            loaded.terminal_font_size,
+            crate::typography::TERMINAL_FONT_SIZE_DEFAULT
         );
     }
 

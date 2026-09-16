@@ -7,6 +7,7 @@ publish.workspace = true
 
 [features]
 browser-fixture = []
+windows-render-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
 
@@ -21,6 +22,10 @@ required-features = ["browser-fixture"]
 [[example]]
 name = "browser-fixture"
 required-features = ["browser-fixture"]
+
+[[example]]
+name = "windows-render-fixture"
+required-features = ["windows-render-fixture"]
 
 [[example]]
 name = "appshots-fixture"
@@ -64,6 +69,7 @@ sha2.workspace = true
 roxmltree = "0.21.1"
 png = "0.18"
 thiserror.workspace = true
+rust-embed = "=8.7.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
@@ -93,3 +99,6 @@ gpui = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 mimalloc.workspace = true
 tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }

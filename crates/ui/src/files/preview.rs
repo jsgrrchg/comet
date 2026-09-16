@@ -32,8 +32,21 @@ use crate::{
 };
 
 const PREVIEW_LINE_HEIGHT: f32 = 20.0;
+/// One shared `code_font_size` setting drives two surfaces in this file that
+/// never agreed on a size: the editable editor and the plain preview. Each
+/// scales off its own baseline so the default setting reproduces the size that
+/// surface always had, and a user-chosen size moves both while keeping their
+/// proportions.
+const EDITOR_TEXT_SIZE: f32 = 13.0;
+const PREVIEW_TEXT_SIZE: f32 = 11.5;
+const EDITOR_TEXT_SIZE_RATIO: f32 = EDITOR_TEXT_SIZE / crate::typography::CODE_FONT_SIZE_DEFAULT;
+const PREVIEW_TEXT_SIZE_RATIO: f32 = PREVIEW_TEXT_SIZE / crate::typography::CODE_FONT_SIZE_DEFAULT;
+const PREVIEW_LINE_HEIGHT_RATIO: f32 = PREVIEW_LINE_HEIGHT / PREVIEW_TEXT_SIZE;
 const WIDE_BREAKPOINT: f32 = 680.0;
 const TREE_SPLIT_DEFAULT: f32 = 286.0;
+const TREE_SPLIT_MIN: f32 = 220.0;
+const TREE_SPLIT_MAX: f32 = 360.0;
+pub(super) const TREE_SPLIT_HITBOX_HALF_WIDTH: f32 = 10.0;
 const EDITOR_COMMENT_CARD_WIDTH: f32 = 320.0;
 const EDITOR_COMMENT_CARD_MARGIN: f32 = 8.0;
 const EDITOR_COMMENT_CARD_MIN_ANCHORED_WIDTH: f32 = 220.0;
@@ -149,9 +162,14 @@ pub(super) struct FilePreviewState {
     tree_sidebar_dismissed: bool,
     tree_width: f32,
     tree_motion: TreeSidebarMotion,
+    tree_edge_bounce: Option<crate::motion::ResizeEdgeBounce>,
+    tree_resize_edge: Option<crate::motion::ResizeEdge>,
+    tree_resize_active: bool,
+    tree_resize_dragging: bool,
     comment_anchors: HashMap<String, HashMap<String, EditorCommentAnchor>>,
     comment_draft: Option<EditorCommentDraft>,
     active_comment: Option<String>,
+    typography_generation: u32,
 }
 
 impl FilePreviewState {
@@ -181,9 +199,14 @@ impl FilePreviewState {
             tree_sidebar_dismissed: false,
             tree_width: TREE_SPLIT_DEFAULT,
             tree_motion: TreeSidebarMotion::default(),
+            tree_edge_bounce: None,
+            tree_resize_edge: None,
+            tree_resize_active: false,
+            tree_resize_dragging: false,
             comment_anchors: HashMap::new(),
             comment_draft: None,
             active_comment: None,
+            typography_generation: 0,
         }
     }
 
@@ -197,6 +220,10 @@ impl FilePreviewState {
         self.close_requested = false;
         self.tree_sidebar_visible = false;
         self.tree_motion = TreeSidebarMotion::default();
+        self.tree_edge_bounce = None;
+        self.tree_resize_edge = None;
+        self.tree_resize_active = false;
+        self.tree_resize_dragging = false;
         self.comment_anchors.clear();
         self.comment_draft = None;
         self.active_comment = None;
@@ -326,6 +353,10 @@ impl FilePreviewState {
     }
 
     fn toggle_tree_sidebar(&mut self) {
+        self.tree_edge_bounce = None;
+        self.tree_resize_edge = None;
+        self.tree_resize_active = false;
+        self.tree_resize_dragging = false;
         let previous = self.tree_sidebar_visible();
         if previous {
             self.tree_sidebar_visible = false;
@@ -339,6 +370,24 @@ impl FilePreviewState {
 
     fn word_wrap(&self) -> bool {
         self.word_wrap
+    }
+
+    /// Row height for plain (non-editable) preview lines. The list's
+    /// uniform-height hint and the painted rows must both read it from here: a
+    /// fixed 20 px row clips glyphs at larger code sizes, and a hint that
+    /// disagrees with the painted row desyncs the virtualized measurements.
+    fn line_height(&self) -> gpui::Pixels {
+        px((self.preview_text_size() * PREVIEW_LINE_HEIGHT_RATIO).max(PREVIEW_LINE_HEIGHT))
+    }
+
+    /// Text size of the editable editor.
+    fn editor_text_size(&self) -> f32 {
+        crate::typography::clamp_font_size(self.editor_font_size * EDITOR_TEXT_SIZE_RATIO)
+    }
+
+    /// Text size of the plain (non-editable) preview rows.
+    fn preview_text_size(&self) -> f32 {
+        crate::typography::clamp_font_size(self.editor_font_size * PREVIEW_TEXT_SIZE_RATIO)
     }
 
     pub(super) fn set_editor_font_size(&mut self, editor_font_size: f32) {
@@ -381,8 +430,38 @@ impl FilePreviewState {
         openness
     }
 
-    pub(super) fn tree_width(&self) -> f32 {
-        self.tree_width
+    pub(super) fn tree_width_frame(&self, window: &mut Window, cx: &App) -> f32 {
+        let Some(bounce) = self.tree_edge_bounce else {
+            return self.tree_width;
+        };
+        if crate::motion::reduced_motion(cx) || !self.tree_sidebar_visible() {
+            return self.tree_width;
+        }
+        let total = Duration::from_millis(crate::motion::RESIZE_EDGE_BOUNCE_MS)
+            .mul_f32(crate::motion::speed_scale());
+        let raw = Instant::now()
+            .saturating_duration_since(bounce.started)
+            .as_secs_f32()
+            / total.as_secs_f32();
+        if raw >= 1.0 {
+            return self.tree_width;
+        }
+        window.request_animation_frame();
+        self.tree_width + crate::motion::resize_bounce_offset(bounce.edge, raw)
+    }
+
+    pub(super) fn tree_resize_active(&self) -> bool {
+        self.tree_resize_active
+    }
+
+    pub(super) fn tree_resize_constrained(&self) -> bool {
+        self.tree_resize_dragging && !self.tree_resize_active
+    }
+
+    fn finish_tree_resize(&mut self) {
+        self.tree_resize_active = false;
+        self.tree_resize_dragging = false;
+        self.tree_resize_edge = None;
     }
 
     pub(super) fn has_unsaved_changes(&self) -> bool {
@@ -1953,7 +2032,7 @@ impl FilesSurface {
             .unwrap_or(0);
         self.preview
             .list
-            .reset_with_uniform_height(count, px(PREVIEW_LINE_HEIGHT));
+            .reset_with_uniform_height(count, self.preview.line_height());
     }
 
     fn request_reload_active_document(&mut self, cx: &mut Context<Self>) {
@@ -2018,6 +2097,14 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        let typography_generation = crate::typography::generation(cx);
+        if self.preview.typography_generation != typography_generation {
+            self.preview.typography_generation = typography_generation;
+            // Row heights are cached per item, including virtualized rows off
+            // screen, so a code-size change leaves stale geometry behind.
+            // `remeasure` re-derives them while holding the scroll position.
+            self.preview.list.remeasure();
+        }
         let Some(active) = self.preview.active.clone() else {
             return gpui::Empty.into_any_element();
         };
@@ -2328,6 +2415,14 @@ impl FilesSurface {
             .tooltip_show_delay(Duration::from_millis(350));
         toolbar(theme)
             .pr(px(crate::surface_chrome::CONTROL_GAP))
+            .child(
+                crate::file_icons::icon(
+                    crate::file_icons::FileIconIdentity::file(path),
+                    theme.appearance,
+                )
+                .size(px(14.0))
+                .flex_none(),
+            )
             .child(crumbs)
             .when(markdown, |element| {
                 element.child(
@@ -2462,6 +2557,17 @@ impl FilesSurface {
             .into_any_element()
     }
 
+    fn markdown_web_link_handler(cx: &Context<Self>) -> super::markdown_preview::WebLinkHandler {
+        let owner = cx.weak_entity();
+        Rc::new(move |activation, cx| {
+            let _ = owner.update(cx, |surface, cx| {
+                let mut activation = activation.clone();
+                activation.source_session = Some(surface.chat_id.clone());
+                cx.emit(FilesEvent::OpenWebLink(activation));
+            });
+        })
+    }
+
     fn prepare_markdown_preview(
         &mut self,
         path: &str,
@@ -2485,15 +2591,18 @@ impl FilesSurface {
             .markdown
             .get_or_insert_with(|| {
                 let owner = cx.weak_entity();
+                let web_links = Self::markdown_web_link_handler(cx);
                 cx.new(|cx| {
-                    super::markdown_preview::MarkdownPreview::new(
+                    let mut view = super::markdown_preview::MarkdownPreview::new(
                         path.to_string(),
                         Rc::new(move |path, cx| {
                             let _ =
                                 owner.update(cx, |surface, cx| surface.open_tree_file(path, cx));
                         }),
                         cx,
-                    )
+                    );
+                    view.set_web_link_handler(web_links);
+                    view
                 })
             })
             .clone();
@@ -2628,9 +2737,9 @@ impl FilesSurface {
                 .relative()
                 .overflow_hidden()
                 .font_family(theme.font_mono.clone())
-                .text_size(px(self.preview.editor_font_size))
+                .text_size(px(self.preview.editor_text_size()))
                 .line_height(px(
-                    (self.preview.editor_font_size + 8.5).max(PREVIEW_LINE_HEIGHT)
+                    (self.preview.editor_text_size() + 8.5).max(PREVIEW_LINE_HEIGHT)
                 ))
                 .child(super::editor::editor_element(&editor))
                 .children(overlays)
@@ -3072,16 +3181,14 @@ impl FilesSurface {
             theme.text.opacity(0.93),
             &theme,
         );
+        let row_height = self.preview.line_height();
         div()
-            .min_h(px(PREVIEW_LINE_HEIGHT))
+            .min_h(row_height)
             .flex_none()
             .flex()
             .when(word_wrap, |element| element.w_full().items_stretch())
             .when(!word_wrap, |element| {
-                element
-                    .h(px(PREVIEW_LINE_HEIGHT))
-                    .min_w_full()
-                    .items_center()
+                element.h(row_height).min_w_full().items_center()
             })
             .child(
                 div()
@@ -3108,7 +3215,10 @@ impl FilesSurface {
                     .pr(px(18.0))
                     .when(!word_wrap, |element| element.whitespace_nowrap())
                     .font_family(theme.font_mono.clone())
-                    .text_size(px(11.5))
+                    // Same source `row_height` derives from; a second reading of
+                    // the code size could drift from the geometry the glyphs
+                    // are measured against.
+                    .text_size(px(self.preview.preview_text_size()))
                     .child(gpui::StyledText::new(line.clone()).with_runs(runs)),
             )
             .into_any_element()
@@ -3120,29 +3230,108 @@ impl FilesSurface {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let width = f32::from(event.bounds.right() - event.event.position.x);
-        self.preview.tree_width = width.clamp(220.0, 360.0);
+        let requested = f32::from(event.bounds.right() - event.event.position.x);
+        let sample = crate::motion::resize_drag_sample(
+            requested,
+            TREE_SPLIT_MIN,
+            TREE_SPLIT_MAX,
+            self.preview.tree_resize_edge,
+            crate::motion::reduced_motion(cx),
+        );
+        self.preview.tree_width = sample.width;
+        self.preview.tree_resize_dragging = true;
+        self.preview.tree_resize_active = sample.edge.is_none();
+        if sample.starts_bounce {
+            self.preview.tree_edge_bounce = sample.edge.map(crate::motion::ResizeEdgeBounce::new);
+        } else if sample.edge.is_none() {
+            self.preview.tree_edge_bounce = None;
+        }
+        self.preview.tree_resize_edge = sample.edge;
         cx.notify();
     }
 
-    pub(super) fn preview_split_handle(&self, cx: &mut Context<Self>) -> AnyElement {
-        let color = Theme::of(cx).border_strong;
+    pub(super) fn preview_split_handle(&self, right: f32, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx);
+        let fade_key = "pane-resize-files-preview-split";
+        let hover_highlight = crate::motion::hover_blend(
+            fade_key,
+            theme.border_strong.opacity(0.0),
+            theme.border_strong,
+        );
+        let highlight = if self.preview.tree_resize_constrained() {
+            theme.border_strong.opacity(0.0)
+        } else if self.preview.tree_resize_active() {
+            theme.border_strong
+        } else {
+            hover_highlight
+        };
+        let clear = highlight.opacity(0.0);
         div()
             .id("files-preview-split")
             .absolute()
-            .left(px(-3.0))
+            .right(px(right))
             .top_0()
             .bottom_0()
-            .w(px(6.0))
+            .w(px(TREE_SPLIT_HITBOX_HALF_WIDTH * 2.0))
             .occlude()
             .cursor_col_resize()
-            .hover(move |style| style.bg(color))
+            .on_hover(crate::motion::hover_listener(fade_key))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left(px(TREE_SPLIT_HITBOX_HALF_WIDTH))
+                    .w(px(1.0))
+                    .flex()
+                    .flex_col()
+                    .child(div().flex_1().bg(gpui::linear_gradient(
+                        180.0,
+                        gpui::linear_color_stop(clear, 0.0),
+                        gpui::linear_color_stop(highlight, 1.0),
+                    )))
+                    .child(div().flex_1().bg(gpui::linear_gradient(
+                        180.0,
+                        gpui::linear_color_stop(highlight, 0.0),
+                        gpui::linear_color_stop(clear, 1.0),
+                    ))),
+            )
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.preview.tree_resize_dragging = true;
+                    this.preview.tree_resize_active = true;
+                    cx.notify();
+                }),
+            )
             .on_drag(
                 PreviewSplitResize,
                 |_, _point: Point<gpui::Pixels>, _, cx| {
                     cx.stop_propagation();
                     cx.new(|_| PreviewDragGhost)
                 },
+            )
+            .on_mouse_up(
+                gpui::MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseUpEvent, window, cx| {
+                    if event.click_count == 2 {
+                        this.preview.tree_width = TREE_SPLIT_DEFAULT;
+                        this.preview.tree_edge_bounce = None;
+                    }
+                    this.preview.finish_tree_resize();
+                    crate::motion::set_hover(fade_key, false, crate::motion::reduced_motion(cx));
+                    window.refresh();
+                    cx.notify();
+                }),
+            )
+            .on_mouse_up_out(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.preview.finish_tree_resize();
+                    crate::motion::set_hover(fade_key, false, crate::motion::reduced_motion(cx));
+                    window.refresh();
+                    cx.notify();
+                }),
             )
             .into_any_element()
     }
@@ -3240,6 +3429,74 @@ fn read_only_message(reason: Option<WorkspaceReadOnlyReason>) -> SharedString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rendering a preview needs a window, so this asserts on `line_height`,
+    // the single source both the uniform-height hint passed to
+    // `reset_with_uniform_height` and the painted row in
+    // `render_preview_line` read.
+    #[test]
+    fn preview_rows_track_the_code_font_size_from_the_default_to_the_maximum() {
+        let default = FilePreviewState::new(false, 900, false, 12.5);
+        assert_eq!(default.line_height(), px(PREVIEW_LINE_HEIGHT));
+
+        let maximum = FilePreviewState::new(false, 900, false, 32.0);
+        assert!(maximum.line_height() > px(PREVIEW_LINE_HEIGHT));
+
+        let minimum = FilePreviewState::new(false, 900, false, 8.0);
+        assert_eq!(minimum.line_height(), px(PREVIEW_LINE_HEIGHT));
+    }
+
+    /// The regression this guards: collapsing both surfaces onto the raw
+    /// setting silently resized them on a fresh install.
+    #[test]
+    fn the_default_code_font_size_reproduces_the_historical_per_surface_sizes() {
+        let default =
+            FilePreviewState::new(false, 900, false, crate::typography::CODE_FONT_SIZE_DEFAULT);
+        assert_eq!(default.editor_text_size(), 13.0);
+        assert_eq!(default.preview_text_size(), 11.5);
+    }
+
+    #[test]
+    fn scaled_preview_sizes_keep_their_proportions_and_stay_clamped() {
+        let doubled = FilePreviewState::new(
+            false,
+            900,
+            false,
+            2.0 * crate::typography::CODE_FONT_SIZE_DEFAULT,
+        );
+        assert_eq!(doubled.editor_text_size(), 26.0);
+        assert_eq!(doubled.preview_text_size(), 23.0);
+
+        // The editor ratio is >1, so the maximum setting would overshoot.
+        let maximum = FilePreviewState::new(false, 900, false, crate::typography::FONT_SIZE_MAX);
+        assert_eq!(maximum.editor_text_size(), crate::typography::FONT_SIZE_MAX);
+        assert!(maximum.preview_text_size() < crate::typography::FONT_SIZE_MAX);
+    }
+
+    #[test]
+    fn tree_split_uses_the_standard_resize_geometry_and_limits() {
+        assert_eq!(TREE_SPLIT_HITBOX_HALF_WIDTH * 2.0, 20.0);
+        let min = crate::motion::resize_drag_sample(
+            TREE_SPLIT_MIN - 1.0,
+            TREE_SPLIT_MIN,
+            TREE_SPLIT_MAX,
+            None,
+            false,
+        );
+        let max = crate::motion::resize_drag_sample(
+            TREE_SPLIT_MAX + 1.0,
+            TREE_SPLIT_MIN,
+            TREE_SPLIT_MAX,
+            None,
+            false,
+        );
+        assert_eq!(min.width, TREE_SPLIT_MIN);
+        assert_eq!(min.edge, Some(crate::motion::ResizeEdge::Min));
+        assert!(min.starts_bounce);
+        assert_eq!(max.width, TREE_SPLIT_MAX);
+        assert_eq!(max.edge, Some(crate::motion::ResizeEdge::Max));
+        assert!(max.starts_bounce);
+    }
 
     fn cached_document(path: &str, text: &str) -> FileDocument {
         let mut document = FileDocument::loading(DocumentKey {
@@ -4244,6 +4501,145 @@ mod markdown_buffer_tests {
                 assert_eq!(document.editor.as_ref(), Some(&editor));
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn markdown_preview_web_links_keep_the_file_session_and_full_target(cx: &mut TestAppContext) {
+        use crate::markdown::render::{self, LinkAction, LinkTarget};
+        use std::cell::RefCell;
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            FilesSurface::new(state, "owner".into(), false, 1000, 13.0, false, false, cx)
+        });
+        let (owner, preview) = window
+            .update(cx, |surface, _, cx| {
+                let mut document = FileDocument::loading(DocumentKey {
+                    chat_id: "owner".into(),
+                    checkout_id: Some("checkout".into()),
+                    path: "README.md".into(),
+                });
+                document.set_loaded(zeron_proto::WorkspaceFileText {
+                    checkout_id: "checkout".into(),
+                    path: "README.md".into(),
+                    text: Some("[Docs](https://example.com/docs)".into()),
+                    content_hash: Some("hash".into()),
+                    size: 32,
+                    modified_at: None,
+                    encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                    line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                    read_only_reason: None,
+                    truncated: false,
+                });
+                document.show_markdown = true;
+                surface.preview.active = Some("README.md".into());
+                surface
+                    .preview
+                    .documents
+                    .insert("README.md".into(), document);
+                let preview = surface
+                    .prepare_markdown_preview("README.md", None, cx)
+                    .unwrap();
+                // Changing the selected chat must not rewrite this file's owner.
+                surface
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("other".into()));
+                (cx.entity(), preview)
+            })
+            .unwrap();
+        let received = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&owner, {
+                let received = received.clone();
+                let preview = preview.clone();
+                move |_, event, cx| {
+                    if let FilesEvent::OpenWebLink(activation) = event {
+                        received.borrow_mut().push(activation.clone());
+                        // Browser selection can suspend this same preview. This
+                        // must run after its owner/preview borrows have unwound.
+                        preview.update(cx, |preview, cx| preview.suspend(cx));
+                    }
+                }
+            })
+        });
+        let ui = preview.update(cx, |preview, cx| preview.link_ui(cx));
+        assert!(
+            ui.source_session.is_none(),
+            "file preview labels are not truncated"
+        );
+        let target = LinkTarget::new("Different label", "https://example.com/docs?q=%C3%B1#full");
+        for action in [
+            LinkAction::Primary,
+            LinkAction::Internal,
+            LinkAction::External,
+            LinkAction::Copy,
+        ] {
+            cx.update_window(window.into(), |_, window, cx| {
+                render::activate_link(target.clone(), action, Some(&ui), window, cx);
+            })
+            .unwrap();
+        }
+        cx.run_until_parked();
+        let events = received.borrow();
+        assert_eq!(events.len(), 3);
+        for (event, action) in events.iter().zip([
+            LinkAction::Primary,
+            LinkAction::Internal,
+            LinkAction::External,
+        ]) {
+            assert_eq!(event.target, target);
+            assert_eq!(event.action, action);
+            assert_eq!(event.source_session.as_deref(), Some("owner"));
+        }
+        drop(events);
+        cx.update(|cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some(target.original.as_str())
+            )
+        });
+        assert!(
+            cx.opened_url().is_none(),
+            "only the shell may open web destinations"
+        );
+        for url in [
+            "javascript:alert(1)",
+            "https://user:secret@example.com",
+            "https://example.com/%ZZ",
+            "https://example.com/\n",
+        ] {
+            for action in [LinkAction::Internal, LinkAction::External] {
+                cx.update_window(window.into(), |_, window, cx| {
+                    render::activate_link(
+                        LinkTarget::new("Bad", url),
+                        action,
+                        Some(&ui),
+                        window,
+                        cx,
+                    );
+                })
+                .unwrap();
+            }
+        }
+        cx.run_until_parked();
+        assert_eq!(received.borrow().len(), 3);
+        assert!(cx.opened_url().is_none());
+        // Mail links retain their existing OS handler.
+        cx.update_window(window.into(), |_, window, cx| {
+            render::activate_link(
+                LinkTarget::new("Mail", "mailto:hello@example.com"),
+                LinkAction::Internal,
+                Some(&ui),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+        assert_eq!(cx.opened_url().as_deref(), Some("mailto:hello@example.com"));
     }
 
     #[gpui::test]

@@ -16,6 +16,7 @@ use super::{
     workspace_path_drag_ghost,
 };
 use crate::{
+    file_icons::{self, FileIconIdentity},
     icons::{self, icon},
     theme::Theme,
 };
@@ -550,9 +551,11 @@ impl FilesSurface {
                 this.search_state.active = index;
                 this.activate_search_result(cx);
             }))
-            .on_drag(drag_payload, |payload, _, _, cx| {
-                cx.stop_propagation();
-                workspace_path_drag_ghost(payload, cx)
+            .when(crate::click_activation_drag_enabled(), |element| {
+                element.on_drag(drag_payload, |payload, _, _, cx| {
+                    cx.stop_propagation();
+                    workspace_path_drag_ghost(payload, cx)
+                })
             })
             .child(
                 div()
@@ -573,16 +576,18 @@ impl FilesSurface {
                         )
                     }),
             )
-            .child(
-                icon(if is_directory {
-                    icons::FOLDER
-                } else {
-                    icons::DOCUMENT
-                })
-                .size(px(13.0))
-                .flex_none()
-                .text_color(theme.text_muted),
-            )
+            .child({
+                let identity = match row.kind {
+                    WorkspaceEntryKind::Directory => {
+                        FileIconIdentity::directory(&row.name, expanded)
+                    }
+                    WorkspaceEntryKind::File => FileIconIdentity::file(&row.name),
+                    WorkspaceEntryKind::Symlink => FileIconIdentity::symlink(&row.name),
+                };
+                file_icons::icon(identity, theme.appearance)
+                    .size(px(14.0))
+                    .flex_none()
+            })
             .child(
                 div()
                     .min_w_0()

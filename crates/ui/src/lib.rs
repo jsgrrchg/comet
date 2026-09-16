@@ -23,8 +23,10 @@ pub mod changes;
 mod comment_ui;
 pub mod comments;
 pub mod composer;
+mod composer_dock;
 mod context_usage;
 pub mod edge_fade;
+pub mod file_icons;
 pub mod files;
 pub mod frost;
 pub mod history;
@@ -35,6 +37,10 @@ pub mod links;
 pub mod loaders;
 pub mod markdown;
 pub mod motion;
+mod new_thread_background_effects;
+mod new_thread_background_image;
+mod new_thread_background_mask;
+mod notice;
 pub mod notify;
 pub mod pickers;
 pub mod popover;
@@ -61,6 +67,16 @@ use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOp
 
 pub use state::EngineBootConfig;
 pub use zeron_proto::HarnessId;
+
+/// Whether a control whose primary action is click activation may also start
+/// a GPUI drag from the same hitbox. GPUI promotes pointer travel above 2 px
+/// to a drag. Normal Windows click jitter can cross that threshold, cancel the
+/// click, and leave the drag ghost following the pointer instead of activating
+/// the control. Drag-first controls (resize handles, scrollbars, queue rows)
+/// intentionally do not use this policy.
+pub(crate) const fn click_activation_drag_enabled() -> bool {
+    !cfg!(target_os = "windows")
+}
 
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/zeron`, not here).
@@ -147,6 +163,10 @@ pub fn run_app(config: UiConfig) {
         typography::init(
             ui_settings.ui_font_family.clone(),
             ui_settings.ui_font_size,
+            ui_settings.terminal_font_family.clone(),
+            ui_settings.terminal_font_size,
+            ui_settings.code_font_family.clone(),
+            ui_settings.code_font_size,
             font_availability,
             cx,
         );
@@ -281,15 +301,15 @@ fn open_main_window(
                 // the titlebar, not the menu bar.
                 // macOS: frameless-inset chrome like the original Electron app
                 // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
-                // feature-inventory §1.1). No title text — the strip is
-                // custom-drawn (zed sets `title: None` the same way). On
+                // feature-inventory §1.1). The strip is custom-drawn. Windows
+                // still needs a native title for taskbar previews and Alt+Tab. On
                 // Linux/Windows `appears_transparent` hides the system titlebar
                 // for our custom-drawn chrome; harmless where unsupported.
                 titlebar: Some(TitlebarOptions {
-                    title: None,
+                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
                     appears_transparent: true,
-                    // Centered on the titlebar's content line (40px bar, content
-                    // shifted 4px down, lights ~12px tall → center 22).
+                    // Native lights are 14px tall: top 14 → center 21, matching
+                    // the 38px titlebar row with 4px top-only content padding.
                     traffic_light_position: Some(gpui::point(px(14.), px(14.))),
                 }),
                 // Our own titlebar strip drags the window (WindowControlArea::

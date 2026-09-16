@@ -31,6 +31,20 @@ use zeron_rpc::methods;
 /// pagination plumbing).
 const MAX_REF_ROWS: usize = 300;
 
+const FOOTER_CHIP_RADIUS: f32 = 6.0;
+
+/// Both sides of the composer handoff share one leading-aligned workspace
+/// cluster. Available width belongs after the pair, never between its labels.
+fn workspace_footer_row() -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+}
+
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
@@ -489,8 +503,14 @@ pub struct Pickers {
     model_rows_cache: std::cell::RefCell<Option<(ModelRowsKey, std::sync::Arc<Vec<ModelRowData>>)>>,
     /// Bumped on every catalog/favorites mutation; invalidates the cache.
     catalog_rev: u64,
-    /// Hover/drag state of the floating model-list scrollbar.
-    model_bar: popover::MenuScrollbarState,
+    /// Hover/drag state of the floating menu scrollbar. One instance serves
+    /// every picker list like `menu_scroll` does — the popups are mutually
+    /// exclusive, so only one list mounts at a time.
+    menu_bar: popover::MenuScrollbarState,
+    /// Scroll handle shared by the plain-div picker lists (branch, project,
+    /// device) — the popups are mutually exclusive, so only one mounts at a
+    /// time and a fresh open resets the offset.
+    menu_scroll: gpui::ScrollHandle,
     /// Shared search / URL / name input, reused across popovers.
     search: Entity<ComposerInput>,
     /// One-shot mute for the next Edited event's highlight reset — armed by
@@ -644,7 +664,8 @@ impl Pickers {
             model_scroll: gpui::UniformListScrollHandle::new(),
             model_rows_cache: std::cell::RefCell::new(None),
             catalog_rev: 0,
-            model_bar: popover::MenuScrollbarState::default(),
+            menu_bar: popover::MenuScrollbarState::default(),
+            menu_scroll: gpui::ScrollHandle::new(),
             search,
             search_reset_muted: false,
             focus: cx.focus_handle(),
@@ -862,7 +883,7 @@ impl Pickers {
 
     /// Outside clicks and navigation keep focus at the clicked destination.
     fn dismiss(&mut self, cx: &mut Context<Self>) {
-        self.model_bar = popover::MenuScrollbarState::default();
+        self.menu_bar = popover::MenuScrollbarState::default();
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
         }
@@ -913,6 +934,13 @@ impl Pickers {
             return;
         }
         self.open.open(kind);
+        // The plain-div menus (branch / project / device) share one scroll
+        // handle; a fresh open starts at the top. The model list resets its
+        // own virtualized handle below. Sync the rail baselines so the jump
+        // back to the top isn't read as scrolling.
+        if kind != PickerKind::HarnessModel {
+            popover::reset_menu_scroll(&self.menu_scroll, &mut self.menu_bar);
+        }
         // Clearing stale text emits Edited AFTER this function returns —
         // mute that one event so its reset can't clobber the highlight
         // anchored below (the no-op clear is also skipped for the same
@@ -948,7 +976,9 @@ impl Pickers {
             PickerKind::Device => self.selected_device_index(cx),
         };
         if kind == PickerKind::HarnessModel {
-            self.model_scroll_base().set_offset(gpui::Point::default());
+            // scroll_to_item below may land anywhere; the first note of the
+            // settled position is the fresh baseline, not scroll motion.
+            popover::reset_menu_scroll(&self.model_scroll_base(), &mut self.menu_bar);
             self.model_scroll
                 .scroll_to_item(self.active, gpui::ScrollStrategy::Nearest);
         }
@@ -1929,63 +1959,66 @@ impl Pickers {
             )
         };
         let active = self.active;
-        let body: AnyElement =
-            if rows.is_empty() {
-                div()
-                    .p(px(Theme::SPACE_SM))
-                    .text_size(crate::typography::ui_rems(12.0))
-                    .text_color(theme.text_faint)
-                    .child(SharedString::from("No devices match."))
-                    .into_any_element()
-            } else {
-                div()
-                    .id("device-list")
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .max_h(px(224.0))
-                    .overflow_y_scroll()
-                    .children(rows.into_iter().zip(online).enumerate().map(
-                        |(ix, (device, online))| {
-                            let is_local = local.as_deref() == Some(device.id.as_str());
-                            let label: SharedString = device.name.clone().into();
-                            let is_selected = effective.as_deref() == Some(device.id.as_str());
-                            let pick_id = device.id.clone();
-                            popover::menu_row_nav(
-                                &theme,
-                                is_selected,
-                                ix == active,
-                                format!("device-row-{ix}"),
-                            )
-                            .id(("device-row", ix))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.pick_device(pick_id.clone(), cx);
-                            }))
-                            .child(div().flex_1().min_w_0().truncate().child(label))
-                            // The local device wears a muted right-aligned "You"
-                            // instead of a "(this device)" suffix in the name.
-                            .when(is_local, |el| {
-                                el.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(crate::typography::ui_rems(10.0))
-                                        .text_color(theme.text_muted.opacity(0.45))
-                                        .child(SharedString::from("You")),
+        let scrollbar = popover::rail(self, "device-scrollbar", &theme, cx);
+        let body: AnyElement = if rows.is_empty() {
+            div()
+                .p(px(Theme::SPACE_SM))
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from("No devices match."))
+                .into_any_element()
+        } else {
+            popover::menu_scroll_host("device-list-host")
+                .on_hover(cx.listener(Self::on_menu_list_hover))
+                .child(
+                    popover::menu_scroll_list("device-list", &self.menu_scroll)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(224.0))
+                        .children(rows.into_iter().zip(online).enumerate().map(
+                            |(ix, (device, online))| {
+                                let is_local = local.as_deref() == Some(device.id.as_str());
+                                let label: SharedString = device.name.clone().into();
+                                let is_selected = effective.as_deref() == Some(device.id.as_str());
+                                let pick_id = device.id.clone();
+                                popover::menu_row_nav(
+                                    &theme,
+                                    is_selected,
+                                    ix == active,
+                                    format!("device-row-{ix}"),
                                 )
-                            })
-                            // Disconnected glyph, not the word (user request).
-                            .when(!online, |el| {
-                                el.child(
-                                    crate::icons::icon(crate::icons::WIFI_OFF)
-                                        .size(px(12.0))
-                                        .flex_none()
-                                        .text_color(theme.warning.opacity(0.8)),
-                                )
-                            })
-                        },
-                    ))
-                    .into_any_element()
-            };
+                                .id(("device-row", ix))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_device(pick_id.clone(), cx);
+                                }))
+                                .child(div().flex_1().min_w_0().truncate().child(label))
+                                // The local device wears a muted right-aligned "You"
+                                // instead of a "(this device)" suffix in the name.
+                                .when(is_local, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(crate::typography::ui_rems(10.0))
+                                            .text_color(theme.text_muted.opacity(0.45))
+                                            .child(SharedString::from("You")),
+                                    )
+                                })
+                                // Disconnected glyph, not the word (user request).
+                                .when(!online, |el| {
+                                    el.child(
+                                        crate::icons::icon(crate::icons::WIFI_OFF)
+                                            .size(px(12.0))
+                                            .flex_none()
+                                            .text_color(theme.warning.opacity(0.8)),
+                                    )
+                                })
+                            },
+                        )),
+                )
+                .children(scrollbar)
+                .into_any_element()
+        };
         div()
             .flex()
             .flex_col()
@@ -2008,6 +2041,7 @@ impl Pickers {
             .map(|s| s.id.clone());
         let active = self.active;
         let no_project_index = rows.len();
+        let scrollbar = popover::rail(self, "space-scrollbar", &theme, cx);
         let body: AnyElement = if rows.is_empty() {
             // Distinguish "the filter ate everything" from "this device has
             // no projects yet" — the scoped list makes the latter common.
@@ -2023,29 +2057,32 @@ impl Pickers {
                 .child(SharedString::from(empty.to_string()))
                 .into_any_element()
         } else {
-            div()
-                .id("space-list")
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .max_h(px(224.0))
-                .overflow_y_scroll()
-                .children(rows.into_iter().enumerate().map(|(ix, space)| {
-                    let label: SharedString = space.display_name().to_string().into();
-                    let is_selected = selected.as_deref() == Some(space.id.as_str());
-                    let pick_id = space.id.clone();
-                    popover::menu_row_nav(
-                        &theme,
-                        is_selected,
-                        ix == active,
-                        format!("space-row-{ix}"),
-                    )
-                    .id(("space-row", ix))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.pick_space(pick_id.clone(), cx);
-                    }))
-                    .child(div().flex_1().min_w_0().truncate().child(label))
-                }))
+            popover::menu_scroll_host("space-list-host")
+                .on_hover(cx.listener(Self::on_menu_list_hover))
+                .child(
+                    popover::menu_scroll_list("space-list", &self.menu_scroll)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(224.0))
+                        .children(rows.into_iter().enumerate().map(|(ix, space)| {
+                            let label: SharedString = space.display_name().to_string().into();
+                            let is_selected = selected.as_deref() == Some(space.id.as_str());
+                            let pick_id = space.id.clone();
+                            popover::menu_row_nav(
+                                &theme,
+                                is_selected,
+                                ix == active,
+                                format!("space-row-{ix}"),
+                            )
+                            .id(("space-row", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pick_space(pick_id.clone(), cx);
+                            }))
+                            .child(div().flex_1().min_w_0().truncate().child(label))
+                        })),
+                )
+                .children(scrollbar)
                 .into_any_element()
         };
         let no_project = popover::menu_row_nav(
@@ -2346,7 +2383,7 @@ impl Pickers {
             .items_center()
             .gap(px(6.0))
             .px(px(8.0))
-            .rounded(px(6.0))
+            .rounded(px(FOOTER_CHIP_RADIUS))
             .text_size(crate::typography::ui_rems(12.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(motion::hover_blend(
@@ -2371,12 +2408,14 @@ impl Pickers {
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(12.0))
+                    .flex_none()
                     .text_color(theme.text_muted.opacity(0.7)),
             )
             .child(div().min_w_0().truncate().child(label))
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(12.0))
+                    .flex_none()
                     .text_color(theme.text_muted.opacity(0.5)),
             )
     }
@@ -2408,11 +2447,9 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// The new-session target row — device + project selector chips rendered
-    /// ABOVE the composer pill, left-aligned like the checkout toolbar (the
-    /// composer footer carries only checkout + ref, and sessions show their
-    /// target in the titlebar instead).
-    pub fn render_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// New-session destination controls. Machine and project form the
+    /// original chip-only cluster floating above the composer's trailing edge.
+    pub fn render_new_thread_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let closing = self.open.closing_since();
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
@@ -2463,17 +2500,12 @@ impl Pickers {
             &theme,
             cx,
         );
-        // Same left-edge geometry as the checkout toolbar under the pill
-        // (`render_footer`'s row): full-width, 10px inset, chips hugging the
-        // left. The row sits just above the composer pill, so the menus open
-        // UPWARD.
         div()
-            .w_full()
+            .flex_none()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .px(px(10.0))
             .child(attach_overlay(
                 device_chip,
                 &mut overlay,
@@ -2481,7 +2513,7 @@ impl Pickers {
                 "device-popover",
                 closing,
             ))
-            .child(attach_overlay(
+            .child(attach_overlay_end(
                 project_chip,
                 &mut overlay,
                 PickerKind::Space,
@@ -2491,10 +2523,77 @@ impl Pickers {
             .into_any_element()
     }
 
+    /// New-session Git controls. Checkout mode and branch form the original
+    /// chip-only cluster floating below the composer's leading edge.
+    pub fn render_new_thread_git_selectors(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let git = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .is_some_and(|space| space.git_detected);
+        if !git {
+            return None;
+        }
+        self.ensure_refs(false, cx);
+        let theme = Theme::of(cx).clone();
+        let closing = self.open.closing_since();
+        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
+            Some(PickerKind::Branch) => {
+                let content = self.render_branch_popover(cx);
+                Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
+            }
+            Some(PickerKind::Checkout) => {
+                let content = self.render_checkout_popover(cx);
+                Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
+            }
+            _ => None,
+        };
+        let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
+            (CheckoutKind::Local, false) => crate::icons::FOLDER,
+            _ => crate::icons::FOLDER_WITH_FILES,
+        };
+        let checkout_chip = self.footer_chip(
+            PickerKind::Checkout,
+            "picker-checkout",
+            kind_icon,
+            SharedString::from(self.checkout_label()),
+            &theme,
+            cx,
+        );
+        let branch_chip = self.footer_chip(
+            PickerKind::Branch,
+            "picker-branch",
+            crate::icons::GIT_BRANCH,
+            self.ref_label(),
+            &theme,
+            cx,
+        );
+        Some(
+            workspace_footer_row()
+                .child(attach_overlay_below(
+                    checkout_chip,
+                    &mut overlay,
+                    PickerKind::Checkout,
+                    "checkout-popover",
+                    closing,
+                ))
+                .child(attach_overlay_below(
+                    branch_chip,
+                    &mut overlay,
+                    PickerKind::Branch,
+                    "branch-popover",
+                    closing,
+                ))
+                .into_any_element(),
+        )
+    }
+
     /// The composer footer row: checkout-kind + ref, LEFT-aligned, only when
-    /// the picked (or session's) project has git. Device + project moved to
-    /// the row above the pill ([`Self::render_target_selectors`]); sessions
-    /// name their target in the titlebar.
+    /// the picked (or session's) project has git. New sessions use the floating
+    /// chip clusters; sessions name their target in the titlebar.
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
@@ -2514,22 +2613,15 @@ impl Pickers {
             (space, session, change_request)
         };
         let row = || {
-            // Symmetric: the container's 8px gap sits above the toolbar;
-            // bleeding 8 of the container's 16px bottom padding (mb -8)
-            // leaves 8 below — equal air on both sides of the row.
+            // The composer owns the row's animated reveal and negative bottom
+            // margin. Keeping that geometry outside this reusable content
+            // lets the new-thread route handoff collapse the footer without
+            // clipping its controls or changing its steady-state spacing.
             // `w_full` is load-bearing: without it the canvas layout sizes
             // the row to CONTENT, and the left cluster's flex_1 (basis 0)
             // collapsed to zero width — both clusters painted from the same
             // origin, chips overlapping (user report).
-            div()
-                .w_full()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(8.0))
-                .px(px(10.0))
-                .mb(px(-8.0))
+            workspace_footer_row().px(px(10.0))
         };
 
         if let Some(chat) = &session {
@@ -2545,8 +2637,7 @@ impl Pickers {
             } else {
                 (crate::icons::FOLDER, "Local checkout")
             };
-            // Mirrors the draft chips: checkout hugs the left edge, ref the
-            // right.
+            // Keep the same reading order and leading edge as the draft.
             let left = div()
                 .flex()
                 .flex_row()
@@ -2563,14 +2654,6 @@ impl Pickers {
                 .items_center()
                 .gap(px(4.0))
                 .min_w_0()
-                .when_some(change_request, |el, summary| {
-                    el.child(crate::change_requests::pull_request_badge(
-                        "composer-pull-request".into(),
-                        summary,
-                        crate::change_requests::ChangeRequestBadgeSurface::Composer,
-                        &theme,
-                    ))
-                })
                 .child(Self::footer_label(
                     crate::icons::GIT_BRANCH,
                     chat.branch
@@ -2579,9 +2662,26 @@ impl Pickers {
                         .unwrap_or_else(|| SharedString::from("No ref")),
                     &theme,
                 ));
-            // The context indicator follows this footer in the composer;
-            // its own padding supplies the spacing after the branch label.
-            return Some(row().pr_0().child(left).child(right).into_any_element());
+            // Checkout + branch stay together. PR and usage form the trailing
+            // status group, independently of the branch label's length.
+            return Some(
+                row()
+                    .pr_0()
+                    .child(left)
+                    .child(right)
+                    .child(div().flex_1().min_w_0())
+                    .when_some(change_request, |el, summary| {
+                        el.child(div().flex_none().child(
+                            crate::change_requests::pull_request_badge(
+                                "composer-pull-request".into(),
+                                summary,
+                                crate::change_requests::ChangeRequestBadgeSurface::Composer,
+                                &theme,
+                            ),
+                        ))
+                    })
+                    .into_any_element(),
+            );
         }
 
         // New-session draft: checkout + ref only, LEFT-aligned (device +
@@ -2602,8 +2702,7 @@ impl Pickers {
                 let content = self.render_checkout_popover(cx);
                 Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
             }
-            // Space/Device popovers mount on the target row above the pill
-            // (`render_target_selectors`), not here.
+            // Space/Device popovers mount in the floating row above the pill.
             _ => None,
         };
 
@@ -2628,8 +2727,8 @@ impl Pickers {
             &theme,
             cx,
         );
-        // Checkout on the left edge, ref on the right — the row's
-        // justify_between splits them (user request).
+        // Match the floating draft's adjacent checkout/ref pair, including
+        // while the newly created session is waiting for its workspace row.
         let left = div()
             .flex()
             .flex_row()
@@ -2647,7 +2746,7 @@ impl Pickers {
             .flex_row()
             .items_center()
             .min_w_0()
-            .child(attach_overlay_end(
+            .child(attach_overlay(
                 ref_chip,
                 &mut overlay,
                 PickerKind::Branch,
@@ -2770,94 +2869,31 @@ impl Pickers {
         self.model_scroll.0.borrow().base_handle.clone()
     }
 
-    fn on_model_list_hover(
+    /// The scroll handle of whichever picker menu is mounted. The popups are
+    /// mutually exclusive: the model list owns its virtualized handle, the
+    /// plain-div menus (branch / project / device) share `menu_scroll`.
+    /// Keys on the MOUNTED menu, not `open_kind` — popovers keep rendering
+    /// through the exit animation, and the rail must keep measuring the
+    /// closing menu's own handle, not `menu_scroll`'s idle geometry.
+    fn active_menu_scroll(&self) -> gpui::ScrollHandle {
+        if self.mounted_kind() == Some(PickerKind::HarnessModel) {
+            self.model_scroll_base()
+        } else {
+            self.menu_scroll.clone()
+        }
+    }
+
+    /// The list-hover half of the rail treatment; the strip's own hover,
+    /// press, drag, and mouse-up listeners come from [`popover::rail`].
+    fn on_menu_list_hover(
         &mut self,
         hovered: &bool,
         _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) {
-        if self.model_bar.set_list_hovered(*hovered) {
+        if self.menu_bar.set_list_hovered(*hovered) {
             cx.notify();
         }
-    }
-
-    fn on_model_scrollbar_hover(
-        &mut self,
-        hovered: &bool,
-        _window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.model_bar.set_bar_hovered(*hovered) {
-            cx.notify();
-        }
-    }
-
-    fn on_model_scrollbar_mouse_down(
-        &mut self,
-        event: &gpui::MouseDownEvent,
-        window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        let scroll = self.model_scroll_base();
-        if !self.model_bar.begin_press(&scroll, event.position.y) {
-            return;
-        }
-        window.focus(&self.focus, cx);
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn on_model_scrollbar_drag_move(
-        &mut self,
-        event: &gpui::DragMoveEvent<popover::MenuScrollbarDrag>,
-        _window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        let scroll = self.model_scroll_base();
-        if self.model_bar.drag_to(&scroll, event.event.position.y) {
-            cx.notify();
-        }
-    }
-
-    fn on_model_scrollbar_mouse_up(
-        &mut self,
-        _event: &gpui::MouseUpEvent,
-        _window: &mut gpui::Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.model_bar.end_press();
-        cx.notify();
-    }
-
-    fn render_model_scrollbar(
-        &self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let metrics = self.model_bar.metrics(&self.model_scroll_base())?;
-        Some(
-            self.model_bar
-                .render_rail(theme, metrics)?
-                .id("model-scrollbar")
-                .on_hover(cx.listener(Self::on_model_scrollbar_hover))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(Self::on_model_scrollbar_mouse_down),
-                )
-                .on_drag(popover::MenuScrollbarDrag, |_, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.new(|_| popover::MenuScrollbarDragGhost)
-                })
-                .on_mouse_up_out(
-                    gpui::MouseButton::Left,
-                    cx.listener(Self::on_model_scrollbar_mouse_up),
-                )
-                .on_mouse_up(
-                    gpui::MouseButton::Left,
-                    cx.listener(Self::on_model_scrollbar_mouse_up),
-                )
-                .into_any_element(),
-        )
     }
 
     /// The ref picker (t3code BranchToolbarBranchSelector): search on top,
@@ -2885,80 +2921,88 @@ impl Pickers {
             .selected_chat_row()
             .and_then(|c| c.branch.clone());
         let switching = self.switching.clone();
-        let body: AnyElement =
-            match &self.refs {
-                Loadable::Loading | Loadable::Idle => {
-                    popover::skeleton_rows("branch-skeleton", &theme, 4, cx.entity_id(), cx)
-                }
-                Loadable::Error(message) => {
-                    let message = message.clone();
-                    self.retry_row("branch-retry", &message, PickerKind::Branch, &theme, cx)
-                }
-                Loadable::Ready(_) if rows.is_empty() => div()
-                    .p(px(Theme::SPACE_SM))
-                    .text_size(crate::typography::ui_rems(12.0))
-                    .text_color(theme.text_faint)
-                    .child(SharedString::from("No refs found."))
-                    .into_any_element(),
-                Loadable::Ready(_) => {
-                    let active = self.active;
-                    let selected = session_branch.or_else(|| self.config.branch.clone());
-                    div()
-                        .id("branch-list")
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.0))
-                        .max_h(px(224.0))
-                        .overflow_y_scroll()
-                        .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
-                            |(ix, row)| {
-                                let label: SharedString = row.name.clone().into();
-                                let is_selected = selected.as_deref() == Some(row.name.as_str());
-                                // Right-aligned muted tag (t3code `text-[10px]
-                                // text-muted-foreground/45`): current beats worktree.
-                                let tag: Option<&'static str> = if row.current {
-                                    Some("current")
-                                } else if row.worktree_path.is_some() {
-                                    Some("worktree")
-                                } else {
-                                    None
-                                };
-                                let is_switching = switching.as_deref() == Some(row.name.as_str());
-                                popover::menu_row_nav(
-                                    &theme,
-                                    is_selected,
-                                    ix == active,
-                                    format!("branch-row-{ix}"),
-                                )
-                                .id(("branch-row", ix))
-                                .when(switching.is_some(), |el| el.opacity(0.55))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.pick_ref(row.clone(), cx);
-                                }))
-                                .child(div().flex_1().min_w_0().truncate().child(label))
-                                .when(is_switching, |el| {
-                                    el.child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(crate::typography::ui_rems(10.0))
-                                            .text_color(theme.text_muted.opacity(0.6))
-                                            .child(SharedString::from("switching…")),
+        let scrollbar = popover::rail(self, "branch-scrollbar", &theme, cx);
+        let body: AnyElement = match &self.refs {
+            Loadable::Loading | Loadable::Idle => {
+                popover::skeleton_rows("branch-skeleton", &theme, 4, cx.entity_id(), cx)
+            }
+            Loadable::Error(message) => {
+                let message = message.clone();
+                self.retry_row("branch-retry", &message, PickerKind::Branch, &theme, cx)
+            }
+            Loadable::Ready(_) if rows.is_empty() => div()
+                .p(px(Theme::SPACE_SM))
+                .text_size(crate::typography::ui_rems(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from("No refs found."))
+                .into_any_element(),
+            Loadable::Ready(_) => {
+                let active = self.active;
+                let selected = session_branch.or_else(|| self.config.branch.clone());
+                popover::menu_scroll_host("branch-list-host")
+                    .on_hover(cx.listener(Self::on_menu_list_hover))
+                    .child(
+                        popover::menu_scroll_list("branch-list", &self.menu_scroll)
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .max_h(px(224.0))
+                            .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
+                                |(ix, row)| {
+                                    let label: SharedString = row.name.clone().into();
+                                    let is_selected =
+                                        selected.as_deref() == Some(row.name.as_str());
+                                    // Right-aligned muted tag (t3code `text-[10px]
+                                    // text-muted-foreground/45`): current beats worktree.
+                                    let tag: Option<&'static str> = if row.current {
+                                        Some("current")
+                                    } else if row.worktree_path.is_some() {
+                                        Some("worktree")
+                                    } else {
+                                        None
+                                    };
+                                    let is_switching =
+                                        switching.as_deref() == Some(row.name.as_str());
+                                    popover::menu_row_nav(
+                                        &theme,
+                                        is_selected,
+                                        ix == active,
+                                        format!("branch-row-{ix}"),
                                     )
-                                })
-                                .when_some(tag, |el, tag| {
-                                    el.child(
-                                        div()
-                                            .flex_none()
-                                            .text_size(crate::typography::ui_rems(10.0))
-                                            .text_color(theme.text_muted.opacity(0.45))
-                                            .child(SharedString::from(tag)),
+                                    .id(("branch-row", ix))
+                                    .when(switching.is_some(), |el| el.opacity(0.55))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.pick_ref(row.clone(), cx);
+                                    }))
+                                    .child(div().flex_1().min_w_0().truncate().child(label))
+                                    .when(is_switching, |el| {
+                                        el.child(
+                                            div()
+                                                .flex_none()
+                                                .text_size(crate::typography::ui_rems(10.0))
+                                                .text_color(theme.text_muted.opacity(0.6))
+                                                .child(SharedString::from("switching…")),
+                                        )
+                                    })
+                                    .when_some(
+                                        tag,
+                                        |el, tag| {
+                                            el.child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_size(crate::typography::ui_rems(10.0))
+                                                    .text_color(theme.text_muted.opacity(0.45))
+                                                    .child(SharedString::from(tag)),
+                                            )
+                                        },
                                     )
-                                })
-                            },
-                        ))
-                        .into_any_element()
-                }
-            };
+                                },
+                            )),
+                    )
+                    .children(scrollbar)
+                    .into_any_element()
+            }
+        };
         let mut popover = div()
             .flex()
             .flex_col()
@@ -3328,7 +3372,7 @@ impl Pickers {
             }
         };
 
-        let model_scrollbar = self.render_model_scrollbar(&theme, cx);
+        let model_scrollbar = popover::rail(self, "model-scrollbar", &theme, cx);
         let list_host = div()
             .id("model-list-scroll-host")
             .relative()
@@ -3338,7 +3382,7 @@ impl Pickers {
             // A whisper of wash keeps the scrolling band readable between
             // the pinned chrome above and the traits tray below.
             .bg(crate::theme::ink(0.02))
-            .on_hover(cx.listener(Self::on_model_list_hover))
+            .on_hover(cx.listener(Self::on_menu_list_hover))
             .child(match model_list {
                 Some(list) => list,
                 // Empty/loading/error notes: a plain static stack.
@@ -3701,6 +3745,20 @@ impl Pickers {
     }
 }
 
+/// The floating-scrollbar treatment for every picker list
+/// ([`popover::rail`] folds the note/hide/metrics/render + pointer listeners
+/// into one call): one shared rail state, fed by whichever handle
+/// [`Pickers::active_menu_scroll`] resolves for the mounted menu.
+impl popover::ScrollRailHost for Pickers {
+    fn rail_bar(&mut self) -> &mut popover::MenuScrollbarState {
+        &mut self.menu_bar
+    }
+
+    fn rail_scroll(&self) -> Option<gpui::ScrollHandle> {
+        Some(self.active_menu_scroll())
+    }
+}
+
 /// The "Default" marker beside a section's default choice: a ghost badge —
 /// bare muted text, no border or fill (user request; t3code draws an outline
 /// pill here).
@@ -3995,7 +4053,7 @@ fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
         .collect()
 }
 
-/// Attach the (single) open popover overlay to its trigger chip.
+/// Attach the (single) open popover above a selector trigger.
 fn attach_overlay(
     chip: gpui::Stateful<gpui::Div>,
     overlay: &mut Option<(PickerKind, AnyElement)>,
@@ -4011,8 +4069,24 @@ fn attach_overlay(
     chip
 }
 
-/// [`attach_overlay`] with the menu RIGHT-ALIGNED to the trigger (t3code
-/// `align="end"` — right-edge triggers like the ref picker open leftward).
+/// Attach the (single) open popover below a selector trigger.
+fn attach_overlay_below(
+    chip: gpui::Stateful<gpui::Div>,
+    overlay: &mut Option<(PickerKind, AnyElement)>,
+    kind: PickerKind,
+    id: &'static str,
+    closing: Option<std::time::Instant>,
+) -> gpui::Stateful<gpui::Div> {
+    if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
+        && let Some((_, element)) = overlay.take()
+    {
+        return chip.child(popover::anchored_menu_below(id, element, closing));
+    }
+    chip
+}
+
+/// Attach the menu ABOVE and RIGHT-ALIGNED to the trigger (t3code
+/// `align="end"` — right-edge controls like the model picker open leftward).
 fn attach_overlay_end(
     chip: gpui::Stateful<gpui::Div>,
     overlay: &mut Option<(PickerKind, AnyElement)>,
@@ -4234,9 +4308,6 @@ impl Render for Pickers {
             .items_center()
             .justify_between()
             .gap(px(Theme::SPACE_SM))
-            // GPUI dispatches this captured stream while the thumb is dragged,
-            // including when the pointer has left the model popover.
-            .on_drag_move(cx.listener(Self::on_model_scrollbar_drag_move))
             .child(left)
             .child(right)
     }
@@ -4246,6 +4317,59 @@ impl Render for Pickers {
 mod tests {
     use super::*;
     use zeron_proto::{FolderEntry, Model, ModelOption, ModelOptionChoice};
+
+    #[gpui::test]
+    fn workspace_footer_pair_keeps_its_leading_edge_and_gap(cx: &mut gpui::TestAppContext) {
+        struct Fixture {
+            width: f32,
+            bounds: std::rc::Rc<std::cell::RefCell<Vec<gpui::Bounds<gpui::Pixels>>>>,
+        }
+        impl gpui::Render for Fixture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let chip = |width| {
+                    let measured = self.bounds.clone();
+                    gpui::canvas(
+                        move |bounds, _, _| measured.borrow_mut().push(bounds),
+                        |_, _, _, _| {},
+                    )
+                    .w(px(width))
+                    .h(px(20.0))
+                    .flex_none()
+                };
+                div().w(px(self.width)).child(
+                    workspace_footer_row()
+                        .px(px(10.0))
+                        .child(chip(120.0))
+                        .child(chip(90.0))
+                        .child(div().flex_1().min_w_0())
+                        .child(chip(60.0)),
+                )
+            }
+        }
+        let bounds = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let handle = cx.add_window(|_, _| Fixture {
+            width: 320.0,
+            bounds: bounds.clone(),
+        });
+        let mut first_left = None;
+        for width in [320.0, 680.0, 1000.0, 320.0] {
+            handle
+                .update(cx, |fixture, _, cx| {
+                    fixture.width = width;
+                    cx.notify();
+                })
+                .unwrap();
+            bounds.borrow_mut().clear();
+            cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+                .unwrap();
+            let measured = bounds.borrow();
+            let pair = &measured[measured.len() - 3..];
+            assert_eq!(pair[0].left(), *first_left.get_or_insert(pair[0].left()));
+            assert!((f32::from(pair[1].left() - pair[0].right()) - 4.0).abs() < 0.1);
+            assert_eq!(pair[0].top(), pair[1].top());
+            assert!((f32::from(pair[2].right() - pair[0].left()) - (width - 20.0)).abs() < 0.1);
+        }
+    }
 
     #[gpui::test]
     fn picker_completion_and_dismissal_have_distinct_focus_behavior(cx: &mut gpui::TestAppContext) {

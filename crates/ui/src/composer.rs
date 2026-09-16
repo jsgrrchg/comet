@@ -34,6 +34,7 @@ use zeron_rpc::{RpcError, methods};
 use crate::appshots::{self, CapturedAppshot};
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
+use crate::notice::{NoticeChipIcon, notice_chip};
 use crate::pickers::Pickers;
 use crate::settings::{ComposerSendBehavior, platform_combo};
 use crate::state::{AppState, Indicator};
@@ -69,12 +70,27 @@ pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BO
 /// compact cluster (`py-1.5` + h-8 = 44) is shorter, so the textarea wins.
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
 /// `max-w-3xl`: stable outer width of the centered composer column.
-const COMPOSER_MAX_WIDTH: f32 = 768.0;
+pub const COMPOSER_MAX_WIDTH: f32 = 768.0;
 /// The queue reads as a narrower tray emerging from behind the composer.
 const QUEUE_SIDE_INSET: f32 = 16.0;
 /// The composer covers the tray's lower padding so the queue reads as emerging
 /// from behind it instead of as a separate rounded pill.
 pub(crate) const QUEUE_COMPOSER_OVERLAP: f32 = 18.0;
+/// The original floating selector rows use the same 20px chip height as the
+/// established-thread footer. Their surrounding rows own no plate or border.
+const NEW_THREAD_SELECTOR_ROW_HEIGHT: f32 = 20.0;
+// Accommodate the 24px usage indicator and PR badge without overflowing the
+// row's equal 8px top/bottom gutters.
+const SESSION_FOOTER_HEIGHT: f32 = 24.0;
+
+/// Route chrome dissolves around the middle of the shared-element move. The
+/// two ramps never overlap, which avoids duplicate picker ids/popovers while
+/// still letting their surrounding geometry collapse continuously.
+fn route_chrome_opacities(new_thread_chrome: f32) -> (f32, f32) {
+    let new_thread = ((new_thread_chrome.clamp(0.0, 1.0) - 0.5) * 2.0).clamp(0.0, 1.0);
+    let session = (((1.0 - new_thread_chrome.clamp(0.0, 1.0)) - 0.5) * 2.0).clamp(0.0, 1.0);
+    (new_thread, session)
+}
 /// Ignore subpixel noise when the shell reports the conversation width.
 const COMPOSER_WIDTH_EPSILON: f32 = 0.5;
 /// Below this pill input width the composer always expands.
@@ -298,9 +314,10 @@ pub fn comment_strip_height(count: usize) -> f32 {
 /// Compact↔expanded flip morph (round 9): the flip used to snap between the
 /// two pill layouts. The original has no height transition (its shell carries
 /// only `transition-colors`), so this is a native nicety: ONE committed flip
-/// starts exactly one 180ms ease-out morph ([`motion::COLLAPSE`], the same
-/// manual-drive pattern as shell.rs `WidthTween` — never `with_animation`,
-/// whose element-id keying replays tweens on remount, round-6 §1–3).
+/// starts exactly one 180ms ease-out morph ([`motion::COLLAPSE`]); the blank-
+/// thread handoff swaps in the coordinated 420ms route-transition spec. Both use the
+/// manual-drive pattern from shell.rs `WidthTween` — never `with_animation`,
+/// whose element-id keying replays tweens on remount, round-6 §1–3.
 ///
 /// The morph animates the pill's COMMITTED height: the flip commits its final
 /// layout immediately (the input entity never remounts — the caret survives,
@@ -317,18 +334,37 @@ pub struct FlipMorph {
     pub from: f32,
     /// Commit time in ms on the caller's monotonic clock.
     pub start_ms: f32,
+    /// Ordinary typing flips use the quick collapse spec; the first-send
+    /// handoff uses the shell's longer coordinated route timeline.
+    pub spec: motion::MotionSpec,
 }
 
 impl FlipMorph {
-    /// Raw timeline position 0..1 over [`motion::COLLAPSE`]'s 180ms.
+    fn collapse(from: f32, start_ms: f32) -> Self {
+        Self {
+            from,
+            start_ms,
+            spec: motion::COLLAPSE,
+        }
+    }
+
+    fn new_thread_transition(from: f32, start_ms: f32) -> Self {
+        Self {
+            from,
+            start_ms,
+            spec: motion::NEW_THREAD_TRANSITION,
+        }
+    }
+
+    /// Raw timeline position 0..1 over this morph's motion spec.
     fn raw(&self, now_ms: f32) -> f32 {
-        let total = motion::COLLAPSE.total().as_secs_f32() * 1000.0;
+        let total = self.spec.total().as_secs_f32() * 1000.0;
         ((now_ms - self.start_ms) / total).clamp(0.0, 1.0)
     }
 
-    /// Eased progress 0..1 (ease-out) — also drives the actions fade.
+    /// Eased progress 0..1 — also drives the inner geometry handoff.
     pub fn progress(&self, now_ms: f32) -> f32 {
-        motion::COLLAPSE.progress(self.raw(now_ms))
+        self.spec.progress(self.raw(now_ms))
     }
 
     pub fn done(&self, now_ms: f32) -> bool {
@@ -444,10 +480,7 @@ pub fn flip_morph_step(
     if reduced_motion || last_height <= 0.0 {
         return None;
     }
-    Some(FlipMorph {
-        from: last_height,
-        start_ms: now_ms,
-    })
+    Some(FlipMorph::collapse(last_height, now_ms))
 }
 
 /// Engines at or above this version understand `pending://` attachment refs
@@ -477,14 +510,14 @@ pub fn composer_has_content(text: &str, attachments: usize, comments: usize) -> 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModifiedSubmitTarget {
     SubmitContent,
-    ActivateQueueHead,
+    ActivateLatestQueued,
 }
 
 fn modified_submit_target(has_content: bool) -> ModifiedSubmitTarget {
     if has_content {
         ModifiedSubmitTarget::SubmitContent
     } else {
-        ModifiedSubmitTarget::ActivateQueueHead
+        ModifiedSubmitTarget::ActivateLatestQueued
     }
 }
 
@@ -3809,6 +3842,10 @@ impl Render for ComposerInput {
 /// Events the shell listens for.
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
+    /// Arm the shared-element transition before the draft route is replaced
+    /// by the newly-created session. Emitting this before `select_chat` keeps
+    /// the first destination frame on the same timeline as the source frame.
+    NewThreadTransitionStarted,
     /// A prompt was sent optimistically — give the transcript its exact row
     /// identity so it can anchor the prompt at the top with the reply's
     /// reserved space below it.
@@ -3856,11 +3893,6 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
         range: at..end,
         query: text[at + 1..cursor].to_string(),
     })
-}
-
-/// Restart a popup's row stack at the top (fresh open / query / result set).
-fn reset_scroll_offset(scroll: &gpui::ScrollHandle) {
-    scroll.set_offset(gpui::Point::new(px(0.0), px(0.0)));
 }
 
 /// The `/` must open the input: slash commands are whole-prompt prefixes
@@ -3960,9 +3992,8 @@ pub struct Composer {
     pub(crate) input: Entity<ComposerInput>,
     /// Draft displaced while a queued message occupies the composer.
     pub(crate) queue_edit_draft: Option<(String, Vec<StagedAttachment>, Vec<CapturedAppshot>)>,
-    /// Composer actions row: repo/branch/harness-model/traits (§1.7).
-    /// Shared with the shell's new-session canvas, which renders the
-    /// device/project target selectors ([`Pickers::render_target_selectors`]).
+    /// Composer actions row plus the new-session floating target tab
+    /// ([`Pickers::render_new_thread_target_selectors`]).
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
@@ -4001,6 +4032,10 @@ pub struct Composer {
     popup_bar: crate::popover::MenuScrollbarState,
     pub(crate) current_key: String,
     sending: bool,
+    /// Armed immediately before a blank-canvas send selects its minted chat.
+    /// The state observer consumes it to distinguish that handoff from normal
+    /// session navigation, which must continue to snap.
+    launching_new_chat: bool,
     pub(crate) failure: Option<SharedString>,
     /// The chat key `failure` belongs to (`None` = global, e.g. "Engine not
     /// connected"). Chat-scoped failures survive navigation and render only
@@ -4079,6 +4114,11 @@ pub struct Composer {
     /// Pill height actually rendered last frame — a committed flip morphs
     /// from here, so mid-flight reversals hand off without a jump.
     last_rendered_height: f32,
+    dock_frame: Option<crate::composer_dock::DockFrame>,
+    /// The shared clock owns this frame's height, including its final step.
+    dock_height_changed: bool,
+    dock_clearance_correction: f32,
+    surface_bounds: crate::new_thread_background_mask::SurfaceBounds,
     last_target_height: f32,
     height_morph: Option<FlipMorph>,
     /// Monotonic clock anchor for the morph timeline.
@@ -4095,6 +4135,33 @@ pub struct Composer {
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
+    pub(crate) fn set_dock_frame(
+        &mut self,
+        frame: crate::composer_dock::DockFrame,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = self.dock_frame != Some(frame);
+        self.dock_height_changed |= self
+            .dock_frame
+            .is_none_or(|previous| previous.amount != frame.amount);
+        self.dock_frame = Some(frame);
+        if frame.active {
+            self.flip_morph = None;
+            self.height_morph = None;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn dock_clearance_correction(&self) -> f32 {
+        self.dock_clearance_correction
+    }
+
+    pub(crate) fn surface_bounds(&self) -> crate::new_thread_background_mask::SurfaceBounds {
+        self.surface_bounds.clone()
+    }
+
     /// The picker entity, for the shell's canvas target selectors.
     pub fn pickers(&self) -> &Entity<Pickers> {
         &self.pickers
@@ -4207,6 +4274,7 @@ impl Composer {
             popup_bar: crate::popover::MenuScrollbarState::default(),
             current_key,
             sending: false,
+            launching_new_chat: false,
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
@@ -4244,6 +4312,10 @@ impl Composer {
             settle_task: None,
             flip_morph: None,
             last_rendered_height: 0.0,
+            dock_frame: None,
+            dock_height_changed: false,
+            dock_clearance_correction: 0.0,
+            surface_bounds: Default::default(),
             last_target_height: 0.0,
             height_morph: None,
             morph_clock: Instant::now(),
@@ -4978,7 +5050,7 @@ impl Composer {
             self.mention.results.clear();
             self.mention.active = None;
             // Fresh open: the row stack restarts at the top.
-            reset_scroll_offset(&self.mention_scroll);
+            crate::popover::reset_menu_scroll(&self.mention_scroll, &mut self.popup_bar);
         }
         self.mention.error = None;
         self.mention.loading = token.is_some();
@@ -5055,7 +5127,10 @@ impl Composer {
                             composer.mention.active = (!results.is_empty()).then_some(0);
                             composer.mention.results = results;
                             // New result set: the row stack restarts at the top.
-                            reset_scroll_offset(&composer.mention_scroll);
+                            crate::popover::reset_menu_scroll(
+                                &composer.mention_scroll,
+                                &mut composer.popup_bar,
+                            );
                         }
                         Err(err) => tracing::warn!(%err, "file mention response decode failed"),
                     },
@@ -5117,7 +5192,7 @@ impl Composer {
     }
 
     fn render_file_mention_popup(
-        &self,
+        &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
@@ -5134,9 +5209,6 @@ impl Composer {
                     window.focus(&this.input.focus_handle(cx), cx);
                 }),
             )
-            // GPUI dispatches this captured stream while the thumb is
-            // dragged, including when the pointer has left the popup.
-            .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         if self.mention.loading && self.mention.results.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
@@ -5191,14 +5263,19 @@ impl Composer {
                                 .items_center()
                                 .gap(px(8.0))
                                 .child(
-                                    crate::icons::icon(if result.is_dir {
-                                        crate::icons::FOLDER
-                                    } else {
-                                        crate::icons::DOCUMENT
-                                    })
+                                    crate::file_icons::icon(
+                                        if result.is_dir {
+                                            crate::file_icons::FileIconIdentity::directory(
+                                                &result.path,
+                                                false,
+                                            )
+                                        } else {
+                                            crate::file_icons::FileIconIdentity::file(&result.path)
+                                        },
+                                        theme.appearance,
+                                    )
                                     .size(px(14.0))
-                                    .flex_none()
-                                    .text_color(theme.text_muted),
+                                    .flex_none(),
                                 )
                                 .child(
                                     div()
@@ -5240,12 +5317,7 @@ impl Composer {
                             .track_scroll(&self.mention_scroll)
                             .children(rows),
                     )
-                    .children(self.popup_scrollbar(
-                        "mention-scrollbar",
-                        &self.mention_scroll,
-                        theme,
-                        cx,
-                    )),
+                    .children(crate::popover::rail(self, "mention-scrollbar", theme, cx)),
             );
         }
         Some(crate::popover::full_width_menu_above(
@@ -5366,7 +5438,7 @@ impl Composer {
         self.slash.filtered = crate::popover::filter_indices(&query, &names);
         self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
         // A fresh query/reopen restarts the row stack at the top.
-        reset_scroll_offset(&self.slash_scroll);
+        crate::popover::reset_menu_scroll(&self.slash_scroll, &mut self.popup_bar);
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -5433,7 +5505,7 @@ impl Composer {
     }
 
     fn render_slash_popup(
-        &self,
+        &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
@@ -5457,9 +5529,6 @@ impl Composer {
                     window.focus(&this.input.focus_handle(cx), cx);
                 }),
             )
-            // GPUI dispatches this captured stream while the thumb is
-            // dragged, including when the pointer has left the popup.
-            .on_drag_move(cx.listener(Self::on_popup_bar_drag_move))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
         if self.slash.loading && commands.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
@@ -5565,12 +5634,7 @@ impl Composer {
                             .track_scroll(&self.slash_scroll)
                             .children(rows),
                     )
-                    .children(self.popup_scrollbar(
-                        "slash-scrollbar",
-                        &self.slash_scroll,
-                        theme,
-                        cx,
-                    )),
+                    .children(crate::popover::rail(self, "slash-scrollbar", theme, cx)),
             );
         }
         // Full pill width above the composer, matching the file-mention popup.
@@ -5579,42 +5643,6 @@ impl Composer {
             card.into_any_element(),
             None,
         ))
-    }
-
-    /// The floating scrollbar rail for a composer popup's scroll host (the
-    /// model-list treatment). Callers pass the id and that popup's scroll
-    /// handle; the hover/drag interaction state is shared.
-    fn popup_scrollbar(
-        &self,
-        id: &'static str,
-        scroll: &gpui::ScrollHandle,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let metrics = self.popup_bar.metrics(scroll)?;
-        Some(
-            self.popup_bar
-                .render_rail(theme, metrics)?
-                .id(id)
-                .on_hover(cx.listener(Self::on_popup_bar_hover))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(Self::on_popup_bar_mouse_down),
-                )
-                .on_drag(crate::popover::MenuScrollbarDrag, |_, _, _, cx| {
-                    cx.stop_propagation();
-                    cx.new(|_| crate::popover::MenuScrollbarDragGhost)
-                })
-                .on_mouse_up_out(
-                    gpui::MouseButton::Left,
-                    cx.listener(Self::on_popup_bar_mouse_up),
-                )
-                .on_mouse_up(
-                    gpui::MouseButton::Left,
-                    cx.listener(Self::on_popup_bar_mouse_up),
-                )
-                .into_any_element(),
-        )
     }
 
     /// The popup whose rows a scrollbar drag is moving — the tokens are
@@ -5638,52 +5666,6 @@ impl Composer {
         if self.popup_bar.set_list_hovered(*hovered) {
             cx.notify();
         }
-    }
-
-    fn on_popup_bar_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.popup_bar.set_bar_hovered(*hovered) {
-            cx.notify();
-        }
-    }
-
-    fn on_popup_bar_mouse_down(
-        &mut self,
-        event: &gpui::MouseDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(scroll) = self.active_popup_scroll() else {
-            return;
-        };
-        if !self.popup_bar.begin_press(&scroll, event.position.y) {
-            return;
-        }
-        cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn on_popup_bar_drag_move(
-        &mut self,
-        event: &gpui::DragMoveEvent<crate::popover::MenuScrollbarDrag>,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(scroll) = self.active_popup_scroll() else {
-            return;
-        };
-        if self.popup_bar.drag_to(&scroll, event.event.position.y) {
-            cx.notify();
-        }
-    }
-
-    fn on_popup_bar_mouse_up(
-        &mut self,
-        _event: &gpui::MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.popup_bar.end_press();
-        cx.notify();
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
@@ -5747,6 +5729,10 @@ impl Composer {
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
+            let new_thread_launch =
+                self.launching_new_chat && self.current_key.is_empty() && !key.is_empty();
+            let returning_to_new_thread = !self.current_key.is_empty() && key.is_empty();
+            self.launching_new_chat = false;
             let old_text = self.input.read(cx).text().to_string();
             if old_text.is_empty() {
                 self.drafts.remove(&self.current_key);
@@ -5770,11 +5756,27 @@ impl Composer {
             // the nav-driven flip only commits AFTER the swapped draft has
             // been re-measured, one or two renders later, so the whole
             // window snaps (see ROUTE_SNAP_MS).
-            self.flip_morph = None;
             self.height_morph = None;
             self.last_target_height = 0.0;
-            self.last_rendered_height = 0.0;
-            self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
+            if (new_thread_launch || returning_to_new_thread)
+                && !motion::reduced_motion(cx)
+                && self.last_rendered_height > 0.0
+            {
+                // Both directions share one timeline. The blank canvas is
+                // always expanded; an established session begins compact.
+                self.expanded_mode = returning_to_new_thread;
+                let now_ms =
+                    self.morph_clock.elapsed().as_secs_f32() * 1000.0 / motion::speed_scale();
+                self.flip_morph = Some(FlipMorph::new_thread_transition(
+                    self.last_rendered_height,
+                    now_ms,
+                ));
+                self.route_snap_until = None;
+            } else {
+                self.flip_morph = None;
+                self.last_rendered_height = 0.0;
+                self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
+            }
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
         }
 
@@ -5903,8 +5905,8 @@ impl Composer {
     }
 
     /// Cmd/Ctrl+Enter remains an ordinary submit while the composer carries
-    /// content. With a truly empty composer it instead advances the queue's
-    /// first actionable row, and never turns an empty chord into Stop.
+    /// content. With a truly empty composer it instead activates the most
+    /// recently queued row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
         if self.commit_queue_edit(cx) {
             return;
@@ -5916,7 +5918,7 @@ impl Composer {
         );
         match modified_submit_target(has_content) {
             ModifiedSubmitTarget::SubmitContent => self.on_submit(cx),
-            ModifiedSubmitTarget::ActivateQueueHead => self.queue_pop_head(cx),
+            ModifiedSubmitTarget::ActivateLatestQueued => self.activate_latest_queued(cx),
         }
     }
 
@@ -6151,6 +6153,10 @@ impl Composer {
             status: None,
             continuation_of: None,
         };
+        self.launching_new_chat = is_new;
+        if is_new {
+            cx.emit(ComposerEvent::NewThreadTransitionStarted);
+        }
         // A queued message is not in the transcript yet — the queue panel is
         // its echo, and it gets a real bubble when the host sends it.
         self.state.update(cx, |s, cx| {
@@ -7058,6 +7064,19 @@ impl Composer {
     }
 }
 
+/// The completion popups' floating rails run through
+/// [`crate::popover::rail`]: the shared `popup_bar` state plus whichever
+/// popup's rows are mounted — see [`Composer::active_popup_scroll`].
+impl crate::popover::ScrollRailHost for Composer {
+    fn rail_bar(&mut self) -> &mut crate::popover::MenuScrollbarState {
+        &mut self.popup_bar
+    }
+
+    fn rail_scroll(&self) -> Option<gpui::ScrollHandle> {
+        self.active_popup_scroll()
+    }
+}
+
 /// Focus lands on the prompt input (window-level focus fallbacks — e.g. after
 /// the focused terminal panel is hidden — route here).
 impl Focusable for Composer {
@@ -7192,14 +7211,20 @@ impl Render for Composer {
         let route_snap = self
             .route_snap_until
             .is_some_and(|until| Instant::now() < until);
-        self.flip_morph = flip_morph_step(
-            self.flip_morph,
-            committed_flip && !new_chat,
-            self.last_rendered_height,
-            now_ms,
-            motion::reduced_motion(cx),
-            route_snap,
-        );
+        let dock_height_changed = std::mem::take(&mut self.dock_height_changed);
+        self.flip_morph =
+            if dock_height_changed || self.dock_frame.is_some_and(|frame| frame.active) {
+                None
+            } else {
+                flip_morph_step(
+                    self.flip_morph,
+                    committed_flip && !new_chat,
+                    self.last_rendered_height,
+                    now_ms,
+                    motion::reduced_motion(cx),
+                    route_snap,
+                )
+            };
         let expanded = self.expanded_mode;
 
         // Chat-scoped failures render only under their own chat; a global
@@ -7250,60 +7275,27 @@ impl Render for Composer {
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
             .when_some(failure, |el, message| {
-                // zeron composer.tsx `Notice` (matches the transcript
-                // ErrorChip palette): `flex items-start gap-2 rounded-xl
-                // border px-3 py-2 text-[12px] leading-snug` with a 14px
-                // DangerTriangle — a subtle tinted wash, not a bare red
-                // stroke. Amber for the offline-ish case (engine not
-                // connected), red for send/run failures. Click dismisses.
+                // Amber with "Warning" for the offline-ish case (engine not
+                // connected), red with "Error" for send/run failures. Click
+                // dismisses.
                 let offline = message.as_ref() == "Engine not connected";
-                let (border_c, wash, text_c) = if offline {
-                    let amber = theme.warning; // amber-400
-                    let amber_200 = theme.warning_muted;
-                    (
-                        amber.opacity(0.16),
-                        amber.opacity(0.05),
-                        amber_200.opacity(0.9),
-                    )
-                } else {
-                    let danger = theme.danger; // red-400
-                    let red_300 = theme.danger_muted;
-                    (
-                        danger.opacity(0.16),
-                        danger.opacity(0.05),
-                        red_300.opacity(0.9),
-                    )
-                };
                 el.child(
-                    div()
-                        .id("composer-failure")
-                        .mx(px(4.0))
-                        .mt(px(6.0))
-                        .flex()
-                        .items_start()
-                        .gap(px(8.0))
-                        .rounded(px(12.0))
-                        .border_1()
-                        .border_color(border_c)
-                        .bg(wash)
-                        .px(px(12.0))
-                        .py(px(8.0))
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .line_height(px(16.0))
-                        .text_color(text_c)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.failure = None;
-                            this.failure_key = None;
-                            cx.notify();
-                        }))
-                        .child(
-                            crate::icons::icon(crate::icons::DANGER_TRIANGLE)
-                                .size(px(14.0))
-                                .mt(px(2.0))
-                                .text_color(text_c),
-                        )
-                        .child(div().min_w_0().child(message)),
+                    notice_chip(
+                        &theme,
+                        offline,
+                        if offline { "Warning" } else { "Error" },
+                        message,
+                        NoticeChipIcon::Plain,
+                    )
+                    .id("composer-failure")
+                    .mx(px(4.0))
+                    .mt(px(6.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.failure = None;
+                        this.failure_key = None;
+                        cx.notify();
+                    })),
                 )
             })
             .when_some(queue_notice, |el, (notice, offline)| {
@@ -7341,7 +7333,7 @@ impl Render for Composer {
         // What is waiting to be sent, stacked directly above the box it was
         // typed in — the queue is a property of this composer, not a panel
         // somewhere else.
-        let show_queue_head_shortcut = self.queue_shortcut_revealed
+        let show_queue_latest_shortcut = self.queue_shortcut_revealed
             && self.editing_queued.is_none()
             && !self.pickers.read(cx).is_open()
             && !composer_has_content(
@@ -7350,7 +7342,7 @@ impl Render for Composer {
                 self.staged_comments(cx).len(),
             );
         let container = container.when_some(
-            self.render_queue_panel(show_queue_head_shortcut, window, cx),
+            self.render_queue_panel(show_queue_latest_shortcut, window, cx),
             |el, panel| {
                 el.child(motion::fade_quick(
                     "composer-queue",
@@ -7378,10 +7370,22 @@ impl Render for Composer {
             }))
         });
 
-        // New chats always use the expanded layout: the repo/branch pickers
-        // need the full-width actions row (zeron composer-actions.tsx
-        // `mustExpand = isNew || …`).
+        // Route coordination must not force an established thread into the
+        // two-row layout. Short drafts keep the original skinny composer.
+        let session_expanded = expanded;
         let expanded = expanded || new_chat;
+        let dock_amount = self.dock_frame.map_or(0.0, |frame| frame.amount);
+        let dock_height = |amount: f32| {
+            let hero = composer_total_height(content_height);
+            let session = if session_expanded {
+                (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN - 16.0, TEXTAREA_MAX)
+                    + ACTIONS_ROW_HEIGHT
+                    + PILL_BORDER_V
+            } else {
+                COMPACT_TOTAL_HEIGHT
+            };
+            motion::lerp(hero, session, amount)
+        };
 
         // Committed-height morph: the layout below is already the NEW mode's;
         // only the pill's height (and the entrance fade/text glide driven by
@@ -7397,21 +7401,53 @@ impl Render for Composer {
         let appshot_count = self.staged_appshots().len();
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
-        let base_height = if expanded {
+        let base_height = if self.dock_frame.is_some() {
+            dock_height(dock_amount)
+        } else if expanded {
             composer_total_height(content_height)
         } else {
             COMPACT_TOTAL_HEIGHT
         };
         let target_height =
             base_height + strip_h + appshot_strip_height(appshot_count) + comment_strip_h;
-        self.height_morph = flip_morph_step(
-            self.height_morph,
-            (target_height - self.last_target_height).abs() > 0.5,
-            self.last_rendered_height,
-            now_ms,
-            motion::reduced_motion(cx),
-            route_snap,
+        let coordinated_route_morph = self
+            .flip_morph
+            .filter(|m| m.spec == motion::NEW_THREAD_TRANSITION && !m.done(now_ms));
+        // The route state commits before its shared-element animation begins.
+        // Reconstruct the departing chrome at t=0, then progressively trade
+        // it for the destination chrome so neither route changes the outer
+        // composer geometry in a single frame.
+        let new_thread_chrome = self
+            .dock_frame
+            .map(|frame| frame.selectors())
+            .unwrap_or_else(|| {
+                coordinated_route_morph.map_or_else(
+                    || if new_chat { 1.0 } else { 0.0 },
+                    |morph| {
+                        let progress = morph.progress(now_ms);
+                        if new_chat { progress } else { 1.0 - progress }
+                    },
+                )
+            });
+        let (new_thread_chrome_opacity, session_chrome_opacity) = self.dock_frame.map_or_else(
+            || route_chrome_opacities(new_thread_chrome),
+            |frame| (frame.selectors(), frame.footer()),
         );
+        self.height_morph =
+            if dock_height_changed || self.dock_frame.is_some_and(|frame| frame.active) {
+                None
+            } else if coordinated_route_morph.is_some() {
+                coordinated_route_morph
+            } else {
+                flip_morph_step(
+                    self.height_morph,
+                    (target_height - self.last_target_height).abs() > 0.5,
+                    self.last_rendered_height,
+                    now_ms,
+                    motion::reduced_motion(cx),
+                    route_snap,
+                )
+            };
         self.last_target_height = target_height;
         let pill_height = self
             .height_morph
@@ -7432,14 +7468,40 @@ impl Render for Composer {
             window.request_animation_frame();
         }
         self.last_rendered_height = pill_height;
-        let text_pt = morph_text_pad(morph_t);
+        self.dock_clearance_correction = self.dock_frame.map_or(0.0, |frame| {
+            dock_height(if frame.docked { 1.0 } else { 0.0 })
+                + strip_h
+                + appshot_strip_height(appshot_count)
+                + comment_strip_h
+                - pill_height
+        });
+        // Route morphs use the dock's reversible clock; typing flips keep
+        // their existing local clock once the composer reaches its dock.
+        let layout_morph_t =
+            if self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded {
+                if expanded {
+                    1.0 - dock_amount
+                } else {
+                    dock_amount
+                }
+            } else {
+                morph_t
+            };
+        let text_pt = morph_text_pad(layout_morph_t);
+        let surface_radius = COMPOSER_RADIUS - 4.0 * dock_amount;
+        let route_to_single_line =
+            self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded;
         let textarea_height = (pill_height
             - strip_h
             - appshot_strip_height(appshot_count)
             - comment_strip_h
             - PILL_BORDER_V
             - ACTIONS_ROW_HEIGHT)
-            .max(0.0);
+            .max(if route_to_single_line {
+                INPUT_LINE_HEIGHT + text_pt + 4.0
+            } else {
+                0.0
+            });
         self.input.update(cx, |input, cx| {
             let height = if expanded {
                 (textarea_height - text_pt - 4.0).max(0.0)
@@ -7447,7 +7509,13 @@ impl Render for Composer {
                 INPUT_LINE_HEIGHT
             };
             let settled_height = if expanded {
-                base_height - PILL_BORDER_V - ACTIONS_ROW_HEIGHT - TEXTAREA_PAD_V
+                (base_height - PILL_BORDER_V - ACTIONS_ROW_HEIGHT - TEXTAREA_PAD_V).max(
+                    if route_to_single_line {
+                        INPUT_LINE_HEIGHT
+                    } else {
+                        0.0
+                    },
+                )
             } else {
                 INPUT_LINE_HEIGHT
             };
@@ -7505,14 +7573,18 @@ impl Render for Composer {
         let appshot_strip = self.render_appshot_strip(&theme, window, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
-        // The pill chrome (zeron composer.tsx): `rounded-[26px] border
-        // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
-        // a hairline over a faint wash, never a solid grey box. Picker chips,
-        // attach, and the send circle all live INSIDE the pill.
-        let pill_bg = theme.input_glass_bg();
-        // No drop shadow on glass: it paints BEHIND the translucent fill and
-        // shows through as an inner glow (theme.rs's card_selected_shadows
-        // lesson; user report).
+        // A translucent cool silver/slate edge sits more naturally on frost
+        // than the general-purpose white/black separator color.
+        let pill_border = if theme.is_frost() {
+            match theme.appearance {
+                crate::theme::Appearance::Dark => gpui::hsla(210.0 / 360.0, 0.18, 0.78, 0.09),
+                crate::theme::Appearance::Light => gpui::hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
+            }
+        } else {
+            theme.border
+        };
+        // Compensate for the transcript canvas beneath the frosted surface.
+        // Keep the opaque fallback when frost is disabled or unsupported.
         let pill = div()
             .on_mouse_down(
                 MouseButton::Left,
@@ -7524,17 +7596,19 @@ impl Render for Composer {
                     }
                 }),
             )
-            .rounded(px(COMPOSER_RADIUS))
-            .bg(pill_bg)
+            .rounded(px(surface_radius))
             .border_1()
-            .border_color(theme.border)
-            .when(!theme.is_frost(), |el| el.shadow_lg());
+            .border_color(pill_border)
+            .when(theme.is_frost(), |el| el.bg(theme.composer_sidebar_tint()))
+            .when(!theme.is_frost(), |el| {
+                el.bg(theme.input_glass_bg()).shadow_lg()
+            });
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
         // (round-9 follow-up: the send/attach/chips must not ride the height,
         // and none of them fade — the full cluster stays visible throughout).
-        let cluster_dy = morph_cluster_dy(morph_t);
+        let cluster_dy = morph_cluster_dy(layout_morph_t);
         let body = if expanded {
             // Expanded: textarea on top (`px-4 pb-1 pt-4`), actions row
             // (`px-3 pb-2.5 pt-1`, h-8 chips → 46px) ABSOLUTE at the pill's
@@ -7545,7 +7619,6 @@ impl Render for Composer {
             // top padding eases 12→16. The whole control cluster stays at
             // full alpha — chips,
             // attach and send are all (near-)stationary on the bottom anchor.
-            let text_pt = morph_text_pad(morph_t);
             pill.h(px(pill_height))
                 .overflow_hidden()
                 .relative()
@@ -7579,7 +7652,7 @@ impl Render for Composer {
                         // Send has a larger structural separation.
                         .gap(px(ACTION_PRIMARY_GAP))
                         .pl(px(12.0))
-                        .pr(px(morph_cluster_inset(true, morph_t)))
+                        .pr(px(morph_cluster_inset(true, layout_morph_t)))
                         .pt(px(4.0))
                         .pb(px(10.0))
                         .child(
@@ -7605,9 +7678,13 @@ impl Render for Composer {
             // its expanded resting place via a decaying relative offset, and
             // the whole inline cluster (chips + attach/send) holds its spot at
             // full alpha (2.5px centering delta gliding in).
-            let text_glide = match self.flip_morph {
-                Some(m) if morphing => collapse_text_glide(m.from, morph_t),
-                _ => 0.0,
+            let text_glide = if self.dock_frame.is_some_and(|frame| frame.active) {
+                collapse_text_glide(dock_height(0.0), dock_amount)
+            } else {
+                match self.flip_morph {
+                    Some(m) if morphing => collapse_text_glide(m.from, morph_t),
+                    _ => 0.0,
+                }
             };
             pill.h(px(pill_height))
                 .overflow_hidden()
@@ -7643,7 +7720,7 @@ impl Render for Composer {
                                 // the right inset alone glides 12→8.
                                 .gap(px(ACTION_PRIMARY_GAP))
                                 .pl(px(4.0))
-                                .pr(px(morph_cluster_inset(false, morph_t)))
+                                .pr(px(morph_cluster_inset(false, layout_morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
                                 .child(
@@ -7660,61 +7737,140 @@ impl Render for Composer {
                         ),
                 )
         };
-        // New sessions: the TARGET row (device + project chips) sits ABOVE
-        // the pill, left-aligned like the checkout toolbar below it (user
-        // request — moved off the canvas). Existing sessions name their
-        // target in the titlebar instead.
-        let container = if new_chat {
-            let selectors = self
-                .pickers
-                .update(cx, |pickers, cx| pickers.render_target_selectors(cx));
-            container.child(selectors)
-        } else {
-            container
-        };
+        let new_thread_target_selectors = (new_thread_chrome_opacity > 0.0).then(|| {
+            self.pickers.update(cx, |pickers, cx| {
+                pickers.render_new_thread_target_selectors(cx)
+            })
+        });
+        let new_thread_git_selectors = (new_thread_chrome_opacity > 0.0)
+            .then(|| {
+                self.pickers.update(cx, |pickers, cx| {
+                    pickers.render_new_thread_git_selectors(cx)
+                })
+            })
+            .flatten();
+        let has_new_thread_git_selectors = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .is_some_and(|space| space.git_detected);
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
         // Frosted: the pill backdrop-blurs the transcript scrolling under it
         // (the popover glass treatment; radius matches the pill's rounding).
-        let container = container.child(
-            div()
-                .relative()
-                .child(crate::frost::frosted(
-                    COMPOSER_RADIUS,
-                    16.0,
-                    motion::fade_quick("composer-input", body),
-                ))
-                // Both completion popups span the full pill width above it —
-                // the file-mention and slash tokens are mutually exclusive.
-                .children(self.render_file_mention_popup(&theme, cx))
-                .children(self.render_slash_popup(&theme, cx)),
-        );
-        // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
-        // checkout-kind selector + ref picker for new sessions, read-only
-        // labels once the session exists. Git spaces only.
-        let footer = self
-            .pickers
-            .update(cx, |pickers, cx| pickers.render_footer(cx));
-        let container =
-            if !new_chat {
-                let usage = self.state.read(cx).context_usage;
-                container.child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .child(div().flex_1().min_w_0().children(footer))
-                        .child(div().pr(px(10.0)).mb(px(-8.0)).child(
-                            crate::context_usage::render(usage, self.state.clone(), &theme),
-                        )),
+        // The shell keeps this entity under one parent on both routes. The
+        // surface itself never fades, and frost follows the same morph radius.
+        let pill_surface = div()
+            .relative()
+            .id("composer-surface")
+            .child(crate::frost::frosted(surface_radius, 16.0, body))
+            .child({
+                let measured = self.surface_bounds.clone();
+                // All prepaint completes before any paint. The background
+                // reads this cell during paint, never last frame's geometry.
+                gpui::canvas(
+                    move |bounds, _, _| measured.set(Some(bounds)),
+                    |_, _, _, _| {},
                 )
-            } else {
-                match footer {
-                    Some(footer) => container.child(footer),
-                    None => container,
-                }
-            };
+                .absolute()
+                .inset_0()
+            })
+            // Both completion popups span the full pill width above it —
+            // the file-mention and slash tokens are mutually exclusive.
+            .children(self.render_file_mention_popup(&theme, cx))
+            .children(self.render_slash_popup(&theme, cx));
+        // Restore the original chip-only selector treatment: destination at
+        // the top-right, no surrounding surface. Cancel the column gap as the
+        // row collapses so the pill never jumps at the route boundary.
+        let container = if self.dock_frame.is_some() {
+            // Floating selectors share the surface's origin and never change its height.
+            container.relative().child(
+                div()
+                    .id("dock-target-selectors")
+                    .absolute()
+                    .top(px(-28.0))
+                    .left(px(Theme::SPACE_LG + 10.0))
+                    .right(px(Theme::SPACE_LG + 10.0))
+                    .h(px(NEW_THREAD_SELECTOR_ROW_HEIGHT))
+                    .flex()
+                    .items_start()
+                    .justify_end()
+                    .opacity(new_thread_chrome_opacity)
+                    .children(new_thread_target_selectors),
+            )
+        } else if new_thread_chrome > 0.0 {
+            container.child(
+                div()
+                    .w_full()
+                    .h(px(NEW_THREAD_SELECTOR_ROW_HEIGHT * new_thread_chrome))
+                    .mb(px(-Theme::SPACE_SM * (1.0 - new_thread_chrome)))
+                    .px(px(10.0))
+                    .flex()
+                    .items_start()
+                    .justify_end()
+                    .opacity(new_thread_chrome_opacity)
+                    .children(new_thread_target_selectors),
+            )
+        } else {
+            container
+        };
+        let container = container.child(pill_surface);
+
+        // The lower slot keeps a stable footprint for Git projects while its
+        // old floating checkout/ref controls dissolve into the session footer.
+        // Non-Git sessions grow the slot continuously from zero.
+        let session_chrome = 1.0 - new_thread_chrome;
+        let bottom_slot = if has_new_thread_git_selectors || self.dock_frame.is_some() {
+            1.0
+        } else {
+            session_chrome
+        };
+        let container = if bottom_slot > 0.0 {
+            let footer = (session_chrome_opacity > 0.0).then(|| {
+                self.pickers
+                    .update(cx, |pickers, cx| pickers.render_footer(cx))
+            });
+            let usage = self.state.read(cx).context_usage;
+            container.child(
+                div()
+                    .w_full()
+                    .h(px(SESSION_FOOTER_HEIGHT * bottom_slot))
+                    .mt(px(-Theme::SPACE_SM * (1.0 - bottom_slot)))
+                    .mb(px(-Theme::SPACE_SM * bottom_slot))
+                    .relative()
+                    .when(new_thread_chrome_opacity > 0.0, |slot| {
+                        slot.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .px(px(10.0))
+                                .flex()
+                                .items_center()
+                                .opacity(new_thread_chrome_opacity)
+                                .children(new_thread_git_selectors),
+                        )
+                    })
+                    .when(session_chrome_opacity > 0.0, |slot| {
+                        slot.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .w_full()
+                                .h(px(SESSION_FOOTER_HEIGHT))
+                                .flex()
+                                .items_center()
+                                .opacity(session_chrome_opacity)
+                                .child(div().flex_1().min_w_0().children(footer.flatten()))
+                                .child(div().flex_none().pr(px(10.0)).child(
+                                    crate::context_usage::render(usage, self.state.clone(), &theme),
+                                )),
+                        )
+                    }),
+            )
+        } else {
+            container
+        };
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
             if std::mem::take(&mut self.preview_focus_pending) {
@@ -7771,6 +7927,55 @@ mod tests {
         cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
             .unwrap();
         (dir, window)
+    }
+
+    #[gpui::test]
+    fn dock_morph_restores_skinny_height_with_a_continuous_editor_origin(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let input = handle
+            .read_with(cx, |composer, _| composer.input.clone())
+            .unwrap();
+        for docked in [true, false] {
+            let amounts = if docked {
+                [0.0, 0.2, 0.6, 0.98, 1.0]
+            } else {
+                [1.0, 0.98, 0.6, 0.2, 0.0]
+            };
+            for amount in amounts {
+                handle
+                    .update(cx, |composer, _, cx| {
+                        composer.state.update(cx, |state, _| {
+                            state.selected_chat = docked.then(|| "chat".into());
+                        });
+                        composer.on_state_changed(cx);
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_text("Hi", cx));
+                        composer.expanded_mode = false;
+                        let mut frame = crate::composer_dock::DockFrame::settled(docked);
+                        frame.amount = amount;
+                        frame.active = amount != if docked { 1.0 } else { 0.0 };
+                        composer.set_dock_frame(frame, cx);
+                    })
+                    .unwrap();
+                cx.update_window(handle.into(), |_, window, cx| {
+                    window.draw(cx).clear();
+                })
+                .unwrap();
+                handle.read_with(cx, |composer, cx| {
+                    assert_eq!(composer.input, input);
+                    let surface = composer.surface_bounds.get().unwrap();
+                    let origin = input.read(cx).last_bounds.unwrap().origin;
+                    assert!((f32::from(origin.y - surface.top()) - (17.0 - 4.0 * amount)).abs() <= 1.0,
+                        "editor jumped: docked={docked}, amount={amount}, origin={origin:?}, surface={surface:?}");
+                    let expected = if docked { COMPACT_TOTAL_HEIGHT } else { COMPOSER_MIN_HEIGHT };
+                    assert!((composer.last_rendered_height + composer.dock_clearance_correction - expected).abs() < 0.1);
+                    assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1);
+                }).unwrap();
+            }
+        }
     }
 
     #[gpui::test]
@@ -8861,6 +9066,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         // Starts exactly at the committed height…
         let mut prev = m.height(124.0, 0.0);
@@ -8880,6 +9086,7 @@ mod tests {
         let down = FlipMorph {
             from: 124.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         assert!(down.height(49.0, 90.0) < 124.0);
         assert!(down.height(49.0, 90.0) > 49.0);
@@ -8890,6 +9097,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         let mid = m.height(124.0, 90.0);
         assert!(mid > 49.0 && mid < 124.0);
@@ -8918,6 +9126,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         assert_eq!(
             flip_morph_step(Some(m), false, 80.0, 50.0, false, true),
@@ -8984,6 +9193,7 @@ mod tests {
         let m = FlipMorph {
             from: 49.0,
             start_ms: 0.0,
+            spec: motion::COLLAPSE,
         };
         // Auto-grow can move the target mid-morph: evaluation tracks the
         // live value instead of finishing on a stale height.
@@ -8996,6 +9206,36 @@ mod tests {
     }
 
     #[test]
+    fn new_thread_route_changes_use_the_coordinated_timeline() {
+        let m = FlipMorph::new_thread_transition(124.0, 0.0);
+        assert_eq!(m.spec, motion::NEW_THREAD_TRANSITION);
+        assert_eq!(m.height(49.0, 0.0), 124.0);
+        assert!(m.height(49.0, 250.0) < 124.0);
+        assert!(m.height(49.0, 250.0) > 49.0);
+        assert_eq!(m.height(49.0, 420.0), 49.0);
+        let reverse = FlipMorph::new_thread_transition(49.0, 0.0);
+        assert_eq!(reverse.height(124.0, 0.0), 49.0);
+        assert_eq!(reverse.height(124.0, 420.0), 124.0);
+    }
+
+    #[test]
+    fn new_thread_selectors_restore_the_compact_floating_row() {
+        assert_eq!(NEW_THREAD_SELECTOR_ROW_HEIGHT, 20.0);
+        assert_eq!(SESSION_FOOTER_HEIGHT, 24.0);
+    }
+
+    #[test]
+    fn route_chrome_crossfade_never_duplicates_picker_controls() {
+        assert_eq!(route_chrome_opacities(1.0), (1.0, 0.0));
+        assert_eq!(route_chrome_opacities(0.5), (0.0, 0.0));
+        assert_eq!(route_chrome_opacities(0.0), (0.0, 1.0));
+        for step in 0..=20 {
+            let (new_thread, session) = route_chrome_opacities(step as f32 / 20.0);
+            assert!(new_thread == 0.0 || session == 0.0);
+        }
+    }
+
+    #[test]
     fn staged_comments_alone_are_content() {
         assert!(!composer_has_content("   ", 0, 0));
         assert!(composer_has_content("hi", 0, 0));
@@ -9004,7 +9244,7 @@ mod tests {
     }
 
     #[test]
-    fn modified_submit_sends_content_and_advances_only_when_empty() {
+    fn modified_submit_sends_content_and_activates_latest_queue_row_when_empty() {
         assert_eq!(
             modified_submit_target(composer_has_content("message", 0, 0)),
             ModifiedSubmitTarget::SubmitContent
@@ -9019,7 +9259,7 @@ mod tests {
         );
         assert_eq!(
             modified_submit_target(composer_has_content("  ", 0, 0)),
-            ModifiedSubmitTarget::ActivateQueueHead
+            ModifiedSubmitTarget::ActivateLatestQueued
         );
     }
 

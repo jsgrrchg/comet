@@ -24,6 +24,7 @@ pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
 pub mod widgets;
+pub mod windows;
 
 /// Sidebar drag-resize bounds (px).
 pub const SIDEBAR_MIN: f32 = 224.0;
@@ -499,6 +500,8 @@ pub enum SidebarSort {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub windows: std::collections::BTreeMap<String, windows::WindowSettings>,
     /// Submit using Enter or the platform modifier plus Enter.
     pub composer_send_behavior: ComposerSendBehavior,
     pub sidebar_width: f32,
@@ -632,6 +635,7 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            windows: Default::default(),
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
             sidebar_grouped: false,
@@ -1585,7 +1589,7 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
-            sidebar_width: 300.0,
+            windows: Default::default(),            sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,
             sidebar_organization: SidebarOrganization::ByDevice,
@@ -2117,7 +2121,8 @@ mod tests {
 
     #[test]
     fn new_project_shortcut_migrates_and_persists() {
-        let mut keymap: KeymapConfig = serde_json::from_str(r#"{"newSession":"mod-alt-n"}"#).unwrap();
+        let mut keymap: KeymapConfig =
+            serde_json::from_str(r#"{"newSession":"mod-alt-n"}"#).unwrap();
         assert_eq!(keymap.get(ShortcutId::NewProject), "mod-shift-n");
         assert_eq!(keymap.get(ShortcutId::NewSession), "mod-alt-n");
         keymap.set(ShortcutId::NewProject, "mod-alt-p".into());

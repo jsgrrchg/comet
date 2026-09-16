@@ -676,6 +676,7 @@ pub struct AppState {
     optimistic_revision: Rc<Cell<u64>>,
     use_shared_conversations: bool,
     application: Option<Entity<AppState>>,
+    pub(crate) window_key: Option<String>,
     application_subscription: Option<gpui::Subscription>,
     optimistic_subscription: Option<gpui::Subscription>,
     observed_optimistic_revision: u64,
@@ -770,6 +771,7 @@ impl AppState {
             optimistic_revision: Default::default(),
             use_shared_conversations: false,
             application: None,
+            window_key: None,
             application_subscription: None,
             optimistic_subscription: None,
             observed_optimistic_revision: 0,
@@ -807,6 +809,7 @@ impl AppState {
     pub(crate) fn for_window(owner: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let mut state = Self::new();
         state.use_shared_conversations = true;
+        state.window_key = Some(uuid::Uuid::new_v4().to_string());
         state.application = Some(owner.clone());
         state.application_subscription = Some(cx.observe(&owner, |this, owner, cx| {
             this.sync_application(&owner, cx);

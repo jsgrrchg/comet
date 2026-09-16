@@ -193,7 +193,11 @@ pub fn run_app(config: UiConfig) {
         cx.register_url_scheme("zeron").detach();
 
         let owner = app_runtime::init(config.boot(), cx);
-        let state = cx.new(|cx| state::AppState::for_window(owner, cx));
+        let state = cx.new(|cx| {
+            let mut state = state::AppState::for_window(owner, cx);
+            state.window_key = Some("main".into());
+            state
+        });
         shell::apply_keymap(cx, &ui_settings.keymap, ui_settings.composer_send_behavior);
         let url_state = state.clone();
         cx.spawn(async move |cx| {
@@ -272,10 +276,17 @@ fn open_main_window(
 ) -> gpui::WindowHandle<shell::Shell> {
     // zeron window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
+    let restored_bounds = state
+        .read(cx)
+        .window_key
+        .as_deref()
+        .and_then(|key| settings::current(cx).windows.get(key).cloned())
+        .and_then(|saved| saved.geometry)
+        .and_then(|geometry| geometry.restore(cx));
     let handle = cx
         .open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(restored_bounds.unwrap_or(WindowBounds::Windowed(bounds))),
                 window_min_size: Some(size(px(900.), px(600.))),
                 // `kind` is deliberately left at its default `WindowKind::Normal`
                 // (gpui platform.rs WindowOptions::default), which on macOS maps

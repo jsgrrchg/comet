@@ -1457,6 +1457,9 @@ pub struct Shell {
     boot: EngineBootConfig,
     data_dir: PathBuf,
     settings: UiSettings,
+    settings_base: UiSettings,
+    window_key: Option<String>,
+    bounds_sub: Option<Subscription>,
     /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
     /// parity — heights stay in [`UiSettings`]).
     panels: SessionPanels,
@@ -1641,7 +1644,16 @@ impl Shell {
             }
         });
         let data_dir = boot.data_dir.clone();
-        let settings = settings::current(cx);
+        let window_key = state.read(cx).window_key.clone();
+        let settings = settings::windows::current(window_key.as_deref(), cx);
+        if let Some(saved) = window_key
+            .as_deref()
+            .and_then(|key| settings.windows.get(key))
+        {
+            state.update(cx, |state, cx| {
+                state.select_chat(saved.selected_chat.clone(), cx)
+            });
+        }
         state.update(cx, |state, cx| {
             state.set_change_requests_visible(settings.sidebar_show_pull_request, cx)
         });
@@ -1794,6 +1806,9 @@ impl Shell {
             import_current: None,
             boot,
             data_dir,
+            settings_base: settings.clone(),
+            window_key,
+            bounds_sub: None,
             settings,
             panels: SessionPanels::default(),
             active_chat: String::new(),
@@ -2156,6 +2171,7 @@ impl Shell {
             self.last_appshot_chat = Some(selected.clone());
         }
         if selected != self.active_chat {
+            self.schedule_save(cx);
             self.suspend_file_images(cx);
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
@@ -3501,7 +3517,15 @@ impl Shell {
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
         self.sync_independent_settings(cx);
-        settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
+        settings::windows::publish(
+            self.window_key.as_deref(),
+            &self.settings_base,
+            &self.settings,
+            self.state.read(cx).selected_chat.clone(),
+            cx,
+        );
+        self.settings = settings::windows::current(self.window_key.as_deref(), cx);
+        self.settings_base = self.settings.clone();
     }
 
     /// Controls outside the Shell mutate these choices directly. A geometry
@@ -9512,6 +9536,26 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.window_key.is_some() {
+            self.settings = settings::windows::current(self.window_key.as_deref(), cx);
+            self.settings_base = self.settings.clone();
+        }
+        if self.bounds_sub.is_none() {
+            self.bounds_sub = Some(cx.observe_window_bounds(window, |this, window, cx| {
+                if let Some(key) = &this.window_key {
+                    let geometry =
+                        settings::windows::WindowGeometry::capture(window.window_bounds());
+                    settings::update(SavePolicy::Debounced, cx, |settings| {
+                        let initial = settings::windows::WindowSettings::from_ui(settings);
+                        settings
+                            .windows
+                            .entry(key.clone())
+                            .or_insert(initial)
+                            .geometry = Some(geometry);
+                    });
+                }
+            }));
+        }
         self.render_time = Some(std::time::Instant::now());
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()

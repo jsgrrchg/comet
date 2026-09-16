@@ -71,3 +71,31 @@ Local evidence: `/tmp/pr387-lab-inspect.pPs2oN` (standard lab success),
 and `/tmp/pr387-clipboard-baseline.DtWeds` (unpatched-client lab failure).
 
 No new native macOS/Windows validation or full repository audit was performed.
+
+## Rustls advisory — already corrected (`no_change`)
+
+The auditor's original head resolved Rustls 0.23.43. The later rebase onto main
+already retained Rustls 0.23.45, the patched version for
+[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
+No additional dependency or runtime change is necessary for this finding.
+
+At the remediation head, `cargo tree --locked -p zeron-rdp -i rustls` reports:
+
+```text
+rustls v0.23.45
+└── tokio-rustls v0.26.4
+    └── zeron-rdp v0.2.71
+```
+
+The committed Cargo.lock contains that same version. Locked builds and tests
+use this resolved dependency rather than the older version in the audited head.
+The existing certificate-pin/handshake-signature test was also rerun:
+
+```sh
+cargo test --locked -p zeron-rdp tls::tests::certificate_pins_still_require_handshake_signatures_and_changed_pins_prompt
+```
+
+Result: passed (1 test). That test protects the application's certificate and
+signature behavior; it is not a reproduction of the upstream TLS encryption-level
+bug. Closure of this specific dependency finding rests on resolving the patched
+version. This verification does not claim a fresh full-tree `cargo audit` run.

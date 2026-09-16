@@ -251,6 +251,13 @@ fn run_application(
         // synchronously, so `set_menus` reads the final bindings for the ⌘-key
         // equivalents (gpui snapshots the keymap at set time).
         cx.set_menus(app_menus::app_menus());
+        // Keep the Dock action available for the application's lifetime,
+        // including after the last macOS window closes.
+        #[cfg(target_os = "macos")]
+        cx.set_dock_menu(vec![gpui::MenuItem::action(
+            "New Window",
+            app_menus::NewWindow,
+        )]);
         cx.activate(true);
         if let Some(on_start) = on_start {
             on_start(cx);

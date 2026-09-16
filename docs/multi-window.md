@@ -8,6 +8,8 @@ window adds a view; it does not start another agent or engine.
 ## Entry points
 
 - File → New Window, the command palette, or `zeron --new-window`.
+- macOS: right-click the running app's Dock icon → **New Window**, including
+  when all of its windows are closed.
 - macOS: **Cmd+Option+N**. Windows/Linux: **Ctrl+Alt+N**.
 - New project remains **Cmd/Ctrl+Shift+N**; new chat remains **Cmd/Ctrl+N**.
 - A conversation's context menu offers **Open in another window**.
@@ -93,6 +95,8 @@ target/release/examples/multi-window-fixture /tmp/zeron-window-evidence
 ```
 
 This fixture uses a temporary local engine and writes `result.txt` on success.
+On macOS, also verify Dock → New Window with windows open, with the app hidden,
+and after closing all windows while leaving the app running.
 On Windows, `scripts/test-windows-lifecycle.ps1` additionally verifies three
 native windows, forwarding, one engine, clean closing and reopening. Windows GUI
 CI requires its existing interactive-desktop workflow-dispatch option. macOS and

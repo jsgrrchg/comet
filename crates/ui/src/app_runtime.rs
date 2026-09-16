@@ -15,6 +15,7 @@ pub(crate) struct AppRuntime {
 impl Global for AppRuntime {}
 
 pub(crate) fn init(boot: EngineBootConfig, cx: &mut App) -> Entity<AppState> {
+    cx.set_global(crate::chat_store::ChatStore::default());
     let state = cx.new(|_| AppState::new());
     cx.set_global(AppRuntime {
         state: state.clone(),

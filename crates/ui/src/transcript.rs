@@ -4100,7 +4100,7 @@ impl Transcript {
                 new_rows.extend(self.rows_for(entry, false));
             }
             if self.doc_override.is_none() {
-                for echo in state.pending_echoes() {
+                for echo in state.pending_echoes().iter() {
                     new_rows.extend(self.rows_for(echo, true));
                 }
             }

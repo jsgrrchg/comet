@@ -485,7 +485,7 @@ impl Transcript {
                 // the first prompt of the range otherwise.
                 let rep = active.filter(|&a| a >= start && a < end).unwrap_or(start);
                 let (tick, row) = &pairs[rep];
-                let (tick, row) = (tick.clone(), *row);
+                let row = *row;
                 let bucket_len = end - start;
                 let is_active = active_bucket == Some(ix);
                 let is_hovered = hover == Some(ix);
@@ -497,12 +497,14 @@ impl Transcript {
                 } else {
                     crate::theme::ink(0.16)
                 };
-                let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
-                let reply = tick
-                    .reply
-                    .as_deref()
-                    .map(|r| truncate_preview(r, PREVIEW_REPLY_CHARS));
                 let card: Option<AnyElement> = is_hovered.then(|| {
+                    // Preview normalization scans the message text. Do it only
+                    // for the visible card, not for every tick on each scroll frame.
+                    let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
+                    let reply = tick
+                        .reply
+                        .as_deref()
+                        .map(|r| truncate_preview(r, PREVIEW_REPLY_CHARS));
                     let card = popover::popover_card(&theme)
                         .w(px(280.0))
                         .p(px(Theme::SPACE_SM))
@@ -513,9 +515,9 @@ impl Transcript {
                             div()
                                 .text_size(crate::typography::ui_rems(12.0))
                                 .text_color(theme.text)
-                                .child(SharedString::from(prompt.clone())),
+                                .child(SharedString::from(prompt)),
                         )
-                        .when_some(reply.clone(), |el, reply| {
+                        .when_some(reply, |el, reply| {
                             el.child(
                                 div()
                                     .text_size(crate::typography::ui_rems(11.0))

@@ -133,6 +133,15 @@ nucleo-matcher = "0.3"
 lto = "thin"
 strip = "symbols"
 
+# Testing-only trackpad experiment from jsgrrchg/zui's
+# feat/trackpad-scroll-lifecycle branch. Pin the direct and gpui-base transitive
+# dependencies to the same revision so the experiment is reproducible.
+[patch."https://github.com/zeronsh/zui"]
+gpui = { git = "https://github.com/jsgrrchg/zui", rev = "3f55b0ec4e2e17761f0001839d27d609d3cc9fd6" }
+gpui_macros = { git = "https://github.com/jsgrrchg/zui", rev = "3f55b0ec4e2e17761f0001839d27d609d3cc9fd6" }
+gpui_platform = { git = "https://github.com/jsgrrchg/zui", rev = "3f55b0ec4e2e17761f0001839d27d609d3cc9fd6" }
+gpui_tokio = { git = "https://github.com/jsgrrchg/zui", rev = "3f55b0ec4e2e17761f0001839d27d609d3cc9fd6" }
+
 [profile.dev]
 # gpui is slow unoptimized; match zed's approach for deps
 opt-level = 0

@@ -35,6 +35,7 @@ pub mod history;
 pub mod icons;
 pub(crate) mod image_media;
 pub(crate) mod image_viewer;
+mod lifecycle;
 pub mod links;
 pub mod loaders;
 pub mod markdown;
@@ -60,6 +61,7 @@ pub mod theme;
 pub mod theme_library;
 pub mod transcript;
 pub mod typography;
+mod window_manager;
 mod workspace_links;
 
 use std::path::PathBuf;
@@ -117,15 +119,6 @@ impl UiConfig {
     }
 }
 
-/// What a dock-icon reopen needs to rebuild the main window after ⌘W closed it
-/// (macOS keeps the process alive with just the menu bar, like zed).
-struct ReopenState {
-    state: gpui::Entity<state::AppState>,
-    boot: EngineBootConfig,
-}
-
-impl gpui::Global for ReopenState {}
-
 /// Run the headed app: tokio bridge up, engine bootstrap kicked off (probe →
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
@@ -141,16 +134,8 @@ pub fn run_app(config: UiConfig) {
     if let Some(url) = config.initial_url.clone() {
         let _ = url_tx.unbounded_send(url);
     }
-    // Dock-icon click with no window (⌘W closed it): rebuild the main window
-    // around the still-running engine — zed does the same via `on_reopen`
-    // (crates/zed/src/main.rs `app.on_reopen`).
     app.on_reopen(|cx| {
-        if cx.windows().is_empty()
-            && let Some(reopen) = cx.try_global::<ReopenState>()
-        {
-            let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
-            open_main_window(state, boot, cx);
-        }
+        window_manager::activate(cx);
     });
     app.run(move |cx: &mut App| {
         // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
@@ -194,16 +179,12 @@ pub fn run_app(config: UiConfig) {
         cx.register_url_scheme("zeron").detach();
 
         let owner = app_runtime::init(config.boot(), cx);
-        let state = cx.new(|cx| {
-            let mut state = state::AppState::for_window(owner, cx);
-            state.window_key = Some("main".into());
-            state
-        });
+        lifecycle::init(cx);
+        window_manager::init(cx);
         shell::apply_keymap(cx, &ui_settings.keymap, ui_settings.composer_send_behavior);
-        let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {
-                url_state.update(cx, |state, cx| state.open_deep_link(&url, cx));
+                let _ = cx.update(|cx| window_manager::deep_link(url, cx));
             }
         })
         .detach();
@@ -213,20 +194,14 @@ pub fn run_app(config: UiConfig) {
         notify::on_click(move |chat_id| {
             let _ = click_tx.unbounded_send(chat_id);
         });
-        let click_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(chat_id) = click_rx.next().await {
-                let _ = cx.update(|cx| open_notified_chat(chat_id, &click_state, cx));
+                let _ = cx.update(|cx| window_manager::notified_chat(chat_id, cx));
             }
         })
         .detach();
-        state::AppState::bootstrap(state.clone(), config.boot(), cx);
-
-        cx.set_global(ReopenState {
-            state: state.clone(),
-            boot: config.boot(),
-        });
-        open_main_window(state, config.boot(), cx);
+        state::AppState::bootstrap(owner, config.boot(), cx);
+        window_manager::open(window_manager::Open::Restore, cx);
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         start_appshot_service(config.boot().data_dir, cx);
         // Native menu bar — macOS gets the standard app menu (About/Services/
@@ -241,32 +216,6 @@ pub fn run_app(config: UiConfig) {
     });
 }
 
-/// A clicked banner: bring Zeron forward on that chat through the sidebar's
-/// own path (chat route + composer focus), reopening the main window first if
-/// ⌘W closed it.
-fn open_notified_chat(chat_id: String, state: &gpui::Entity<state::AppState>, cx: &mut App) {
-    cx.activate(true);
-    if cx.windows().is_empty()
-        && let Some(reopen) = cx.try_global::<ReopenState>()
-    {
-        let (state, boot) = (reopen.state.clone(), reopen.boot.clone());
-        open_main_window(state, boot, cx);
-    }
-    let shell = cx
-        .windows()
-        .into_iter()
-        .find_map(|window| window.downcast::<shell::Shell>());
-    match shell {
-        Some(shell) => {
-            let _ = shell.update(cx, |shell, window, cx| {
-                window.activate_window();
-                shell.open_chat(chat_id, cx);
-            });
-        }
-        None => state.update(cx, |state, cx| state.select_chat(Some(chat_id), cx)),
-    }
-}
-
 /// Open the 1320×880 main window (min 900×600) with [`shell::Shell`] as the
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
 /// clicked after ⌘W closed the window.
@@ -274,7 +223,7 @@ fn open_main_window(
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
     cx: &mut App,
-) -> gpui::WindowHandle<shell::Shell> {
+) -> anyhow::Result<gpui::WindowHandle<shell::Shell>> {
     // zeron window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
     let restored_bounds = state
@@ -284,81 +233,79 @@ fn open_main_window(
         .and_then(|key| settings::current(cx).windows.get(key).cloned())
         .and_then(|saved| saved.geometry)
         .and_then(|geometry| geometry.restore(cx));
-    let handle = cx
-        .open_window(
-            WindowOptions {
-                window_bounds: Some(restored_bounds.unwrap_or(WindowBounds::Windowed(bounds))),
-                window_min_size: Some(size(px(900.), px(600.))),
-                // `kind` is deliberately left at its default `WindowKind::Normal`
-                // (gpui platform.rs WindowOptions::default), which on macOS maps
-                // to `NSNormalWindowLevel` (gpui_macos window.rs) — same as zed's
-                // main window. Nothing here raises the window level or touches
-                // presentation options; the "menu bar never appears" symptom came
-                // from the missing `set_menus` call (nil `NSApp.mainMenu`), not
-                // from window kind/level, and `appears_transparent` only affects
-                // the titlebar, not the menu bar.
-                // macOS: frameless-inset chrome like the original Electron app
-                // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
-                // feature-inventory §1.1). The strip is custom-drawn. Windows
-                // still needs a native title for taskbar previews and Alt+Tab. On
-                // Linux/Windows `appears_transparent` hides the system titlebar
-                // for our custom-drawn chrome; harmless where unsupported.
-                titlebar: Some(TitlebarOptions {
-                    title: cfg!(target_os = "windows").then(|| "Zeron".into()),
-                    appears_transparent: true,
-                    // Native lights are 14px tall: top 14 → center 21, matching
-                    // the 38px titlebar row with 4px top-only content padding.
-                    traffic_light_position: Some(gpui::point(px(14.), px(14.))),
-                }),
-                // Our own titlebar strip drags the window (WindowControlArea::
-                // Drag + start_window_move) — mark the content view app-owned
-                // so AppKit neither dead-zones the strip nor delays clicks.
-                app_owns_titlebar_drag: true,
-                // Linux: request client-side decorations — zeron draws its own
-                // unified titlebar and (under CSD) its own caption buttons
-                // (shell.rs `render_linux_caption_controls`). Leaving this unset
-                // requests SERVER decorations, which stacked a compositor
-                // titlebar on top of the app's chrome under sway/KDE, while
-                // compositors without SSD support (GNOME) went client-side
-                // anyway — frameless, and before the shell drew caption buttons,
-                // with no window controls at all. The compositor can still
-                // override via xdg-decoration negotiation; the shell re-resolves
-                // what to draw every frame.
-                window_decorations: cfg!(target_os = "linux")
-                    .then_some(gpui::WindowDecorations::Client),
-                // Frosted shell (macOS): blur the desktop behind the window; the
-                // shell paints its frost surface translucent so the sidebar reads
-                // as glass (shell.rs root). Elsewhere blur support is compositor
-                // roulette — stay opaque.
-                // One source of truth with the re-apply loop in `appearance::apply`
-                // — if these two ever disagree, vibrancy dies on the first theme
-                // change and never comes back.
-                window_background: theme::Theme::of(cx).window_background_appearance(),
-                app_id: Some("zeron".into()),
-                ..Default::default()
-            },
-            move |window, cx| {
-                window.set_rem_size(px(typography::font_size(cx).pixels()));
-                // React to the user flipping macOS between light and dark. Detached:
-                // the subscription lives as long as the window does, and the window
-                // owns nothing that would drop it early.
-                appearance::observe_window(window, cx).detach();
-                let shell = cx.new(|cx| shell::Shell::new(state, boot, cx));
-                let weak_shell = shell.downgrade();
-                window.on_window_should_close(cx, move |_, cx| {
-                    weak_shell
-                        .update(cx, |shell, cx| shell.prepare_window_close(cx))
-                        .unwrap_or(true)
-                });
-                shell
-            },
-        )
-        .expect("failed to open window");
+    let handle = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(restored_bounds.unwrap_or(WindowBounds::Windowed(bounds))),
+            window_min_size: Some(size(px(900.), px(600.))),
+            // `kind` is deliberately left at its default `WindowKind::Normal`
+            // (gpui platform.rs WindowOptions::default), which on macOS maps
+            // to `NSNormalWindowLevel` (gpui_macos window.rs) — same as zed's
+            // main window. Nothing here raises the window level or touches
+            // presentation options; the "menu bar never appears" symptom came
+            // from the missing `set_menus` call (nil `NSApp.mainMenu`), not
+            // from window kind/level, and `appears_transparent` only affects
+            // the titlebar, not the menu bar.
+            // macOS: frameless-inset chrome like the original Electron app
+            // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
+            // feature-inventory §1.1). The strip is custom-drawn. Windows
+            // still needs a native title for taskbar previews and Alt+Tab. On
+            // Linux/Windows `appears_transparent` hides the system titlebar
+            // for our custom-drawn chrome; harmless where unsupported.
+            titlebar: Some(TitlebarOptions {
+                title: cfg!(target_os = "windows").then(|| "Zeron".into()),
+                appears_transparent: true,
+                // Native lights are 14px tall: top 14 → center 21, matching
+                // the 38px titlebar row with 4px top-only content padding.
+                traffic_light_position: Some(gpui::point(px(14.), px(14.))),
+            }),
+            // Our own titlebar strip drags the window (WindowControlArea::
+            // Drag + start_window_move) — mark the content view app-owned
+            // so AppKit neither dead-zones the strip nor delays clicks.
+            app_owns_titlebar_drag: true,
+            // Linux: request client-side decorations — zeron draws its own
+            // unified titlebar and (under CSD) its own caption buttons
+            // (shell.rs `render_linux_caption_controls`). Leaving this unset
+            // requests SERVER decorations, which stacked a compositor
+            // titlebar on top of the app's chrome under sway/KDE, while
+            // compositors without SSD support (GNOME) went client-side
+            // anyway — frameless, and before the shell drew caption buttons,
+            // with no window controls at all. The compositor can still
+            // override via xdg-decoration negotiation; the shell re-resolves
+            // what to draw every frame.
+            window_decorations: cfg!(target_os = "linux")
+                .then_some(gpui::WindowDecorations::Client),
+            // Frosted shell (macOS): blur the desktop behind the window; the
+            // shell paints its frost surface translucent so the sidebar reads
+            // as glass (shell.rs root). Elsewhere blur support is compositor
+            // roulette — stay opaque.
+            // One source of truth with the re-apply loop in `appearance::apply`
+            // — if these two ever disagree, vibrancy dies on the first theme
+            // change and never comes back.
+            window_background: theme::Theme::of(cx).window_background_appearance(),
+            app_id: Some("zeron".into()),
+            ..Default::default()
+        },
+        move |window, cx| {
+            window.set_rem_size(px(typography::font_size(cx).pixels()));
+            // React to the user flipping macOS between light and dark. Detached:
+            // the subscription lives as long as the window does, and the window
+            // owns nothing that would drop it early.
+            appearance::observe_window(window, cx).detach();
+            let shell = cx.new(|cx| shell::Shell::new(state, boot, cx));
+            let weak_shell = shell.downgrade();
+            window.on_window_should_close(cx, move |_, cx| {
+                weak_shell
+                    .update(cx, |shell, cx| shell.prepare_window_close(cx))
+                    .unwrap_or(true)
+            });
+            shell
+        },
+    )?;
     // Belt and braces: assert the blur once the window actually exists. The
     // `WindowOptions` value is applied during creation, before the view is
     // attached; re-pushing it here means a window is never left opaque.
     appearance::reapply_window_background(cx);
-    handle
+    Ok(handle)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -467,14 +414,7 @@ fn deliver_appshot(
         .unwrap_or_else(|| cx.windows())
         .into_iter()
         .find_map(|handle| handle.downcast::<shell::Shell>())
-        .or_else(|| {
-            let reopen = cx.try_global::<ReopenState>()?;
-            Some(open_main_window(
-                reopen.state.clone(),
-                reopen.boot.clone(),
-                cx,
-            ))
-        });
+        .or_else(|| window_manager::activate(cx));
     let Some(handle) = handle else {
         if !captures.is_empty() {
             let count = captures.len();

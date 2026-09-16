@@ -76,7 +76,11 @@ fn quit(_: &Quit, cx: &mut App) {
 pub(crate) fn request_quit(cx: &mut App) {
     // Actions may arrive while GPUI has the active window borrowed. Inspect
     // roots only after that dispatch completes.
-    cx.defer(prepare_quit);
+    if crate::lifecycle::installed(cx) {
+        crate::lifecycle::request(crate::lifecycle::Action::Quit, None, cx);
+    } else {
+        cx.defer(prepare_quit);
+    }
 }
 
 fn prepare_quit(cx: &mut App) {
@@ -89,11 +93,15 @@ fn prepare_quit(cx: &mut App) {
         }
     }
     if ready {
-        quit_after_save(cx);
+        finish_quit(cx);
     }
 }
 
 pub(crate) fn quit_after_save(cx: &mut App) {
+    request_quit(cx);
+}
+
+pub(crate) fn finish_quit(cx: &mut App) {
     #[cfg(target_os = "macos")]
     native_quit::allow();
     cx.quit();

@@ -941,7 +941,8 @@ struct RenameChatDialog {
 }
 
 /// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
-enum UpdateFlow {
+#[derive(Clone, PartialEq)]
+pub(crate) enum UpdateFlow {
     Idle,
     Downloading,
     /// Staged bundle ready to swap in — one click restarts into it.
@@ -954,7 +955,7 @@ enum UpdateFlow {
 /// `RestartPending` survives only as the fallback when the in-place swap
 /// fails and a full quit is the safe way out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SyncFlow {
+pub(crate) enum SyncFlow {
     Idle,
     Enabling,
     Canceling,
@@ -1289,6 +1290,7 @@ impl Render for SidebarPane {
 
 #[derive(Debug, Clone)]
 enum PendingExit {
+    Application,
     CloseWindow,
     Quit,
     RuntimeChange,
@@ -1296,7 +1298,7 @@ enum PendingExit {
 }
 
 pub struct Shell {
-    state: Entity<AppState>,
+    pub(crate) state: Entity<AppState>,
     sidebar_pane: Entity<SidebarPane>,
     transcript: Entity<Transcript>,
     composer: Entity<Composer>,
@@ -1553,6 +1555,8 @@ pub struct Shell {
     /// 1s heartbeat re-rendering the working indicator (elapsed + flavour word).
     _ticker: Task<()>,
     _state_observation: Subscription,
+    _operations_observation: Subscription,
+    runtime_epoch: u64,
     _composer_events: Subscription,
     /// The primary transcript's spawn-chip events (subagent tabs).
     _transcript_events: Subscription,
@@ -1709,6 +1713,10 @@ impl Shell {
             _observation: cx.observe(&shell, |_, _, cx| cx.notify()),
         });
         Self {
+            runtime_epoch: state.read(cx).runtime_epoch,
+            _operations_observation: cx.observe_self(|shell, cx| {
+                crate::lifecycle::publish(cx.entity(), shell.application_progress(), cx);
+            }),
             state,
             sidebar_pane,
             transcript,
@@ -1905,6 +1913,34 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        self.sync_application_progress(cx);
+        let epoch = state.read(cx).runtime_epoch;
+        if self.runtime_epoch != epoch {
+            self.runtime_epoch = epoch;
+            self.files.clear();
+            self.files_subs.clear();
+            self.file_surfaces.clear();
+            self.file_surface_subs.clear();
+            self.file_surface_paths.clear();
+            self.file_surface_keys.clear();
+            self.diffs.clear();
+            self.diff_subs.clear();
+            self.subagent_tabs.clear();
+            self.right_tabs.clear();
+            self.terminal = None;
+            self.right_terminal = None;
+            for browser in self.browsers.values() {
+                browser.update(cx, |browser, cx| browser.close(cx));
+            }
+            self.browsers.clear();
+            self.browser_subs.clear();
+            self.browser_context = crate::browser::BrowserContext::default();
+            self.nav = NavHistory::new(NavEntry::Chat(String::new()));
+            self.route = Route::Chat;
+            self.space_boot_applied = false;
+            self.composer
+                .update(cx, |composer, cx| composer.reset_for_runtime(cx));
+        }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
             self.sidebar_notice = Some(notice.into());
         }
@@ -1932,7 +1968,10 @@ impl Shell {
         // AuthStatus is shared by every viewport. Whichever viewport owns the
         // embedded runtime drains it; remote viewports request daemon shutdown
         // and all of them independently reattach to the new local runtime.
-        if signed_out_synced && self.runtime_change_task.is_none() {
+        if signed_out_synced
+            && self.runtime_change_task.is_none()
+            && !crate::lifecycle::blocks_commands(cx)
+        {
             self.start_local_runtime_transition(false, cx);
         }
         // Capture knob: the add-space palette needs only the device registry.
@@ -2070,7 +2109,9 @@ impl Shell {
             self.last_appshot_chat = Some(selected.clone());
         }
         if selected != self.active_chat {
-            self.schedule_save(cx);
+            if self.window_key.is_some() {
+                self.schedule_save(cx);
+            }
             self.suspend_file_images(cx);
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
@@ -3110,6 +3151,7 @@ impl Shell {
     }
 
     fn cancel_file_close(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
+        crate::lifecycle::cancel(cx);
         self.pending_file_closes.remove(&surface);
         self.pending_exit = None;
         cx.notify();
@@ -3151,6 +3193,86 @@ impl Shell {
 
     pub fn prepare_quit(&mut self, cx: &mut Context<Self>) -> bool {
         self.prepare_exit(PendingExit::Quit, cx)
+    }
+
+    pub(crate) fn prepare_application_operation(&mut self, cx: &mut Context<Self>) -> bool {
+        self.prepare_exit(PendingExit::Application, cx)
+    }
+
+    pub(crate) fn lock_application_editors(&mut self, locked: bool, cx: &mut Context<Self>) {
+        for files in self.files.values().chain(self.file_surfaces.values()) {
+            files.update(cx, |files, cx| files.lock_application_editors(locked, cx));
+        }
+        self.composer
+            .read(cx)
+            .input
+            .clone()
+            .update(cx, |input, cx| {
+                if input.read_only != locked {
+                    input.read_only = locked;
+                    cx.notify();
+                }
+            });
+    }
+
+    fn application_progress(&self) -> crate::lifecycle::Progress {
+        let replacing = self.runtime_change_task.is_some()
+            || matches!(
+                self.sync_flow,
+                SyncFlow::Switching { .. } | SyncFlow::Importing { .. }
+            );
+        crate::lifecycle::Progress {
+            sync: self.sync_flow,
+            update: self.update_flow.clone(),
+            error: self.runtime_change_error.clone(),
+            current: self.import_current.clone(),
+            busy: replacing
+                || self.auth_task.is_some()
+                || self.import_task.is_some()
+                || self.org.as_ref().is_some_and(|org| org.submitting)
+                || matches!(self.update_flow, UpdateFlow::Downloading),
+            replacing,
+        }
+    }
+
+    fn claim_application_operation(&mut self, cx: &mut Context<Self>) -> bool {
+        self.sync_application_progress(cx);
+        if crate::lifecycle::claim(cx.entity(), self.application_progress(), cx) {
+            true
+        } else {
+            self.sidebar_notice = Some("An application operation is already in progress".into());
+            cx.notify();
+            false
+        }
+    }
+
+    fn sync_application_progress(&mut self, cx: &Context<Self>) {
+        if let Some(progress) = crate::lifecycle::progress(cx.entity_id(), cx) {
+            self.sync_flow = progress.sync;
+            self.update_flow = progress.update;
+            self.runtime_change_error = progress.error;
+            self.import_current = progress.current;
+        }
+    }
+
+    pub(crate) fn execute_application_operation(
+        &mut self,
+        action: crate::lifecycle::Action,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.claim_application_operation(cx) {
+            return;
+        }
+        match action {
+            crate::lifecycle::Action::Local(sign_out) => {
+                self.finish_local_runtime_transition(sign_out, cx)
+            }
+            crate::lifecycle::Action::Synced(import) => self.finish_synced_switch(import, cx),
+            crate::lifecycle::Action::RuntimeQuit => self.finish_runtime_quit(cx),
+            crate::lifecycle::Action::Install(staged) => self.finish_staged_update(staged, cx),
+            crate::lifecycle::Action::Quit => unreachable!(),
+        }
+        cx.notify();
     }
 
     fn prepare_exit(&mut self, action: PendingExit, cx: &mut Context<Self>) -> bool {
@@ -4007,6 +4129,18 @@ impl Shell {
     }
 
     fn start_local_runtime_transition(&mut self, sign_out: bool, cx: &mut Context<Self>) {
+        if crate::lifecycle::installed(cx) {
+            crate::lifecycle::request(
+                crate::lifecycle::Action::Local(sign_out),
+                Some(cx.entity()),
+                cx,
+            );
+            return;
+        }
+        self.finish_local_runtime_transition(sign_out, cx);
+    }
+
+    fn finish_local_runtime_transition(&mut self, sign_out: bool, cx: &mut Context<Self>) {
         if self.runtime_change_task.is_some() {
             return;
         }
@@ -4063,6 +4197,9 @@ impl Shell {
     }
 
     fn cancel_auth_setup(&mut self, cx: &mut Context<Self>) {
+        if !self.claim_application_operation(cx) {
+            return;
+        }
         let local = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -4086,6 +4223,7 @@ impl Shell {
                 .call(methods::SIGN_OUT, serde_json::json!({}))
                 .await;
             this.update(cx, |shell, cx| {
+                shell.auth_task = None;
                 match result {
                     Ok(_) => {
                         shell.org = None;
@@ -4147,6 +4285,18 @@ impl Shell {
     /// Failure falls back to the quit-and-reopen dialog — the local profile is
     /// untouched, so the old path is always a safe exit.
     fn start_synced_switch(&mut self, import: bool, cx: &mut Context<Self>) {
+        if crate::lifecycle::installed(cx) {
+            crate::lifecycle::request(
+                crate::lifecycle::Action::Synced(import),
+                Some(cx.entity()),
+                cx,
+            );
+            return;
+        }
+        self.finish_synced_switch(import, cx);
+    }
+
+    fn finish_synced_switch(&mut self, import: bool, cx: &mut Context<Self>) {
         if self.runtime_change_task.is_some() {
             return;
         }
@@ -4201,6 +4351,9 @@ impl Shell {
     /// chose a fresh start); a runtime that comes back non-synced fell out of
     /// the swap — surface the quit fallback rather than pretend.
     fn drive_sync_switch(&mut self, cx: &mut Context<Self>) {
+        if !crate::lifecycle::is_owner(cx.entity_id(), cx) {
+            return;
+        }
         let SyncFlow::Switching { import } = self.sync_flow else {
             return;
         };
@@ -4244,6 +4397,9 @@ impl Shell {
     /// Subscribe to the engine's one-time import stream and mirror its
     /// progress into the wizard.
     fn spawn_local_import(&mut self, cx: &mut Context<Self>) {
+        if !self.claim_application_operation(cx) {
+            return;
+        }
         if self.import_task.is_some() {
             return;
         }
@@ -4345,6 +4501,14 @@ impl Shell {
     }
 
     fn quit_for_runtime_change(&mut self, cx: &mut Context<Self>) {
+        if crate::lifecycle::installed(cx) {
+            crate::lifecycle::request(crate::lifecycle::Action::RuntimeQuit, Some(cx.entity()), cx);
+            return;
+        }
+        self.finish_runtime_quit(cx);
+    }
+
+    fn finish_runtime_quit(&mut self, cx: &mut Context<Self>) {
         if !self.prepare_exit(PendingExit::RuntimeChange, cx) {
             return;
         }
@@ -4399,6 +4563,9 @@ impl Shell {
     }
 
     fn start_sign_in(&mut self, cx: &mut Context<Self>) {
+        if !self.claim_application_operation(cx) {
+            return;
+        }
         let scope = self.state.read(cx).workspace_scope;
         if scope == Some(WorkspaceScope::Development) {
             return;
@@ -4415,20 +4582,24 @@ impl Shell {
                 .client()
                 .call(methods::SIGN_IN, serde_json::json!({}))
                 .await;
-            this.update(cx, |shell, cx| match result {
-                Ok(value) => {
-                    if let Some(url) = value.get("url").and_then(|u| u.as_str()) {
-                        cx.open_url(url);
+            this.update(cx, |shell, cx| {
+                shell.auth_task = None;
+                match result {
+                    Ok(value) => {
+                        if let Some(url) = value.get("url").and_then(|u| u.as_str()) {
+                            cx.open_url(url);
+                        }
+                        cx.notify();
                     }
-                    cx.notify();
-                }
-                Err(err) => {
-                    if scope == Some(WorkspaceScope::Local) && shell.sync_flow == SyncFlow::Enabling
-                    {
-                        shell.sync_flow = SyncFlow::Idle;
+                    Err(err) => {
+                        if scope == Some(WorkspaceScope::Local)
+                            && shell.sync_flow == SyncFlow::Enabling
+                        {
+                            shell.sync_flow = SyncFlow::Idle;
+                        }
+                        shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
+                        cx.notify();
                     }
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
-                    cx.notify();
                 }
             })
             .ok();
@@ -4487,6 +4658,9 @@ impl Shell {
     }
 
     fn create_org(&mut self, cx: &mut Context<Self>) {
+        if !self.claim_application_operation(cx) {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -4524,6 +4698,9 @@ impl Shell {
     }
 
     fn select_org(&mut self, organization_id: String, cx: &mut Context<Self>) {
+        if !self.claim_application_operation(cx) {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -6127,6 +6304,12 @@ impl Shell {
     /// Fetch the manifest and stage the new Zeron desktop bundle under the data dir
     /// (tokio — reqwest); the strip flips to "restart to apply" when done.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
+        if !self.claim_application_operation(cx) {
+            return;
+        }
+        if matches!(self.update_flow, UpdateFlow::Downloading) {
+            return;
+        }
         let edge_url = self.boot.edge_url.clone();
         let data_dir = self.data_dir.clone();
         let install = self.install.clone();
@@ -6142,6 +6325,7 @@ impl Shell {
                 Err(join_err) => Err(join_err.to_string()),
             };
             this.update(cx, |shell, cx| {
+                shell.update_task = None;
                 shell.update_flow = match outcome {
                     Ok(staged) => UpdateFlow::Ready(staged),
                     Err(message) => {
@@ -6160,6 +6344,18 @@ impl Shell {
     /// relauncher, and quit — the relauncher `open`s the new bundle once this
     /// process (and its engine lock / IPC port) is gone.
     fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
+        if crate::lifecycle::installed(cx) {
+            crate::lifecycle::request(
+                crate::lifecycle::Action::Install(staged),
+                Some(cx.entity()),
+                cx,
+            );
+            return;
+        }
+        self.finish_staged_update(staged, cx);
+    }
+
+    fn finish_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
         if !self.prepare_exit(PendingExit::InstallUpdate(staged.clone()), cx) {
             return;
         }
@@ -9435,6 +9631,16 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_application_progress(cx);
+        let title = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.title.as_deref())
+            .filter(|title| !title.is_empty())
+            .map(|title| format!("{title} — Zeron"))
+            .unwrap_or_else(|| "Zeron".into());
+        window.set_window_title(&title);
         if self.window_key.is_some() {
             self.settings = settings::windows::current(self.window_key.as_deref(), cx);
             self.settings_base = self.settings.clone();
@@ -9461,7 +9667,9 @@ impl Render for Shell {
         {
             let shell = cx.weak_entity();
             window.defer(cx, move |window, cx| {
-                if matches!(action, PendingExit::Quit) {
+                if matches!(action, PendingExit::Application) {
+                    crate::lifecycle::resume(cx);
+                } else if matches!(action, PendingExit::Quit) {
                     crate::app_menus::request_quit(cx);
                 } else {
                     shell
@@ -9475,7 +9683,7 @@ impl Render for Shell {
                             PendingExit::InstallUpdate(staged) => {
                                 shell.apply_staged_update(staged, cx)
                             }
-                            PendingExit::Quit => unreachable!(),
+                            PendingExit::Quit | PendingExit::Application => unreachable!(),
                         })
                         .ok();
                 }
@@ -9584,7 +9792,9 @@ impl Render for Shell {
             self.activation_sub = Some(cx.observe_window_activation(
                 window,
                 |this: &mut Shell, window, cx| {
-                    if !window.is_window_active() {
+                    if window.is_window_active() {
+                        crate::window_manager::activated(window.window_handle().window_id(), cx);
+                    } else {
                         this.set_jump_hints(false, cx);
                         this.composer.update(cx, |composer, cx| {
                             composer.set_queue_shortcut_revealed(false, cx)
@@ -11945,6 +12155,78 @@ mod exit_regressions {
                 shell.toggle_right_pane(cx);
                 assert!(!shell.right_pane_open(cx));
                 assert!(!shell.close_active_surface(window, cx));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn lifecycle_transition_waits_for_dirty_files_in_another_window(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::lifecycle::init(cx);
+        });
+        let mut windows = Vec::new();
+        for _ in 0..2 {
+            windows.push(cx.add_window(|_, cx| {
+                let state = cx.new(|_| AppState::new());
+                Shell::new(
+                    state,
+                    EngineBootConfig {
+                        data_dir: dir.path().into(),
+                        ipc_port: 0,
+                        edge_url: "http://127.0.0.1:1".into(),
+                        edge_token: None,
+                        org_id: None,
+                        workos_client_id: None,
+                        default_harness: zeron_proto::HarnessId::Mock,
+                    },
+                    cx,
+                )
+            }));
+        }
+        windows[1]
+            .update(cx, |shell, _, cx| {
+                let state = shell.state.clone();
+                let files = cx.new(|cx| {
+                    let mut files = FilesSurface::new(
+                        state,
+                        "dirty".into(),
+                        false,
+                        1000,
+                        13.,
+                        false,
+                        false,
+                        cx,
+                    );
+                    files.seed_pending_exit_test_document(true);
+                    files
+                });
+                shell.files.insert("dirty".into(), files);
+            })
+            .unwrap();
+        windows[0]
+            .update(cx, |shell, _, cx| {
+                shell.start_local_runtime_transition(false, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        windows[0]
+            .read_with(cx, |shell, _| {
+                assert!(
+                    shell.runtime_change_error.is_none(),
+                    "transition must not run before peer saves"
+                );
+                assert!(shell.runtime_change_task.is_none());
+            })
+            .unwrap();
+        windows[1]
+            .update(cx, |shell, _, cx| {
+                assert!(matches!(shell.pending_exit, Some(PendingExit::Application)));
+                assert!(crate::lifecycle::blocks_commands(cx));
+                shell.cancel_file_close(RightSurface::Files, cx);
+                assert!(!crate::lifecycle::blocks_commands(cx));
             })
             .unwrap();
     }

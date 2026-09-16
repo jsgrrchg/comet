@@ -22,3 +22,24 @@ upstream behavior. Existing clipboard format/text validation remains in place.
 
 When upgrading IronRDP, retain these patches and tests until equivalent upstream
 limits are available and configured before any peer traffic is processed.
+
+## Display Control
+
+`ironrdp-dvc` is copied from the crates.io release 0.8.0 (archive SHA-256
+`3a5de64988ddabf96928e2f042e1772a5f7201f0001ea99012129c73a105fc52`), with
+the same source/manifest/license preservation and root patching as SVC.
+
+- `DvcProcessor::max_message_size` defaults to `None`; Display Control returns
+  20, the complete incoming CAPS PDU size. The limit is captured when creating
+  the channel, including channels constructed through a listener.
+- `CompleteData` validates the advertised total and actual bytes before storing
+  or appending fragments, including standalone Data and DataFirst messages.
+  Invalid limited messages release their partial data and return a fatal error.
+- A complete replacement DataFirst resets the old total, preventing leftover
+  fragment state from affecting the next legitimate message.
+- The connector caps the outer drdynvc SVC at 64 KiB before negotiation. This
+  leaves space for control messages and bounds copies made by the DVC decoder
+  before it dispatches to the 20-byte Display Control accumulator. A bound only
+  on individual outer messages would not bound an inner fragmented message.
+- DVC boundary tests and RDP tests cover both nested layers and valid fragmented
+  capability negotiation. These tests run in the RDP CI job.

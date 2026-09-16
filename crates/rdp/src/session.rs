@@ -192,6 +192,13 @@ async fn establish(
         ironrdp::dvc::DrdynvcClient::new()
             .with_dynamic_channel(crate::display_control::DisplayControl(server_area.clone())),
     );
+    // The outer transport also carries CREATE/capability/control messages. Its
+    // independent cap applies before DVC decoding copies or accumulates data.
+    connector
+        .static_channels
+        .get_by_type_mut::<ironrdp::dvc::DrdynvcClient>()
+        .expect("dynamic channel transport was just attached")
+        .set_max_message_size(crate::display_control::MAX_TRANSPORT_BYTES);
     let mut framed = TokioFramed::new(stream);
     let upgrade = limited(
         config.timeout,

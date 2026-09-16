@@ -4902,8 +4902,6 @@ dependencies = [
 [[package]]
 name = "ironrdp-dvc"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a5de64988ddabf96928e2f042e1772a5f7201f0001ea99012129c73a105fc52"
 dependencies = [
  "ironrdp-core",
  "ironrdp-pdu",

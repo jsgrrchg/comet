@@ -20,6 +20,7 @@ pub(super) struct CommandPalette {
 enum Entry {
     NewChat,
     NewProject,
+    NewWindow,
     Settings,
     Chat(String),
 }
@@ -29,6 +30,7 @@ impl Entry {
         match self {
             Self::NewChat => Some(("New chat", icons::PEN_NEW_SQUARE)),
             Self::NewProject => Some(("New project", icons::FOLDER)),
+            Self::NewWindow => Some(("New window", icons::WINDOW_RESTORE)),
             Self::Settings => Some(("Open settings", icons::SETTINGS_MINIMALISTIC)),
             Self::Chat(_) => None,
         }
@@ -41,10 +43,15 @@ fn matches_query(query: &str, text: &str) -> bool {
 }
 
 fn actions_for(query: &str) -> Vec<Entry> {
-    [Entry::NewChat, Entry::NewProject, Entry::Settings]
-        .into_iter()
-        .filter(|entry| matches_query(query, entry.action().unwrap().0))
-        .collect()
+    [
+        Entry::NewChat,
+        Entry::NewProject,
+        Entry::NewWindow,
+        Entry::Settings,
+    ]
+    .into_iter()
+    .filter(|entry| matches_query(query, entry.action().unwrap().0))
+    .collect()
 }
 
 impl Shell {
@@ -142,6 +149,7 @@ impl Shell {
         match entry {
             Entry::NewChat => self.open_new_session(cx),
             Entry::NewProject => self.open_add_space(cx),
+            Entry::NewWindow => crate::app_menus::new_window(cx),
             Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
             Entry::Chat(id) => self.open_chat(id, cx),
         }
@@ -183,24 +191,28 @@ impl Shell {
                 );
             }
             let content = if let Some((label, glyph)) = entry.action() {
-                let shortcut = match entry {
-                    Entry::NewChat | Entry::NewProject => {
-                        let id = if *entry == Entry::NewChat {
-                            ShortcutId::NewSession
-                        } else {
-                            ShortcutId::NewProject
-                        };
-                        let combo = self.settings.keymap.get(id);
-                        let valid = Keystroke::parse(&platform_combo(combo)).is_ok();
-                        Some(crate::settings::badge_combo(if valid {
-                            combo
-                        } else {
-                            id.default_combo()
-                        }))
-                    }
-                    Entry::Settings => Some(crate::settings::badge_combo("mod-,")),
-                    _ => None,
-                };
+                let shortcut =
+                    match entry {
+                        Entry::NewChat | Entry::NewProject => {
+                            let id = if *entry == Entry::NewChat {
+                                ShortcutId::NewSession
+                            } else {
+                                ShortcutId::NewProject
+                            };
+                            let combo = self.settings.keymap.get(id);
+                            let valid = Keystroke::parse(&platform_combo(combo)).is_ok();
+                            Some(crate::settings::badge_combo(if valid {
+                                combo
+                            } else {
+                                id.default_combo()
+                            }))
+                        }
+                        Entry::NewWindow => self.settings.keymap.new_window_binding().map(|_| {
+                            crate::settings::badge_combo(&self.settings.keymap.new_window)
+                        }),
+                        Entry::Settings => Some(crate::settings::badge_combo("mod-,")),
+                        _ => None,
+                    };
                 let entry = entry.clone();
                 popover::menu_row(&theme, ix == active, format!("command-action-{ix}"))
                     .id(("command-action", ix))
@@ -436,9 +448,17 @@ mod tests {
     fn action_search_hides_empty_section_and_preserves_order() {
         assert_eq!(
             actions_for(""),
-            vec![Entry::NewChat, Entry::NewProject, Entry::Settings]
+            vec![
+                Entry::NewChat,
+                Entry::NewProject,
+                Entry::NewWindow,
+                Entry::Settings
+            ]
         );
-        assert_eq!(actions_for("new"), vec![Entry::NewChat, Entry::NewProject]);
+        assert_eq!(
+            actions_for("new"),
+            vec![Entry::NewChat, Entry::NewProject, Entry::NewWindow]
+        );
         assert_eq!(actions_for("settings"), vec![Entry::Settings]);
         assert!(actions_for("deployment").is_empty());
     }

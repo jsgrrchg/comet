@@ -85,6 +85,15 @@ pub struct ShortcutsPage {
 impl EventEmitter<ShortcutsEvent> for ShortcutsPage {}
 
 impl ShortcutsPage {
+    fn sync_preferences(&mut self, cx: &gpui::App) {
+        if cx.has_global::<crate::app_runtime::AppRuntime>() {
+            let settings = crate::settings::current(cx);
+            self.keymap = settings.keymap;
+            self.composer_send_behavior = settings.composer_send_behavior;
+            self.escape_stops_active_agent = settings.escape_stops_active_agent;
+        }
+    }
+
     pub fn new(
         state: Entity<AppState>,
         keymap: KeymapConfig,
@@ -195,6 +204,7 @@ impl ShortcutsPage {
     }
 
     fn record_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) {
+        self.sync_preferences(cx);
         let Some(recording) = self.recording else {
             return;
         };
@@ -325,6 +335,8 @@ impl ShortcutsPage {
         let non_default = combo != id.default_combo();
         let chip_text: SharedString = if is_recording {
             "Press keys…".into()
+        } else if combo.is_empty() {
+            "Unassigned".into()
         } else {
             display_combo(&combo).into()
         };
@@ -347,6 +359,7 @@ impl ShortcutsPage {
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text))
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            this.sync_preferences(cx);
                             this.keymap.reset(id);
                             this.stop_recording();
                             this.commit(cx);
@@ -464,12 +477,13 @@ pub fn modifier_send_label(is_macos: bool) -> &'static str {
 /// extends the match and appears on the page by construction
 /// (`every_shortcut_lands_in_a_rendered_group` holds the other half: its group
 /// name must be listed here).
-const GROUP_ORDER: [&str; 7] = [
+const GROUP_ORDER: [&str; 8] = [
     "Files",
     "Browser",
     "Panels",
     "Sessions",
     "Projects",
+    "Windows",
     "Jump to session",
     "Appshots",
 ];
@@ -484,6 +498,7 @@ fn group(id: ShortcutId) -> &'static str {
             "Panels"
         }
         ShortcutId::NewProject => "Projects",
+        ShortcutId::NewWindow => "Windows",
         ShortcutId::NewSession
         | ShortcutId::NextSession
         | ShortcutId::PrevSession
@@ -506,6 +521,7 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
         ShortcutId::NewSession => "Open a blank session canvas to start a new session.",
         ShortcutId::NewProject => "Open the new project dialog.",
+        ShortcutId::NewWindow => "Open another window with shared conversations.",
         ShortcutId::NextSession => "Select the next session in the sidebar, wrapping at the end.",
         ShortcutId::PrevSession => {
             "Select the previous session in the sidebar, wrapping at the start."
@@ -519,6 +535,7 @@ fn description(id: ShortcutId) -> &'static str {
 
 impl Render for ShortcutsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_preferences(cx);
         self.appshot_capabilities = crate::appshots::capabilities();
         if self.appshots_page {
             if std::mem::take(&mut self.appshots_focus_pending) {

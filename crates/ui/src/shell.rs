@@ -320,6 +320,9 @@ pub fn apply_keymap(
     // close, ⌘M minimize, ⌘H hide on macOS) — these back the native menu
     // key equivalents and must survive keymap re-application.
     crate::app_menus::bind_keys(cx);
+    if let Some(combo) = keymap.new_window_binding() {
+        cx.bind_keys([KeyBinding::new(&combo, crate::app_menus::NewWindow, None)]);
+    }
     cx.bind_keys([
         KeyBinding::new(
             &valid_or_default(&keymap.save_file, "mod-s"),
@@ -7089,6 +7092,7 @@ impl Shell {
             let chat_id = menu_state.chat_id;
             let position = menu_state.position;
             let chat_menu_closing = self.chat_menu.closing_since();
+            let window_chat = chat_id.clone();
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
@@ -7101,6 +7105,26 @@ impl Shell {
                 .flex_col();
             let menu = match menu_state.page {
                 ChatMenuPage::Root => menu
+                    .child(
+                        popover::menu_row(&theme, false, format!("chat-menu-window-{chat_id}"))
+                            .id("chat-menu-new-window")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.close_chat_menu(cx);
+                                let chat = window_chat.clone();
+                                cx.defer(move |cx| {
+                                    crate::window_manager::open(
+                                        crate::window_manager::Open::Chat(chat),
+                                        cx,
+                                    );
+                                });
+                            }))
+                            .child(
+                                icon(icons::WINDOW_RESTORE)
+                                    .size(px(16.))
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(SharedString::from("Open in another window")),
+                    )
                     .child(
                         popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
                             .id("chat-menu-rename")

@@ -498,6 +498,7 @@ impl Transcript {
                     crate::theme::ink(0.16)
                 };
                 let card: Option<AnyElement> = is_hovered.then(|| {
+                    let theme = theme.for_popup();
                     // Preview normalization scans the message text. Do it only
                     // for the visible card, not for every tick on each scroll frame.
                     let prompt = truncate_preview(&tick.prompt, PREVIEW_PROMPT_CHARS);
@@ -531,7 +532,7 @@ impl Transcript {
                             el.child(
                                 div()
                                     .text_size(crate::typography::ui_rems(10.0))
-                                    .text_color(theme.text_muted.opacity(0.7))
+                                    .text_color(theme.text_muted)
                                     .child(SharedString::from(format!("{bucket_len} prompts"))),
                             )
                         });

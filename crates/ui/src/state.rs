@@ -692,6 +692,7 @@ pub struct AppState {
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
     engine: Option<EngineHandle>,
+    bootstrap_task: Option<Task<()>>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
     change_requests: ChangeRequestClientState,
@@ -763,6 +764,7 @@ impl AppState {
             update: None,
             data_dir: None,
             engine: None,
+            bootstrap_task: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
             change_requests: ChangeRequestClientState::default(),
@@ -1615,6 +1617,7 @@ impl AppState {
     /// account while the local profile is opening.
     pub fn prepare_runtime_replacement(&mut self, cx: &mut Context<Self>) {
         self.engine = None;
+        self.bootstrap_task = None;
         self.watch_tasks.clear();
         self.transcript_task = None;
         self.change_request_tasks.clear();
@@ -1654,6 +1657,10 @@ impl AppState {
     /// Kick off (or retry) the engine bootstrap: probe → connect-or-embed on
     /// tokio, then attach subscriptions. Safe to call again after `Failed`.
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
+        let state = crate::app_runtime::owner_or(state, cx);
+        if state.read(cx).bootstrap_task.is_some() {
+            return;
+        }
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
@@ -1663,7 +1670,8 @@ impl AppState {
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
-        cx.spawn(async move |cx| {
+        let owner = state.clone();
+        let task = cx.spawn(async move |cx| {
             let outcome = match boot.await {
                 Ok(Ok(handle)) => Ok(handle),
                 Ok(Err(err)) => Err(format!("{err:#}")),
@@ -1672,16 +1680,19 @@ impl AppState {
             // NB: at the pinned rev `Entity::update(&mut AsyncApp)` returns the
             // closure's value directly (no Result) — AsyncApp implements
             // AppContext like App does.
-            state.update(cx, |s, cx| match outcome {
-                Ok(handle) => s.attach_engine(handle, cx),
-                Err(message) => {
-                    tracing::error!(%message, "engine bootstrap failed");
-                    s.connection = ConnectionStatus::Failed(message);
-                    cx.notify();
+            state.update(cx, |s, cx| {
+                s.bootstrap_task = None;
+                match outcome {
+                    Ok(handle) => s.attach_engine(handle, cx),
+                    Err(message) => {
+                        tracing::error!(%message, "engine bootstrap failed");
+                        s.connection = ConnectionStatus::Failed(message);
+                        cx.notify();
+                    }
                 }
             });
-        })
-        .detach();
+        });
+        owner.update(cx, |s, _| s.bootstrap_task = Some(task));
     }
 
     /// Wire the connected engine: mark Ready and start the standing watches.

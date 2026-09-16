@@ -13,6 +13,7 @@
 //! - [`loaders`] — zeron pulse loader, gradient spinner, boot splash.
 
 pub mod app_menus;
+mod app_runtime;
 pub mod appearance;
 pub mod appshots;
 pub mod attachments;
@@ -190,7 +191,8 @@ pub fn run_app(config: UiConfig) {
         app_menus::init(cx);
         cx.register_url_scheme("zeron").detach();
 
-        let state = cx.new(|_| state::AppState::new());
+        let state = app_runtime::init(config.boot(), cx);
+        shell::apply_keymap(cx, &ui_settings.keymap, ui_settings.composer_send_behavior);
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {
@@ -212,23 +214,6 @@ pub fn run_app(config: UiConfig) {
         })
         .detach();
         state::AppState::bootstrap(state.clone(), config.boot(), cx);
-
-        // Graceful teardown: an in-process engine drains live runs and flushes
-        // doc snapshots before the process exits (remote engines outlive us).
-        let quit_state = state.clone();
-        cx.on_app_quit(move |cx| {
-            settings::flush(cx);
-            let shutdown =
-                quit_state.read(cx).engine().cloned().map(|handle| {
-                    gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
-                });
-            async move {
-                if let Some(task) = shutdown {
-                    let _ = task.await;
-                }
-            }
-        })
-        .detach();
 
         cx.set_global(ReopenState {
             state: state.clone(),

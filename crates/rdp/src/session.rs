@@ -180,6 +180,13 @@ async fn establish(
     connector.attach_static_channel(ironrdp::cliprdr::CliprdrClient::new(Box::new(
         crate::clipboard::Backend(clipboard.clone()),
     )));
+    // CLIPRDR's eight-byte header is accumulated before the clipboard backend
+    // sees the body. Bound the SVC buffer before any connection traffic arrives.
+    connector
+        .static_channels
+        .get_by_type_mut::<ironrdp::cliprdr::CliprdrClient>()
+        .expect("clipboard channel was just attached")
+        .set_max_message_size(crate::MAX_CLIPBOARD_BYTES + 8);
     let server_area = Arc::new(AtomicU64::new(0));
     connector.attach_static_channel(
         ironrdp::dvc::DrdynvcClient::new()

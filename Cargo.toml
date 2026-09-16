@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["vendor/ironrdp-svc"]
 members = [
     "crates/theme",
     "crates/proto",
@@ -128,6 +129,9 @@ ttf-parser = "0.25.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 ignore = "0.4"
 nucleo-matcher = "0.3"
+
+[patch.crates-io]
+ironrdp-svc = { path = "vendor/ironrdp-svc" }
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

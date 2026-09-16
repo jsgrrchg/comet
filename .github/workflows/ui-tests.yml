@@ -7,6 +7,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'vendor/ironrdp-*/**'
       - 'scripts/test-linux-browser.sh'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'scripts/test-remote-desktop.sh'
@@ -22,6 +23,7 @@ on:
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - 'crates/**'
+      - 'vendor/ironrdp-*/**'
       - 'scripts/test-linux-browser.sh'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'scripts/test-remote-desktop.sh'
@@ -49,7 +51,7 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       - name: Protocol, TLS, input, clipboard and lifecycle contracts
-        run: cargo test --locked -p zeron-rdp
+        run: cargo test --locked -p ironrdp-svc -p zeron-rdp
       - name: Build direct interoperability probe
         run: cargo build --release --locked -p zeron-rdp --example probe
       - name: Real xrdp login, Unicode input, clipboard and reactivation

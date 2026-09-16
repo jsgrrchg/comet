@@ -137,6 +137,9 @@ impl GuiInstance {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let result = (|| -> anyhow::Result<()> {
+                                // macOS/BSD inherit the listener's nonblocking mode.
+                                // Reading a complete request needs blocking I/O with timeouts.
+                                stream.set_nonblocking(false)?;
                                 stream.set_read_timeout(Some(Duration::from_millis(500)))?;
                                 stream.set_write_timeout(Some(Duration::from_millis(500)))?;
                                 let message: Message = read_message(&stream)?;
@@ -254,6 +257,51 @@ mod tests {
             GuiInstance::acquire(dir.path(), LaunchRequest::Activate).unwrap(),
             Launch::Primary(_)
         ));
+    }
+
+    #[test]
+    fn fragmented_launch_is_acknowledged_and_forwarded_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let Launch::Primary(mut primary) =
+            GuiInstance::acquire(dir.path(), LaunchRequest::Activate).unwrap()
+        else {
+            panic!()
+        };
+        let endpoint: Endpoint =
+            serde_json::from_slice(&std::fs::read(dir.path().join("ui-endpoint.json")).unwrap())
+                .unwrap();
+        let message = Message {
+            version: VERSION,
+            token: endpoint.token.clone(),
+            id: "fragmented-request".into(),
+            request: LaunchRequest::NewWindow,
+        };
+        let bytes = serde_json::to_vec(&message).unwrap();
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, endpoint.port)).unwrap();
+        stream.set_nodelay(true).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        // Give the listener time to read an incomplete JSON document, then to
+        // wait for the newline separately. Neither fragment is a full request.
+        let split = bytes.len() / 2;
+        stream.write_all(&bytes[..split]).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        stream.write_all(&bytes[split..]).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        stream.write_all(b"\n").unwrap();
+        let mut ack = [0; 3];
+        stream.read_exact(&mut ack).unwrap();
+        assert_eq!(&ack, b"ok\n");
+
+        forward(&endpoint, &message.id, &message.request).unwrap();
+        let rx = primary.incoming.as_mut().unwrap();
+        assert_eq!(rx.try_recv().unwrap(), LaunchRequest::NewWindow);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

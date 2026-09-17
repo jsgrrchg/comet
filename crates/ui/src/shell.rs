@@ -1341,6 +1341,8 @@ pub struct Shell {
     right_terminal: Option<Entity<TerminalPanel>>,
     /// The surface-tab strip's `+` menu (Files / Terminal / Diffs / History rows).
     right_plus: popover::Popup<()>,
+    #[cfg(feature = "browser-fixture")]
+    right_plus_fixture_bounds: std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<Pixels>>>>,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
@@ -1731,6 +1733,8 @@ impl Shell {
             terminal: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
+            #[cfg(feature = "browser-fixture")]
+            right_plus_fixture_bounds: Default::default(),
             diffs: std::collections::HashMap::new(),
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
@@ -8932,8 +8936,18 @@ impl Shell {
                                     .child(SharedString::from("History")),
                             )
                         }),
+                );
+            #[cfg(feature = "browser-fixture")]
+            let menu = menu.relative().child({
+                let measured = self.right_plus_fixture_bounds.clone();
+                gpui::canvas(
+                    move |bounds, _, _| measured.set(Some(bounds)),
+                    |_, _, _, _| {},
                 )
-                .into_any_element();
+                .absolute()
+                .inset_0()
+            });
+            let menu = menu.into_any_element();
             plus = plus.relative().child(popover::anchored_menu_below_gap(
                 "right-plus-menu",
                 menu,
@@ -12343,6 +12357,9 @@ impl Shell {
         } else {
             self.close_right_plus(cx);
         }
+    }
+    pub fn fixture_browser_menu_bounds(&self) -> Option<gpui::Bounds<Pixels>> {
+        self.right_plus_fixture_bounds.get()
     }
     pub fn fixture_browser_menu_mounted(&self) -> bool {
         self.right_plus.get().is_some()

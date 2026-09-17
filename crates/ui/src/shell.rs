@@ -745,6 +745,27 @@ const SIDEBAR_ACTIVE_HARNESS_TITLE_GAP: f32 = Theme::SPACE_SM;
 const SIDEBAR_ARCHIVED_HARNESS_ICON_SIZE: f32 = 14.0;
 const SIDEBAR_ARCHIVED_HARNESS_TITLE_GAP: f32 = 10.0;
 
+/// Keep the fade short so only the last few glyphs recede. Tracking clipped
+/// content lets the shared paint-time overflow gate leave fitting labels intact.
+fn sidebar_faded_label(id: SharedString, fill: bool, label: impl IntoElement) -> impl IntoElement {
+    let overflow = gpui::ScrollHandle::new();
+    crate::edge_fade::edge_faded(
+        20.0,
+        false,
+        false,
+        div()
+            .id(id)
+            .when(fill, |el| el.flex_1())
+            .min_w_0()
+            .overflow_hidden()
+            .track_scroll(&overflow)
+            .flex()
+            .child(div().flex_none().whitespace_nowrap().child(label)),
+    )
+    .fade_right(true)
+    .fade_label_overflow(&overflow)
+}
+
 /// New-thread controls float over the tail of a top-anchored image hero. The
 /// hero reaches below the composer, giving its lower mask room to dissolve
 /// gradually into the otherwise empty lower canvas.
@@ -3728,6 +3749,7 @@ impl Shell {
         self.settings.terminal_font_size = current.terminal_font_size;
         self.settings.code_font_family = current.code_font_family;
         self.settings.code_font_size = current.code_font_size;
+        self.settings.transcript_width = current.transcript_width;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -6216,16 +6238,15 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
-                    .child(
+                    .child(sidebar_faded_label(
+                        format!("chat-device-{id}").into(),
+                        true,
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
                             .text_size(crate::typography::ui_rems(11.0))
                             .line_height(px(14.0))
                             .text_color(subline)
                             .child(popover::search_highlight(space_name, search_query, theme)),
-                    )
+                    ))
                     .child(div().text_color(subline).child(corner)),
             )
             // Line 2: harness identity belongs directly with the title,
@@ -6248,15 +6269,14 @@ impl Shell {
                             )
                         },
                     )
-                    .child(
+                    .child(sidebar_faded_label(
+                        format!("chat-title-{id}").into(),
+                        true,
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
                             .text_size(crate::typography::ui_rems(13.0))
                             .line_height(px(17.0))
                             .child(popover::search_highlight(title, search_query, theme)),
-                    ),
+                    )),
             )
             // Line 3 is structural, not reserved whitespace: compact states
             // omit it completely when both Branch and Pull request are hidden.
@@ -6275,15 +6295,15 @@ impl Shell {
                                     .flex_none()
                                     .text_color(subline),
                             )
-                            .child(
+                            .child(sidebar_faded_label(
+                                format!("chat-branch-{id}").into(),
+                                false,
                                 div()
-                                    .min_w_0()
-                                    .truncate()
                                     .text_size(crate::typography::ui_rems(11.0))
                                     .line_height(px(14.0))
                                     .text_color(subline)
                                     .child(popover::search_highlight(branch, search_query, theme)),
-                            )
+                            ))
                         })
                         // Stable invisible spring keeps the optional PR badge
                         // pinned right without changing no-PR paint.
@@ -12297,6 +12317,7 @@ mod exit_regressions {
             };
             let terminal_size = 15.0 + index as f32;
             let code_size = 11.0 + index as f32;
+            let transcript_width = 736.0 + 16.0 * index as f32;
             let geometry = Some(settings::WindowGeometry {
                 display_uuid: Some(uuid::Uuid::from_u128(7)),
                 x: 80.0 + index as f32,
@@ -12318,6 +12339,7 @@ mod exit_regressions {
                         settings.terminal_font_size = terminal_size;
                         settings.code_font_family = code_family.clone();
                         settings.code_font_size = code_size;
+                        settings.transcript_width = transcript_width;
                     });
                     for step in 0..3 {
                         shell.settings.sidebar_width = 290.0 + step as f32;
@@ -12332,6 +12354,7 @@ mod exit_regressions {
                         assert_eq!(current.terminal_font_size, terminal_size);
                         assert_eq!(current.code_font_family, code_family);
                         assert_eq!(current.code_font_size, code_size);
+                        assert_eq!(current.transcript_width, transcript_width);
                     }
                     settings::flush(cx);
                     let loaded = settings::UiSettings::load(dir.path());
@@ -12342,6 +12365,7 @@ mod exit_regressions {
                     assert_eq!(loaded.terminal_font_size, terminal_size);
                     assert_eq!(loaded.code_font_family, code_family);
                     assert_eq!(loaded.code_font_size, code_size);
+                    assert_eq!(loaded.transcript_width, transcript_width);
                     assert_eq!(loaded.sidebar_width, 292.0);
                     assert_eq!(loaded.right_pane_width, 542.0);
                     assert_eq!(loaded.terminal_height, 302.0);

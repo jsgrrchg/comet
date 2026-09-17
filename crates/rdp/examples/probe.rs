@@ -144,7 +144,7 @@ async fn run(generation: u64) -> Result<(), Box<dyn std::error::Error>> {
             type_command(
                 &session,
                 "printf 'niño con acento á\\n' > /tmp/zeron-rdp-input.txt; printf 'remote ñ\\n' | xclip -selection clipboard",
-            )?;
+            ).await?;
         }
         if lab
             && snapshot.capabilities.clipboard_text
@@ -177,7 +177,8 @@ async fn run(generation: u64) -> Result<(), Box<dyn std::error::Error>> {
             type_command(
                 &session,
                 "xclip -selection clipboard -o > /tmp/zeron-rdp-clipboard.txt",
-            )?;
+            )
+            .await?;
         }
         if matches!(
             snapshot.state,
@@ -216,7 +217,7 @@ async fn run(generation: u64) -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
-fn type_command(session: &SessionHandle, text: &str) -> Result<(), SessionError> {
+async fn type_command(session: &SessionHandle, text: &str) -> Result<(), SessionError> {
     // Resizing can clear the server window manager's active window. Focus the
     // lab terminal exactly as the interactive user does before typing.
     for down in [true, false] {
@@ -227,6 +228,9 @@ fn type_command(session: &SessionHandle, text: &str) -> Result<(), SessionError>
             y: 100,
         }))?;
     }
+    // The window manager handles focus asynchronously; allow the click to be
+    // processed before sending keyboard events to the newly focused terminal.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     session.send(Command::Input(InputEvent::Text(text.into())))?;
     session.send(Command::Input(InputEvent::ScanCode {
         code: 28,

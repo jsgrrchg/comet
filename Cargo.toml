@@ -16,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.71"
+version = "0.2.75"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -92,6 +92,9 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json5 = "0.4"
+# antigravity writes `settings.json` but reads it back with `hjson.load`, so a
+# user's comments and unquoted keys have to survive our read of the same file.
+deser-hjson = "2.2"
 plist = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -115,6 +118,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 notify = "7"
 portable-pty = "0.8"
 alacritty_terminal = "0.26"
@@ -133,14 +137,14 @@ nucleo-matcher = "0.3"
 lto = "thin"
 strip = "symbols"
 
-# Testing-only trackpad experiment from jsgrrchg/zui's
-# feat/trackpad-scroll-lifecycle branch. Pin the direct and gpui-base transitive
-# dependencies to the same revision so the experiment is reproducible.
+# Testing-only trackpad experiment plus upstream's per-pixel text fade changes,
+# combined on jsgrrchg/zui's feat/trackpad-scroll-lifecycle branch. Pin direct and
+# gpui-base transitive dependencies together so the experiment is reproducible.
 [patch."https://github.com/zeronsh/zui"]
-gpui = { git = "https://github.com/jsgrrchg/zui", rev = "3f55b0ec4e2e17761f0001839d27d609d3cc9fd6" }
-gpui_macros = { git = "https://github.com/jsgrrchg/zui", rev = "3f55b0ec4e2e17761f0001839d27d609d3cc9fd6" }
-gpui_platform = { git = "https://github.com/jsgrrchg/zui", rev = "3f55b0ec4e2e17761f0001839d27d609d3cc9fd6" }
-gpui_tokio = { git = "https://github.com/jsgrrchg/zui", rev = "3f55b0ec4e2e17761f0001839d27d609d3cc9fd6" }
+gpui = { git = "https://github.com/jsgrrchg/zui", rev = "3cffdb09de66288f55f22928549d7fd449acfddd" }
+gpui_macros = { git = "https://github.com/jsgrrchg/zui", rev = "3cffdb09de66288f55f22928549d7fd449acfddd" }
+gpui_platform = { git = "https://github.com/jsgrrchg/zui", rev = "3cffdb09de66288f55f22928549d7fd449acfddd" }
+gpui_tokio = { git = "https://github.com/jsgrrchg/zui", rev = "3cffdb09de66288f55f22928549d7fd449acfddd" }
 
 [profile.dev]
 # gpui is slow unoptimized; match zed's approach for deps

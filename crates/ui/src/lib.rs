@@ -298,31 +298,6 @@ fn restored_main_window_bounds(cx: &App) -> (Bounds<gpui::Pixels>, Option<gpui::
         })
 }
 
-fn save_main_window_geometry(window: &gpui::Window, cx: &mut App) {
-    if window.is_fullscreen() {
-        return;
-    }
-    // macos infers maximization from screen-sized bounds, including ordinary
-    // windows; other desktop backends report a distinct maximized variant.
-    let WindowBounds::Windowed(bounds) = window.window_bounds() else {
-        return;
-    };
-    let mut geometry = settings::WindowGeometry::from_bounds(bounds);
-    geometry.display_uuid = window.display(cx).and_then(|display| display.uuid().ok());
-    if geometry.is_valid() {
-        settings::update(settings::SavePolicy::Debounced, cx, |settings| {
-            settings.window_geometry = Some(geometry);
-        });
-    }
-}
-
-fn observe_main_window_geometry<T: 'static>(window: &mut gpui::Window, cx: &gpui::Context<T>) {
-    cx.observe_window_bounds(window, |_, window, cx| {
-        save_main_window_geometry(window, cx);
-    })
-    .detach();
-}
-
 fn open_main_window(
     state: gpui::Entity<state::AppState>,
     boot: EngineBootConfig,
@@ -343,6 +318,16 @@ fn open_main_window(
         || (WindowBounds::Windowed(legacy_bounds), legacy_display_id),
         |bounds| (bounds, None),
     );
+    if is_main && restored_bounds.is_none() && settings::current(cx).window_geometry.is_some() {
+        // Migrate the pre-multi-window geometry while platform access is safe.
+        // Window-bound observers maintain this entry from this point forward.
+        let geometry = settings::windows::WindowGeometry::capture(window_bounds);
+        settings::update(settings::SavePolicy::Debounced, cx, |settings| {
+            let mut window = settings::windows::WindowSettings::from_ui(settings);
+            window.geometry = Some(geometry);
+            settings.windows.insert("main".into(), window);
+        });
+    }
     let handle = cx.open_window(
         WindowOptions {
             window_bounds: Some(window_bounds),
@@ -402,24 +387,13 @@ fn open_main_window(
             // the subscription lives as long as the window does, and the window
             // owns nothing that would drop it early.
             appearance::observe_window(window, cx).detach();
-            let shell = cx.new(|cx| {
-                if is_main {
-                    observe_main_window_geometry(window, cx);
-                }
-                shell::Shell::new(state, boot, cx)
-            });
-            if is_main {
-                save_main_window_geometry(window, cx);
-            }
+            let shell = cx.new(|cx| shell::Shell::new(state, boot, cx));
             let weak_shell = shell.downgrade();
-            window.on_window_should_close(cx, move |window, cx| {
+            window.on_window_should_close(cx, move |_, cx| {
                 let should_close = weak_shell
                     .update(cx, |shell, cx| shell.prepare_window_close(cx))
                     .unwrap_or(true);
                 if should_close {
-                    if is_main {
-                        save_main_window_geometry(window, cx);
-                    }
                     settings::flush(cx);
                 }
                 should_close

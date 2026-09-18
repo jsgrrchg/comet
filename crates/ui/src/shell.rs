@@ -1609,8 +1609,6 @@ pub struct Shell {
     sidebar_pin_write: Option<sidebar_pins::PendingSidebarPins>,
     sidebar_pin_write_generation: u64,
     sidebar_pin_write_notice: Option<SharedString>,
-    /// At most one legacy import attempt per profile/engine attachment.
-    sidebar_pin_migration: Option<(String, crate::state::EngineHandle)>,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
@@ -1990,7 +1988,6 @@ impl Shell {
             sidebar_pin_write: None,
             sidebar_pin_write_generation: 0,
             sidebar_pin_write_notice: None,
-            sidebar_pin_migration: None,
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             connectivity_notifications: Default::default(),
@@ -4307,7 +4304,7 @@ impl Shell {
             }
             return;
         }
-        self.migrate_legacy_sidebar_pins(profile_key, cx);
+        // Synced profiles use only registry sidebarPins rows, never local lists.
     }
 
     fn active_sidebar_pin_profile_key(&self, cx: &App) -> Option<String> {

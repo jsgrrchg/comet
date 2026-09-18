@@ -22,64 +22,6 @@ pub(super) fn preferences_reply(
 }
 
 impl Shell {
-    pub(super) fn migrate_legacy_sidebar_pins(
-        &mut self,
-        profile_key: String,
-        cx: &mut Context<Self>,
-    ) {
-        let state = self.state.read(cx);
-        if !matches!(
-            state.workspace_scope,
-            Some(WorkspaceScope::Synced | WorkspaceScope::Development)
-        ) || !state.sidebar_preferences.synced
-        {
-            return;
-        }
-        let Some(engine) = state.engine().cloned() else {
-            return;
-        };
-        let Some(legacy) = self
-            .settings
-            .sidebar_pinned_session_ids_by_profile
-            .get(&profile_key)
-            .cloned()
-        else {
-            return;
-        };
-        if self
-            .sidebar_pin_migration
-            .as_ref()
-            .is_some_and(|(key, previous)| key == &profile_key && previous.same_connection(&engine))
-        {
-            return;
-        }
-        self.sidebar_pin_migration = Some((profile_key.clone(), engine.clone()));
-        cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::MUTATE, serde_json::json!({
-                "op": "migrateSidebarPins", "pinnedSessionIds": legacy,
-            })).await.map_err(|e| e.to_string()).and_then(preferences_reply);
-            this.update(cx, |shell, cx| {
-                if shell.active_sidebar_pin_profile_key(cx).as_ref() != Some(&profile_key)
-                    || !shell.state.read(cx).engine().is_some_and(|current| current.same_connection(&engine))
-                { return; }
-                match result {
-                    Ok(preferences) => {
-                        shell.clear_pin_write_notice();
-                        shell.state.update(cx, |state, cx| {
-                            if state.apply_sidebar_preferences(preferences) { cx.notify(); }
-                        });
-                    }
-                    Err(error) => {
-                        shell.set_pin_write_notice(format!("Couldn't migrate pins: {error}. Original pins retained; reconnect to retry.").into());
-                    }
-                }
-                // Keep local preferences as a backup even after success. The
-                // registry marker makes all later attempts harmless no-ops.
-                cx.notify();
-            }).ok();
-        }).detach();
-    }
-
     fn set_pin_write_notice(&mut self, message: SharedString) {
         self.sidebar_pin_write_notice = Some(message.clone());
         self.sidebar_notice = Some(message);

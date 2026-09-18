@@ -363,15 +363,13 @@ mod pinned_session_tests {
     }
 
     #[gpui::test]
-    fn sidebar_legacy_import_waits_for_sync_runs_once_and_retains_backup(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn sidebar_remote_pins_never_import_local_preferences(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let _guard = runtime.enter();
-        let (engine, mut requests, replies) = pin_test_engine();
+        let (engine, mut requests, _replies) = pin_test_engine();
         let dir = tempfile::tempdir().unwrap();
         let window = pin_test_shell(cx, dir.path());
         window
@@ -384,8 +382,8 @@ mod pinned_session_tests {
                 shell
                     .settings
                     .sidebar_pinned_session_ids_by_profile
-                    .insert(key.clone(), ids(&["old-b", "old-a"]));
-                shell.migrate_legacy_sidebar_pins(key, cx);
+                    .insert(key, ids(&["old-b", "old-a"]));
+                shell.reconcile_sidebar_pins(cx);
             })
             .unwrap();
         cx.run_until_parked();
@@ -393,34 +391,12 @@ mod pinned_session_tests {
         window
             .update(cx, |shell, _, cx| {
                 shell.state.update(cx, |state, _| {
-                    state.sidebar_preferences.synced = true;
+                    state.apply_sidebar_preferences(pin_snapshot(1, &["remote"]));
                 });
-                let key = shell.active_sidebar_pin_profile_key(cx).unwrap();
-                shell.migrate_legacy_sidebar_pins(key.clone(), cx);
-                shell.migrate_legacy_sidebar_pins(key, cx);
-            })
-            .unwrap();
-        cx.run_until_parked();
-        let request: serde_json::Value =
-            serde_json::from_str(&requests.try_recv().unwrap()).unwrap();
-        assert_eq!(request["params"]["op"], "migrateSidebarPins");
-        assert_eq!(
-            request["params"]["pinnedSessionIds"],
-            serde_json::json!(["old-b", "old-a"])
-        );
-        assert!(requests.try_recv().is_err());
-        deliver_pin_rpc_reply(
-            &runtime,
-            &replies,
-            serde_json::json!({"id":request["id"], "ok":{"sidebarPreferences":pin_snapshot(1, &["old-b", "old-a"])}}),
-        );
-        cx.run_until_parked();
-        window
-            .update(cx, |shell, _, cx| {
-                assert_eq!(shell.active_sidebar_pins(cx), ids(&["old-b", "old-a"]));
+                shell.reconcile_sidebar_pins(cx);
+                assert_eq!(shell.active_sidebar_pins(cx), ids(&["remote"]));
                 let key = shell.active_sidebar_pin_profile_key(cx).unwrap();
                 assert_eq!(shell.settings.sidebar_pins(&key), ids(&["old-b", "old-a"]));
-                shell.migrate_legacy_sidebar_pins(key, cx);
             })
             .unwrap();
         cx.run_until_parked();

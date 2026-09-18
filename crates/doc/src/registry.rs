@@ -1201,7 +1201,6 @@ impl RegistryDoc {
             return Ok(false);
         }
         let initialized = self.sidebar_pins_initialized();
-        let migrated = self.migrate_sidebar_pins(true, None)?;
         self.initialize_sidebar_pins();
         let known: std::collections::HashSet<_> =
             self.read_chats()?.into_iter().map(|c| c.id).collect();
@@ -1215,7 +1214,7 @@ impl RegistryDoc {
                 session_id: id.clone(),
             })?;
         }
-        Ok(migrated || !initialized || !removed.is_empty())
+        Ok(!initialized || !removed.is_empty())
     }
 
     pub fn read_all(&self) -> Result<WorkspaceState, DocError> {

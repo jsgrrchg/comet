@@ -524,8 +524,6 @@ enum MutateParams {
     ChangeSidebarPin {
         change: zeron_proto::SidebarPinChange,
     },
-    #[serde(rename_all = "camelCase")]
-    MigrateSidebarPins { pinned_session_ids: Vec<String> },
     /// Full-config replace on the chat row (zeron `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
@@ -969,10 +967,6 @@ impl EngineRpc {
             MutateParams::ChangeSidebarPin { change } => {
                 self.workspace.change_sidebar_pin(&change).map_err(failed)
             }
-            MutateParams::MigrateSidebarPins { pinned_session_ids } => self
-                .workspace
-                .migrate_sidebar_pins(&pinned_session_ids)
-                .map_err(failed),
             MutateParams::SetChatConfig { chat_id, config } => self
                 .workspace
                 .set_chat_config(&chat_id, &config)
@@ -1828,10 +1822,7 @@ impl RpcService for EngineRpc {
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
-                let sidebar_pins = matches!(
-                    &p,
-                    MutateParams::ChangeSidebarPin { .. } | MutateParams::MigrateSidebarPins { .. }
-                );
+                let sidebar_pins = matches!(&p, MutateParams::ChangeSidebarPin { .. });
                 self.mutate(p)?;
                 if sidebar_pins {
                     return RpcReply::value(&serde_json::json!({

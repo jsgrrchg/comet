@@ -661,17 +661,6 @@ impl WorkspaceHost {
         })
     }
 
-    /// One-time personal-cut upgrade. Do not acknowledge until the registry
-    /// snapshot (including pending operations and the marker) is durable.
-    pub fn migrate_sidebar_pins(&self, local: &[String]) -> Result<(), EngineError> {
-        let authoritative = !self.edge_expected() || self.sync_status().is_some_and(|s| s.synced);
-        if !authoritative {
-            return Err(EngineError::Other("Pins are still syncing".into()));
-        }
-        self.mutate(|doc| doc.migrate_sidebar_pins(true, Some(local)))?;
-        self.inner.persist_snapshot()
-    }
-
     // ── watches (WatchChats / WatchDevices / merged WatchSessions) ──────────
 
     pub fn watch_chats(&self) -> watch::Receiver<Vec<Chat>> {
@@ -1335,7 +1324,7 @@ impl WorkspaceHostInner {
 
     fn persist_snapshot(&self) -> Result<(), EngineError> {
         // Keep export and disk write serialized: an older background snapshot
-        // must not overwrite an acknowledged migration's durable snapshot.
+        // must not overwrite a newer durable snapshot.
         let doc = lock(&self.reg);
         let bytes = doc.to_bytes()?;
         self.store
@@ -1793,65 +1782,6 @@ mod tests {
         let acknowledgement = host.sidebar_preferences_snapshot();
         assert!(acknowledgement.revision > first_revision);
         assert_eq!(*preferences.borrow(), acknowledgement);
-    }
-
-    #[tokio::test]
-    async fn sidebar_migration_failure_keeps_source_and_retry_persists_marker() {
-        use super::*;
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let host = WorkspaceHost::open(
-            store.clone(),
-            WorkspaceHostConfig {
-                device_id: "test-device".into(),
-                device_name: "Test".into(),
-                platform: "linux".into(),
-                org_id: "org".into(),
-                user_id: "user".into(),
-                edge: None,
-            },
-        )
-        .unwrap();
-        host.create_chat("legacy", None, Some("test-device"), None, None)
-            .unwrap();
-        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
-        db.execute_batch("CREATE TRIGGER fail_pin_snapshot BEFORE INSERT ON snapshots BEGIN SELECT RAISE(FAIL, 'injected pin disk failure'); END;").unwrap();
-        assert!(
-            host.migrate_sidebar_pins(&["legacy".into()])
-                .unwrap_err()
-                .to_string()
-                .contains("injected pin disk failure")
-        );
-        assert_eq!(
-            host.sidebar_preferences_snapshot().pinned_session_ids,
-            ["legacy"]
-        );
-        db.execute_batch("DROP TRIGGER fail_pin_snapshot;").unwrap();
-        host.migrate_sidebar_pins(&["legacy".into()]).unwrap();
-        let bytes = store.load_snapshot(REGISTRY_DOC_ID).unwrap().unwrap();
-        let mut restored = RegistryDoc::from_bytes(&bytes, "test-device").unwrap();
-        assert!(restored.sidebar_pin_migration_complete());
-        assert_eq!(
-            restored.sidebar_preferences().unwrap().pinned_session_ids,
-            ["legacy"]
-        );
-        restored
-            .change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
-                session_id: "legacy".into(),
-            })
-            .unwrap();
-        assert!(
-            !restored
-                .migrate_sidebar_pins(true, Some(&["legacy".into()]))
-                .unwrap()
-        );
-        assert!(
-            restored
-                .sidebar_preferences()
-                .unwrap()
-                .pinned_session_ids
-                .is_empty()
-        );
     }
 
     #[test]

@@ -614,48 +614,6 @@ final class RegistryDoc {
 
     var sidebarPinsInitialized: Bool { rowExists(kind: "preferences", id: "sidebarPins") }
 
-    var sidebarPinMigrationComplete: Bool {
-        overlayRow(kind: "preferences", id: "sidebarPins")?.fields["personalCutLegacyImported"] == .bool(true)
-    }
-
-    private func finishSidebarPinMigration() {
-        guard !sidebarPinMigrationComplete else { return }
-        write(kind: "preferences", id: "sidebarPins", op: .upsert,
-              set: ["personalCutLegacyImported": .bool(true)])
-    }
-
-    /// Personal-cut one-time import, after an authoritative registry snapshot.
-    /// The legacy clock and ordinal keys match Rust exactly for concurrent imports.
-    @discardableResult
-    func migrateSidebarPins(authoritative: Bool) -> Bool {
-        guard authoritative, !sidebarPinMigrationComplete else { return false }
-        let state = overlayRow(kind: "preferences", id: "sidebarPins")
-        if !overlayRows(kind: "sidebarPins").isEmpty ||
-            (state != nil && state?.fields["personalCutLegacyPending"] != .bool(true)) {
-            finishSidebarPinMigration()
-            return true
-        }
-        guard let legacy = overlayRow(kind: "preferences", id: "sidebar-v1"),
-              let values = legacy.fields["pinnedSessionIds"]?.arrayValue,
-              values.count <= 200, values.allSatisfy({ $0.stringValue != nil }) else { return false }
-        let known = Set(overlayRows(kind: "chats").map(\.id))
-        var seen = Set<String>()
-        let ids = values.compactMap(\.stringValue).filter { known.contains($0) && seen.insert($0).inserted }
-        let validID = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:@/-")
-        guard ids.allSatisfy({ !$0.isEmpty && $0.utf8.count <= 256 && $0.unicodeScalars.allSatisfy(validID.contains) }) else { return false }
-        let hlc = legacy.clocks.values.max() ?? nextHlc()
-        var ops = ids.enumerated().map { index, id in
-            RegistryOp(kind: "sidebarPins", id: id, op: .upsert,
-                       set: ["pinned": .bool(true), "orderKey": .string(String(format: "%08x8", index))],
-                       hlc: hlc, clocks: nil)
-        }
-        ops.append(RegistryOp(kind: "preferences", id: "sidebarPins", op: .upsert,
-                              set: ["initialized": .bool(true), "personalCutLegacyImported": .bool(true)],
-                              hlc: nextHlc(), clocks: nil))
-        enqueue(ops: ops)
-        return true
-    }
-
     var orderedSidebarPins: [(id: String, key: String)] {
         overlayRows(kind: "sidebarPins").compactMap { row in
             guard row.fields["pinned"]?.boolValue == true,
@@ -667,8 +625,7 @@ final class RegistryDoc {
     /// Cache readiness for empty lists too, without importing old preferences.
     func initializeSidebarPins() {
         guard !sidebarPinsInitialized else { return }
-        write(kind: "preferences", id: "sidebarPins", op: .upsert,
-              set: ["initialized": .bool(true), "personalCutLegacyPending": .bool(true)])
+        write(kind: "preferences", id: "sidebarPins", op: .upsert, set: ["initialized": .bool(true)])
     }
 
     /// A move never writes membership. Explicit false survives delayed moves.
@@ -685,7 +642,6 @@ final class RegistryDoc {
         }
         let current = orderedSidebarPins
         if pinned == false {
-            finishSidebarPinMigration()
             write(kind: "sidebarPins", id: id, op: .upsert, set: ["pinned": .bool(false)])
             return true
         }
@@ -701,7 +657,6 @@ final class RegistryDoc {
                                         index < others.count ? others[index].key : nil, nonce: hlc) else { return false }
         var fields: [String: JSONValue] = ["orderKey": .string(key)]
         if pinned == true { fields["pinned"] = .bool(true) }
-        finishSidebarPinMigration()
         enqueue(ops: [RegistryOp(kind: "sidebarPins", id: id, op: .upsert, set: fields, hlc: hlc, clocks: nil)])
         return true
     }

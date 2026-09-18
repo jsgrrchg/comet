@@ -281,11 +281,10 @@ final class WorkspaceStore {
         guard synced else { return }
         let known = Set(chats.map(\.id))
         let initialized = doc.sidebarPinsInitialized
-        let migrated = doc.migrateSidebarPins(authoritative: true)
         doc.initializeSidebarPins()
         let removed = pinnedSessionIds.filter { !known.contains($0) }
         for id in removed { doc.changeSidebarPin(id: id, pinned: false) }
-        if migrated || !initialized || !removed.isEmpty { afterLocalWrite() }
+        if !initialized || !removed.isEmpty { afterLocalWrite() }
     }
 
     // MARK: Presence

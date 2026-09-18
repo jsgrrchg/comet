@@ -101,22 +101,46 @@ final class PinnedSessionsTests: XCTestCase {
         )
     }
 
-    func testOldPreferencesImportOnceAndDoNotResurrectAfterRestart() throws {
+    func testRetiredImportPreservesKeysMarkersAndUnpinsAfterRestart() throws {
         let doc = RegistryDoc(deviceId: "ios-test")
-        for id in ["chat-b", "chat-a"] {
-            doc.write(kind: "chats", id: id, op: .upsert, set: ["title": .string(id)])
+        doc.write(kind: "preferences", id: "sidebar-v1", op: .upsert, set: [
+            "pinnedSessionIds": .array([.string("b"), .string("removed"), .string("a")]),
+        ])
+        doc.write(kind: "preferences", id: "sidebarPins", op: .upsert, set: [
+            "initialized": .bool(true), "personalCutLegacyImported": .bool(true),
+            "personalCutLegacyPending": .bool(true),
+        ])
+        for (id, key, pinned) in [("b", "000000008", true), ("removed", "000000018", false),
+                                  ("a", "000000028", true)] {
+            doc.write(kind: "sidebarPins", id: id, op: .upsert, set: [
+                "pinned": .bool(pinned), "orderKey": .string(key),
+            ])
         }
+        let restored = try RegistryDoc.from(data: doc.toData(), deviceId: "ios-test")
+        restored.initializeSidebarPins()
+        XCTAssertEqual(restored.orderedSidebarPins.map(\.id), ["b", "a"])
+        XCTAssertEqual(restored.orderedSidebarPins.map(\.key), ["000000008", "000000028"])
+        XCTAssertTrue(restored.changeSidebarPin(id: "a", pinned: nil, before: "b"))
+        XCTAssertEqual(restored.orderedSidebarPins.map(\.id), ["a", "b"])
+        for id in ["a", "b"] {
+            XCTAssertTrue(restored.changeSidebarPin(id: id, pinned: false))
+        }
+        let restarted = try RegistryDoc.from(data: restored.toData(), deviceId: "ios-test")
+        restarted.initializeSidebarPins()
+        XCTAssertTrue(restarted.orderedSidebarPins.isEmpty)
+        let state = restarted.overlayRow(kind: "preferences", id: "sidebarPins")
+        XCTAssertEqual(state?.fields["personalCutLegacyImported"], .bool(true))
+        XCTAssertEqual(state?.fields["personalCutLegacyPending"], .bool(true))
+        XCTAssertNotNil(restarted.overlayRow(kind: "preferences", id: "sidebar-v1"))
+    }
+
+    func testOldPreferencesAreNotImported() {
+        let doc = RegistryDoc(deviceId: "ios-test")
         doc.write(kind: "preferences", id: "sidebar-v1", op: .upsert, set: [
             "pinnedSessionIds": .array([.string("chat-b"), .string("chat-a")]),
         ])
-        XCTAssertFalse(doc.migrateSidebarPins(authoritative: false))
-        XCTAssertTrue(doc.migrateSidebarPins(authoritative: true))
+        doc.initializeSidebarPins()
         XCTAssertTrue(doc.sidebarPinsInitialized)
-        XCTAssertEqual(doc.orderedSidebarPins.map(\.id), ["chat-b", "chat-a"])
-        XCTAssertEqual(doc.orderedSidebarPins.map(\.key), ["000000008", "000000018"])
-        XCTAssertTrue(doc.changeSidebarPin(id: "chat-b", pinned: false))
-        let restored = try RegistryDoc.from(data: doc.toData(), deviceId: "ios-test")
-        XCTAssertFalse(restored.migrateSidebarPins(authoritative: true))
-        XCTAssertEqual(restored.orderedSidebarPins.map(\.id), ["chat-a"])
+        XCTAssertTrue(doc.orderedSidebarPins.isEmpty)
     }
 }

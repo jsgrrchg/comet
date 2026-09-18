@@ -892,7 +892,7 @@ fn sidebar_cleanup_waits_for_authority_and_keeps_archived_pins() {
 }
 
 #[test]
-fn sidebar_migrates_old_whole_list_once_and_keeps_source() {
+fn sidebar_ignores_old_whole_list_preferences() {
     let mut doc = RegistryDoc::new("desktop");
     doc.upsert_chat(&chat("old", "desktop")).unwrap();
     doc.write(
@@ -903,21 +903,13 @@ fn sidebar_migrates_old_whole_list_once_and_keeps_source() {
     );
     assert!(doc.sidebar_preferences().is_none());
     doc.reconcile_sidebar_pins(true).unwrap();
-    assert_eq!(
-        doc.sidebar_preferences().unwrap().pinned_session_ids,
-        ["old"]
-    );
-    assert!(doc.sidebar_pin_migration_complete());
-    assert!(doc.overlay_row(KIND_PREFERENCES, "sidebar-v1").is_some());
-    doc.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
-        session_id: "old".into(),
-    })
-    .unwrap();
-    let mut doc = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "desktop").unwrap();
     assert!(
-        !doc.migrate_sidebar_pins(true, Some(&["old".into()]))
+        doc.sidebar_preferences()
             .unwrap()
+            .pinned_session_ids
+            .is_empty()
     );
+    assert!(doc.overlay_row(KIND_PREFERENCES, "sidebar-v1").is_some());
     pin_sessions(&mut doc, &["new"]);
     assert_eq!(
         doc.sidebar_preferences().unwrap().pinned_session_ids,
@@ -943,179 +935,116 @@ fn sidebar_rejects_invalid_or_missing_sessions_before_writing() {
 }
 
 #[test]
-fn sidebar_migration_waits_for_authority_preserves_order_and_archived() {
+fn sidebar_retired_import_preserves_existing_keys_markers_and_unpins() {
+    use zeron_proto::SidebarPinChange;
     let mut doc = RegistryDoc::new("desktop");
-    for id in ["a", "b", "archived"] {
+    for id in ["a", "b", "removed"] {
         doc.upsert_chat(&chat(id, "desktop")).unwrap();
     }
-    let mut archived = chat("archived", "desktop");
-    archived.archived = true;
-    doc.upsert_chat(&archived).unwrap();
+    // Snapshot produced by the retired importer, including its retained source.
     doc.write(
         KIND_PREFERENCES,
         "sidebar-v1",
         OpKind::Upsert,
-        fields([(
-            "pinnedSessionIds",
-            json!(["b", "archived", "gone", "a", "b"]),
-        )]),
+        fields([("pinnedSessionIds", json!(["b", "removed", "a"]))]),
     );
-    let before = doc.to_bytes().unwrap();
-    assert!(!doc.migrate_sidebar_pins(false, None).unwrap());
-    assert_eq!(doc.to_bytes().unwrap(), before);
-    assert!(doc.migrate_sidebar_pins(true, None).unwrap());
-    assert_eq!(
-        doc.sidebar_preferences().unwrap().pinned_session_ids,
-        ["b", "archived", "a"]
+    doc.write(
+        KIND_PREFERENCES,
+        SIDEBAR_PINS_STATE_ID,
+        OpKind::Upsert,
+        fields([
+            ("initialized", json!(true)),
+            ("personalCutLegacyImported", json!(true)),
+            ("personalCutLegacyPending", json!(true)),
+        ]),
     );
-    assert!(
-        doc.ordered_sidebar_pins()
-            .iter()
-            .all(|(_, key)| zeron_proto::valid_pin_order_key(key))
-    );
-    let ops = &doc.pending.last().unwrap().ops;
-    assert_eq!(ops.len(), 4, "pins and marker belong to one batch");
-    assert_eq!(ops.last().unwrap().id, SIDEBAR_PINS_STATE_ID);
-}
-
-#[test]
-fn sidebar_migration_local_fallback_is_once_and_registry_empty_wins() {
-    for registry_empty in [false, true] {
-        let mut doc = RegistryDoc::new("desktop");
-        doc.upsert_chat(&chat("a", "desktop")).unwrap();
-        if registry_empty {
-            doc.write(
-                KIND_PREFERENCES,
-                "sidebar-v1",
-                OpKind::Upsert,
-                fields([("pinnedSessionIds", json!([]))]),
-            );
-        }
-        doc.reconcile_sidebar_pins(true).unwrap();
-        doc.migrate_sidebar_pins(true, Some(&["a".into()])).unwrap();
-        assert_eq!(
-            doc.sidebar_preferences().unwrap().pinned_session_ids,
-            if registry_empty { vec![] } else { vec!["a"] }
+    for (id, key, pinned) in [
+        ("b", "000000008", true),
+        ("removed", "000000018", false),
+        ("a", "000000028", true),
+    ] {
+        doc.write(
+            KIND_SIDEBAR_PINS,
+            id,
+            OpKind::Upsert,
+            fields([("pinned", json!(pinned)), ("orderKey", json!(key))]),
         );
-        doc.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+    }
+    let pins = doc.ordered_sidebar_pins();
+    let mut restored = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "desktop").unwrap();
+    assert!(!restored.reconcile_sidebar_pins(true).unwrap());
+    assert_eq!(restored.ordered_sidebar_pins(), pins);
+    assert_eq!(
+        restored.sidebar_preferences().unwrap().pinned_session_ids,
+        ["b", "a"]
+    );
+    restored
+        .change_sidebar_pin(&SidebarPinChange::Move {
             session_id: "a".into(),
+            after: None,
+            before: Some("b".into()),
         })
         .unwrap();
-        let mut restored = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "desktop").unwrap();
-        assert!(
-            !restored
-                .migrate_sidebar_pins(true, Some(&["a".into()]))
-                .unwrap()
-        );
-        assert!(
-            restored
-                .sidebar_preferences()
-                .unwrap()
-                .pinned_session_ids
-                .is_empty()
-        );
-    }
-}
-
-#[test]
-fn sidebar_migration_never_overwrites_new_format_or_explicit_empty() {
-    for mode in 0..3 {
-        let mut doc = RegistryDoc::new("desktop");
-        doc.upsert_chat(&chat("old", "desktop")).unwrap();
-        doc.write(
-            KIND_PREFERENCES,
-            "sidebar-v1",
-            OpKind::Upsert,
-            fields([("pinnedSessionIds", json!(["old"]))]),
-        );
-        // Model upstream state, without personal-cut's migration marker.
-        if mode == 0 {
-            doc.write(
-                KIND_PREFERENCES,
-                SIDEBAR_PINS_STATE_ID,
-                OpKind::Upsert,
-                fields([("initialized", json!(true))]),
-            );
-        } else {
-            doc.write(
-                KIND_SIDEBAR_PINS,
-                "old",
-                OpKind::Upsert,
-                fields([("pinned", json!(mode == 1)), ("orderKey", json!("8"))]),
-            );
-        }
-        let pins = doc.ordered_sidebar_pins();
-        assert!(
-            doc.migrate_sidebar_pins(true, Some(&["old".into()]))
-                .unwrap()
-        );
-        assert_eq!(doc.ordered_sidebar_pins(), pins);
-        assert!(doc.sidebar_pin_migration_complete());
-    }
-}
-
-#[test]
-fn sidebar_migration_concurrent_imports_cannot_resurrect_a_later_unpin() {
-    let mut a = RegistryDoc::new("a");
-    a.upsert_chat(&chat("one", "a")).unwrap();
-    a.upsert_chat(&chat("two", "a")).unwrap();
-    a.write(
-        KIND_PREFERENCES,
-        "sidebar-v1",
-        OpKind::Upsert,
-        fields([("pinnedSessionIds", json!(["two", "one"]))]),
+    assert_eq!(
+        restored.sidebar_preferences().unwrap().pinned_session_ids,
+        ["a", "b"]
     );
-    let mut b = RegistryDoc::new("b");
-    let mut server = HashMap::new();
-    let mut seq = 0;
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    a.migrate_sidebar_pins(true, None).unwrap();
-    b.migrate_sidebar_pins(true, None).unwrap();
-    assert_eq!(a.ordered_sidebar_pins(), b.ordered_sidebar_pins());
-    a.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
-        session_id: "two".into(),
-    })
-    .unwrap();
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    assert_eq!(a.sidebar_preferences(), b.sidebar_preferences());
-    assert_eq!(a.sidebar_preferences().unwrap().pinned_session_ids, ["one"]);
-    assert!(!b.migrate_sidebar_pins(true, None).unwrap());
+    for id in ["a", "b"] {
+        restored
+            .change_sidebar_pin(&SidebarPinChange::Unpin {
+                session_id: id.into(),
+            })
+            .unwrap();
+    }
+    let mut restarted = RegistryDoc::from_bytes(&restored.to_bytes().unwrap(), "desktop").unwrap();
+    assert!(!restarted.reconcile_sidebar_pins(true).unwrap());
+    assert!(
+        restarted
+            .sidebar_preferences()
+            .unwrap()
+            .pinned_session_ids
+            .is_empty()
+    );
+    let state = restarted
+        .overlay_row(KIND_PREFERENCES, SIDEBAR_PINS_STATE_ID)
+        .unwrap();
+    assert_eq!(
+        state.fields.get("personalCutLegacyImported"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        state.fields.get("personalCutLegacyPending"),
+        Some(&json!(true))
+    );
+    assert!(
+        restarted
+            .overlay_row(KIND_PREFERENCES, "sidebar-v1")
+            .is_some()
+    );
 }
 
 #[test]
-fn sidebar_migration_invalid_source_is_retained_without_partial_import() {
+fn sidebar_retired_import_ignores_unfinished_legacy_state() {
     let mut doc = RegistryDoc::new("desktop");
+    doc.upsert_chat(&chat("old", "desktop")).unwrap();
     doc.write(
         KIND_PREFERENCES,
         "sidebar-v1",
         OpKind::Upsert,
-        fields([("pinnedSessionIds", json!("bad"))]),
+        fields([("pinnedSessionIds", json!(["old"]))]),
     );
-    let before = doc.to_bytes().unwrap();
-    assert!(doc.migrate_sidebar_pins(true, None).is_err());
-    assert_eq!(doc.to_bytes().unwrap(), before);
-    assert!(!doc.sidebar_pin_migration_complete());
-}
-
-#[test]
-fn sidebar_migration_delayed_local_seed_cannot_undo_unpin_on_another_device() {
-    let mut a = RegistryDoc::new("a");
-    a.upsert_chat(&chat("pin", "a")).unwrap();
-    let mut b = RegistryDoc::new("b");
-    let mut server = HashMap::new();
-    let mut seq = 0;
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    a.migrate_sidebar_pins(true, Some(&["pin".into()])).unwrap();
-    a.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
-        session_id: "pin".into(),
-    })
-    .unwrap();
-    // B has not observed A's migration or unpin yet.
-    b.migrate_sidebar_pins(true, Some(&["pin".into()])).unwrap();
-    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
-    assert_eq!(a.sidebar_preferences(), b.sidebar_preferences());
+    doc.write(
+        KIND_PREFERENCES,
+        SIDEBAR_PINS_STATE_ID,
+        OpKind::Upsert,
+        fields([
+            ("initialized", json!(true)),
+            ("personalCutLegacyPending", json!(true)),
+        ]),
+    );
+    assert!(!doc.reconcile_sidebar_pins(true).unwrap());
     assert!(
-        b.sidebar_preferences()
+        doc.sidebar_preferences()
             .unwrap()
             .pinned_session_ids
             .is_empty()

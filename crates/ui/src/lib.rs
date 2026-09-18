@@ -137,6 +137,10 @@ fn run_application(
     on_start: Option<Box<dyn FnOnce(&mut App)>>,
 ) {
     let mut launches = instance.incoming.take().expect("GUI launch receiver");
+    // Retain ownership for the whole application lifetime. The bridge's
+    // default runtime has only two workers, insufficient for a desktop engine.
+    let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
+    let runtime_handle = runtime.handle().clone();
     let app = gpui_platform::application().with_assets(icons::Assets);
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
     let callback_tx = url_tx.clone();
@@ -152,8 +156,7 @@ fn run_application(
         window_manager::activate(cx);
     });
     app.run(move |cx: &mut App| {
-        // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
-        gpui_tokio::init(cx);
+        gpui_tokio::init_from_handle(cx, runtime_handle);
         gpui_base::init(cx);
         let data_dir = config.boot().data_dir.clone();
         let ui_settings = settings::UiSettings::load(&data_dir);

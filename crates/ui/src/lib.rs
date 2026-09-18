@@ -128,6 +128,10 @@ impl gpui::Global for ReopenState {}
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
 pub fn run_app(config: UiConfig) {
+    // Retain ownership for the whole application lifetime. The bridge's
+    // default runtime has only two workers, insufficient for a desktop engine.
+    let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
+    let runtime_handle = runtime.handle().clone();
     let platform = gpui_platform::current_platform(false);
     let app = gpui::Application::with_platform(platform.clone()).with_assets(icons::Assets);
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
@@ -153,8 +157,7 @@ pub fn run_app(config: UiConfig) {
     });
     app.run(move |cx: &mut App| {
         remote_desktop::cursor::init(platform, cx);
-        // NB: pinned-rev API — `gpui_tokio::init(cx)` free function (not `Tokio::init`).
-        gpui_tokio::init(cx);
+        gpui_tokio::init_from_handle(cx, runtime_handle);
         gpui_base::init(cx);
         let data_dir = config.boot().data_dir.clone();
         let ui_settings = settings::UiSettings::load(&data_dir);

@@ -837,79 +837,525 @@ fn reconnect_replay_is_idempotent() {
     }
 }
 
+fn pin_sessions(doc: &mut RegistryDoc, ids: &[&str]) {
+    for id in ids {
+        if doc.chat(id).unwrap().is_none() {
+            doc.upsert_chat(&chat(id, "desktop")).unwrap();
+        }
+        doc.change_sidebar_pin(&zeron_proto::SidebarPinChange::Pin {
+            session_id: (*id).into(),
+            after: None,
+            before: None,
+        })
+        .unwrap();
+    }
+}
+
 #[test]
-fn sidebar_preferences_preserve_absent_empty_and_ordered_states() {
+fn sidebar_preferences_preserve_unknown_empty_and_ordered_states() {
     let mut doc = RegistryDoc::new("dev-a");
     assert_eq!(doc.sidebar_preferences(), None);
-
-    doc.set_sidebar_pinned_sessions(&[]).unwrap();
-    assert_eq!(
-        doc.sidebar_preferences(),
-        Some(SidebarPreferences {
-            pinned_session_ids: vec![],
-        })
-    );
-
-    let ordered = vec!["chat-b".to_string(), "chat-a".to_string()];
-    doc.set_sidebar_pinned_sessions(&ordered).unwrap();
-    assert_eq!(
+    assert!(!doc.reconcile_sidebar_pins(false).unwrap());
+    assert!(doc.reconcile_sidebar_pins(true).unwrap());
+    assert!(
         doc.sidebar_preferences()
-            .expect("preferences row")
-            .pinned_session_ids,
-        ordered
+            .unwrap()
+            .pinned_session_ids
+            .is_empty()
+    );
+    pin_sessions(&mut doc, &["chat-b", "chat-a"]);
+    assert_eq!(
+        doc.sidebar_preferences().unwrap().pinned_session_ids,
+        ["chat-b", "chat-a"]
     );
 }
 
 #[test]
-fn sidebar_preferences_reject_invalid_lists() {
-    let mut doc = RegistryDoc::new("dev-a");
-    let duplicate = vec!["chat-a".to_string(), "chat-a".to_string()];
-    assert!(doc.set_sidebar_pinned_sessions(&duplicate).is_err());
-    assert!(doc.sidebar_preferences().is_none());
-
-    let too_many = (0..=MAX_SIDEBAR_PINS)
-        .map(|index| format!("chat-{index}"))
-        .collect::<Vec<_>>();
-    assert!(doc.set_sidebar_pinned_sessions(&too_many).is_err());
-    assert!(doc.sidebar_preferences().is_none());
+fn sidebar_cleanup_waits_for_authority_and_keeps_archived_pins() {
+    let mut doc = RegistryDoc::new("desktop");
+    pin_sessions(&mut doc, &["live", "archived", "deleted"]);
+    let mut archived = chat("archived", "desktop");
+    archived.archived = true;
+    doc.upsert_chat(&archived).unwrap();
+    doc.delete_chat("deleted").unwrap();
+    assert!(!doc.reconcile_sidebar_pins(false).unwrap());
+    assert_eq!(
+        doc.sidebar_preferences().unwrap().pinned_session_ids.len(),
+        3
+    );
+    assert!(doc.reconcile_sidebar_pins(true).unwrap());
+    assert_eq!(
+        doc.sidebar_preferences().unwrap().pinned_session_ids,
+        ["live", "archived"]
+    );
+    assert!(!doc.reconcile_sidebar_pins(true).unwrap());
 }
 
 #[test]
-fn sidebar_preferences_converge_between_devices() {
+fn sidebar_migrates_old_whole_list_once_and_keeps_source() {
+    let mut doc = RegistryDoc::new("desktop");
+    doc.upsert_chat(&chat("old", "desktop")).unwrap();
+    doc.write(
+        KIND_PREFERENCES,
+        "sidebar-v1",
+        OpKind::Upsert,
+        fields([("pinnedSessionIds", json!(["old"]))]),
+    );
+    assert!(doc.sidebar_preferences().is_none());
+    doc.reconcile_sidebar_pins(true).unwrap();
+    assert_eq!(
+        doc.sidebar_preferences().unwrap().pinned_session_ids,
+        ["old"]
+    );
+    assert!(doc.sidebar_pin_migration_complete());
+    assert!(doc.overlay_row(KIND_PREFERENCES, "sidebar-v1").is_some());
+    doc.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+        session_id: "old".into(),
+    })
+    .unwrap();
+    let mut doc = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "desktop").unwrap();
+    assert!(
+        !doc.migrate_sidebar_pins(true, Some(&["old".into()]))
+            .unwrap()
+    );
+    pin_sessions(&mut doc, &["new"]);
+    assert_eq!(
+        doc.sidebar_preferences().unwrap().pinned_session_ids,
+        ["new"]
+    );
+}
+
+#[test]
+fn sidebar_rejects_invalid_or_missing_sessions_before_writing() {
+    use zeron_proto::SidebarPinChange;
+    let mut doc = RegistryDoc::new("dev-a");
+    for id in ["", "invalid id", "missing"] {
+        assert!(
+            doc.change_sidebar_pin(&SidebarPinChange::Pin {
+                session_id: id.into(),
+                after: None,
+                before: None
+            })
+            .is_err()
+        );
+        assert!(doc.sidebar_preferences().is_none());
+    }
+}
+
+#[test]
+fn sidebar_migration_waits_for_authority_preserves_order_and_archived() {
+    let mut doc = RegistryDoc::new("desktop");
+    for id in ["a", "b", "archived"] {
+        doc.upsert_chat(&chat(id, "desktop")).unwrap();
+    }
+    let mut archived = chat("archived", "desktop");
+    archived.archived = true;
+    doc.upsert_chat(&archived).unwrap();
+    doc.write(
+        KIND_PREFERENCES,
+        "sidebar-v1",
+        OpKind::Upsert,
+        fields([(
+            "pinnedSessionIds",
+            json!(["b", "archived", "gone", "a", "b"]),
+        )]),
+    );
+    let before = doc.to_bytes().unwrap();
+    assert!(!doc.migrate_sidebar_pins(false, None).unwrap());
+    assert_eq!(doc.to_bytes().unwrap(), before);
+    assert!(doc.migrate_sidebar_pins(true, None).unwrap());
+    assert_eq!(
+        doc.sidebar_preferences().unwrap().pinned_session_ids,
+        ["b", "archived", "a"]
+    );
+    assert!(
+        doc.ordered_sidebar_pins()
+            .iter()
+            .all(|(_, key)| zeron_proto::valid_pin_order_key(key))
+    );
+    let ops = &doc.pending.last().unwrap().ops;
+    assert_eq!(ops.len(), 4, "pins and marker belong to one batch");
+    assert_eq!(ops.last().unwrap().id, SIDEBAR_PINS_STATE_ID);
+}
+
+#[test]
+fn sidebar_migration_local_fallback_is_once_and_registry_empty_wins() {
+    for registry_empty in [false, true] {
+        let mut doc = RegistryDoc::new("desktop");
+        doc.upsert_chat(&chat("a", "desktop")).unwrap();
+        if registry_empty {
+            doc.write(
+                KIND_PREFERENCES,
+                "sidebar-v1",
+                OpKind::Upsert,
+                fields([("pinnedSessionIds", json!([]))]),
+            );
+        }
+        doc.reconcile_sidebar_pins(true).unwrap();
+        doc.migrate_sidebar_pins(true, Some(&["a".into()])).unwrap();
+        assert_eq!(
+            doc.sidebar_preferences().unwrap().pinned_session_ids,
+            if registry_empty { vec![] } else { vec!["a"] }
+        );
+        doc.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+            session_id: "a".into(),
+        })
+        .unwrap();
+        let mut restored = RegistryDoc::from_bytes(&doc.to_bytes().unwrap(), "desktop").unwrap();
+        assert!(
+            !restored
+                .migrate_sidebar_pins(true, Some(&["a".into()]))
+                .unwrap()
+        );
+        assert!(
+            restored
+                .sidebar_preferences()
+                .unwrap()
+                .pinned_session_ids
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn sidebar_migration_never_overwrites_new_format_or_explicit_empty() {
+    for mode in 0..3 {
+        let mut doc = RegistryDoc::new("desktop");
+        doc.upsert_chat(&chat("old", "desktop")).unwrap();
+        doc.write(
+            KIND_PREFERENCES,
+            "sidebar-v1",
+            OpKind::Upsert,
+            fields([("pinnedSessionIds", json!(["old"]))]),
+        );
+        // Model upstream state, without personal-cut's migration marker.
+        if mode == 0 {
+            doc.write(
+                KIND_PREFERENCES,
+                SIDEBAR_PINS_STATE_ID,
+                OpKind::Upsert,
+                fields([("initialized", json!(true))]),
+            );
+        } else {
+            doc.write(
+                KIND_SIDEBAR_PINS,
+                "old",
+                OpKind::Upsert,
+                fields([("pinned", json!(mode == 1)), ("orderKey", json!("8"))]),
+            );
+        }
+        let pins = doc.ordered_sidebar_pins();
+        assert!(
+            doc.migrate_sidebar_pins(true, Some(&["old".into()]))
+                .unwrap()
+        );
+        assert_eq!(doc.ordered_sidebar_pins(), pins);
+        assert!(doc.sidebar_pin_migration_complete());
+    }
+}
+
+#[test]
+fn sidebar_migration_concurrent_imports_cannot_resurrect_a_later_unpin() {
+    let mut a = RegistryDoc::new("a");
+    a.upsert_chat(&chat("one", "a")).unwrap();
+    a.upsert_chat(&chat("two", "a")).unwrap();
+    a.write(
+        KIND_PREFERENCES,
+        "sidebar-v1",
+        OpKind::Upsert,
+        fields([("pinnedSessionIds", json!(["two", "one"]))]),
+    );
+    let mut b = RegistryDoc::new("b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    a.migrate_sidebar_pins(true, None).unwrap();
+    b.migrate_sidebar_pins(true, None).unwrap();
+    assert_eq!(a.ordered_sidebar_pins(), b.ordered_sidebar_pins());
+    a.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+        session_id: "two".into(),
+    })
+    .unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(a.sidebar_preferences(), b.sidebar_preferences());
+    assert_eq!(a.sidebar_preferences().unwrap().pinned_session_ids, ["one"]);
+    assert!(!b.migrate_sidebar_pins(true, None).unwrap());
+}
+
+#[test]
+fn sidebar_migration_invalid_source_is_retained_without_partial_import() {
+    let mut doc = RegistryDoc::new("desktop");
+    doc.write(
+        KIND_PREFERENCES,
+        "sidebar-v1",
+        OpKind::Upsert,
+        fields([("pinnedSessionIds", json!("bad"))]),
+    );
+    let before = doc.to_bytes().unwrap();
+    assert!(doc.migrate_sidebar_pins(true, None).is_err());
+    assert_eq!(doc.to_bytes().unwrap(), before);
+    assert!(!doc.sidebar_pin_migration_complete());
+}
+
+#[test]
+fn sidebar_migration_delayed_local_seed_cannot_undo_unpin_on_another_device() {
+    let mut a = RegistryDoc::new("a");
+    a.upsert_chat(&chat("pin", "a")).unwrap();
+    let mut b = RegistryDoc::new("b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    a.migrate_sidebar_pins(true, Some(&["pin".into()])).unwrap();
+    a.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+        session_id: "pin".into(),
+    })
+    .unwrap();
+    // B has not observed A's migration or unpin yet.
+    b.migrate_sidebar_pins(true, Some(&["pin".into()])).unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(a.sidebar_preferences(), b.sidebar_preferences());
+    assert!(
+        b.sidebar_preferences()
+            .unwrap()
+            .pinned_session_ids
+            .is_empty()
+    );
+}
+
+#[test]
+fn sidebar_independent_moves_merge_and_only_write_the_moved_pin() {
+    use zeron_proto::SidebarPinChange;
     let mut desktop = RegistryDoc::new("desktop");
     let mut phone = RegistryDoc::new("phone");
     let mut server = HashMap::new();
-    let mut seq = 0u64;
-
+    let mut seq = 0;
+    for id in ["a", "b", "c", "d"] {
+        desktop.upsert_chat(&chat(id, "desktop")).unwrap();
+    }
+    pin_sessions(&mut desktop, &["a", "b", "c", "d"]);
+    server_round(&mut server, &mut seq, &mut [&mut desktop, &mut phone]);
     desktop
-        .set_sidebar_pinned_sessions(&["chat-b".into(), "chat-a".into()])
+        .change_sidebar_pin(&SidebarPinChange::Move {
+            session_id: "d".into(),
+            after: None,
+            before: Some("a".into()),
+        })
         .unwrap();
-    server_round(
-        &mut server,
-        &mut seq,
-        &mut [&mut desktop, &mut phone],
-    );
-    assert_eq!(
-        phone.sidebar_preferences().unwrap().pinned_session_ids,
-        vec!["chat-b", "chat-a"]
-    );
-
     phone
-        .set_sidebar_pinned_sessions(&["chat-a".into(), "chat-b".into()])
+        .change_sidebar_pin(&SidebarPinChange::Move {
+            session_id: "b".into(),
+            after: Some("d".into()),
+            before: None,
+        })
         .unwrap();
-    server_round(
-        &mut server,
-        &mut seq,
-        &mut [&mut desktop, &mut phone],
-    );
-    assert_eq!(
-        desktop.sidebar_preferences(),
-        phone.sidebar_preferences()
-    );
+    for doc in [&desktop, &phone] {
+        assert_eq!(doc.pending.len(), 1);
+        let ops = &doc.pending[0].ops;
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].kind, KIND_SIDEBAR_PINS);
+        assert_eq!(
+            ops[0].set.as_ref().unwrap().keys().collect::<Vec<_>>(),
+            vec!["orderKey"]
+        );
+    }
+    server_round(&mut server, &mut seq, &mut [&mut desktop, &mut phone]);
+    assert_eq!(desktop.sidebar_preferences(), phone.sidebar_preferences());
     assert_eq!(
         desktop.sidebar_preferences().unwrap().pinned_session_ids,
-        vec!["chat-a", "chat-b"]
+        ["d", "a", "c", "b"]
     );
+}
+
+#[test]
+fn sidebar_unpin_survives_concurrent_move_and_replayed_pin() {
+    use zeron_proto::SidebarPinChange;
+    for reverse in [false, true] {
+        let mut a = RegistryDoc::new("a");
+        let mut b = RegistryDoc::new("b");
+        let mut server = HashMap::new();
+        let mut seq = 0;
+        a.upsert_chat(&chat("pin", "a")).unwrap();
+        pin_sessions(&mut a, &["pin"]);
+        let seed = a.pending.last().unwrap().clone();
+        server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+        a.change_sidebar_pin(&SidebarPinChange::Unpin {
+            session_id: "pin".into(),
+        })
+        .unwrap();
+        b.change_sidebar_pin(&SidebarPinChange::Move {
+            session_id: "pin".into(),
+            after: None,
+            before: None,
+        })
+        .unwrap();
+        if reverse {
+            server_round(&mut server, &mut seq, &mut [&mut b, &mut a]);
+        } else {
+            server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+        }
+        b.enqueue_ops(seed.ops);
+        server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+        assert_eq!(a.sidebar_preferences(), b.sidebar_preferences());
+        assert!(
+            a.sidebar_preferences()
+                .unwrap()
+                .pinned_session_ids
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn sidebar_concurrent_additions_keep_overflow_and_allow_removal_and_moves() {
+    use zeron_proto::SidebarPinChange;
+    let mut a = RegistryDoc::new("a");
+    let mut b = RegistryDoc::new("b");
+    let mut server = HashMap::new();
+    let mut seq = 0;
+    let ids: Vec<_> = (0..199).map(|i| format!("pin-{i}")).collect();
+    for id in ids
+        .iter()
+        .map(String::as_str)
+        .chain(["extra-a", "extra-b", "extra-c"])
+    {
+        a.upsert_chat(&chat(id, "a")).unwrap();
+    }
+    pin_sessions(&mut a, &ids.iter().map(String::as_str).collect::<Vec<_>>());
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    for (doc, id) in [(&mut a, "extra-a"), (&mut b, "extra-b")] {
+        doc.change_sidebar_pin(&SidebarPinChange::Pin {
+            session_id: id.into(),
+            after: None,
+            before: None,
+        })
+        .unwrap();
+    }
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(
+        a.sidebar_preferences().unwrap().pinned_session_ids.len(),
+        201
+    );
+    assert!(!a.reconcile_sidebar_pins(true).unwrap());
+    assert!(
+        a.change_sidebar_pin(&SidebarPinChange::Pin {
+            session_id: "extra-c".into(),
+            after: None,
+            before: None
+        })
+        .is_err()
+    );
+    a.change_sidebar_pin(&SidebarPinChange::Move {
+        session_id: "extra-a".into(),
+        after: None,
+        before: Some("pin-0".into()),
+    })
+    .unwrap();
+    a.change_sidebar_pin(&SidebarPinChange::Unpin {
+        session_id: "extra-b".into(),
+    })
+    .unwrap();
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(
+        a.sidebar_preferences().unwrap().pinned_session_ids.len(),
+        200
+    );
+    assert_eq!(a.sidebar_preferences(), b.sidebar_preferences());
+}
+
+#[test]
+fn sidebar_keys_and_pending_membership_survive_restart() {
+    use zeron_proto::SidebarPinChange;
+    let mut a = RegistryDoc::new("a");
+    a.upsert_chat(&chat("pin", "a")).unwrap();
+    a.change_sidebar_pin(&SidebarPinChange::Pin {
+        session_id: "pin".into(),
+        after: None,
+        before: None,
+    })
+    .unwrap();
+    let reopened = RegistryDoc::from_bytes(&a.to_bytes().unwrap(), "a").unwrap();
+    assert_eq!(a.sidebar_preferences(), reopened.sidebar_preferences());
+    assert_eq!(a.ordered_sidebar_pins(), reopened.ordered_sidebar_pins());
+}
+
+#[test]
+fn sidebar_local_edits_follow_an_observed_future_clock() {
+    use zeron_proto::SidebarPinChange;
+    let mut doc = RegistryDoc::new("local");
+    pin_sessions(&mut doc, &["pin"]);
+    let remote = RowOp {
+        kind: KIND_SIDEBAR_PINS.into(),
+        id: "pin".into(),
+        op: OpKind::Upsert,
+        set: Some(fields([("pinned", json!(true)), ("orderKey", json!("8"))])),
+        hlc: "9999999999999-000001-remote".into(),
+        clocks: None,
+    };
+    let mut row = apply_op(None, &remote).0.unwrap();
+    row.seq = 1;
+    let _ = doc.apply_rows(1, vec![row]);
+    doc.change_sidebar_pin(&SidebarPinChange::Unpin {
+        session_id: "pin".into(),
+    })
+    .unwrap();
+    assert!(
+        doc.sidebar_preferences()
+            .unwrap()
+            .pinned_session_ids
+            .is_empty()
+    );
+    doc.change_sidebar_pin(&SidebarPinChange::Pin {
+        session_id: "pin".into(),
+        after: None,
+        before: None,
+    })
+    .unwrap();
+    assert_eq!(
+        doc.sidebar_preferences().unwrap().pinned_session_ids,
+        ["pin"]
+    );
+    assert!(doc.pending.last().unwrap().ops[0].hlc > remote.hlc);
+}
+
+#[test]
+fn sidebar_concurrent_moves_of_one_pin_converge_by_clock_in_either_order() {
+    use zeron_proto::SidebarPinChange;
+    for reverse in [false, true] {
+        let mut a = RegistryDoc::new("a");
+        let mut b = RegistryDoc::new("b");
+        let mut server = HashMap::new();
+        let mut seq = 0;
+        pin_sessions(&mut a, &["first", "moved", "last"]);
+        server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+        a.change_sidebar_pin(&SidebarPinChange::Move {
+            session_id: "moved".into(),
+            after: None,
+            before: Some("first".into()),
+        })
+        .unwrap();
+        b.change_sidebar_pin(&SidebarPinChange::Move {
+            session_id: "moved".into(),
+            after: Some("last".into()),
+            before: None,
+        })
+        .unwrap();
+        let a_wins = a.pending[0].ops[0].hlc > b.pending[0].ops[0].hlc;
+        let expected = if a_wins {
+            ["moved", "first", "last"]
+        } else {
+            ["first", "last", "moved"]
+        };
+        if reverse {
+            server_round(&mut server, &mut seq, &mut [&mut b, &mut a]);
+        } else {
+            server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+        }
+        assert_eq!(a.sidebar_preferences(), b.sidebar_preferences());
+        assert_eq!(
+            a.sidebar_preferences().unwrap().pinned_session_ids,
+            expected
+        );
+    }
 }
 
 #[test]

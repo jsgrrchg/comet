@@ -32,8 +32,10 @@ pub const KIND_CHATS: &str = "chats";
 pub const KIND_SESSIONS: &str = "sessions";
 pub const KIND_PREFERENCES: &str = "preferences";
 
-/// One row owns the complete sidebar pin order for this user and organization.
-pub const SIDEBAR_PREFERENCES_ID: &str = "sidebar-v1";
+/// Readiness only; membership and order live on individual pins.
+pub const SIDEBAR_PINS_STATE_ID: &str = "sidebarPins";
+pub const KIND_SIDEBAR_PINS: &str = "sidebarPins";
+mod sidebar_pins;
 
 /// Snapshot row id in the local `DocsStore` for the persisted registry state.
 pub const REGISTRY_DOC_ID: &str = "registry1";
@@ -1184,38 +1186,36 @@ impl RegistryDoc {
     // ── whole-doc read ──────────────────────────────────────────────────────
 
     pub fn sidebar_preferences(&self) -> Option<SidebarPreferences> {
-        self.overlay_row(KIND_PREFERENCES, SIDEBAR_PREFERENCES_ID)
-            .and_then(|row| row_to(&row))
+        self.sidebar_pins_initialized().then(|| SidebarPreferences {
+            pinned_session_ids: self
+                .ordered_sidebar_pins()
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect(),
+        })
     }
 
-    /// Replace the complete ordered pin list. The row is always upserted,
-    /// including for an empty list, so "unpin all" cannot be mistaken for a
-    /// missing row and re-imported by another desktop.
-    pub fn set_sidebar_pinned_sessions(
-        &mut self,
-        pinned_session_ids: &[String],
-    ) -> Result<(), DocError> {
-        if pinned_session_ids.len() > MAX_SIDEBAR_PINS {
-            return Err(DocError::Schema(format!(
-                "sidebar pins exceed the {MAX_SIDEBAR_PINS}-item limit"
-            )));
+    /// Initialize readiness and clean deleted pins from one authoritative snapshot.
+    pub fn reconcile_sidebar_pins(&mut self, authoritative: bool) -> Result<bool, DocError> {
+        if !authoritative {
+            return Ok(false);
         }
-        let mut seen = std::collections::HashSet::new();
-        if pinned_session_ids
-            .iter()
-            .any(|id| id.is_empty() || !seen.insert(id.as_str()))
-        {
-            return Err(DocError::Schema(
-                "sidebar pins must be non-empty and unique".into(),
-            ));
+        let initialized = self.sidebar_pins_initialized();
+        let migrated = self.migrate_sidebar_pins(true, None)?;
+        self.initialize_sidebar_pins();
+        let known: std::collections::HashSet<_> =
+            self.read_chats()?.into_iter().map(|c| c.id).collect();
+        let removed: Vec<_> = self
+            .ordered_sidebar_pins()
+            .into_iter()
+            .filter(|(id, _)| !known.contains(id))
+            .collect();
+        for (id, _) in &removed {
+            self.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+                session_id: id.clone(),
+            })?;
         }
-        self.write(
-            KIND_PREFERENCES,
-            SIDEBAR_PREFERENCES_ID,
-            OpKind::Upsert,
-            fields([("pinnedSessionIds", json!(pinned_session_ids))]),
-        );
-        Ok(())
+        Ok(migrated || !initialized || !removed.is_empty())
     }
 
     pub fn read_all(&self) -> Result<WorkspaceState, DocError> {

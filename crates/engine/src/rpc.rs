@@ -519,9 +519,13 @@ enum MutateParams {
     SetChatHost { chat_id: String, device_id: String },
     #[serde(rename_all = "camelCase")]
     SetChatArchived { chat_id: String, archived: bool },
-    /// Replace the user's complete ordered sidebar pin list.
+    /// Change one pin without replacing another device's edits.
     #[serde(rename_all = "camelCase")]
-    SetSidebarPinnedSessions { pinned_session_ids: Vec<String> },
+    ChangeSidebarPin {
+        change: zeron_proto::SidebarPinChange,
+    },
+    #[serde(rename_all = "camelCase")]
+    MigrateSidebarPins { pinned_session_ids: Vec<String> },
     /// Full-config replace on the chat row (zeron `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
@@ -962,9 +966,12 @@ impl EngineRpc {
                 .set_chat_archived(&chat_id, archived)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::SetSidebarPinnedSessions { pinned_session_ids } => self
+            MutateParams::ChangeSidebarPin { change } => {
+                self.workspace.change_sidebar_pin(&change).map_err(failed)
+            }
+            MutateParams::MigrateSidebarPins { pinned_session_ids } => self
                 .workspace
-                .set_sidebar_pinned_sessions(&pinned_session_ids)
+                .migrate_sidebar_pins(&pinned_session_ids)
                 .map_err(failed),
             MutateParams::SetChatConfig { chat_id, config } => self
                 .workspace
@@ -1821,7 +1828,16 @@ impl RpcService for EngineRpc {
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;
+                let sidebar_pins = matches!(
+                    &p,
+                    MutateParams::ChangeSidebarPin { .. } | MutateParams::MigrateSidebarPins { .. }
+                );
                 self.mutate(p)?;
+                if sidebar_pins {
+                    return RpcReply::value(&serde_json::json!({
+                        "ok": true, "sidebarPreferences": self.workspace.sidebar_preferences_snapshot(),
+                    }));
+                }
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::WATCH_CHECKOUT_DIFFS => {
@@ -2887,14 +2903,14 @@ mod tests {
     #[test]
     fn sidebar_preferences_mutation_accepts_desktop_wire_shape() {
         let p: MutateParams = parse_params(serde_json::json!({
-            "op": "setSidebarPinnedSessions",
-            "pinnedSessionIds": ["chat-b", "chat-a"],
+            "op": "changeSidebarPin",
+            "change": {"action":"move","sessionId":"chat-b","before":"chat-a","after":null},
         }))
         .expect("sidebar preferences params");
         assert!(matches!(
             p,
-            MutateParams::SetSidebarPinnedSessions { pinned_session_ids }
-                if pinned_session_ids == ["chat-b", "chat-a"]
+            MutateParams::ChangeSidebarPin { change: zeron_proto::SidebarPinChange::Move { session_id, before, .. } }
+                if session_id == "chat-b" && before.as_deref() == Some("chat-a")
         ));
     }
 

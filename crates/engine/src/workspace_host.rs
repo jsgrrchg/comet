@@ -281,6 +281,7 @@ impl WorkspaceHost {
         let (spaces_tx, _) = watch::channel(state.spaces);
         let preferences = doc.sidebar_preferences();
         let (sidebar_preferences_tx, _) = watch::channel(SidebarPreferencesState {
+            revision: 0,
             synced: false,
             initialized: preferences.is_some(),
             pinned_session_ids: preferences
@@ -647,11 +648,28 @@ impl WorkspaceHost {
         Ok(self.read(|doc| doc.read_sessions())?)
     }
 
-    pub fn set_sidebar_pinned_sessions(
+    pub fn change_sidebar_pin(
         &self,
-        pinned_session_ids: &[String],
+        change: &zeron_proto::SidebarPinChange,
     ) -> Result<(), EngineError> {
-        Ok(self.mutate(|doc| doc.set_sidebar_pinned_sessions(pinned_session_ids))?)
+        let synced = self.sync_status().is_some_and(|status| status.synced);
+        self.mutate(|doc| {
+            if self.edge_expected() && !synced && doc.sidebar_preferences().is_none() {
+                return Err(EngineError::Other("Pins are still syncing".into()));
+            }
+            Ok(doc.change_sidebar_pin(change)?)
+        })
+    }
+
+    /// One-time personal-cut upgrade. Do not acknowledge until the registry
+    /// snapshot (including pending operations and the marker) is durable.
+    pub fn migrate_sidebar_pins(&self, local: &[String]) -> Result<(), EngineError> {
+        let authoritative = !self.edge_expected() || self.sync_status().is_some_and(|s| s.synced);
+        if !authoritative {
+            return Err(EngineError::Other("Pins are still syncing".into()));
+        }
+        self.mutate(|doc| doc.migrate_sidebar_pins(true, Some(local)))?;
+        self.inner.persist_snapshot()
     }
 
     // ── watches (WatchChats / WatchDevices / merged WatchSessions) ──────────
@@ -675,6 +693,14 @@ impl WorkspaceHost {
 
     pub fn watch_sidebar_preferences(&self) -> watch::Receiver<SidebarPreferencesState> {
         self.inner.sidebar_preferences_tx.subscribe()
+    }
+
+    /// Mutation acknowledgements and watches share the same ordered revision.
+    pub fn sidebar_preferences_snapshot(&self) -> SidebarPreferencesState {
+        let synced = self.sync_status().is_some_and(|status| status.synced);
+        let doc = lock(&self.inner.reg);
+        self.inner.publish_sidebar_preferences(&doc, synced);
+        self.inner.sidebar_preferences_tx.borrow().clone()
     }
 
     /// WatchSessions source: remote devices' rows from the registry merged with
@@ -1134,12 +1160,23 @@ impl WorkspaceHostInner {
             .as_ref()
             .is_some_and(|room| room.stats().synced);
         let snapshot = {
-            let doc = lock(&self.reg);
+            let mut doc = lock(&self.reg);
+            match doc.reconcile_sidebar_pins(registry_synced) {
+                Ok(true) => {
+                    // Persist and transmit cleanup just like a user mutation.
+                    self.bump_changed();
+                    if let Some(room) = lock(&self.room).as_ref() {
+                        room.nudge();
+                    }
+                }
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, "sidebar pin cleanup failed"),
+            }
+            self.publish_sidebar_preferences(&doc, registry_synced);
             doc.read_all()
-                .map(|state| (state, doc.sidebar_preferences()))
         };
         match snapshot {
-            Ok((mut state, preferences)) => {
+            Ok(mut state) => {
                 self.overlay_presence(&mut state.devices);
                 // Retain the latest value even with no subscribers, but don't
                 // wake every list for unrelated registry/presence changes.
@@ -1153,21 +1190,38 @@ impl WorkspaceHostInner {
                 }
                 publish_if_changed(&self.sessions_tx, state.sessions);
                 publish_if_changed(&self.spaces_tx, state.spaces);
-                publish_if_changed(
-                    &self.sidebar_preferences_tx,
-                    SidebarPreferencesState {
-                        synced: registry_synced,
-                        initialized: preferences.is_some(),
-                        pinned_session_ids: preferences
-                            .map(|preferences| preferences.pinned_session_ids)
-                            .unwrap_or_default(),
-                    },
-                );
             }
             Err(err) => {
                 tracing::warn!(error = %err, "registry read failed");
             }
         }
+    }
+
+    /// Called under the registry lock so publications cannot overtake one another.
+    fn publish_sidebar_preferences(&self, doc: &RegistryDoc, synced: bool) {
+        let preferences = doc.sidebar_preferences();
+        let initialized = preferences.is_some();
+        let pins = preferences
+            .map(|p| p.pinned_session_ids)
+            .unwrap_or_default();
+        self.sidebar_preferences_tx.send_if_modified(|current| {
+            // Readiness is sticky for this host. A caller that sampled stats
+            // before another publisher acquired the lock must not regress it.
+            let synced = synced || current.synced;
+            if current.synced == synced
+                && current.initialized == initialized
+                && current.pinned_session_ids == pins
+            {
+                return false;
+            }
+            *current = SidebarPreferencesState {
+                revision: current.revision + 1,
+                synced,
+                initialized,
+                pinned_session_ids: pins,
+            };
+            true
+        });
     }
 
     /// Fold the 15s presence heartbeats into the device rows' `lastSeenAt`
@@ -1274,17 +1328,19 @@ impl WorkspaceHostInner {
     }
 
     fn save_snapshot(&self) {
-        let bytes = lock(&self.reg).to_bytes();
-        match bytes {
-            Ok(bytes) => {
-                if let Err(err) = self.store.save_snapshot(REGISTRY_DOC_ID, &bytes) {
-                    tracing::warn!(error = %err, "registry snapshot save failed");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, "registry snapshot export failed");
-            }
+        if let Err(error) = self.persist_snapshot() {
+            tracing::warn!(%error, "registry snapshot save failed");
         }
+    }
+
+    fn persist_snapshot(&self) -> Result<(), EngineError> {
+        // Keep export and disk write serialized: an older background snapshot
+        // must not overwrite an acknowledged migration's durable snapshot.
+        let doc = lock(&self.reg);
+        let bytes = doc.to_bytes()?;
+        self.store
+            .save_snapshot(REGISTRY_DOC_ID, &bytes)
+            .map_err(|error| EngineError::Other(format!("registry snapshot save failed: {error}")))
     }
 
     /// Presence heartbeat — a memory-only frame on the room, never a row write.
@@ -1708,13 +1764,94 @@ mod tests {
         let mut preferences = host.watch_sidebar_preferences();
         assert!(!preferences.borrow().initialized);
 
-        host.set_sidebar_pinned_sessions(&[]).unwrap();
+        host.change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+            session_id: "absent".into(),
+        })
+        .unwrap();
         host.inner.publish();
         assert!(preferences.has_changed().unwrap());
         let state = preferences.borrow_and_update();
         assert!(state.initialized);
         assert!(!state.synced);
         assert!(state.pinned_session_ids.is_empty());
+        let first_revision = state.revision;
+        drop(state);
+        let acknowledgement = host.sidebar_preferences_snapshot();
+        assert_eq!(acknowledgement.revision, first_revision);
+        assert!(
+            !preferences.has_changed().unwrap(),
+            "unchanged acknowledgements must not churn watches"
+        );
+        host.create_chat("cached", None, Some("test-device"), None, None)
+            .unwrap();
+        host.change_sidebar_pin(&zeron_proto::SidebarPinChange::Pin {
+            session_id: "cached".into(),
+            after: None,
+            before: None,
+        })
+        .unwrap();
+        let acknowledgement = host.sidebar_preferences_snapshot();
+        assert!(acknowledgement.revision > first_revision);
+        assert_eq!(*preferences.borrow(), acknowledgement);
+    }
+
+    #[tokio::test]
+    async fn sidebar_migration_failure_keeps_source_and_retry_persists_marker() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = WorkspaceHost::open(
+            store.clone(),
+            WorkspaceHostConfig {
+                device_id: "test-device".into(),
+                device_name: "Test".into(),
+                platform: "linux".into(),
+                org_id: "org".into(),
+                user_id: "user".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        host.create_chat("legacy", None, Some("test-device"), None, None)
+            .unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_pin_snapshot BEFORE INSERT ON snapshots BEGIN SELECT RAISE(FAIL, 'injected pin disk failure'); END;").unwrap();
+        assert!(
+            host.migrate_sidebar_pins(&["legacy".into()])
+                .unwrap_err()
+                .to_string()
+                .contains("injected pin disk failure")
+        );
+        assert_eq!(
+            host.sidebar_preferences_snapshot().pinned_session_ids,
+            ["legacy"]
+        );
+        db.execute_batch("DROP TRIGGER fail_pin_snapshot;").unwrap();
+        host.migrate_sidebar_pins(&["legacy".into()]).unwrap();
+        let bytes = store.load_snapshot(REGISTRY_DOC_ID).unwrap().unwrap();
+        let mut restored = RegistryDoc::from_bytes(&bytes, "test-device").unwrap();
+        assert!(restored.sidebar_pin_migration_complete());
+        assert_eq!(
+            restored.sidebar_preferences().unwrap().pinned_session_ids,
+            ["legacy"]
+        );
+        restored
+            .change_sidebar_pin(&zeron_proto::SidebarPinChange::Unpin {
+                session_id: "legacy".into(),
+            })
+            .unwrap();
+        assert!(
+            !restored
+                .migrate_sidebar_pins(true, Some(&["legacy".into()]))
+                .unwrap()
+        );
+        assert!(
+            restored
+                .sidebar_preferences()
+                .unwrap()
+                .pinned_session_ids
+                .is_empty()
+        );
     }
 
     #[test]

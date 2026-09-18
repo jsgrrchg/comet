@@ -269,6 +269,10 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Probe the IPC port and connect (daemon listening) or embed (nothing there).
     /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
     /// tokio tasks.
@@ -933,6 +937,14 @@ impl AppState {
     }
 
     // ---- reducers (pure) ----
+
+    pub(crate) fn apply_sidebar_preferences(&mut self, value: SidebarPreferencesState) -> bool {
+        if value.revision < self.sidebar_preferences.revision || value == self.sidebar_preferences {
+            return false;
+        }
+        self.sidebar_preferences = value;
+        true
+    }
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
@@ -1863,10 +1875,7 @@ impl AppState {
                 cx,
                 handle.clone(),
                 methods::WATCH_SIDEBAR_PREFERENCES,
-                |state, value| {
-                    state.sidebar_preferences = value;
-                    true
-                },
+                AppState::apply_sidebar_preferences,
             ),
             spawn_watch(
                 cx,

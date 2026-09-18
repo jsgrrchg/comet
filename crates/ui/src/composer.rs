@@ -69,7 +69,8 @@ pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BO
 /// (scrollHeight rounds to 47 in the original) + the 2px hairline = 49. The
 /// compact cluster (`py-1.5` + h-8 = 44) is shorter, so the textarea wins.
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
-/// `max-w-3xl`: stable outer width of the centered composer column.
+/// `max-w-3xl`: outer width of the new-chat composer, also used when no shell
+/// width is supplied. Established threads follow the conversation column.
 pub const COMPOSER_MAX_WIDTH: f32 = 768.0;
 /// The queue reads as a narrower tray emerging from behind the composer.
 const QUEUE_SIDE_INSET: f32 = 16.0;
@@ -4181,10 +4182,11 @@ impl Composer {
         &self.pickers
     }
 
-    /// Feed the stable conversation-column width into responsive composer
-    /// controls.
+    /// Feed the shell's current outer width into responsive composer controls.
+    /// During a route transition this is the interpolated width, including
+    /// when returning from a wider conversation to the new-chat composer.
     pub fn set_available_width(&mut self, width: f32, cx: &mut Context<Self>) {
-        let composer_width = width.clamp(0.0, COMPOSER_MAX_WIDTH);
+        let composer_width = width.max(0.0);
         if composer_width_changed(self.last_available_width, composer_width) {
             self.last_available_width = Some(composer_width);
             // The shell renders before this child, so this queues one more
@@ -7291,10 +7293,11 @@ impl Render for Composer {
                 (text, offline)
             })
         };
-        // Centered composer column (zeron `mx-auto w-full max-w-3xl`).
+        // The shell owns the width and its route animation. A route-dependent
+        // cap here would cut a wide composer before its return glide finishes.
         let container = div()
             .w_full()
-            .max_w(px(COMPOSER_MAX_WIDTH))
+            .max_w(px(self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH)))
             .mx_auto()
             .flex()
             .flex_col()
@@ -7654,12 +7657,19 @@ impl Render for Composer {
                     )
                 })
             };
-        let surface_width = self
-            .surface_bounds
-            .get()
-            .map_or(strip_width_hint + PILL_BORDER_V, |bounds| {
-                f32::from(bounds.size.width)
-            });
+        // The shell supplies this frame's animated width before rendering us.
+        // Measured bounds still belong to the previous frame here; using them
+        // would add the per-frame width delta to the model selector's glide.
+        let surface_width = self.last_available_width.map_or_else(
+            || {
+                self.surface_bounds
+                    .get()
+                    .map_or(strip_width_hint + PILL_BORDER_V, |bounds| {
+                        f32::from(bounds.size.width)
+                    })
+            },
+            |width| (width - 2.0 * Theme::SPACE_LG).max(0.0),
+        );
         let model_travel = (surface_width
             - PILL_BORDER_V
             - 12.0
@@ -8021,36 +8031,46 @@ mod tests {
         let input = handle
             .read_with(cx, |composer, _| composer.input.clone())
             .unwrap();
-        for docked in [true, false] {
-            let amounts = if docked {
-                [0.0, 0.2, 0.6, 0.98, 1.0]
-            } else {
-                [1.0, 0.98, 0.6, 0.2, 0.0]
-            };
-            for amount in amounts {
-                handle
-                    .update(cx, |composer, _, cx| {
-                        composer.state.update(cx, |state, _| {
-                            state.selected_chat = docked.then(|| "chat".into());
-                        });
-                        composer.on_state_changed(cx);
-                        composer
-                            .input
-                            .update(cx, |input, cx| input.set_text("Hi", cx));
-                        composer.expanded_mode = false;
-                        let mut frame = crate::composer_dock::DockFrame::settled(docked);
-                        frame.amount = amount;
-                        frame.active = amount != if docked { 1.0 } else { 0.0 };
-                        composer.set_dock_frame(frame, cx);
+        for thread_width in [436.0, 592.0, 768.0, 1232.0] {
+            for docked in [true, false] {
+                let amounts = if docked {
+                    [0.0, 0.2, 0.6, 0.98, 1.0]
+                } else {
+                    [1.0, 0.98, 0.6, 0.2, 0.0]
+                };
+                for amount in amounts {
+                    let outer_width = motion::lerp(COMPOSER_MAX_WIDTH, thread_width, amount);
+                    cx.update(|cx| {
+                    handle
+                        .update(cx, |composer, window, cx| {
+                            window.resize(size(px(outer_width), px(800.0)));
+                            composer.set_available_width(outer_width, cx);
+                            composer.state.update(cx, |state, _| {
+                                state.selected_chat = docked.then(|| "chat".into());
+                            });
+                            composer.on_state_changed(cx);
+                            composer
+                                .input
+                                .update(cx, |input, cx| input.set_text("Hi", cx));
+                            composer.expanded_mode = false;
+                            let mut frame = crate::composer_dock::DockFrame::settled(docked);
+                            frame.amount = amount;
+                            frame.active = amount != if docked { 1.0 } else { 0.0 };
+                            composer.set_dock_frame(frame, cx);
+                        })
+                        .unwrap();
+                    cx.update_window(handle.into(), |_, window, cx| {
+                        window.refresh();
+                        window.draw(cx).clear();
                     })
                     .unwrap();
-                cx.update_window(handle.into(), |_, window, cx| {
-                    window.draw(cx).clear();
-                })
-                .unwrap();
-                handle.read_with(cx, |composer, cx| {
+                    // Inspect the first painted frame before TestAppContext
+                    // flushes effects and automatically draws dirty views.
+                    handle.read_with(cx, |composer, cx| {
                     assert_eq!(composer.input, input);
                     let surface = composer.surface_bounds.get().unwrap();
+                    assert!((f32::from(surface.size.width) - (outer_width - 2.0 * Theme::SPACE_LG)).abs() <= 1.0,
+                        "surface width clipped: docked={docked}, amount={amount}, outer={outer_width}, surface={surface:?}");
                     let origin = input.read(cx).last_bounds.unwrap().origin;
                     assert!((f32::from(origin.y - surface.top()) - (17.0 - 4.0 * amount)).abs() <= 1.0,
                         "editor jumped: docked={docked}, amount={amount}, origin={origin:?}, surface={surface:?}");
@@ -8065,7 +8085,9 @@ mod tests {
                     let expected = if docked { COMPACT_TOTAL_HEIGHT } else { COMPOSER_MIN_HEIGHT };
                     assert!((composer.last_rendered_height + composer.dock_clearance_correction - expected).abs() < 0.1);
                     assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1);
-                }).unwrap();
+                        }).unwrap();
+                    });
+                }
             }
         }
     }
@@ -8083,6 +8105,128 @@ mod tests {
             assert!(drift.abs() <= 6.0);
             assert!(side == 0.0 || side == 1.0);
         }
+    }
+
+    #[gpui::test]
+    fn conversation_resize_reflows_the_live_draft_and_preserves_the_flip(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let draft = "A draft near the compact boundary. ".repeat(2);
+        handle
+            .update(cx, |composer, window, cx| {
+                composer
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("chat".into()));
+                composer.on_state_changed(cx);
+                composer.route_snap_until = None;
+                composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
+                composer.set_available_width(1232.0, cx);
+                window.resize(size(px(1232.0), px(800.0)));
+            })
+            .unwrap();
+        let draw = |cx: &mut gpui::TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+            })
+            .unwrap();
+        };
+        for _ in 0..3 {
+            draw(cx);
+        }
+        // Finish measuring the wide input before typing; the hero's previous
+        // width must not accidentally put this fixture into the resize hold.
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.width_changed_at = None;
+                composer.input.update(cx, |input, cx| {
+                    input.set_text(draft.clone(), cx);
+                    input.selected_range = 2..8;
+                });
+            })
+            .unwrap();
+        for _ in 0..3 {
+            draw(cx);
+        }
+        let input = handle
+            .read_with(cx, |composer, cx| {
+                assert!(
+                    !composer.expanded_mode,
+                    "draft must fit the wide compact input: text={}, capacity={}",
+                    composer.input.read(cx).measured_text_width(),
+                    composer.compact_capacity,
+                );
+                assert!(composer.input.read(cx).measured_text_width() < composer.compact_capacity);
+                composer.input.clone()
+            })
+            .unwrap();
+
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.set_available_width(592.0, cx);
+                window.resize(size(px(592.0), px(800.0)));
+            })
+            .unwrap();
+        for _ in 0..3 {
+            draw(cx);
+        }
+        handle
+            .update(cx, |composer, _, _| {
+                assert!(
+                    composer.expanded_mode,
+                    "narrowing must expand the overflowing draft immediately"
+                );
+                assert!(
+                    composer.flip_morph.is_some(),
+                    "resize must retain the height/controls morph"
+                );
+                assert!(composer.last_target_height > COMPACT_TOTAL_HEIGHT);
+                composer.morph_clock -= Duration::from_secs(1);
+            })
+            .unwrap();
+        draw(cx);
+        handle
+            .read_with(cx, |composer, _| {
+                let surface = composer.surface_bounds.get().unwrap();
+                let model = composer.model_bounds.get().unwrap();
+                let left = surface.left() + px(1.0 + 12.0 + 28.0 + ACTION_UTILITY_GAP);
+                assert!(
+                    (f32::from(model.left() - left)).abs() <= 1.0,
+                    "expanded controls must finish on the left"
+                );
+            })
+            .unwrap();
+
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.set_available_width(1232.0, cx);
+                window.resize(size(px(1232.0), px(800.0)));
+            })
+            .unwrap();
+        for _ in 0..3 {
+            draw(cx);
+        }
+        handle
+            .update(cx, |composer, _, _| {
+                assert!(
+                    composer.expanded_mode,
+                    "widening must wait for resize to settle before collapsing"
+                );
+                composer.width_changed_at =
+                    Some(Instant::now() - Duration::from_millis(RESIZE_SETTLE_MS + 1));
+            })
+            .unwrap();
+        draw(cx);
+        handle
+            .read_with(cx, |composer, cx| {
+                assert!(!composer.expanded_mode);
+                assert!(composer.flip_morph.is_some());
+                assert_eq!(composer.last_target_height, COMPACT_TOTAL_HEIGHT);
+                assert_eq!(composer.input, input);
+                assert_eq!(input.read(cx).text(), draft);
+                assert_eq!(input.read(cx).selected_range, 2..8);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

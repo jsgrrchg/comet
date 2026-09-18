@@ -474,6 +474,59 @@ mod tests {
     }
 
     #[test]
+    fn conversation_width_transitions_settle_and_panel_handoffs_resize_while_hidden() {
+        for thread_width in [592.0, 768.0, 1232.0] {
+            for reduced in [false, true] {
+                let mut state = DockState::default();
+                let mut now = Instant::now();
+                state.tick(false, reduced, now);
+                assert_eq!(state.layout_width(768.0, reduced, now), 768.0);
+                state.position = Some((Glide::new(0.0), Glide::new(300.0)));
+                let mut source = 768.0;
+                for (docked, target) in [(true, thread_width), (false, 768.0)] {
+                    now += std::time::Duration::from_secs(30);
+                    state.tick(docked, reduced, now);
+                    assert_eq!(
+                        state.layout_width(target, reduced, now),
+                        if reduced { target } else { source },
+                        "a route change starts at the painted width unless motion is reduced"
+                    );
+                    for _ in 0..90 {
+                        now += std::time::Duration::from_millis(16);
+                        state.tick(docked, reduced, now);
+                        let width = state.layout_width(target, reduced, now);
+                        assert!(width >= source.min(target) && width <= source.max(target));
+                    }
+                    assert_eq!(state.layout_width(target, reduced, now), target);
+                    source = target;
+                }
+            }
+
+            for (docked, source, target) in
+                [(true, 768.0, thread_width), (false, thread_width, 768.0)]
+            {
+                let mut state = DockState::default();
+                let now = Instant::now();
+                let source_pane = if docked { 0.0 } else { 480.0 };
+                let target_pane = if docked { 480.0 } else { 0.0 };
+                state.observe_pane(!docked, source_pane, true, now);
+                state.tick(!docked, false, now);
+                state.layout_width(source, false, now);
+                state.position = Some((Glide::new(0.0), Glide::new(300.0)));
+                state.observe_pane(docked, target_pane, true, now);
+                state.tick(docked, false, now);
+                assert_eq!(state.layout_width(target, false, now), source);
+                let hidden =
+                    now + std::time::Duration::from_secs_f32(0.075 * crate::motion::speed_scale());
+                state.observe_pane(docked, target_pane, true, hidden);
+                state.tick(docked, false, hidden);
+                assert_eq!(state.opacity(), 0.0);
+                assert_eq!(state.layout_width(target, false, hidden), target);
+            }
+        }
+    }
+
+    #[test]
     fn panel_exit_retains_source_transcript_width_only_until_handoff_ends() {
         let mut state = DockState::default();
         assert_eq!(state.transcript_width(540.0, true, false), 540.0);
@@ -552,11 +605,11 @@ mod tests {
         }
         let measured = Rc::new(std::cell::Cell::new(None));
         let now = Instant::now();
-        let handle = cx.add_window(|_, _| Fixture {
+        let handle = cx.open_window(gpui::size(px(1600.0), px(900.0)), |_, _| Fixture {
             state: Default::default(),
             now,
             docked: false,
-            width: 400.0,
+            width: 768.0,
             measured: measured.clone(),
         });
         let draw = |cx: &mut gpui::TestAppContext| {
@@ -571,6 +624,7 @@ mod tests {
             .update(cx, |fixture, _, cx| {
                 fixture.now = now + std::time::Duration::from_secs(30);
                 fixture.docked = true;
+                fixture.width = 1232.0;
                 cx.notify();
             })
             .unwrap();
@@ -586,7 +640,7 @@ mod tests {
         handle
             .update(cx, |fixture, _, cx| {
                 fixture.docked = false;
-                fixture.width = 300.0;
+                fixture.width = 768.0;
                 cx.notify();
             })
             .unwrap();
@@ -606,7 +660,7 @@ mod tests {
         }
         let settled = draw(cx);
         assert!((f32::from(settled.top() - origin.top())).abs() < 0.1);
-        assert!((f32::from(settled.size.width) - 300.0).abs() < 0.1);
+        assert!((f32::from(settled.size.width) - 768.0).abs() < 0.1);
     }
 
     #[test]

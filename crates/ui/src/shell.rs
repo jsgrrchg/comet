@@ -204,11 +204,10 @@ fn composer_target_width(panel_width: f32, content_width: f32, docked: bool) -> 
     if !docked {
         return panel_width.min(crate::composer::COMPOSER_MAX_WIDTH);
     }
-    let column_width =
-        content_width.min((panel_width - 2.0 * crate::transcript::CONTENT_SIDE_GUTTER).max(0.0));
-    // The transcript setting describes the visible column; the composer's
-    // outer box also includes its two padding gutters.
-    (column_width + 2.0 * Theme::SPACE_LG).min(panel_width)
+    // Share the configurable maximum, including the composer's outer padding.
+    // Below that maximum, keep the original full-panel responsive width: using
+    // transcript gutters here would remove 64px and wrap attachments too early.
+    (content_width + 2.0 * Theme::SPACE_LG).min(panel_width)
 }
 
 fn titlebar_new_session_alpha(is_chat_route: bool, has_selected_chat: bool) -> f32 {
@@ -10477,14 +10476,39 @@ mod tests {
     }
 
     #[test]
-    fn composer_width_tracks_the_visible_column_only_in_established_threads() {
+    fn composer_width_shares_the_maximum_only_in_established_threads() {
         for (setting, outer) in [(560.0, 592.0), (736.0, 768.0), (1200.0, 1232.0)] {
             assert_eq!(composer_target_width(1600.0, setting, true), outer);
             assert_eq!(composer_target_width(1600.0, setting, false), 768.0);
-            // A narrow pane leaves the same 48px gutters around both surfaces.
-            assert_eq!(composer_target_width(500.0, setting, true), 436.0);
+            // Narrow panes keep the composer's original gutters and usable width.
+            assert_eq!(composer_target_width(500.0, setting, true), 500.0);
             assert_eq!(composer_target_width(500.0, setting, false), 500.0);
             assert_eq!(composer_target_width(0.0, setting, true), 0.0);
+        }
+    }
+
+    #[test]
+    fn default_composer_width_preserves_main_resizing_and_many_attachment_rows() {
+        for panel_width in (0..=1600).step_by(8) {
+            let panel_width = panel_width as f32;
+            assert_eq!(
+                composer_target_width(panel_width, settings::TRANSCRIPT_WIDTH_DEFAULT, true),
+                panel_width.min(crate::composer::COMPOSER_MAX_WIDTH),
+                "default width must preserve main's responsive layout at {panel_width}px"
+            );
+        }
+        // At the same 300px pane width, main fits three thumbnails per row.
+        // Applying transcript gutters reduced this to two and turned 60 images
+        // from a 1284px strip into a 1924px strip, pushing controls off-screen.
+        for setting in [560.0, 736.0, 1200.0] {
+            let width = composer_target_width(300.0, setting, true);
+            let inner = width - 2.0 * Theme::SPACE_LG - 2.0;
+            for (count, expected_height) in [(3, 68.0), (60, 1284.0), (120, 2564.0)] {
+                assert_eq!(
+                    crate::composer::attachment_strip_height(count, inner),
+                    expected_height
+                );
+            }
         }
     }
 

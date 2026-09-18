@@ -64,9 +64,6 @@ pub const STICK_THRESHOLD_PX: f32 = 70.0;
 pub const OVERDRAW_PX: f32 = 320.0;
 /// Show the scroll-to-bottom button beyond this distance from the end.
 pub const SCROLL_BUTTON_THRESHOLD_PX: f32 = 320.0;
-/// Shared with the docked composer so their visible edges align even when
-/// the conversation column is constrained by a narrow window or side pane.
-pub(crate) const CONTENT_SIDE_GUTTER: f32 = 48.0;
 
 fn jump_visibility(was_shown: bool, distance: f32) -> bool {
     // Once offered, keep the control until close to the end. A single 320px
@@ -6148,7 +6145,7 @@ impl Transcript {
             .pt(px(top_gap))
             .pb(px(bottom_pad))
             // Keep side gutters as the configurable column shrinks to fit.
-            .px(px(CONTENT_SIDE_GUTTER))
+            .px(px(48.0))
             .child(
                 div()
                     .w_full()

@@ -58,6 +58,8 @@ pub(crate) struct DockFrame {
     pub amount: f32,
     pub docked: bool,
     pub active: bool,
+    /// Panel handoffs replace geometry while hidden; reduced motion also snaps.
+    snap_reflow: bool,
     visuals: Visuals,
 }
 
@@ -67,6 +69,7 @@ impl DockFrame {
             amount: if docked { 1.0 } else { 0.0 },
             docked,
             active: false,
+            snap_reflow: false,
             visuals: Visuals::settled(docked),
         }
     }
@@ -82,6 +85,92 @@ impl DockFrame {
     }
     pub fn dissolve(self) -> f32 {
         self.visuals.dissolve
+    }
+}
+
+/// Layout endpoints can change while the route clock is moving: text wraps,
+/// the input changes mode, or attachments gain a row. Keep that discrete change
+/// out of the painted geometry without filtering the route animation itself.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DockLayout {
+    pub hero_height: f32,
+    pub thread_height: f32,
+    pub extra_height: f32,
+    pub compact: bool,
+}
+
+impl DockLayout {
+    pub fn height(self, amount: f32) -> f32 {
+        crate::motion::lerp(self.hero_height, self.thread_height, amount) + self.extra_height
+    }
+
+    fn compact_amount(self, amount: f32) -> f32 {
+        if self.compact { amount } else { 0.0 }
+    }
+}
+
+pub(crate) struct DockReflow {
+    previous: Option<(DockLayout, DockFrame)>,
+    height_offset: Glide,
+    compact_offset: Glide,
+    last_sample: Option<Instant>,
+}
+
+impl Default for DockReflow {
+    fn default() -> Self {
+        Self {
+            previous: None,
+            height_offset: Glide::new(0.0),
+            compact_offset: Glide::new(0.0),
+            last_sample: None,
+        }
+    }
+}
+
+impl DockReflow {
+    pub fn active(&self) -> bool {
+        self.height_offset.active() || self.compact_offset.active()
+    }
+
+    /// Return a height correction and compact-control position on the dock's
+    /// timeline. Outside a route/reflow, local typing morphs retain ownership.
+    pub fn sample(
+        &mut self,
+        layout: DockLayout,
+        frame: DockFrame,
+        reduced: bool,
+        now: Instant,
+    ) -> (f32, f32) {
+        let previous = self.previous.replace((layout, frame));
+        let last_sample = self.last_sample.replace(now);
+        let owns_layout = frame.active
+            || self.active()
+            || previous.is_some_and(|(_, previous)| previous.amount != frame.amount);
+        if reduced || frame.snap_reflow || !owns_layout || previous.is_none() {
+            self.height_offset = Glide::new(0.0);
+            self.compact_offset = Glide::new(0.0);
+        } else if let Some((previous_layout, previous_frame)) = previous {
+            // Do not consume idle time or lose velocity on route reversal.
+            let dt = if frame.docked != previous_frame.docked {
+                0.0
+            } else {
+                last_sample.map_or(0.0, |last| {
+                    now.saturating_duration_since(last).as_secs_f32()
+                })
+            };
+            self.height_offset.advance(0.0, dt, duration(frame.docked));
+            self.compact_offset.advance(0.0, dt, duration(frame.docked));
+            // Evaluate both layouts at THIS route phase. Only the reflow is
+            // compensated; normal hero/thread travel keeps its original curve.
+            self.height_offset.value +=
+                previous_layout.height(frame.amount) - layout.height(frame.amount);
+            self.compact_offset.value +=
+                previous_layout.compact_amount(frame.amount) - layout.compact_amount(frame.amount);
+        }
+        (
+            self.height_offset.value,
+            (layout.compact_amount(frame.amount) + self.compact_offset.value).clamp(0.0, 1.0),
+        )
     }
 }
 
@@ -298,6 +387,7 @@ impl DockState {
             amount: self.phase.value.clamp(0.0, 1.0),
             docked,
             active: self.phase.active() || self.choreography.is_some(),
+            snap_reflow: reduced || self.pane.progress.is_some(),
             visuals,
         };
         self.frame
@@ -440,6 +530,123 @@ impl IntoElement for DockedComposer {
 mod tests {
     use super::*;
     use gpui::{Context, Render, canvas, div, prelude::*};
+
+    fn attachment_layout(outer_width: f32) -> DockLayout {
+        DockLayout {
+            hero_height: crate::composer::COMPOSER_MIN_HEIGHT,
+            thread_height: crate::composer::COMPACT_TOTAL_HEIGHT,
+            extra_height: crate::composer::attachment_strip_height(10, outer_width - 34.0),
+            compact: true,
+        }
+    }
+
+    #[test]
+    fn reflow_keeps_route_height_continuous_across_attachment_rows_and_reversal() {
+        for docked in [true, false] {
+            let mut reflow = DockReflow::default();
+            let mut now = Instant::now();
+            let (before, after) = if docked {
+                (698.0, 697.0)
+            } else {
+                (697.0, 698.0)
+            };
+            let source = attachment_layout(before);
+            let target = attachment_layout(after);
+            assert_eq!((source.extra_height - target.extra_height).abs(), 64.0);
+            let mut frame = DockFrame::settled(docked);
+            frame.active = true;
+            frame.amount = 0.4;
+            reflow.sample(source, frame, false, now);
+            let (offset, compact) = reflow.sample(target, frame, false, now);
+            assert_eq!(
+                target.height(frame.amount) + offset,
+                source.height(frame.amount)
+            );
+            assert_eq!(compact, frame.amount);
+            assert!(reflow.active());
+
+            now += std::time::Duration::from_millis(16);
+            let (offset, _) = reflow.sample(target, frame, false, now);
+            let painted = target.height(frame.amount) + offset;
+            assert!((painted - source.height(frame.amount)).abs() < 5.0);
+            // Reverse both route and wrapping before the correction has settled.
+            frame.docked = !docked;
+            let (offset, _) = reflow.sample(source, frame, false, now);
+            assert!((source.height(frame.amount) + offset - painted).abs() < 0.001);
+            frame.amount = if frame.docked { 1.0 } else { 0.0 };
+            frame.active = false;
+            for _ in 0..120 {
+                now += std::time::Duration::from_millis(16);
+                reflow.sample(source, frame, false, now);
+            }
+            assert!(!reflow.active());
+            assert_eq!(reflow.sample(source, frame, false, now).0, 0.0);
+        }
+    }
+
+    #[test]
+    fn reflow_coordinates_wrapped_text_height_and_compact_controls() {
+        let mut reflow = DockReflow::default();
+        let mut now = Instant::now();
+        let short = DockLayout {
+            extra_height: 0.0,
+            ..attachment_layout(768.0)
+        };
+        let multiline = DockLayout {
+            hero_height: 150.0,
+            thread_height: 134.0,
+            compact: false,
+            ..short
+        };
+        let mut frame = DockFrame::settled(true);
+        frame.amount = 0.7;
+        frame.active = true;
+        reflow.sample(short, frame, false, now);
+        let (offset, compact) = reflow.sample(multiline, frame, false, now);
+        assert!(
+            (multiline.height(frame.amount) + offset - short.height(frame.amount)).abs() < 0.001
+        );
+        assert_eq!(
+            compact, 0.7,
+            "the selector must not jump to the left when mode changes"
+        );
+        frame.amount = 1.0;
+        frame.active = false;
+        for _ in 0..120 {
+            now += std::time::Duration::from_millis(16);
+            reflow.sample(multiline, frame, false, now);
+        }
+        assert_eq!(reflow.sample(multiline, frame, false, now), (0.0, 0.0));
+        assert!(!reflow.active());
+    }
+
+    #[test]
+    fn reflow_snaps_for_hidden_panels_and_reduced_motion_and_leaves_idle_resizes_alone() {
+        let source = attachment_layout(768.0);
+        let target = attachment_layout(592.0);
+        let now = Instant::now();
+        for (active, hidden, reduced) in [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let mut reflow = DockReflow::default();
+            let mut frame = DockFrame::settled(true);
+            frame.active = active;
+            reflow.sample(source, frame, false, now);
+            frame.snap_reflow = hidden;
+            assert_eq!(reflow.sample(target, frame, reduced, now).0, 0.0);
+            assert!(!reflow.active());
+        }
+        let mut reflow = DockReflow::default();
+        let mut frame = DockFrame::settled(true);
+        frame.active = true;
+        reflow.sample(source, frame, false, now);
+        reflow.sample(target, frame, false, now);
+        assert!(reflow.active());
+        assert_eq!(reflow.sample(target, frame, true, now).0, 0.0);
+        assert!(!reflow.active());
+    }
 
     #[test]
     fn panel_handoff_hides_background_during_geometry_switch_in_both_sidebar_states() {

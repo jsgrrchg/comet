@@ -4130,6 +4130,7 @@ pub struct Composer {
     model_handoff_morph: Option<FlipMorph>,
     model_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     dock_frame: Option<crate::composer_dock::DockFrame>,
+    dock_reflow: crate::composer_dock::DockReflow,
     /// The shared clock owns this frame's height, including its final step.
     dock_height_changed: bool,
     dock_clearance_correction: f32,
@@ -4333,6 +4334,7 @@ impl Composer {
             model_handoff_morph: None,
             model_bounds: Default::default(),
             dock_frame: None,
+            dock_reflow: Default::default(),
             dock_height_changed: false,
             dock_clearance_correction: 0.0,
             surface_bounds: Default::default(),
@@ -5753,6 +5755,11 @@ impl Composer {
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
+            if !key.is_empty() && !self.current_key.is_empty() {
+                // Switching between established chats still snaps to the new
+                // draft; a tail from a hero transition belongs to its old chat.
+                self.dock_reflow = Default::default();
+            }
             let new_thread_launch =
                 self.launching_new_chat && self.current_key.is_empty() && !key.is_empty();
             let returning_to_new_thread = !self.current_key.is_empty() && key.is_empty();
@@ -7241,19 +7248,21 @@ impl Render for Composer {
             .route_snap_until
             .is_some_and(|until| Instant::now() < until);
         let dock_height_changed = std::mem::take(&mut self.dock_height_changed);
-        self.flip_morph =
-            if dock_height_changed || self.dock_frame.is_some_and(|frame| frame.active) {
-                None
-            } else {
-                flip_morph_step(
-                    self.flip_morph,
-                    committed_flip && !new_chat,
-                    self.last_rendered_height,
-                    now_ms,
-                    motion::reduced_motion(cx),
-                    route_snap,
-                )
-            };
+        self.flip_morph = if dock_height_changed
+            || self.dock_frame.is_some_and(|frame| frame.active)
+            || self.dock_reflow.active()
+        {
+            None
+        } else {
+            flip_morph_step(
+                self.flip_morph,
+                committed_flip && !new_chat,
+                self.last_rendered_height,
+                now_ms,
+                motion::reduced_motion(cx),
+                route_snap,
+            )
+        };
         let expanded = self.expanded_mode;
 
         // Chat-scoped failures render only under their own chat; a global
@@ -7405,16 +7414,17 @@ impl Render for Composer {
         let session_expanded = expanded;
         let expanded = expanded || new_chat;
         let dock_amount = self.dock_frame.map_or(0.0, |frame| frame.amount);
-        let dock_height = |amount: f32| {
-            let hero = composer_total_height(content_height);
-            let session = if session_expanded {
+        let mut dock_layout = crate::composer_dock::DockLayout {
+            hero_height: composer_total_height(content_height),
+            thread_height: if session_expanded {
                 (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN - 16.0, TEXTAREA_MAX)
                     + ACTIONS_ROW_HEIGHT
                     + PILL_BORDER_V
             } else {
                 COMPACT_TOTAL_HEIGHT
-            };
-            motion::lerp(hero, session, amount)
+            },
+            extra_height: 0.0,
+            compact: !session_expanded,
         };
 
         // Committed-height morph: the layout below is already the NEW mode's;
@@ -7432,7 +7442,7 @@ impl Render for Composer {
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
         let base_height = if self.dock_frame.is_some() {
-            dock_height(dock_amount)
+            dock_layout.height(dock_amount)
         } else if expanded {
             composer_total_height(content_height)
         } else {
@@ -7440,6 +7450,15 @@ impl Render for Composer {
         };
         let target_height =
             base_height + strip_h + appshot_strip_height(appshot_count) + comment_strip_h;
+        dock_layout.extra_height = strip_h + appshot_strip_height(appshot_count) + comment_strip_h;
+        let dock_owns_layout = self.dock_frame.is_some_and(|frame| frame.active)
+            || dock_height_changed
+            || self.dock_reflow.active();
+        let (reflow_height, dock_compact_amount) =
+            self.dock_frame.map_or((0.0, dock_amount), |frame| {
+                self.dock_reflow
+                    .sample(dock_layout, frame, motion::reduced_motion(cx), now)
+            });
         let coordinated_route_morph = self
             .flip_morph
             .filter(|m| m.spec == motion::NEW_THREAD_TRANSITION && !m.done(now_ms));
@@ -7463,26 +7482,26 @@ impl Render for Composer {
             || route_chrome_opacities(new_thread_chrome),
             |frame| (frame.selectors(), frame.footer()),
         );
-        self.height_morph =
-            if dock_height_changed || self.dock_frame.is_some_and(|frame| frame.active) {
-                None
-            } else if coordinated_route_morph.is_some() {
-                coordinated_route_morph
-            } else {
-                flip_morph_step(
-                    self.height_morph,
-                    (target_height - self.last_target_height).abs() > 0.5,
-                    self.last_rendered_height,
-                    now_ms,
-                    motion::reduced_motion(cx),
-                    route_snap,
-                )
-            };
+        self.height_morph = if dock_owns_layout {
+            None
+        } else if coordinated_route_morph.is_some() {
+            coordinated_route_morph
+        } else {
+            flip_morph_step(
+                self.height_morph,
+                (target_height - self.last_target_height).abs() > 0.5,
+                self.last_rendered_height,
+                now_ms,
+                motion::reduced_motion(cx),
+                route_snap,
+            )
+        };
         self.last_target_height = target_height;
         let pill_height = self
             .height_morph
-            .map_or(target_height, |m| m.height(target_height, now_ms));
-        if self.height_morph.is_some() {
+            .map_or(target_height, |m| m.height(target_height, now_ms))
+            + reflow_height;
+        if self.height_morph.is_some() || self.dock_reflow.active() {
             window.request_animation_frame();
         }
         let (_, morph_t, morphing) = match self.flip_morph {
@@ -7499,24 +7518,19 @@ impl Render for Composer {
         }
         self.last_rendered_height = pill_height;
         self.dock_clearance_correction = self.dock_frame.map_or(0.0, |frame| {
-            dock_height(if frame.docked { 1.0 } else { 0.0 })
-                + strip_h
-                + appshot_strip_height(appshot_count)
-                + comment_strip_h
-                - pill_height
+            dock_layout.height(if frame.docked { 1.0 } else { 0.0 }) - pill_height
         });
         // Route morphs use the dock's reversible clock; typing flips keep
         // their existing local clock once the composer reaches its dock.
-        let layout_morph_t =
-            if self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded {
-                if expanded {
-                    1.0 - dock_amount
-                } else {
-                    dock_amount
-                }
+        let layout_morph_t = if dock_owns_layout {
+            if expanded {
+                1.0 - dock_compact_amount
             } else {
-                morph_t
-            };
+                dock_compact_amount
+            }
+        } else {
+            morph_t
+        };
         let text_pt = morph_text_pad(layout_morph_t);
         let surface_radius = COMPOSER_RADIUS - 4.0 * dock_amount;
         let route_to_single_line =
@@ -7549,7 +7563,7 @@ impl Render for Composer {
             } else {
                 INPUT_LINE_HEIGHT
             };
-            let resizing = self.height_morph.is_some();
+            let resizing = self.height_morph.is_some() || self.dock_reflow.active();
             let top_padding = if expanded { text_pt } else { 0.0 };
             if input.viewport_height != Some(height)
                 || input.settled_viewport_height != Some(settled_height)
@@ -7645,18 +7659,17 @@ impl Render for Composer {
             self.model_handoff_morph = self.flip_morph;
         }
         let compact_target = if expanded { 0.0 } else { 1.0 };
-        self.model_handoff_position =
-            if self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded {
-                dock_amount
-            } else {
-                self.flip_morph.map_or(compact_target, |morph| {
-                    motion::lerp(
-                        self.model_handoff_from,
-                        compact_target,
-                        motion::EASE_IN_OUT.eval(morph.raw(now_ms)),
-                    )
-                })
-            };
+        self.model_handoff_position = if dock_owns_layout {
+            dock_compact_amount
+        } else {
+            self.flip_morph.map_or(compact_target, |morph| {
+                motion::lerp(
+                    self.model_handoff_from,
+                    compact_target,
+                    motion::EASE_IN_OUT.eval(morph.raw(now_ms)),
+                )
+            })
+        };
         // The shell supplies this frame's animated width before rendering us.
         // Measured bounds still belong to the previous frame here; using them
         // would add the per-frame width delta to the model selector's glide.
@@ -7767,8 +7780,8 @@ impl Render for Composer {
             // its expanded resting place via a decaying relative offset, and
             // attachment/Send hold their spots (4.5px centering delta gliding
             // in), with the model handoff sharing that same timeline.
-            let text_glide = if self.dock_frame.is_some_and(|frame| frame.active) {
-                collapse_text_glide(dock_height(0.0), dock_amount)
+            let text_glide = if dock_owns_layout {
+                collapse_text_glide(dock_layout.hero_height, dock_compact_amount)
             } else {
                 match self.flip_morph {
                     Some(m) if morphing => collapse_text_glide(m.from, morph_t),
@@ -8105,6 +8118,145 @@ mod tests {
             assert!(drift.abs() <= 6.0);
             assert!(side == 0.0 || side == 1.0);
         }
+    }
+
+    #[gpui::test]
+    fn dock_reflow_paints_attachment_wrap_without_a_height_jump(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF1cAAAAASUVORK5CYII=").unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("chat".into()));
+                composer.on_state_changed(cx);
+                composer.attachments.insert(
+                    composer.current_key.clone(),
+                    (0..10)
+                        .map(|i| {
+                            attachments::stage_png_bytes(format!("image-{i}.png"), png.clone())
+                        })
+                        .collect(),
+                );
+                composer.set_available_width(698.0, cx);
+                composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Hi", cx));
+            })
+            .unwrap();
+        let mut frame = crate::composer_dock::DockFrame::settled(true);
+        frame.active = true;
+        frame.amount = 0.4;
+        handle
+            .update(cx, |composer, _, cx| composer.set_dock_frame(frame, cx))
+            .unwrap();
+        let before = handle
+            .read_with(cx, |composer, _| composer.last_rendered_height)
+            .unwrap();
+        // Both widths are within the same route frame: only the thumbnail row
+        // changes. Inspect before GPUI's automatic follow-up paints can hide it.
+        cx.update(|cx| {
+            handle
+                .update(cx, |composer, _, cx| {
+                    composer.set_available_width(697.0, cx)
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            })
+            .unwrap();
+            handle
+                .read_with(cx, |composer, cx| {
+                    assert_eq!(composer.staged().len(), 10);
+                    assert_eq!(attachment_strip_height(10, 698.0 - 34.0), 68.0);
+                    assert_eq!(attachment_strip_height(10, 697.0 - 34.0), 132.0);
+                    let surface = composer.surface_bounds.get().unwrap();
+                    assert!(
+                        (f32::from(surface.size.height) - before).abs() <= 1.0,
+                        "attachment reflow jumped from {before} to {:?}",
+                        surface.size.height
+                    );
+                    assert!(composer.dock_reflow.active());
+                    assert!(composer.height_morph.is_none());
+                    assert!(
+                        (composer.last_rendered_height + composer.dock_clearance_correction
+                            - (COMPACT_TOTAL_HEIGHT + 132.0))
+                            .abs()
+                            < 0.1,
+                        "transcript clearance must reserve the destination height"
+                    );
+                    assert_eq!(composer.input.read(cx).text(), "Hi");
+                })
+                .unwrap();
+        });
+    }
+
+    #[gpui::test]
+    fn dock_reflow_keeps_text_growth_and_model_controls_continuous(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("chat".into()));
+                composer.on_state_changed(cx);
+                composer.set_available_width(592.0, cx);
+                composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Hi", cx));
+            })
+            .unwrap();
+        let mut frame = crate::composer_dock::DockFrame::settled(true);
+        frame.active = true;
+        frame.amount = 0.7;
+        handle
+            .update(cx, |composer, _, cx| composer.set_dock_frame(frame, cx))
+            .unwrap();
+        let (before, model_before) = handle
+            .read_with(cx, |composer, _| {
+                (
+                    composer.last_rendered_height,
+                    composer.model_bounds.get().unwrap().left(),
+                )
+            })
+            .unwrap();
+        cx.update(|cx| {
+            handle
+                .update(cx, |composer, _, cx| {
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text("One\nTwo\nThree\nFour", cx));
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            })
+            .unwrap();
+            handle
+                .read_with(cx, |composer, _| {
+                    assert!(composer.expanded_mode);
+                    assert!(composer.dock_reflow.active());
+                    assert!(composer.flip_morph.is_none());
+                    assert!(
+                        (composer.last_rendered_height - before).abs() <= 1.0,
+                        "text growth jumped from {before} to {}",
+                        composer.last_rendered_height
+                    );
+                    assert!((composer.model_handoff_position - 0.7).abs() < 0.001);
+                    assert!(
+                        (f32::from(composer.model_bounds.get().unwrap().left() - model_before))
+                            .abs()
+                            <= 1.0,
+                        "model selector jumped on the compact/expanded commit"
+                    );
+                })
+                .unwrap();
+        });
     }
 
     #[gpui::test]

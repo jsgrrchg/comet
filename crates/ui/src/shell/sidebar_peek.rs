@@ -1,7 +1,7 @@
 //! Transient sidebar presentation. None of this state is persisted.
 use super::*;
 
-pub(super) const EDGE: f32 = 8.0;
+pub(super) const EDGE: f32 = 14.0;
 const LEAVE_SLOP: f32 = 12.0;
 const OPEN_DELAY: Duration = Duration::from_millis(120);
 const CLOSE_DELAY: Duration = Duration::from_millis(300);

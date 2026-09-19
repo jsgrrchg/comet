@@ -297,7 +297,8 @@ impl Shell {
                 ),
             );
         // Priority zero is above native browser content and below menus (1)
-        // and dialogs (2). Only the panel/edge hitboxes intercept native input.
+        // and dialogs (2). Mount this native input overlay only during peek;
+        // idle controls must stay in the base scene so the page keeps input.
         gpui::deferred(
             div()
                 .absolute()

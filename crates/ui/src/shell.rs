@@ -10992,20 +10992,23 @@ impl Render for Shell {
                             ),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
-                    .when(self.settings.sidebar_collapsed, |el| {
-                        // Invisible intent strip. Deferred also receives pointer
-                        // events over a native browser in takeover mode.
-                        el.child(gpui::deferred(
-                            div()
-                                .id("sidebar-peek-edge")
-                                .absolute()
-                                .left_0()
-                                .top(px(Theme::TITLEBAR_HEIGHT))
-                                .bottom_0()
-                                .w(px(sidebar_peek::EDGE))
-                                .occlude(),
-                        ))
-                    })
+                    .when(
+                        self.settings.sidebar_collapsed && settings::sidebar_hover_enabled(cx),
+                        |el| {
+                            // Invisible intent strip. Deferred also receives pointer
+                            // events over a native browser in takeover mode.
+                            el.child(gpui::deferred(
+                                div()
+                                    .id("sidebar-peek-edge")
+                                    .absolute()
+                                    .left_0()
+                                    .top(px(Theme::TITLEBAR_HEIGHT))
+                                    .bottom_0()
+                                    .w(px(sidebar_peek::EDGE))
+                                    .occlude(),
+                            ))
+                        },
+                    )
                     .when(self.sidebar_peek_mounted(), |el| {
                         el.child(self.render_sidebar_peek(cx))
                     })
@@ -11013,7 +11016,8 @@ impl Render for Shell {
                     // surface, while menus/dialogs retain their higher priority.
                     .child(gpui::deferred(self.render_titlebar_cluster(cx)))
                     .when(
-                        self.settings.sidebar_collapsed || self.sidebar_peek_mounted(),
+                        (self.settings.sidebar_collapsed && settings::sidebar_hover_enabled(cx))
+                            || self.sidebar_peek_mounted(),
                         |el| el.child(self.sidebar_peek_pointer_observer(cx)),
                     )
                     .children(overlays);

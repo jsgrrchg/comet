@@ -90,7 +90,8 @@ impl Shell {
             || self.sync_flow.has_visible_overlay()
             || self.sync_flow == SyncFlow::SignedOutRestartRequired;
         PeekInput {
-            enabled: self.settings.sidebar_collapsed
+            enabled: settings::sidebar_hover_enabled(cx)
+                && self.settings.sidebar_collapsed
                 && !self.tween_active(self.sidebar_tween)
                 && window.is_window_active()
                 && !modal
@@ -513,6 +514,31 @@ mod tests {
         cx.simulate_mouse_move(chat, None, gpui::Modifiers::default());
         advance(cx, CLOSE_DELAY);
         shell.read_with(cx, |shell, _| assert!(!shell.sidebar_peek.open));
+    }
+
+    #[gpui::test]
+    fn sidebar_hover_opt_out_cancels_pending_and_open_peeks_and_persists(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| settings::init(UiSettings::default(), dir.path(), cx));
+        let (shell, cx) = setup(cx);
+        let edge = gpui::point(px(3.0), px(150.0));
+        cx.simulate_mouse_move(edge, None, Default::default());
+        advance(cx, OPEN_DELAY / 2);
+        cx.update(|_, cx| settings::set_sidebar_hover_enabled(false, cx));
+        advance(cx, OPEN_DELAY * 2);
+        shell.read_with(cx, |shell, _| assert!(!shell.sidebar_peek.open));
+
+        cx.update(|_, cx| settings::set_sidebar_hover_enabled(true, cx));
+        advance(cx, OPEN_DELAY);
+        shell.read_with(cx, |shell, _| assert!(shell.sidebar_peek.open));
+        cx.update(|_, cx| settings::set_sidebar_hover_enabled(false, cx));
+        advance(cx, CLOSE_DELAY);
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.sidebar_peek.open);
+            assert!(shell.settings.sidebar_collapsed);
+        });
+        cx.update(|_, cx| settings::flush(cx));
+        assert!(!UiSettings::load(dir.path()).sidebar_hover_enabled);
     }
 
     #[gpui::test]

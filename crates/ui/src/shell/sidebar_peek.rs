@@ -226,6 +226,12 @@ impl Shell {
         let progress = self.sidebar_peek_progress();
         let theme = Theme::of(cx);
         let width = self.settings.sidebar_width;
+        let shadow_alpha = progress
+            * if theme.appearance.is_dark() {
+                0.18
+            } else {
+                0.10
+            };
         // The same tint/blur as contextual menus, extending behind the native
         // traffic lights. Only the content is inset below the titlebar; the
         // surface itself is flush with all three window edges.
@@ -241,7 +247,6 @@ impl Shell {
             .border_r_1()
             .border_color(theme.border)
             .bg(popover::surface_bg(theme))
-            .when(!theme.is_frost(), |el| el.shadow_lg())
             .child(
                 div()
                     .size_full()
@@ -269,7 +274,23 @@ impl Shell {
                 .top_0()
                 .bottom_0()
                 .w(px(width))
-                .child(crate::frost::frosted(0.0, crate::frost::MENU_BLUR, panel)),
+                .child(crate::frost::frosted(0.0, crate::frost::MENU_BLUR, panel))
+                // Keep the shadow outside the glass: a filled drop shadow
+                // behind the panel would darken its translucent surface.
+                // Follow the painted edge and fade with the reveal tween.
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(width * progress))
+                        .top_0()
+                        .bottom_0()
+                        .w(px(12.0))
+                        .bg(gpui::linear_gradient(
+                            90.0,
+                            gpui::linear_color_stop(gpui::black().opacity(shadow_alpha), 0.0),
+                            gpui::linear_color_stop(gpui::black().opacity(0.0), 1.0),
+                        )),
+                ),
         )
         .into_any_element()
     }

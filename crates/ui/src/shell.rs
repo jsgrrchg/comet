@@ -7797,6 +7797,7 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.sidebar_peek_key_down(event, window, cx);
         if event.keystroke.key == "escape" && self.sidebar_session_transfer.is_some() {
             cx.stop_active_drag(window);
             self.cancel_sidebar_session_transfer(cx);

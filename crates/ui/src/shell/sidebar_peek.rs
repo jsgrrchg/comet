@@ -17,6 +17,8 @@ pub(super) struct SidebarPeek {
     suppressed: bool,
     pointer_inside: bool,
     pressed: bool,
+    /// Pointer clicks can leave focus behind; only keyboard use retains it.
+    keyboard_focus: bool,
     /// Keep the floating presentation while the pinned layout catches up.
     handoff: bool,
 }
@@ -45,6 +47,7 @@ impl Shell {
         self.sidebar_peek.pending = None;
         self.sidebar_peek.task = None;
         self.sidebar_peek.pressed = false;
+        self.sidebar_peek.keyboard_focus = false;
         self.sidebar_peek.pointer_inside = false;
         self.set_sidebar_peek(false, cx);
     }
@@ -100,7 +103,12 @@ impl Shell {
                 && x >= 0.0
                 && x <= self.settings.sidebar_width * self.sidebar_peek_progress() + LEAVE_SLOP,
             held: self.sidebar_peek_menu_open()
-                || self.sidebar_peek_focus.contains_focused(window, cx),
+                || (self.sidebar_peek_focus.contains_focused(window, cx)
+                    && (self.sidebar_peek.keyboard_focus
+                        || window
+                            .context_stack()
+                            .iter()
+                            .any(|context| context.contains("Composer")))),
             busy: self.sidebar_peek.pressed
                 || cx.has_active_drag()
                 || self.pane_resize_dragging.is_some(),
@@ -111,7 +119,27 @@ impl Shell {
         if self.sidebar_peek.open != open {
             let from = self.sidebar_peek_progress();
             self.sidebar_peek.open = open;
+            if !open {
+                self.sidebar_peek.keyboard_focus = false;
+            }
             self.sidebar_peek.tween = Some(WidthTween::new(from, if open { 1.0 } else { 0.0 }));
+            cx.notify();
+        }
+    }
+
+    pub(super) fn sidebar_peek_key_down(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Capture before child controls consume navigation. Tab may enter the
+        // sidebar later in this dispatch; the hold still requires focus inside.
+        if self.sidebar_peek.open
+            && (event.keystroke.key == "tab"
+                || self.sidebar_peek_focus.contains_focused(window, cx))
+        {
+            self.sidebar_peek.keyboard_focus = true;
             cx.notify();
         }
     }
@@ -332,6 +360,7 @@ impl Shell {
                         pressing
                             .update(cx, |this, cx| {
                                 this.sidebar_peek.pressed = true;
+                                this.sidebar_peek.keyboard_focus = false;
                                 this.sidebar_peek.pointer_inside = true;
                                 this.reconcile_sidebar_peek(window, cx);
                             })
@@ -376,6 +405,10 @@ mod tests {
                 shell.reconcile_sidebar_peek(window, cx);
                 div()
                     .size_full()
+                    .track_focus(&shell.sidebar_peek_focus)
+                    .capture_key_down(cx.listener(|shell, event, window, cx| {
+                        shell.sidebar_peek_key_down(event, window, cx);
+                    }))
                     .child(shell.sidebar_peek_pointer_observer(cx))
             })
         }
@@ -483,6 +516,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn sidebar_peek_click_focus_does_not_hold_but_keyboard_focus_does(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        let edge = gpui::point(px(3.0), px(150.0));
+        let chat = gpui::point(px(650.0), px(150.0));
+        cx.simulate_mouse_move(edge, None, Default::default());
+        advance(cx, OPEN_DELAY);
+        cx.simulate_click(edge, Default::default());
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| window.focus(&shell.sidebar_peek_focus, cx));
+        });
+        cx.simulate_mouse_move(chat, None, Default::default());
+        advance(cx, CLOSE_DELAY);
+        shell.read_with(cx, |shell, _| assert!(!shell.sidebar_peek.open));
+
+        cx.simulate_mouse_move(edge, None, Default::default());
+        advance(cx, OPEN_DELAY);
+        cx.simulate_keystrokes("down");
+        cx.simulate_mouse_move(chat, None, Default::default());
+        advance(cx, CLOSE_DELAY * 2);
+        shell.read_with(cx, |shell, _| assert!(shell.sidebar_peek.open));
+
+        // Returning to pointer interaction releases the keyboard hold even
+        // when the clicked control leaves the same focus handle in place.
+        cx.simulate_click(edge, Default::default());
+        cx.simulate_mouse_move(chat, None, Default::default());
+        advance(cx, CLOSE_DELAY);
+        shell.read_with(cx, |shell, _| assert!(!shell.sidebar_peek.open));
+    }
+
+    #[gpui::test]
     fn sidebar_peek_drag_across_edge_does_not_open_and_exit_cancels(cx: &mut TestAppContext) {
         let (shell, cx) = setup(cx);
         let edge = gpui::point(px(3.0), px(150.0));
@@ -578,8 +641,9 @@ mod tests {
                 let settings = shell.settings.clone();
                 shell.set_sidebar_peek(true, cx);
                 let opening = shell.sidebar_peek.tween.unwrap();
-                shell.render_time =
-                    Some(opening.started + PEEK_MOTION.total().mul_f32(motion::speed_scale() * 0.5));
+                shell.render_time = Some(
+                    opening.started + PEEK_MOTION.total().mul_f32(motion::speed_scale() * 0.5),
+                );
                 let visible = shell.sidebar_peek_progress();
                 assert!(visible > 0.0 && visible < 1.0);
                 shell.set_sidebar_peek(false, cx);

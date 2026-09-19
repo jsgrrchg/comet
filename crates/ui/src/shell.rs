@@ -5008,19 +5008,28 @@ impl Shell {
     /// schedules the next animation frame. Finished, stale, absent, or under
     /// reduced motion: exactly `target`. Honors `ZERON_MOTION_SCALE`.
     fn eval_tween(&self, tween: Option<WidthTween>, target: f32) -> f32 {
+        self.eval_tween_with_spec(tween, target, RESIZE)
+    }
+
+    fn eval_tween_with_spec(
+        &self,
+        tween: Option<WidthTween>,
+        target: f32,
+        spec: motion::MotionSpec,
+    ) -> f32 {
         let Some(WidthTween { from, to, started }) = tween else {
             return target;
         };
         if self.reduced_motion {
             return target;
         }
-        let total = RESIZE.total().mul_f32(motion::speed_scale());
+        let total = spec.total().mul_f32(motion::speed_scale());
         let raw = self.tween_elapsed(started).as_secs_f32() / total.as_secs_f32();
         if raw >= 1.0 {
             return target;
         }
         self.motion_active.set(true);
-        motion::lerp(from, to, RESIZE.progress(raw))
+        motion::lerp(from, to, spec.progress(raw))
     }
 
     fn eval_resize_edge_bounce(

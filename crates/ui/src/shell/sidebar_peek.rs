@@ -5,6 +5,7 @@ pub(super) const EDGE: f32 = 8.0;
 const LEAVE_SLOP: f32 = 12.0;
 const OPEN_DELAY: Duration = Duration::from_millis(120);
 const CLOSE_DELAY: Duration = Duration::from_millis(300);
+const PEEK_MOTION: motion::MotionSpec = motion::MotionSpec::new(120, motion::EASE_OUT);
 
 #[derive(Default)]
 pub(super) struct SidebarPeek {
@@ -49,9 +50,10 @@ impl Shell {
     }
 
     fn sidebar_peek_progress(&self) -> f32 {
-        self.eval_tween(
+        self.eval_tween_with_spec(
             self.sidebar_peek.tween,
             if self.sidebar_peek.open { 1.0 } else { 0.0 },
+            PEEK_MOTION,
         )
     }
 
@@ -577,7 +579,7 @@ mod tests {
                 shell.set_sidebar_peek(true, cx);
                 let opening = shell.sidebar_peek.tween.unwrap();
                 shell.render_time =
-                    Some(opening.started + RESIZE.total().mul_f32(motion::speed_scale() * 0.5));
+                    Some(opening.started + PEEK_MOTION.total().mul_f32(motion::speed_scale() * 0.5));
                 let visible = shell.sidebar_peek_progress();
                 assert!(visible > 0.0 && visible < 1.0);
                 shell.set_sidebar_peek(false, cx);

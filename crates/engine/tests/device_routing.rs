@@ -194,33 +194,33 @@ fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine assembles")
 }
 
+async fn git(cwd: &std::path::Path, args: &[&str]) {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .env("GIT_AUTHOR_NAME", "test")
+        .env("GIT_AUTHOR_EMAIL", "test@test")
+        .env("GIT_COMMITTER_NAME", "test")
+        .env("GIT_COMMITTER_EMAIL", "test@test")
+        .output()
+        .await
+        .expect("git spawns");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
 async fn init_workspace_repo(path: &std::path::Path) {
     std::fs::create_dir_all(path.join("src")).expect("repo tree");
-    let run = |args: &'static [&'static str]| async move {
-        let output = tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .env("GIT_AUTHOR_NAME", "test")
-            .env("GIT_AUTHOR_EMAIL", "test@test")
-            .env("GIT_COMMITTER_NAME", "test")
-            .env("GIT_COMMITTER_EMAIL", "test@test")
-            .output()
-            .await
-            .expect("git spawns");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    run(&["init", "-b", "main"]).await;
+    git(path, &["init", "-b", "main"]).await;
     std::fs::write(
         path.join("src/remote.rs"),
         "pub const REMOTE: bool = true;\n",
     )
     .expect("remote source");
-    run(&["add", "."]).await;
-    run(&["commit", "-m", "initial"]).await;
+    git(path, &["add", "."]).await;
+    git(path, &["commit", "-m", "initial"]).await;
 }
 
 struct StaticChangeRequestLookup {
@@ -383,24 +383,6 @@ fn assert_public_change_request_payload(item: &serde_json::Value) {
     let payload = item.to_string();
     assert!(!payload.contains("ios-token"));
     assert!(!payload.to_ascii_lowercase().contains("stderr"));
-}
-
-async fn git(cwd: &std::path::Path, args: &[&str]) {
-    let output = tokio::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_AUTHOR_NAME", "test")
-        .env("GIT_AUTHOR_EMAIL", "test@test")
-        .env("GIT_COMMITTER_NAME", "test")
-        .env("GIT_COMMITTER_EMAIL", "test@test")
-        .output()
-        .await
-        .expect("git spawns");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 // ---------------------------------------------------------------------------

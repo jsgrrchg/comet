@@ -38,7 +38,7 @@ const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 
 struct LiveTerminal {
-    // Keep the private script alive until the shell exits or the tab is closed.
+    // Keep the private action script alive until the shell exits or the tab is closed.
     initial_script: Option<tempfile::NamedTempFile>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
@@ -241,14 +241,24 @@ impl Terminals {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| shell.clone());
 
-        let mut initial_script = None;
-        let mut bootstrap = None;
         #[cfg(windows)]
-        if let Some(command) = command {
-            // ConPTY has no Unix canonical line buffer. Preserve interactive
-            // shell syntax and avoid imposing PowerShell script execution policy.
-            bootstrap = Some(format!("{command}\r"));
-        }
+        let (initial_script, bootstrap) = (None, command.map(|command| format!("{command}\r")));
+        #[cfg(not(windows))]
+        let (initial_script, bootstrap) = if let Some(command) = command {
+            let (suffix, source) = match shell_name.as_str() {
+                "fish" => (".fish", "source \"$ZERON_ACTION_SCRIPT\"\r"),
+                _ => (".sh", ". \"$ZERON_ACTION_SCRIPT\"\r"),
+            };
+            let mut script = tempfile::Builder::new()
+                .prefix("zeron-action-")
+                .suffix(suffix)
+                .tempfile()?;
+            script.write_all(command.as_bytes())?;
+            script.flush()?;
+            (Some(script), Some(source.to_string()))
+        } else {
+            (None, None)
+        };
 
         #[cfg(windows)]
         let (master, mut child) =
@@ -261,7 +271,9 @@ impl Terminals {
                 .openpty(clamp_size(cols, rows))
                 .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
             let mut cmd = CommandBuilder::new(&shell);
-            cmd.arg("-l"); // login shell — the user's real PATH/profile
+            if !cfg!(windows) {
+                cmd.arg("-l"); // login shell — the user's real PATH/profile
+            }
             cmd.cwd(cwd);
             cmd.env("TERM", "xterm-256color");
             cmd.env("COLORTERM", "truecolor");
@@ -269,20 +281,8 @@ impl Terminals {
             for (name, value) in environment {
                 cmd.env(name, value);
             }
-            if let Some(command) = command {
-                let (suffix, source) = match shell_name.as_str() {
-                    "fish" => (".fish", "source \"$ZERON_ACTION_SCRIPT\"\r"),
-                    _ => (".sh", ". \"$ZERON_ACTION_SCRIPT\"\r"),
-                };
-                let mut script = tempfile::Builder::new()
-                    .prefix("zeron-action-")
-                    .suffix(suffix)
-                    .tempfile()?;
-                script.write_all(command.as_bytes())?;
-                script.flush()?;
+            if let Some(script) = initial_script.as_ref() {
                 cmd.env("ZERON_ACTION_SCRIPT", script.path());
-                initial_script = Some(script);
-                bootstrap = Some(source.to_string());
             }
             let child = pair
                 .slave

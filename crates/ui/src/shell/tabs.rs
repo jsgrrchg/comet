@@ -230,23 +230,24 @@ impl Shell {
         };
         let row_gap = 8.0;
         let right_pad = self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET);
-        let open_controls_width = right_pane_open.then(|| {
+        let open_trailing_width = right_pane_open.then(|| {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
-            let gap_budget = if takeover { row_gap } else { row_gap * 2.0 };
+            let gap_budget = if takeover { row_gap } else { row_gap * 3.0 };
             let avail = self.viewport_width - row_left - right_pad - gap_budget;
-            ((right_now - right_pad).min(avail) - 28.0).max(0.0)
+            let animated_width = ((right_now - right_pad).min(avail) - 28.0).max(0.0);
+            animated_width + 28.0
         });
         let trailing_width = if on_canvas {
             0.0
         } else {
-            open_controls_width.unwrap_or(0.0) + 28.0
+            open_trailing_width.unwrap_or(28.0)
         };
         let available_titlebar_width =
             (self.viewport_width - row_left - right_pad - trailing_width - row_gap * 3.0).max(0.0);
 
         let trailing: Option<gpui::AnyElement> = if on_canvas {
             None
-        } else {
+        } else if let Some(trailing_width) = open_trailing_width {
             let mut controls = div()
                 .id("right-titlebar-controls")
                 .flex_none()
@@ -254,46 +255,58 @@ impl Shell {
                 .flex()
                 .flex_row()
                 .items_center();
-            if let Some(animated_width) = open_controls_width {
-                // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
-                // options live in the pane's own second row. Only the tabs and
-                // expand action animate; the open/close trigger stays fixed.
-                let tabs = self.render_right_tab_strip(cx);
-                controls = controls.child(
-                    div()
-                        .w(px(animated_width))
-                        .h_full()
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(4.0))
-                        .overflow_hidden()
-                        // 8 + the trigger's own 8px pad = the pane's 16px
-                        // text gutter. The 4px right padding is the stable
-                        // gap before the fixed toggle.
-                        .pl(px(8.0))
-                        .pr(px(4.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .h_full()
-                                .overflow_hidden()
-                                .child(tabs),
-                        )
-                        .child(header_icon_button(
-                            "expand-changes",
-                            right_pane_expand_icon(self.right_pane_expanded),
-                            &theme,
-                            cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
-                        )),
-                );
-            }
+            let tabs = self.render_right_tab_strip(cx);
+            controls = controls.child(
+                div()
+                    .w(px((trailing_width - 28.0).max(0.0)))
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .overflow_hidden()
+                    // 8 + the trigger's own 8px pad = the pane's 16px
+                    // text gutter. The 4px right padding is the stable
+                    // gap before the fixed toggle.
+                    .pl(px(8.0))
+                    .pr(px(4.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(tabs),
+                    )
+                    .child(header_icon_button(
+                        "expand-changes",
+                        right_pane_expand_icon(self.right_pane_expanded),
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
+                    )),
+            );
             // Keep the trigger mounted at one fixed position while the pane
             // controls reveal to its left.
             Some(
                 controls
+                    .child(header_icon_button(
+                        "toggle-changes",
+                        icons::SIDEBAR_MINIMALISTIC,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+                    ))
+                    .into_any_element(),
+            )
+        } else {
+            Some(
+                div()
+                    .id("right-titlebar-controls")
+                    .flex_none()
+                    .h_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
                     .child(header_icon_button(
                         "toggle-changes",
                         icons::SIDEBAR_MINIMALISTIC,
@@ -356,7 +369,6 @@ impl Shell {
                         .when_some(target, |el, target| {
                             el.child(
                                 div()
-                                    .flex_none()
                                     .min_w_0()
                                     .truncate()
                                     .text_size(crate::typography::ui_rems(12.0))

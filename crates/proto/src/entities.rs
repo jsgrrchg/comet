@@ -1279,6 +1279,28 @@ mod tests {
     }
 
     #[test]
+    fn create_worktree_outcome_accepts_legacy_reply_and_stays_flattened() {
+        let legacy = serde_json::json!({
+            "repoPath": "/repo",
+            "path": "/worktree",
+            "branch": "zeron/branch",
+            "name": "branch",
+            "checkoutId": "checkout",
+        });
+        let outcome: CreateWorktreeOutcome = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(outcome.worktree.path, "/worktree");
+        assert!(outcome.setup_action.is_none());
+        assert!(outcome.setup_error.is_none());
+
+        let encoded = serde_json::to_value(outcome).unwrap();
+        assert_eq!(encoded["path"], legacy["path"]);
+        assert!(encoded.get("worktree").is_none());
+        assert!(encoded.get("setupAction").is_none());
+        assert!(encoded.get("setupError").is_none());
+        assert!(serde_json::from_value::<Worktree>(encoded).is_ok());
+    }
+
+    #[test]
     fn workspace_file_requests_flatten_target_and_omit_options() {
         let request = ListWorkspaceDirectoryRequest {
             target: WorkspaceTarget {
@@ -1388,27 +1410,5 @@ mod tests {
             serde_json::from_value::<WorkspaceFileChanges>(value).unwrap(),
             changes
         );
-    }
-
-    #[test]
-    fn create_worktree_outcome_accepts_legacy_reply_and_stays_flattened() {
-        let legacy = serde_json::json!({
-            "repoPath": "/repo",
-            "path": "/worktree",
-            "branch": "zeron/branch",
-            "name": "branch",
-            "checkoutId": "checkout",
-        });
-        let outcome: CreateWorktreeOutcome = serde_json::from_value(legacy.clone()).unwrap();
-        assert_eq!(outcome.worktree.path, "/worktree");
-        assert!(outcome.setup_action.is_none());
-        assert!(outcome.setup_error.is_none());
-
-        let encoded = serde_json::to_value(outcome).unwrap();
-        assert_eq!(encoded["path"], legacy["path"]);
-        assert!(encoded.get("worktree").is_none());
-        assert!(encoded.get("setupAction").is_none());
-        assert!(encoded.get("setupError").is_none());
-        assert!(serde_json::from_value::<Worktree>(encoded).is_ok());
     }
 }

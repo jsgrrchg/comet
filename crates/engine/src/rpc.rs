@@ -155,6 +155,13 @@ struct RelayCommandParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct TakeProjectActionSetupParams {
+    chat_id: String,
+    command_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct QueueMessageParams {
     chat_id: String,
     text: String,
@@ -1047,6 +1054,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
+            | methods::TAKE_PROJECT_ACTION_SETUP
             | methods::WATCH_DOC_MESSAGES
             // The queue lives on the chat doc, and only its host may send from
             // it — same addressing as the command ledger next door.
@@ -1449,6 +1457,20 @@ impl RpcService for EngineRpc {
                     .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
+            }
+            methods::TAKE_PROJECT_ACTION_SETUP => {
+                let p: TakeProjectActionSetupParams = parse_params(params)?;
+                let outcome = self
+                    .project_actions
+                    .take_setup_handoff(&p.command_id, &p.chat_id);
+                match outcome {
+                    Some(outcome) => RpcReply::value(&serde_json::json!({
+                        "ready": true,
+                        "setupAction": outcome.setup_action,
+                        "setupError": outcome.setup_error,
+                    })),
+                    None => RpcReply::value(&serde_json::json!({ "ready": false })),
+                }
             }
             methods::RETRY_DELIVERY => {
                 let p: ChatParams = parse_params(params)?;
@@ -2523,33 +2545,44 @@ impl RpcService for EngineRpc {
             methods::LIST_PROJECT_ACTIONS => {
                 let p: ListProjectActionsParams = parse_params(params)?;
                 let space = self.local_project_action_space(&p.space_id)?;
-                let snapshot = self
-                    .project_actions
-                    .snapshot(&space.id, std::path::Path::new(&space.path))
-                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                let actions = self.project_actions.clone();
+                // Snapshots discover repository files; keep all filesystem work
+                // (including mutation persistence below) off the async worker.
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    actions.snapshot(&space.id, std::path::Path::new(&space.path))
+                })
+                .await
+                .map_err(|err| RpcError::Failed(err.to_string()))?
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
                 RpcReply::value(&snapshot)
             }
             methods::UPSERT_PROJECT_ACTION => {
                 let p: UpsertProjectActionParams = parse_params(params)?;
                 let space = self.local_project_action_space(&p.space_id)?;
-                let snapshot = self
-                    .project_actions
-                    .upsert(
+                let actions = self.project_actions.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    actions.upsert(
                         &space.id,
                         std::path::Path::new(&space.path),
                         p.action_id.as_deref(),
                         p.action,
                     )
-                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                })
+                .await
+                .map_err(|err| RpcError::Failed(err.to_string()))?
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
                 RpcReply::value(&snapshot)
             }
             methods::DELETE_PROJECT_ACTION => {
                 let p: DeleteProjectActionParams = parse_params(params)?;
                 let space = self.local_project_action_space(&p.space_id)?;
-                let snapshot = self
-                    .project_actions
-                    .delete(&space.id, std::path::Path::new(&space.path), &p.action_id)
-                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                let actions = self.project_actions.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    actions.delete(&space.id, std::path::Path::new(&space.path), &p.action_id)
+                })
+                .await
+                .map_err(|err| RpcError::Failed(err.to_string()))?
+                .map_err(|err| RpcError::Failed(err.to_string()))?;
                 RpcReply::value(&snapshot)
             }
             methods::RUN_PROJECT_ACTION => {

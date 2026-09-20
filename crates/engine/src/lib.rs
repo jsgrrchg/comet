@@ -256,7 +256,7 @@ impl EngineCore {
         doc_host.set_repos(repos.clone());
         let terminals = Terminals::new();
         let project_actions = ProjectActionsStore::open(profile.store_root())?;
-        doc_host.set_worktree_setup_services(project_actions.clone(), terminals.clone());
+        doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
         let previews = zeron_preview::PreviewService::new(
             profile.store_root().join("previews.json"),
             device_id.clone(),

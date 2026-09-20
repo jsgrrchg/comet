@@ -821,7 +821,10 @@ impl EngineRpc {
         if is_stream_method(method) {
             // Streams are unbounded by design (a quiet WATCH_* is healthy);
             // only unary calls below get the reply deadline.
-            if method == methods::WATCH_CHECKOUT_CHANGE_REQUEST {
+            if matches!(
+                method,
+                methods::WATCH_CHECKOUT_CHANGE_REQUEST | methods::WATCH_WORKSPACE_GIT_STATUS
+            ) {
                 let rx = match client.subscribe_checked(method, params).await {
                     Ok(rx) => rx,
                     Err(err) => {
@@ -1098,6 +1101,7 @@ fn forwardable(method: &str) -> bool {
             | methods::RUN_PROJECT_ACTION
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
+            | methods::WATCH_WORKSPACE_GIT_STATUS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::LIST_OPEN_CHANGE_REQUESTS
             | methods::GET_CHECKOUT_DIFF
@@ -1137,6 +1141,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_QUEUE
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
+            | methods::WATCH_WORKSPACE_GIT_STATUS
             | methods::WATCH_WORKSPACE_FILES
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::UPDATE_STATUS
@@ -1857,6 +1862,39 @@ impl RpcService for EngineRpc {
             methods::WATCH_CHECKOUT_DIFFS => {
                 Ok(RpcReply::Stream(watch_stream(self.diff_sync.watch_diffs())))
             }
+            methods::WATCH_WORKSPACE_GIT_STATUS => {
+                let request: zeron_proto::WatchWorkspaceFilesRequest = parse_params(params)?;
+                let workspace = self.workspace_files.resolve_target(&request.target).await?;
+                let rx = self.diff_sync.watch_git_statuses();
+                // Only this authorized checkout crosses the connection. None means
+                // unavailable, including plain folders and initial/restarting engines.
+                let stream = futures::stream::unfold(
+                    (rx, workspace.checkout_id, None, false),
+                    |(mut rx, checkout_id, mut previous, mut emitted)| async move {
+                        loop {
+                            if emitted {
+                                rx.changed().await.ok()?;
+                            }
+                            let next = rx
+                                .borrow_and_update()
+                                .iter()
+                                .find(|s| s.checkout_id == checkout_id)
+                                .cloned();
+                            if !emitted || previous != next {
+                                emitted = true;
+                                previous = next.clone();
+                                let value =
+                                    serde_json::to_value(zeron_proto::WorkspaceGitStatusFrame {
+                                        status: next,
+                                    })
+                                    .ok()?;
+                                return Some((value, (rx, checkout_id, previous, emitted)));
+                            }
+                        }
+                    },
+                );
+                Ok(RpcReply::Stream(stream.boxed()))
+            }
             methods::WATCH_CHECKOUT_CHANGE_REQUEST => {
                 let p: CheckoutChangeRequestParams = parse_params(params)?;
                 let cwd = self.change_request_root(&p.cwd).await?;
@@ -1869,12 +1907,18 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(stream.boxed()))
             }
             methods::LIST_OPEN_CHANGE_REQUESTS => {
-                let items = self
-                    .open_change_requests
-                    .list_authored_open()
-                    .await
-                    .map_err(change_request_rpc_error)?;
-                RpcReply::value(&items)
+                // Keep this personal-cut branch behind an allocation so adding
+                // it to upstream's already-large dispatcher does not inflate
+                // every RPC future past Tokio's default worker stack.
+                Box::pin(async move {
+                    let items = self
+                        .open_change_requests
+                        .list_authored_open()
+                        .await
+                        .map_err(change_request_rpc_error)?;
+                    RpcReply::value(&items)
+                })
+                .await
             }
             // One-shot scoped capture for the Changes pane: `branch` diffs the
             // working tree against merge-base(baseRef, HEAD); `turn` diffs the
@@ -2021,11 +2065,12 @@ impl RpcService for EngineRpc {
                         }
                     }
 
-                    let snapshot = self
-                        .diff_sync
-                        .discard_working_tree(&identity.id, &p.expected_checksum)
-                        .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let snapshot = Box::pin(
+                        self.diff_sync
+                            .discard_working_tree(&identity.id, &p.expected_checksum),
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                     RpcReply::value(&serde_json::json!({
                         "ok": true,
                         "checksum": snapshot.checksum,
@@ -2959,6 +3004,7 @@ mod tests {
         assert!(forwardable(methods::READ_WORKSPACE_IMAGE));
         assert!(forwardable(methods::WRITE_WORKSPACE_FILE));
         assert!(forwardable(methods::WATCH_WORKSPACE_FILES));
+        assert!(forwardable(methods::WATCH_WORKSPACE_GIT_STATUS));
         assert!(!is_stream_method(methods::LIST_WORKSPACE_DIRECTORY));
         assert!(!is_stream_method(methods::SEARCH_WORKSPACE_FILES));
         assert!(!is_stream_method(methods::READ_WORKSPACE_FILE));
@@ -2968,6 +3014,7 @@ mod tests {
         assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(forwardable(methods::LIST_OPEN_CHANGE_REQUESTS));
         assert!(!is_stream_method(methods::LIST_OPEN_CHANGE_REQUESTS));
+        assert!(is_stream_method(methods::WATCH_WORKSPACE_GIT_STATUS));
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —

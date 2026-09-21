@@ -8,6 +8,8 @@ publish.workspace = true
 [features]
 # Synthetic native protocol peer for subprocess tests; never part of a normal build.
 native-fixture = []
+# Explicit installer injection for integration tests; never enabled in the app.
+installer-fixture = []
 
 [[bin]]
 name = "harness-native-fixture"
@@ -30,6 +32,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+semver = "1"
 zip.workspace = true
 
 [target.'cfg(unix)'.dependencies]

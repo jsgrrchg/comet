@@ -33,9 +33,13 @@ pub const SIDEBAR_MIN: f32 = 224.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
-/// Right ("Changes") pane drag-resize floor and default (px). Its runtime
-/// maximum is the window space remaining after the left sidebar and the
-/// conversation's [`CHAT_PANEL_MIN`] reservation.
+/// Independent file explorer width preference and drag bounds (px).
+pub const FILES_PANEL_DEFAULT: f32 = 286.0;
+pub const FILES_PANEL_MIN: f32 = 220.0;
+pub const FILES_PANEL_MAX: f32 = 440.0;
+
+/// Surface pane floor and default (px). Runtime sizing also reserves space
+/// for the conversation and any docked file explorer.
 pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
 /// Minimum width retained for the conversation when the right pane is open.
@@ -517,8 +521,6 @@ fn flush_latest(cx: &mut App) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum SidebarOrganization {
-    /// Legacy persisted value. Project scope now belongs exclusively to the
-    /// project selector and is normalized to [`Self::InOneList`] on load.
     ByProject,
     ByDevice,
     #[default]
@@ -630,6 +632,9 @@ pub struct UiSettings {
     pub sidebar_sort: SidebarSort,
     /// Optional harness branding and repository metadata shown below each
     /// session title.
+    pub sidebar_show_project_label: bool,
+    pub sidebar_compact: bool,
+    pub sidebar_show_project_icon: bool,
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
@@ -637,6 +642,9 @@ pub struct UiSettings {
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
+    /// Last successfully launched Action per project in this viewport.
+    #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub last_project_action_by_space_id: std::collections::HashMap<String, String>,
     /// Open session tabs in visual order (drag-reorder edits in place).
     /// Device-local: a tab is a local viewport onto the synced session list —
     /// closing one never archives the session. Ids of archived/deleted chats
@@ -673,6 +681,7 @@ pub struct UiSettings {
     /// Suppress the banner while a Zeron window is focused (the chime covers
     /// the foreground case).
     pub notifications_background_only: bool,
+    pub files_panel_width: f32,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
@@ -762,10 +771,14 @@ impl Default for UiSettings {
             sidebar_grouped: false,
             sidebar_organization: SidebarOrganization::InOneList,
             sidebar_sort: SidebarSort::LastUpdated,
+            sidebar_show_project_label: true,
+            sidebar_compact: true,
+            sidebar_show_project_icon: true,
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
             last_space_id: None,
+            last_project_action_by_space_id: std::collections::HashMap::new(),
             open_tabs: None,
             space_filter: None,
             sidebar_pinned_session_ids_by_profile: HashMap::new(),
@@ -777,6 +790,7 @@ impl Default for UiSettings {
             sound_attention_enabled: true,
             notifications_enabled: true,
             notifications_background_only: true,
+            files_panel_width: FILES_PANEL_DEFAULT,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
@@ -1356,9 +1370,6 @@ impl UiSettings {
     pub fn clamped(mut self) -> Self {
         self.transcript_width = normalize_transcript_width(self.transcript_width);
         self.window_geometry = self.window_geometry.filter(|geometry| geometry.is_valid());
-        if self.sidebar_organization == SidebarOrganization::ByProject {
-            self.sidebar_organization = SidebarOrganization::InOneList;
-        }
         self.sidebar_width = clamp_or(
             self.sidebar_width,
             SIDEBAR_MIN,
@@ -1367,6 +1378,12 @@ impl UiSettings {
         );
         // The right pane has no persisted upper bound: its live drag clamps
         // against the current window, which is unavailable while loading.
+        self.files_panel_width = clamp_or(
+            self.files_panel_width,
+            FILES_PANEL_MIN,
+            FILES_PANEL_MAX,
+            FILES_PANEL_DEFAULT,
+        );
         self.right_pane_width = min_or(self.right_pane_width, RIGHT_PANE_MIN, RIGHT_PANE_DEFAULT);
         self.terminal_height = clamp_or(
             self.terminal_height,
@@ -2017,10 +2034,17 @@ mod tests {
             sidebar_grouped: true,
             sidebar_organization: SidebarOrganization::ByDevice,
             sidebar_sort: SidebarSort::Created,
+            sidebar_compact: true,
+            sidebar_show_project_icon: false,
+            sidebar_show_project_label: false,
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
             last_space_id: Some("space-1".into()),
+            last_project_action_by_space_id: std::collections::HashMap::from([(
+                "space-1".into(),
+                "dev".into(),
+            )]),
             open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
             space_filter: Some("space-1".into()),
             sidebar_pinned_session_ids_by_profile: HashMap::from([
@@ -2044,6 +2068,7 @@ mod tests {
             sound_attention_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,
+            files_panel_width: 310.0,
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,
@@ -2205,7 +2230,25 @@ mod tests {
     }
 
     #[test]
-    fn legacy_project_organization_normalizes_to_one_list() {
+    fn sidebar_display_defaults_and_preferences_round_trip() {
+        let settings: UiSettings = serde_json::from_str("{}").unwrap();
+        assert!(settings.sidebar_compact);
+        assert!(settings.sidebar_show_project_icon);
+        assert!(settings.sidebar_show_project_label);
+        let customized = UiSettings {
+            sidebar_compact: false,
+            sidebar_show_project_icon: false,
+            sidebar_show_project_label: false,
+            sidebar_organization: SidebarOrganization::ByProject,
+            ..settings
+        };
+        let restored: UiSettings =
+            serde_json::from_str(&serde_json::to_string(&customized).unwrap()).unwrap();
+        assert_eq!(restored.clamped(), customized);
+    }
+
+    #[test]
+    fn project_organization_survives_loading() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             UiSettings::path(dir.path()),
@@ -2215,7 +2258,7 @@ mod tests {
 
         assert_eq!(
             UiSettings::load(dir.path()).sidebar_organization,
-            SidebarOrganization::InOneList
+            SidebarOrganization::ByProject
         );
     }
 
@@ -2480,6 +2523,32 @@ mod tests {
         assert_eq!(settings.sidebar_pins("synced:org-a:user-a"), ["a-1"]);
         assert_eq!(settings.sidebar_pins("synced:org-b:user-b"), ["b-1"]);
         assert_eq!(settings.sidebar_pins("synced:org-a:user-a"), ["a-1"]);
+    }
+
+    #[test]
+    fn files_panel_width_defaults_roundtrips_and_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(UiSettings::path(dir.path()), r#"{"sidebarWidth":256}"#).unwrap();
+        assert_eq!(
+            UiSettings::load(dir.path()).files_panel_width,
+            FILES_PANEL_DEFAULT
+        );
+        for (value, expected) in [
+            (310.0, 310.0),
+            (1.0, FILES_PANEL_MIN),
+            (900.0, FILES_PANEL_MAX),
+            (f32::NAN, FILES_PANEL_DEFAULT),
+        ] {
+            let settings = UiSettings {
+                files_panel_width: value,
+                ..Default::default()
+            }
+            .clamped();
+            assert_eq!(settings.files_panel_width, expected);
+            let encoded = serde_json::to_string(&settings).unwrap();
+            let decoded: UiSettings = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.files_panel_width, expected);
+        }
     }
 
     #[test]

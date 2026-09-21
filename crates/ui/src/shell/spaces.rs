@@ -4882,7 +4882,9 @@ impl Shell {
             state
                 .chats
                 .iter()
-                .filter(|c| c.archived)
+                // Spawned children stay out of the Archived section too — the
+                // same top-level rule as `visible_chats`.
+                .filter(|c| c.archived && c.parent_chat_id.is_none())
                 .filter(|chat| match &filter {
                     Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
                     None => true,
@@ -6385,6 +6387,7 @@ mod tests {
             created_at: Utc.timestamp_opt(5, 0).unwrap(),
             harness_session_id: None,
             harness_session_cwd: None,
+            parent_chat_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,

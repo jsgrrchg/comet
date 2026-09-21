@@ -77,6 +77,7 @@ actions!(
         SaveFile,
         ToggleSidebar,
         ToggleChanges,
+        ToggleFiles,
         AddSpacePalette,
         ToggleCommandPalette,
         OpenModelPicker,
@@ -358,6 +359,11 @@ pub fn apply_keymap(
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_changes, "mod-r"),
             ToggleChanges,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.toggle_files, "mod-e"),
+            ToggleFiles,
             None,
         ),
         KeyBinding::new(
@@ -11027,6 +11033,13 @@ impl Render for Shell {
                     }
                 }
             }))
+            // The explorer's own toggle (the titlebar tree button): docks or
+            // undocks the explorer portion without touching the surface host.
+            .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
+                if matches!(this.route, Route::Chat) {
+                    this.toggle_files_panel(window, cx);
+                }
+            }))
             // Chat-scoped like the panel toggles: Settings has no current
             // session to archive. Quiet under an open popover, like the other
             // session-nav shortcuts.
@@ -11454,6 +11467,7 @@ mod tests {
             space_id: None,
             last_seen_at: None,
             room_gen: None,
+            parent_chat_id: None,
         }
     }
 

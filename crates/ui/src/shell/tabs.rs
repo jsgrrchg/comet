@@ -49,7 +49,7 @@ struct PanelTitlebarWidths {
 /// row gap they cost the project-actions control.
 const SESSION_CONTROLS_WIDTH: f32 = 28.0 * 2.0 + 2.0 + 8.0;
 
-/// Separate Subagents, Files, and surface-pane buttons in the titlebar.
+/// Separate surface-pane, Subagents, and Files buttons in the titlebar.
 const PANEL_TOGGLE_GAP: f32 = 4.0;
 const EXPLORER_BUTTONS_WIDTH: f32 = 60.0;
 const PANEL_TOGGLE_SLOTS: f32 = EXPLORER_BUTTONS_WIDTH + 28.0 + PANEL_TOGGLE_GAP;
@@ -407,8 +407,8 @@ impl Shell {
                 );
             }
             // The explorer slot sits over the explorer column and carries the
-            // two fixed right-edge anchors — the explorer buttons and,
-            // outermost, the pane toggle — which stay mounted at one position
+            // two fixed right-edge anchors — the pane toggle followed by the
+            // explorer buttons — which stay mounted at one position
             // while the surface tabs reveal to their left. The explorer's own
             // search and visibility controls live in its secondary header.
             Some(
@@ -428,13 +428,13 @@ impl Shell {
                             // second one on the slot stacked on the same
                             // pixels and read lighter than the seam beneath
                             // it (user report).
-                            .child(self.render_explorer_buttons(&theme, cx))
                             .child(header_icon_button(
                                 "toggle-changes",
                                 icons::SIDEBAR_MINIMALISTIC,
                                 &theme,
                                 cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-                            )),
+                            ))
+                            .child(self.render_explorer_buttons(&theme, cx)),
                     )
                     .into_any_element(),
             )

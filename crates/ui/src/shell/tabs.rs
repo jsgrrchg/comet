@@ -92,7 +92,7 @@ impl Shell {
                         ExplorerPage::Agents,
                         "toggle-agents-panel",
                         icons::BOT,
-                        "Subagents & chats",
+                        "Subagents & sidechats",
                     ),
                     (
                         ExplorerPage::Files,

@@ -226,7 +226,7 @@ impl FilesSurface {
                     .truncate()
                     .text_size(px(11.5))
                     .text_color(theme.text_muted)
-                    .child("Subagents & chats"),
+                    .child("Subagents & sidechats"),
             );
         let agents = div()
             .id("explorer-agents-page")

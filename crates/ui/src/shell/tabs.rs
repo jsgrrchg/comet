@@ -120,7 +120,12 @@ impl Shell {
                         if selected { "Hide" } else { "Show" }
                     )))
                     .aria_selected(selected)
-                    .when(selected, |button| button.bg(crate::theme::wash(0.09)))
+                    // Selection must snap independently of the shared header
+                    // button's hover fade, including on the button we just left.
+                    .bg(crate::theme::wash(if selected { 0.09 } else { 0.0 }))
+                    .hover(move |style| {
+                        style.bg(crate::theme::wash(if selected { 0.09 } else { 0.04 }))
+                    })
                     .tooltip(move |_, cx| {
                         cx.new(|_| SurfaceTabTooltip {
                             text: tooltip.clone(),

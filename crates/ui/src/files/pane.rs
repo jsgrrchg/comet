@@ -116,11 +116,18 @@ impl ExplorerPane {
 
 impl FilesSurface {
     pub(crate) fn explorer_page(&self) -> ExplorerPage {
-        self.pane.page
+        // Expose the intended page during the gesture so the titlebar need
+        // not wait for Ended or the idle timer. Keep the gesture's origin in
+        // pane.page until settling, so reversing a swipe can still cancel it.
+        if self.pane.axis == Some(GestureAxis::Horizontal) {
+            self.pane.destination()
+        } else {
+            self.pane.page
+        }
     }
 
     pub(crate) fn select_explorer_page(&mut self, page: ExplorerPage, cx: &mut Context<Self>) {
-        let changed = self.pane.page != page;
+        let changed = self.explorer_page() != page;
         self.pane.settle = None;
         self.pane.axis = None;
         self.pane.select(page, motion::reduced_motion(cx));
@@ -142,6 +149,7 @@ impl FilesSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let previous_page = self.explorer_page();
         if event.touch_phase == TouchPhase::Started {
             self.pane.axis = None;
         }
@@ -156,6 +164,9 @@ impl FilesSurface {
         if horizontal {
             cx.stop_propagation();
             cx.notify();
+        }
+        if self.explorer_page() != previous_page {
+            cx.emit(FilesEvent::ExplorerPageChanged);
         }
         if event.touch_phase == TouchPhase::Ended {
             self.pane.settle = None;
@@ -368,24 +379,57 @@ mod tests {
         files.read_with(cx, |files, _| {
             assert_eq!(files.explorer_page(), ExplorerPage::Files)
         });
+        let selected_pages = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed_pages = selected_pages.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&files, move |files, event, cx| {
+                if matches!(event, FilesEvent::ExplorerPageChanged) {
+                    observed_pages
+                        .borrow_mut()
+                        .push(files.read(cx).explorer_page());
+                }
+            })
+        });
+        // Reversing before release cancels the intended page immediately,
+        // including the notification that repaints the shell's highlight.
+        for (touch_phase, x, expected) in [
+            (TouchPhase::Started, 90.0, ExplorerPage::Agents),
+            (TouchPhase::Moved, -90.0, ExplorerPage::Files),
+        ] {
+            cx.simulate_event(ScrollWheelEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(x), px(0.0))),
+                touch_phase,
+                ..Default::default()
+            });
+            files.read_with(cx, |files, _| assert_eq!(files.explorer_page(), expected));
+            assert_eq!(selected_pages.borrow().last(), Some(&expected));
+        }
+        cx.simulate_event(ScrollWheelEvent {
+            position,
+            touch_phase: TouchPhase::Ended,
+            ..Default::default()
+        });
         for x in [90.0, -90.0] {
+            let expected = if x > 0.0 {
+                ExplorerPage::Agents
+            } else {
+                ExplorerPage::Files
+            };
             cx.simulate_event(ScrollWheelEvent {
                 position,
                 delta: ScrollDelta::Pixels(point(px(x), px(0.0))),
                 touch_phase: TouchPhase::Started,
                 ..Default::default()
             });
+            files.read_with(cx, |files, _| assert_eq!(files.explorer_page(), expected));
+            assert_eq!(selected_pages.borrow().last(), Some(&expected));
             cx.simulate_event(ScrollWheelEvent {
                 position,
                 touch_phase: TouchPhase::Ended,
                 ..Default::default()
             });
             cx.update(|window, cx| window.draw(cx).clear());
-            let expected = if x > 0.0 {
-                ExplorerPage::Agents
-            } else {
-                ExplorerPage::Files
-            };
             files.read_with(cx, |files, cx| {
                 assert_eq!(files.explorer_page(), expected);
                 assert_eq!(files.search.read(cx).text(), "src/main.rs");

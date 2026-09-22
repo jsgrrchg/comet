@@ -3538,7 +3538,7 @@ impl Pickers {
                             theme.text_muted
                         }),
                 )
-                .when(favorites_view, |el| el.child(tab_indicator(theme.accent))),
+                .when(favorites_view, |el| el.child(popover::tab_indicator(theme.accent))),
         );
         for (ix, descriptor) in descriptors.iter().enumerate() {
             let harness = descriptor.id;
@@ -3570,7 +3570,7 @@ impl Pickers {
                                 theme.text_muted
                             }),
                         ))
-                        .when(is_viewed, |el| el.child(tab_indicator(theme.accent))),
+                        .when(is_viewed, |el| el.child(popover::tab_indicator(theme.accent))),
                 );
         }
 
@@ -4340,23 +4340,6 @@ fn default_badge(theme: &Theme) -> gpui::Div {
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme.for_popup().text_muted)
         .child(SharedString::from("Default"))
-}
-
-/// Brand mark + optional tint for a harness (the Claude mark keeps its brand
-/// orange even on the monochrome surface; the mock harness scripts
-/// Claude-flavoured runs, so it wears the Claude mark).
-/// The 2px underline marking the viewed top tab: sits on the tab row's
-/// bottom hairline (the tab is 32px tall inside a 40px row, so -4px lands
-/// exactly on the border), rounded like a capsule.
-fn tab_indicator(tint: gpui::Hsla) -> gpui::Div {
-    div()
-        .absolute()
-        .bottom(px(-4.0))
-        .left(px(6.0))
-        .right(px(6.0))
-        .h(px(2.0))
-        .rounded(px(1.0))
-        .bg(tint)
 }
 
 /// Flatten the picker's visible rows for one tab. The QUERY NEVER LEAVES THE

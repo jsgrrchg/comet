@@ -334,6 +334,20 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
         .text_color(theme.text)
 }
 
+/// The 2px underline marking the viewed top tab: sits on the tab row's
+/// bottom hairline (the tab is 32px tall inside a 40px row, so -4px lands
+/// exactly on the border), rounded like a capsule.
+pub(crate) fn tab_indicator(tint: gpui::Hsla) -> gpui::Div {
+    div()
+        .absolute()
+        .bottom(px(-4.0))
+        .left(px(6.0))
+        .right(px(6.0))
+        .h(px(2.0))
+        .rounded(px(1.0))
+        .bg(tint)
+}
+
 /// [`popover_card`] without the shared inset — for popovers that manage their
 /// own internal panes (the harness/model picker's rail + list split).
 pub fn popover_card_flush(theme: &Theme) -> gpui::Div {

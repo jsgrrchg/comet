@@ -42,6 +42,10 @@ required-features = ["project-palette-fixture"]
 name = "remote-desktop-fixture"
 required-features = ["remote-desktop-fixture"]
 
+[[example]]
+name = "sidebar-fixture"
+required-features = ["project-palette-fixture"]
+
 [dependencies]
 url = "2"
 zeron-proto.workspace = true

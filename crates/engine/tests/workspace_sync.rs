@@ -679,6 +679,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 last_seen_at: Some(now),
                 created_at: Some(now),
                 version: Some("0.1.17".into()),
+                cursor_sdk_version: None,
                 capabilities: Vec::new(),
             })
             .unwrap();
@@ -711,6 +712,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 harness_session_id: Some("hs-9".into()),
                 room_gen: None,
                 harness_session_cwd: Some("/tmp/legacy".into()),
+                parent_chat_id: None,
                 space_id: Some("space-legacy".into()),
                 last_seen_at: Some(now),
             })

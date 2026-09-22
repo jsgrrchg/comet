@@ -13,6 +13,8 @@ use crate::popover::{self, ScrollRailHost};
 
 #[path = "appshots.rs"]
 mod appshots_page;
+#[path = "completion.rs"]
+mod completion;
 use crate::settings::widgets;
 use crate::settings::{
     ComposerSendBehavior, KeymapConfig, ShortcutId, combo_from_keystroke, display_combo,
@@ -77,9 +79,9 @@ pub struct ShortcutsPage {
     appshot_capabilities: AppshotCapabilities,
     capture_access_prompted: bool,
     semantic_access_prompted: bool,
-    // The page never talks RPC; state is kept for parity with sibling pages
-    // (and future per-device keymaps).
-    _state: Entity<AppState>,
+    state: Entity<AppState>,
+    completion_harnesses: popover::Loadable<Vec<zeron_engine::registry::HarnessDescriptor>>,
+    completion_task: Option<gpui::Task<()>>,
 }
 
 impl EventEmitter<ShortcutsEvent> for ShortcutsPage {}
@@ -115,7 +117,9 @@ impl ShortcutsPage {
             appshot_capabilities: crate::appshots::capabilities(),
             capture_access_prompted: false,
             semantic_access_prompted: false,
-            _state: state,
+            state,
+            completion_harnesses: popover::Loadable::Idle,
+            completion_task: None,
         }
     }
 
@@ -480,9 +484,10 @@ fn group(id: ShortcutId) -> &'static str {
         ShortcutId::CaptureAppshot => "Appshots",
         ShortcutId::SaveFile => "Files",
         ShortcutId::BrowserReload => "Browser",
-        ShortcutId::ToggleSidebar | ShortcutId::ToggleChanges | ShortcutId::ToggleTerminal => {
-            "Panels"
-        }
+        ShortcutId::ToggleSidebar
+        | ShortcutId::ToggleChanges
+        | ShortcutId::ToggleFiles
+        | ShortcutId::ToggleTerminal => "Panels",
         ShortcutId::NewProject => "Projects",
         ShortcutId::OpenModelPicker
         | ShortcutId::NewSession
@@ -504,6 +509,7 @@ fn description(id: ShortcutId) -> &'static str {
         ShortcutId::BrowserReload => "Reload the focused browser tab.",
         ShortcutId::ToggleSidebar => "Show or hide sessions and settings navigation.",
         ShortcutId::ToggleChanges => "Show or hide the right sidebar for the current session.",
+        ShortcutId::ToggleFiles => "Show or hide the files panel for the current session.",
         ShortcutId::ToggleTerminal => "Show or hide the terminal for the current session.",
         ShortcutId::NewSession => "Open a blank session canvas to start a new session.",
         ShortcutId::NewProject => "Open the new project dialog.",
@@ -529,6 +535,10 @@ impl Render for ShortcutsPage {
             return self.render_appshots(cx);
         }
         let theme = Theme::of(cx).clone();
+        if matches!(self.completion_harnesses, popover::Loadable::Idle) {
+            self.load_completion_harnesses(cx);
+        }
+        let completion = self.render_completion(&theme, cx);
         let recording = self.recording;
         let escape_stops_active_agent = self.escape_stops_active_agent;
         let send_behavior = self.composer_send_behavior;
@@ -791,6 +801,7 @@ impl Render for ShortcutsPage {
                                     }),
                             )
                             .child(send_behavior_row.mt(px(32.0)))
+                            .child(completion)
                             .child(
                                 div()
                                     .mt(px(28.0))

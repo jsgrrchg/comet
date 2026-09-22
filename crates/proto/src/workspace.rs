@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 /// builds may share a semver with upstream while exposing a different RPC and
 /// document surface.
 pub mod capabilities {
+    /// The host decodes durable composer references at the harness boundary.
+    pub const COMPOSER_REFERENCES_V1: &str = "composer-references-v1";
     pub const MESSAGE_QUEUE_V1: &str = "message-queue-v1";
     pub const MESSAGE_QUEUE_ACTIONS_V1: &str = "message-queue-actions-v1";
     pub const MESSAGE_QUEUE_ATTACHMENTS_V1: &str = "message-queue-attachments-v1";
@@ -14,6 +16,7 @@ pub mod capabilities {
     pub const MESSAGE_QUEUE_EDIT_LEASE_V1: &str = "message-queue-edit-lease-v1";
 
     pub const CURRENT: &[&str] = &[
+        COMPOSER_REFERENCES_V1,
         MESSAGE_QUEUE_V1,
         MESSAGE_QUEUE_ACTIONS_V1,
         MESSAGE_QUEUE_ATTACHMENTS_V1,
@@ -44,6 +47,9 @@ pub enum WorkspaceScope {
 pub struct EngineInfo {
     pub device_id: String,
     pub workspace_scope: WorkspaceScope,
+    /// SDK selected by the owning engine, absent on older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_sdk_version: Option<String>,
     /// Supported protocol/document features. Missing on older engines.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
@@ -79,6 +85,7 @@ mod tests {
         let info = EngineInfo {
             device_id: "device-1".into(),
             workspace_scope: WorkspaceScope::Local,
+            cursor_sdk_version: Some("1.0.31".into()),
             capabilities: capabilities::current(),
         };
         assert_eq!(
@@ -86,7 +93,9 @@ mod tests {
             serde_json::json!({
                 "deviceId": "device-1",
                 "workspaceScope": "local",
+                "cursorSdkVersion": "1.0.31",
                 "capabilities": [
+                    "composer-references-v1",
                     "message-queue-v1",
                     "message-queue-actions-v1",
                     "message-queue-attachments-v1",
@@ -105,6 +114,8 @@ mod tests {
         }))
         .unwrap();
         assert!(info.capabilities.is_empty());
+        assert!(info.cursor_sdk_version.is_none());
         assert!(!info.supports(capabilities::MESSAGE_QUEUE_V1));
+        assert!(!info.supports(capabilities::COMPOSER_REFERENCES_V1));
     }
 }

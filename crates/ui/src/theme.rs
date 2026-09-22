@@ -376,7 +376,7 @@ pub const INK_HAIRLINE_SCALE: f32 = 1.35;
 /// Paint-only syntax colors. The hues follow the Git history graph's lane
 /// palette (indigo, pink, emerald, amber, red, neutral), while light-mode
 /// variants are darkened enough to remain readable as text on white.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SyntaxPalette {
     pub comment: Hsla,
     pub keyword: Hsla,
@@ -898,6 +898,15 @@ impl Theme {
     /// alpha (and with it whether glass is on at all) is per-appearance.
     pub fn is_glass(&self) -> bool {
         self.glass().a < 1.0
+    }
+
+    /// Shared background for the editor host and the adjacent Files column.
+    pub fn panel_bg(&self) -> Hsla {
+        if self.is_glass() {
+            self.bg.opacity(0.4)
+        } else {
+            self.bg
+        }
     }
 
     /// Whether FLOATING surfaces (popovers, the composer pill) paint their

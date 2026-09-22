@@ -14,11 +14,12 @@ members = [
     "crates/ui",
     "crates/rdp",
     "crates/syntax",
+    "crates/mcp",
     "apps/zeron",
 ]
 
 [workspace.package]
-version = "0.2.77"
+version = "0.2.83"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -36,6 +37,7 @@ zeron-ui = { path = "crates/ui" }
 zeron-rdp = { path = "crates/rdp" }
 zeron-syntax = { path = "crates/syntax" }
 zeron-theme = { path = "crates/theme" }
+zeron-mcp = { path = "crates/mcp" }
 
 # CRDT
 loro = "1.13"

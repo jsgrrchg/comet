@@ -361,6 +361,10 @@ impl SessionsEngine {
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
+        // Native-only catalog entries have no portable file fallback. Reject
+        // cross-harness delivery before recording or routing the user turn.
+        zeron_proto::invocation::validate_harness_invocations(&request.prompt, harness_id)
+            .map_err(EngineError::Other)?;
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -379,7 +383,14 @@ impl SessionsEngine {
                 // Register acceptance before a fast boundary can retire it.
                 let mut pending = lock(&ledger);
                 let message = SteerMessage {
-                    prompt: request.prompt.clone(),
+                    // OpenCode must see the canonical selection before it
+                    // decodes the provider command: a project-scoped command
+                    // can disappear between composer discovery and delivery.
+                    prompt: if harness_id == HarnessId::Opencode {
+                        request.prompt.clone()
+                    } else {
+                        zeron_proto::invocation::harness_prompt(&request.prompt, harness_id)
+                    },
                     message_id: Some(user_id.clone()),
                 };
                 if steer_tx.try_send(message).is_ok() {
@@ -545,16 +556,23 @@ impl SessionsEngine {
             .map(|h| {
                 (
                     h.run_id.clone(),
+                    h.runtime_config.harness_id,
                     h.steer_tx.clone(),
                     h.routed_steers.clone(),
                 )
             });
-        let Some((run_id, steer_tx, ledger)) = target else {
+        let Some((run_id, harness_id, steer_tx, ledger)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
+        zeron_proto::invocation::validate_harness_invocations(prompt, harness_id)
+            .map_err(EngineError::Other)?;
         let user_id = message_id.unwrap_or_else(new_id);
         let message = SteerMessage {
-            prompt: prompt.to_string(),
+            prompt: if harness_id == HarnessId::Opencode {
+                prompt.to_owned()
+            } else {
+                zeron_proto::invocation::harness_prompt(prompt, harness_id)
+            },
             message_id: Some(user_id.clone()),
         };
         {
@@ -613,17 +631,17 @@ impl SessionsEngine {
         let Some((run_id, token, cancel, pending)) = target else {
             return Ok(false);
         };
-        // Unpark any blocked question FIRST (mirrors zeron: harness teardown can await a
-        // parked question callback — a run stuck on a question would deadlock the stop).
+        // Publish cancellation BEFORE waking the harness. Otherwise a fast
+        // EOF after token.cancel() can beat this watch notification and be
+        // classified as an error instead of an interrupted turn.
+        let _ = cancel.send(true);
+        // Unpark questions before harness teardown, which can await them.
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
         }
         // Harness-level interrupt (protocol + child teardown) …
         token.cancel();
-        // … plus the engine-side grace deadline in the run task, so a harness that
-        // ignores its token still settles with a synthesized Done{interrupted}.
-        let _ = cancel.send(true);
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
         for _ in 0..500 {
             if !self.is_live(chat_id, &run_id) {
@@ -1250,6 +1268,7 @@ impl SubagentSink {
             device_id: device_id.to_owned(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            duration_ms: None,
         };
         if let Err(err) = self.doc.push_message(&entry) {
             tracing::warn!(doc = %self.doc_id, error = %err, "subagent steer write failed");
@@ -1394,7 +1413,7 @@ fn finish_segment<'a>(
 }
 
 /// `~` / `~/…` → this host's home directory. Anything else passes through.
-fn expand_home(cwd: &str) -> String {
+pub(crate) fn expand_home(cwd: &str) -> String {
     match cwd.strip_prefix("~") {
         Some("") => crate::repos::home_dir().to_string_lossy().into_owned(),
         Some(rest) if rest.starts_with('/') => crate::repos::home_dir()
@@ -1416,13 +1435,75 @@ struct RunResumeState {
     startup_retry: bool,
 }
 
+fn cursor_unstarted_history(
+    doc: &SessionDoc,
+    current_id: &str,
+    prompt: &str,
+    has_session: bool,
+) -> Result<String, DocError> {
+    // Convert each message before JSON encoding. Rewriting canonical chips in
+    // the encoded envelope can introduce unescaped quotes or newlines and can
+    // cause Cursor's current message to be converted twice.
+    let prompt = zeron_proto::invocation::harness_prompt(prompt, HarnessId::Cursor);
+    let entries = doc.read_entries()?;
+    let preceding: Vec<_> = entries
+        .iter()
+        .take_while(|entry| entry.id != current_id)
+        .collect();
+    // With an existing session, only bridge the tail whose assistant never
+    // produced content. A process can die before writing its SDK-side receipt,
+    // even though an older session ID still exists.
+    let after = if has_session {
+        preceding
+            .iter()
+            .rposition(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.parts.iter().any(|part| match part {
+                        MessagePart::Text { text, .. } | MessagePart::Reasoning { text, .. } => {
+                            !text.is_empty()
+                        }
+                        MessagePart::Tool { .. } | MessagePart::Input { .. } => true,
+                        _ => false,
+                    })
+            })
+            .map_or(0, |i| i + 1)
+    } else {
+        0
+    };
+    let previous: Vec<String> = preceding
+        .iter()
+        .skip(after)
+        .filter(|entry| entry.role == MessageRole::User)
+        .map(|entry| {
+            entry
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.is_empty())
+        .map(|text| zeron_proto::invocation::harness_prompt(&text, HarnessId::Cursor))
+        .collect();
+    if previous.is_empty() {
+        return Ok(prompt);
+    }
+    Ok(format!(
+        "The preceding user messages may not have reached a Cursor checkpoint before startup stopped. Retain this JSON as conversation history; do not rerun prior tools or side effects. Respond to the current message.\n{}",
+        serde_json::json!({"previousUserMessages": previous, "currentUserMessage": prompt})
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
     chat_id: String,
     run_id: String,
     harness: Arc<dyn Harness>,
-    request: RunRequest,
+    mut request: RunRequest,
     doc: Arc<SessionDoc>,
     controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
@@ -1444,7 +1525,33 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
-    let mut stream = match harness.run(request, controls).await {
+    // Startup can stop before the SDK saves user text, with no new session
+    // ID or receipt. Bridge that unacknowledged tail from our transcript;
+    // a fresh session needs all prior user text, not just the latest tail.
+    let prepared = if harness_id == HarnessId::Cursor {
+        cursor_unstarted_history(
+            &doc,
+            &resume_state.user_message_id,
+            &request.prompt,
+            request.resume.is_some(),
+        )
+        .map(|prompt| request.prompt = prompt)
+        .map_err(|e| zeron_harness::HarnessError::Protocol(e.to_string()))
+    } else {
+        Ok(())
+    };
+    let started = match prepared {
+        Ok(()) => {
+            let mut wire_request = request;
+            if !matches!(harness_id, HarnessId::Cursor | HarnessId::Opencode) {
+                wire_request.prompt =
+                    zeron_proto::invocation::harness_prompt(&wire_request.prompt, harness_id);
+            }
+            harness.run(wire_request, controls).await
+        }
+        Err(error) => Err(error),
+    };
+    let mut stream = match started {
         Ok(stream) => stream,
         Err(err) => {
             let message = err.to_string();
@@ -2383,6 +2490,97 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cursor_recovery_converts_rich_messages_before_json_encoding() {
+        let doc = zeron_doc::SessionDoc::init("cursor-rich-recovery").unwrap();
+        let skill = zeron_proto::invocation::Invocation::Skill {
+            name: "review \"quoted\"".into(),
+            path: "/repo/quoted \"path\"/SKILL.md".into(),
+            command: None,
+        }
+        .link();
+        let previous = format!("Previous {skill}\nSecond line with \\ and \"quotes\"");
+        doc.push_message(&zeron_doc::SessionMessageEntry {
+            id: "u1".into(),
+            role: zeron_doc::MessageRole::User,
+            parts: vec![zeron_doc::MessagePart::Text {
+                id: "u1-text".into(),
+                text: previous.clone(),
+            }],
+            created_at: 0,
+            device_id: "test".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+        let current = format!("Current {skill}\nKeep **Markdown**");
+        let delivered = super::cursor_unstarted_history(&doc, "u2", &current, false).unwrap();
+        let (_, json) = delivered.split_once('\n').unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed["currentUserMessage"],
+            zeron_proto::invocation::harness_prompt(&current, zeron_proto::HarnessId::Cursor)
+        );
+        assert_eq!(
+            parsed["previousUserMessages"][0],
+            zeron_proto::invocation::harness_prompt(&previous, zeron_proto::HarnessId::Cursor)
+        );
+    }
+
+    #[test]
+    fn cursor_without_a_session_id_retains_only_preceding_user_messages() {
+        let doc = zeron_doc::SessionDoc::init("cursor-unstarted").unwrap();
+        for (id, role, text) in [
+            (
+                "u1",
+                zeron_doc::MessageRole::User,
+                "first interrupted request",
+            ),
+            ("a1", zeron_doc::MessageRole::Assistant, "partial output"),
+            ("u2", zeron_doc::MessageRole::User, "current request"),
+            ("u3", zeron_doc::MessageRole::User, "future pending request"),
+        ] {
+            doc.push_message(&zeron_doc::SessionMessageEntry {
+                id: id.into(),
+                role,
+                parts: vec![zeron_doc::MessagePart::Text {
+                    id: format!("{id}-text"),
+                    text: text.into(),
+                }],
+                created_at: 0,
+                device_id: "test".into(),
+                status: None,
+                continuation_of: None,
+                duration_ms: None,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            super::cursor_unstarted_history(&doc, "u1", "first interrupted request", false)
+                .unwrap(),
+            "first interrupted request"
+        );
+        let prompt = super::cursor_unstarted_history(&doc, "u2", "current request", false).unwrap();
+        assert!(prompt.contains("first interrupted request"));
+        assert!(prompt.contains("current request"));
+        assert!(!prompt.contains("partial output"));
+        assert!(!prompt.contains("future pending request"));
+        assert!(prompt.contains("do not rerun prior tools or side effects"));
+        assert_eq!(
+            super::cursor_unstarted_history(&doc, "u2", "current request", true).unwrap(),
+            "current request",
+            "content from the preceding turn is already in the native session"
+        );
+        assert!(
+            super::cursor_unstarted_history(&doc, "u3", "future pending request", true)
+                .unwrap()
+                .contains("current request"),
+            "an unacknowledged prompt after an older checkpoint must survive"
+        );
+        assert_eq!(doc.read_entries().unwrap().len(), 4);
+    }
+
     use super::{RuntimeConfig, subagent_doc_id};
     use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
 

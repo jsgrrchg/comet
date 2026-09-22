@@ -2141,9 +2141,9 @@ dependencies = [
 
 [[package]]
 name = "cryptoki"
-version = "0.12.0"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff765b99fc49f3116c9a908484486a2b92fd73c48da45c3a69716471c6cc56c6"
+checksum = "625cf4599c43d69a16996ce2573fc80745a0b0300c962f0bfa11d55b6cab2b2d"
 dependencies = [
  "bitflags 2.13.1",
  "cryptoki-sys",
@@ -9387,6 +9387,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
 name = "serdect"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11221,6 +11234,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
+
+[[package]]
 name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12876,9 +12895,9 @@ dependencies = [
 
 [[package]]
 name = "yuv"
-version = "0.8.18"
+version = "0.8.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ee07950d2f109605ec02cf0208fd5c33d05a36940b9c0cbe7bfd2a8d3b5d390"
+checksum = "a295923535c00a4e72a50a0a1130097f93160b39892dd4d2d006b1e2b90d6bf9"
 dependencies = [
  "num-traits",
 ]
@@ -13128,7 +13147,7 @@ dependencies = [
 
 [[package]]
 name = "zeron"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "clap",
@@ -13142,6 +13161,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-sys 0.61.2",
  "zeron-engine",
+ "zeron-mcp",
  "zeron-rpc",
  "zeron-ui",
  "zeron-update",
@@ -13149,7 +13169,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-doc"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "chrono",
  "loro",
@@ -13163,7 +13183,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-engine"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13197,11 +13217,12 @@ dependencies = [
  "zeron-rpc",
  "zeron-sync",
  "zeron-update",
+ "zip",
 ]
 
 [[package]]
 name = "zeron-harness"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13210,8 +13231,10 @@ dependencies = [
  "futures",
  "libc",
  "reqwest",
+ "semver",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.20",
@@ -13225,8 +13248,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeron-mcp"
+version = "0.2.83"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+ "zeron-doc",
+ "zeron-proto",
+ "zeron-rpc",
+]
+
+[[package]]
 name = "zeron-preview"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13254,9 +13295,10 @@ dependencies = [
 
 [[package]]
 name = "zeron-proto"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "chrono",
+ "pulldown-cmark",
  "serde",
  "serde_json",
  "uuid",
@@ -13264,7 +13306,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-rdp"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "ironrdp",
  "ironrdp-tokio",
@@ -13283,7 +13325,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-rpc"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -13302,7 +13344,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-sync"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "block2 0.6.2",
  "chrono",
@@ -13325,7 +13367,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-syntax"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "thiserror 2.0.20",
  "tree-sitter",
@@ -13359,7 +13401,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-theme"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "clap",
@@ -13374,7 +13416,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-ui"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -13441,7 +13483,7 @@ dependencies = [
 
 [[package]]
 name = "zeron-update"
-version = "0.2.77"
+version = "0.2.83"
 dependencies = [
  "anyhow",
  "futures",

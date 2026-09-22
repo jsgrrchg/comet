@@ -1,25 +1,14 @@
-//! The explorer's footer: two collapsible sections docked under the file
-//! tree — **Subagents** (the spawn chips of the active chat's transcript,
-//! with their live status) and **Chats** (the side chats hanging off the
-//! active chat: forks, and chats an agent spawned through the Zeron MCP
-//! server). Rows borrow the left sidebar's compact session row — 29px, status
-//! glyph, title, time — minus the harness, project and device icons, which
-//! say nothing here (every row shares the parent's context). Clicking a row
-//! opens it in the right pane's surface host; the Chats header carries "+"
-//! and fork beside its caret; the section chrome animates with the same
-//! collapse motion as the sidebar's disclosures.
-//!
-//! The footer has a fixed height budget that the open sections share and
-//! scroll inside, and like the sidebar's Archived shelf each shows ten rows
-//! before a "Show N more" row pages by ten.
+//! Subagents and side chats of the main conversation, available from the
+//! robot button below its composer. The translucent popover keeps the compact
+//! status/title/time rows, collapsible sections, and paged scrolling.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, EntityId, MouseButton, ScrollHandle,
-    SharedString, div, prelude::*, px,
+    Animation, AnimationExt as _, AnyElement, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    MouseButton, ScrollHandle, SharedString, Subscription, Window, div, prelude::*, px,
 };
 use zeron_doc::{MessagePart, SubagentStatus};
 use zeron_proto::{Chat, ChatIndicator};
@@ -29,14 +18,14 @@ use crate::state::AppState;
 use crate::theme::Theme;
 use crate::{loaders, motion};
 
-use super::{FilesEvent, FilesSurface};
+use crate::popover;
 
 const SECTION_HEADER_HEIGHT: f32 = 28.0;
 const SECTION_BODY_INSET: f32 = 4.0;
 const ROW_HEIGHT: f32 = 29.0;
 const ROW_GAP: f32 = 2.0;
 /// Empty state: the copy (two 16px lines so it can wrap in a narrow
-/// explorer) and, for Chats, a row of pill actions — left-aligned like the
+/// activity menu) and, for Chats, a row of pill actions — left-aligned like the
 /// rows it stands in for.
 const EMPTY_COPY_HEIGHT: f32 = 36.0;
 const EMPTY_ACTIONS_HEIGHT: f32 = 40.0;
@@ -45,23 +34,230 @@ const EMPTY_PAD: f32 = 10.0;
 /// to the shorter lists).
 const LIST_FADE_BAND: f32 = 16.0;
 /// Hover group of a section header (reveals its actions).
-const HEADER_GROUP: &str = "files-section-header";
+const HEADER_GROUP: &str = "chat-activity-section-header";
 /// Rows a section shows before "Show more" pages it, and the page size —
 /// the sidebar's Archived shelf numbers.
 const INITIAL_ROWS: usize = 10;
 const PAGE_ROWS: usize = 10;
 /// An open section never shrinks below this, so one or two rows still
 /// leave the section room to breathe.
-const MIN_BODY_HEIGHT: f32 = 120.0;
-const FOOTER_PAD_TOP: f32 = 4.0;
-const FOOTER_PAD_BOTTOM: f32 = 6.0;
-/// The footer's height budget; shorter content shrinks the footer to fit.
-const FOOTER_HEIGHT: f32 = 510.0;
+const MIN_BODY_HEIGHT: f32 = 48.0;
+const MENU_PAD_TOP: f32 = 4.0;
+const MENU_PAD_BOTTOM: f32 = 6.0;
+/// The menu's height budget; shorter content shrinks the menu to fit.
+const MENU_HEIGHT: f32 = 510.0;
 const TWEEN_GRACE: std::time::Duration = std::time::Duration::from_millis(120);
 
-/// Which footer section a motion or toggle addresses.
+#[derive(Debug, Clone)]
+pub(crate) enum ChatActivityEvent {
+    OpenSubagent {
+        doc_id: String,
+        title: String,
+        frozen: bool,
+    },
+    OpenChildChat(String),
+    ChildChatContextMenu {
+        chat_id: String,
+        position: gpui::Point<gpui::Pixels>,
+    },
+    NewChildChat,
+    ForkChat,
+}
+
+pub(crate) struct ChatActivity {
+    state: Entity<AppState>,
+    chat_id: String,
+    sections: ActivitySections,
+    menu: popover::Popup<()>,
+    menu_height: f32,
+    focus: FocusHandle,
+    composer_focus: FocusHandle,
+    focus_pending: bool,
+    child_overlay_open: bool,
+    _observe: Subscription,
+}
+
+impl EventEmitter<ChatActivityEvent> for ChatActivity {}
+
+impl ChatActivity {
+    pub(crate) fn new(
+        state: Entity<AppState>,
+        composer_focus: FocusHandle,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let chat_id = state.read(cx).selected_chat.clone().unwrap_or_default();
+        let observe = cx.observe(&state, |this: &mut Self, state, cx| {
+            let chat_id = state.read(cx).selected_chat.clone().unwrap_or_default();
+            if this.chat_id != chat_id {
+                this.chat_id = chat_id;
+                this.menu = popover::Popup::default();
+                this.sections = ActivitySections::default();
+                this.focus_pending = false;
+                this.child_overlay_open = false;
+                cx.notify();
+            }
+            this.refresh_sections(cx);
+        });
+        Self {
+            state,
+            chat_id,
+            sections: ActivitySections::default(),
+            menu: popover::Popup::default(),
+            menu_height: MENU_HEIGHT,
+            focus: cx.focus_handle(),
+            composer_focus,
+            focus_pending: false,
+            child_overlay_open: false,
+            _observe: observe,
+        }
+    }
+
+    pub(crate) fn is_open(&self) -> bool {
+        self.menu.is_open()
+    }
+
+    /// Context actions and their dialogs dismiss before the activity list.
+    pub(crate) fn set_child_overlay_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.child_overlay_open != open {
+            self.child_overlay_open = open;
+            cx.notify();
+        }
+    }
+
+    fn dismiss(&mut self, cx: &mut Context<Self>) {
+        self.focus_pending = false;
+        if self.menu.begin_close() {
+            popover::reap_popup(cx, |activity: &mut Self| &mut activity.menu);
+            cx.notify();
+        }
+    }
+}
+
+impl Render for ChatActivity {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.chat_id.is_empty() {
+            return div().into_any_element();
+        }
+        if std::mem::take(&mut self.focus_pending) {
+            window.focus(&self.focus, cx);
+        }
+        let theme = Theme::of(cx).clone();
+        let state = self.state.read(cx);
+        let agents = subagent_rows(state, &self.chat_id).len();
+        let chats = child_chat_rows(state, &self.chat_id, Utc::now()).len();
+        let count = agents + chats;
+        let label = format!("Subagents and side chats: {agents} subagents, {chats} side chats");
+        let mut trigger = div()
+            .id("chat-activity-trigger")
+            .debug_selector(|| "chat-activity-trigger".into())
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(label))
+            .relative()
+            .flex_none()
+            .h(px(24.0))
+            .px(px(5.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .cursor_pointer()
+            .text_color(if self.is_open() {
+                theme.text
+            } else {
+                theme.text_muted
+            })
+            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.menu.note_trigger_press();
+                }),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                if this.menu.take_press_was_open() || this.is_open() {
+                    this.dismiss(cx);
+                    window.focus(&this.composer_focus, cx);
+                } else {
+                    this.menu.open(());
+                    this.focus_pending = true;
+                    cx.notify();
+                }
+            }))
+            .child(
+                icon(icons::BOT)
+                    .size(px(15.0))
+                    .text_color(if self.is_open() {
+                        theme.text
+                    } else {
+                        theme.text_muted
+                    }),
+            )
+            .child(
+                div()
+                    .id("chat-activity-count")
+                    .min_w(px(16.0))
+                    .h(px(16.0))
+                    .px(px(4.0))
+                    .rounded_full()
+                    .bg(theme.glass_hover())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(crate::typography::ui_rems(10.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(count.to_string()),
+            );
+        if self.menu.get().is_some() {
+            // Capture the painted overlay state: its outside-click handler
+            // may close it before this menu handles the same mouse press.
+            let child_overlay_open = self.child_overlay_open;
+            let theme = theme.for_popup();
+            let viewport = window.viewport_size();
+            self.menu_height =
+                (f32::from(viewport.height) - 100.0).clamp(chrome_height(), MENU_HEIGHT);
+            let card = popover::popover_card(&theme)
+                // macOS leaves the backdrop visible without a fill; Linux
+                // uses the shared popover tint and translucency unchanged.
+                .when(cfg!(target_os = "macos"), |card| {
+                    card.bg(gpui::transparent_black())
+                })
+                .w(px((f32::from(viewport.width) - 24.0).clamp(0.0, 360.0)))
+                .id("chat-activity-menu")
+                .debug_selector(|| "chat-activity-menu".into())
+                .role(gpui::Role::Group)
+                .aria_label("Subagents and side chats")
+                .track_focus(&self.focus)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        this.dismiss(cx);
+                        window.focus(&this.composer_focus, cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .on_mouse_down_out(cx.listener(move |this, _, window, cx| {
+                    if child_overlay_open {
+                        return;
+                    }
+                    this.dismiss(cx);
+                    if this.focus.contains_focused(window, cx) {
+                        window.blur();
+                    }
+                }))
+                .child(self.render_sections(&theme, cx));
+            trigger = trigger.child(popover::anchored_menu_above_end(
+                "chat-activity-popover",
+                card.into_any_element(),
+                self.menu.closing_since(),
+            ));
+        }
+        trigger.into_any_element()
+    }
+}
+
+/// Which menu section a motion or toggle addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) enum Section {
+pub(crate) enum Section {
     Subagents,
     Chats,
 }
@@ -83,7 +279,7 @@ impl Section {
 }
 
 /// One in-flight open/close of a section body (the sidebar's
-/// `SidebarDisclosureMotion`, kept local so the explorer owns its own
+/// `SidebarDisclosureMotion`, kept local so the activity menu owns its own
 /// epochs). A re-toggle mid-flight picks up from the painted height.
 #[derive(Debug, Clone, Copy)]
 struct DisclosureMotion {
@@ -109,9 +305,9 @@ impl DisclosureMotion {
     }
 }
 
-/// Footer state on the explorer surface.
+/// Footer state on the activity menu surface.
 #[derive(Debug)]
-pub(super) struct ExplorerSections {
+pub(crate) struct ActivitySections {
     open: HashMap<Section, bool>,
     motion: HashMap<Section, DisclosureMotion>,
     /// Rows revealed per section ("Show more" pages this up).
@@ -119,13 +315,13 @@ pub(super) struct ExplorerSections {
     /// One scroll handle per section list, so the edge fades can read
     /// overflow at paint time.
     scroll: HashMap<Section, ScrollHandle>,
-    /// Hash of what the footer would draw, so the state observer only
-    /// re-renders the explorer when a section's contents actually changed —
+    /// Hash of what the menu would draw, so the state observer only
+    /// re-renders the activity menu when a section's contents actually changed —
     /// not on every streamed transcript delta.
     fingerprint: u64,
 }
 
-impl Default for ExplorerSections {
+impl Default for ActivitySections {
     fn default() -> Self {
         Self {
             open: [(Section::Subagents, true), (Section::Chats, true)]
@@ -144,8 +340,8 @@ impl Default for ExplorerSections {
     }
 }
 
-impl ExplorerSections {
-    pub(super) fn is_open(&self, section: Section) -> bool {
+impl ActivitySections {
+    pub(crate) fn is_open(&self, section: Section) -> bool {
         self.open.get(&section).copied().unwrap_or(true)
     }
 
@@ -189,9 +385,9 @@ impl ExplorerSections {
     }
 }
 
-/// A spawn chip of the active transcript, as the footer lists it.
+/// A spawn chip of the active transcript, as the menu lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SubagentRow {
+pub(crate) struct SubagentRow {
     pub doc_id: String,
     pub title: SharedString,
     pub status: Option<SubagentStatus>,
@@ -223,7 +419,7 @@ impl SubagentRow {
 /// Only genuine spawn chips with a stamped doc ref qualify — the chip IS the
 /// index (there is no listing endpoint), and a stray ref on a non-Agent tool
 /// must not surface as a phantom subagent.
-pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow> {
+pub(crate) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow> {
     if state.selected_chat.as_deref() != Some(chat_id) {
         return Vec::new();
     }
@@ -260,9 +456,9 @@ pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow>
     rows
 }
 
-/// A side chat of the active chat, as the footer lists it.
+/// A side chat of the active chat, as the menu lists it.
 #[derive(Debug, Clone, PartialEq)]
-pub(super) struct ChildChatRow {
+pub(crate) struct ChildChatRow {
     pub chat_id: String,
     pub title: SharedString,
     pub status: ChatIndicator,
@@ -274,7 +470,7 @@ pub(super) struct ChildChatRow {
 
 /// The live (unarchived) children of `chat_id`, most recent activity first —
 /// the same order the sidebar's Sessions list keeps.
-pub(super) fn child_chat_rows(
+pub(crate) fn child_chat_rows(
     state: &AppState,
     chat_id: &str,
     now: DateTime<Utc>,
@@ -301,16 +497,16 @@ pub(super) fn child_chat_rows(
 
 /// A side chat titles itself on its first turn; until then the preview or a
 /// placeholder stands in.
-pub(super) fn child_chat_title(chat: &Chat) -> String {
+pub(crate) fn child_chat_title(chat: &Chat) -> String {
     chat.title
         .clone()
         .or_else(|| chat.last_message_preview.clone())
         .unwrap_or_else(|| "New side chat".into())
 }
 
-/// What the footer would draw for `chat_id`, hashed. Cheap enough to run on
+/// What the menu would draw for `chat_id`, hashed. Cheap enough to run on
 /// every state notification.
-pub(super) fn fingerprint(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> u64 {
+pub(crate) fn fingerprint(state: &AppState, chat_id: &str, now: DateTime<Utc>) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for row in subagent_rows(state, chat_id) {
         row.doc_id.hash(&mut hasher);
@@ -334,7 +530,7 @@ pub(super) fn fingerprint(state: &AppState, chat_id: &str, now: DateTime<Utc>) -
 /// The height a section body wants for `count` rows with `shown` revealed:
 /// inset, the visible rows, and a "Show more" row while more remain. Empty
 /// sections want their empty-state copy (Chats adds its action row).
-pub(super) fn content_height(section: Section, count: usize, shown: usize) -> f32 {
+pub(crate) fn content_height(section: Section, count: usize, shown: usize) -> f32 {
     content_height_unfloored(section, count, shown).max(MIN_BODY_HEIGHT)
 }
 
@@ -354,10 +550,10 @@ fn content_height_unfloored(section: Section, count: usize, shown: usize) -> f32
     SECTION_BODY_INSET + slots as f32 * ROW_HEIGHT + slots.saturating_sub(1) as f32 * ROW_GAP
 }
 
-/// Split the footer's body budget between two open sections: each may take
+/// Split the menu's body budget between two open sections: each may take
 /// what it wants, and a short one hands its slack to the other. Closed
 /// sections get 0. Pure.
-pub(super) fn body_budget(budget: f32, wants: [f32; 2], open: [bool; 2]) -> [f32; 2] {
+pub(crate) fn body_budget(budget: f32, wants: [f32; 2], open: [bool; 2]) -> [f32; 2] {
     let budget = budget.max(0.0);
     let want = |i: usize| if open[i] { wants[i] } else { 0.0 };
     let (a, b) = (want(0), want(1));
@@ -370,14 +566,14 @@ pub(super) fn body_budget(budget: f32, wants: [f32; 2], open: [bool; 2]) -> [f32
     [first, second]
 }
 
-/// The footer's chrome outside the bodies: padding and the two headers.
+/// The menu's chrome outside the bodies: padding and the two headers.
 fn chrome_height() -> f32 {
-    FOOTER_PAD_TOP + FOOTER_PAD_BOTTOM + 2.0 * SECTION_HEADER_HEIGHT
+    MENU_PAD_TOP + MENU_PAD_BOTTOM + 2.0 * SECTION_HEADER_HEIGHT
 }
 
-impl FilesSurface {
-    /// Re-render only when the footer's contents changed.
-    pub(super) fn refresh_sections(&mut self, cx: &mut Context<Self>) {
+impl ChatActivity {
+    /// Re-render only when the menu's contents changed.
+    pub(crate) fn refresh_sections(&mut self, cx: &mut Context<Self>) {
         let fingerprint = fingerprint(self.state.read(cx), &self.chat_id, Utc::now());
         if fingerprint != self.sections.fingerprint {
             self.sections.fingerprint = fingerprint;
@@ -385,7 +581,7 @@ impl FilesSurface {
         }
     }
 
-    pub(super) fn render_sections(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sections(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let now = Utc::now();
         let (subagents, chats) = {
             let state = self.state.read(cx);
@@ -411,22 +607,22 @@ impl FilesSurface {
             self.sections.is_open(Section::Subagents),
             self.sections.is_open(Section::Chats),
         ];
-        let budget = FOOTER_HEIGHT - chrome_height();
+        let budget = self.menu_height - chrome_height();
         let heights = body_budget(budget, wants, open);
         let view = cx.entity_id();
         let subagent_body = self.render_subagent_rows(&subagents, view, theme, cx);
         let chat_body = self.render_chat_rows(&chats, theme, cx);
         let chats_actions = self.render_chats_header_actions(theme, cx);
         div()
-            .id("files-sections")
+            .id("chat-activity-sections")
             .relative()
             .flex_none()
             .w_full()
             .flex()
             .flex_col()
             .px(px(6.0))
-            .pt(px(FOOTER_PAD_TOP))
-            .pb(px(FOOTER_PAD_BOTTOM))
+            .pt(px(MENU_PAD_TOP))
+            .pb(px(MENU_PAD_BOTTOM))
             .child(self.render_section(
                 Section::Subagents,
                 subagents.len(),
@@ -465,26 +661,28 @@ impl FilesSurface {
             .group_hover(HEADER_GROUP, |s| s.opacity(1.0))
             .child(
                 header_action(
-                    "files-sections-new-chat",
+                    "chat-activity-sections-new-chat",
                     icons::PLUS,
                     "New side chat",
                     theme,
                 )
-                .on_click(cx.listener(|_, _, _, cx| {
+                .on_click(cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    cx.emit(FilesEvent::NewChildChat);
+                    this.dismiss(cx);
+                    cx.emit(ChatActivityEvent::NewChildChat);
                 })),
             )
             .child(
                 header_action(
-                    "files-sections-fork",
+                    "chat-activity-sections-fork",
                     icons::GIT_BRANCH,
                     "Fork this chat",
                     theme,
                 )
-                .on_click(cx.listener(|_, _, _, cx| {
+                .on_click(cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    cx.emit(FilesEvent::ForkChat);
+                    this.dismiss(cx);
+                    cx.emit(ChatActivityEvent::ForkChat);
                 })),
             )
             .into_any_element()
@@ -515,11 +713,11 @@ impl FilesSurface {
         let full = if open {
             height
         } else {
-            wanted.min(FOOTER_HEIGHT - chrome_height()).max(0.0)
+            wanted.min(self.menu_height - chrome_height()).max(0.0)
         };
         let header = div()
             .id(SharedString::from(format!(
-                "files-section-{}",
+                "chat-activity-section-{}",
                 section.key()
             )))
             .group(HEADER_GROUP)
@@ -585,7 +783,7 @@ impl FilesSurface {
             frame
                 .child(chevron.with_animation(
                     SharedString::from(format!(
-                        "files-section-chevron-{}-{}",
+                        "chat-activity-section-chevron-{}-{}",
                         section.key(),
                         tween.epoch
                     )),
@@ -626,7 +824,7 @@ impl FilesSurface {
         frame
             .with_animation(
                 SharedString::from(format!(
-                    "files-section-body-{}-{}",
+                    "chat-activity-section-body-{}-{}",
                     section.key(),
                     tween.epoch
                 )),
@@ -652,7 +850,7 @@ impl FilesSurface {
     ) -> AnyElement {
         div()
             .id(SharedString::from(format!(
-                "files-section-{}-more",
+                "chat-activity-section-{}-more",
                 section.key()
             )))
             .role(gpui::Role::Button)
@@ -693,10 +891,10 @@ impl FilesSurface {
         let now = Utc::now();
         let shown = self.sections.shown(Section::Subagents);
         let scroll = self.sections.scroll(Section::Subagents);
-        let mut list = row_list("files-subagent-rows", &scroll);
+        let mut list = row_list("chat-activity-subagent-rows", &scroll);
         for row in rows.iter().take(shown) {
             let glyph = status_glyph(
-                format!("files-subagent-{}", row.doc_id),
+                format!("chat-activity-subagent-{}", row.doc_id),
                 row.indicator(),
                 view,
                 theme,
@@ -704,11 +902,12 @@ impl FilesSurface {
             );
             let open = row.clone();
             list = list.child(
-                compact_row(format!("files-subagent-{}", row.doc_id), theme)
+                compact_row(format!("chat-activity-subagent-{}", row.doc_id), theme)
                     .aria_label(SharedString::from(format!("Open subagent {}", row.title)))
-                    .on_click(cx.listener(move |_, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        cx.emit(FilesEvent::OpenSubagent {
+                        this.dismiss(cx);
+                        cx.emit(ChatActivityEvent::OpenSubagent {
                             doc_id: open.doc_id.clone(),
                             title: open.title.to_string(),
                             frozen: open.frozen(),
@@ -716,7 +915,7 @@ impl FilesSurface {
                     }))
                     .child(glyph)
                     .child(row_title(
-                        format!("files-subagent-title-{}", row.doc_id),
+                        format!("chat-activity-subagent-title-{}", row.doc_id),
                         row.title.clone(),
                     ))
                     .child(time_ago_label(
@@ -751,26 +950,28 @@ impl FilesSurface {
                 .h(px(EMPTY_ACTIONS_HEIGHT))
                 .child(
                     pill_button(
-                        "files-sections-empty-fork",
+                        "chat-activity-sections-empty-fork",
                         icons::GIT_BRANCH,
                         "Fork",
                         theme,
                     )
-                    .on_click(cx.listener(|_, _, _, cx| {
+                    .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
-                        cx.emit(FilesEvent::ForkChat);
+                        this.dismiss(cx);
+                        cx.emit(ChatActivityEvent::ForkChat);
                     })),
                 )
                 .child(
                     pill_button(
-                        "files-sections-empty-new",
+                        "chat-activity-sections-empty-new",
                         icons::PLUS,
                         "New side chat",
                         theme,
                     )
-                    .on_click(cx.listener(|_, _, _, cx| {
+                    .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
-                        cx.emit(FilesEvent::NewChildChat);
+                        this.dismiss(cx);
+                        cx.emit(ChatActivityEvent::NewChildChat);
                     })),
                 )
                 .into_any_element();
@@ -783,10 +984,10 @@ impl FilesSurface {
         let view = cx.entity_id();
         let shown = self.sections.shown(Section::Chats);
         let scroll = self.sections.scroll(Section::Chats);
-        let mut list = row_list("files-chat-rows", &scroll);
+        let mut list = row_list("chat-activity-chat-rows", &scroll);
         for row in rows.iter().take(shown) {
             let glyph = status_glyph(
-                format!("files-chat-{}", row.chat_id),
+                format!("chat-activity-chat-{}", row.chat_id),
                 row.status,
                 view,
                 theme,
@@ -795,17 +996,18 @@ impl FilesSurface {
             let open_id = row.chat_id.clone();
             let menu_id = row.chat_id.clone();
             list = list.child(
-                compact_row(format!("files-chat-{}", row.chat_id), theme)
+                compact_row(format!("chat-activity-chat-{}", row.chat_id), theme)
                     .aria_label(SharedString::from(format!("Open side chat {}", row.title)))
-                    .on_click(cx.listener(move |_, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
-                        cx.emit(FilesEvent::OpenChildChat(open_id.clone()));
+                        this.dismiss(cx);
+                        cx.emit(ChatActivityEvent::OpenChildChat(open_id.clone()));
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |_, event: &gpui::MouseDownEvent, _, cx| {
                             cx.stop_propagation();
-                            cx.emit(FilesEvent::ChildChatContextMenu {
+                            cx.emit(ChatActivityEvent::ChildChatContextMenu {
                                 chat_id: menu_id.clone(),
                                 position: event.position,
                             });
@@ -813,12 +1015,12 @@ impl FilesSurface {
                     )
                     .child(glyph)
                     .child(row_title(
-                        format!("files-chat-title-{}", row.chat_id),
+                        format!("chat-activity-chat-title-{}", row.chat_id),
                         row.title.clone(),
                     ))
                     .children(row.change_request.clone().map(|summary| {
                         crate::change_requests::pull_request_badge(
-                            format!("files-chat-pr-{}", row.chat_id).into(),
+                            format!("chat-activity-chat-pr-{}", row.chat_id).into(),
                             summary,
                             crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
                             theme,
@@ -866,7 +1068,7 @@ fn header_action(
         )
 }
 
-/// The empty state's pill buttons — the explorer's Retry button shape.
+/// The empty state's pill buttons — the activity menu's Retry button shape.
 fn pill_button(
     id: &'static str,
     icon_path: &'static str,
@@ -952,7 +1154,8 @@ fn empty_state(copy: &'static str, actions: Option<AnyElement>, theme: &Theme) -
 /// 29px, 8px radius, the glass hover wash, 13px title on a 17px line.
 fn compact_row(id: String, theme: &Theme) -> gpui::Stateful<gpui::Div> {
     div()
-        .id(SharedString::from(id))
+        .id(SharedString::from(id.clone()))
+        .debug_selector(move || id.clone())
         .role(gpui::Role::Button)
         .flex_none()
         .h(px(ROW_HEIGHT))
@@ -1031,6 +1234,121 @@ mod tests {
     use super::*;
     use zeron_doc::{MessageRole, MessageStatus, SessionMessageEntry};
     use zeron_proto::ToolCall;
+
+    #[gpui::test]
+    fn activity_menu_toggles_navigates_and_resets_with_the_conversation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        struct Host {
+            activity: Entity<ChatActivity>,
+            events: Vec<ChatActivityEvent>,
+            _events: Subscription,
+        }
+        impl Render for Host {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .justify_end()
+                    .items_end()
+                    .p(px(20.0))
+                    .child(div().track_focus(&self.activity.read(cx).composer_focus))
+                    .child(self.activity.clone())
+            }
+        }
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("main".into());
+                state.chats = vec![chat("main", None, 60), chat("child", Some("main"), 1)];
+                state.transcript = vec![entry(vec![spawn(
+                    "t1",
+                    "Agent: verify",
+                    Some("sub-1"),
+                    Some(SubagentStatus::Done),
+                )])];
+                state
+            });
+            let focus = cx.focus_handle();
+            let activity = cx.new(|cx| ChatActivity::new(state, focus, cx));
+            let events = cx.subscribe(
+                &activity,
+                |this: &mut Host, _, event: &ChatActivityEvent, _| {
+                    this.events.push(event.clone());
+                },
+            );
+            Host {
+                activity,
+                events: Vec::new(),
+                _events: events,
+            }
+        });
+        let activity = host.read_with(cx, |host, _| host.activity.clone());
+        let click = |cx: &mut gpui::VisualTestContext, selector| {
+            let position = cx.debug_bounds(selector).expect(selector).center();
+            cx.simulate_mouse_down(position, MouseButton::Left, gpui::Modifiers::default());
+            cx.simulate_mouse_up(position, MouseButton::Left, gpui::Modifiers::default());
+        };
+
+        click(cx, "chat-activity-trigger");
+        assert!(activity.read_with(cx, |activity, _| activity.is_open()));
+        let trigger = cx.debug_bounds("chat-activity-trigger").unwrap();
+        let menu = cx.debug_bounds("chat-activity-menu").unwrap();
+        assert!(
+            menu.bottom() <= trigger.top(),
+            "the menu opens above the footer"
+        );
+        assert!(cx.debug_bounds("chat-activity-subagent-sub-1").is_some());
+        assert!(cx.debug_bounds("chat-activity-chat-child").is_some());
+
+        click(cx, "chat-activity-trigger");
+        assert!(
+            !activity.read_with(cx, |activity, _| activity.is_open()),
+            "a second click closes instead of reopening"
+        );
+        activity.update(cx, |activity, cx| {
+            activity.menu = popover::Popup::default();
+            cx.notify();
+        });
+        click(cx, "chat-activity-trigger");
+        cx.simulate_keystrokes("escape");
+        assert!(!activity.read_with(cx, |activity, _| activity.is_open()));
+        cx.update(|window, cx| assert!(activity.read(cx).composer_focus.is_focused(window)));
+
+        activity.update(cx, |activity, cx| {
+            activity.menu = popover::Popup::default();
+            cx.notify();
+        });
+        click(cx, "chat-activity-trigger");
+        click(cx, "chat-activity-chat-child");
+        assert!(!activity.read_with(cx, |activity, _| activity.is_open()));
+        host.read_with(cx, |host, _| {
+            assert!(matches!(host.events.last(), Some(ChatActivityEvent::OpenChildChat(id)) if id == "child"));
+        });
+
+        activity.update(cx, |activity, cx| {
+            activity.menu.open(());
+            activity.sections.shown.insert(Section::Chats, 30);
+            activity.state.update(cx, |state, cx| {
+                state.selected_chat = Some("other".into());
+                state.transcript.clear();
+                cx.notify();
+            });
+        });
+        activity.read_with(cx, |activity, _| {
+            assert!(!activity.is_open());
+            assert_eq!(activity.chat_id, "other");
+            assert_eq!(activity.sections.shown(Section::Chats), INITIAL_ROWS);
+        });
+
+        click(cx, "chat-activity-trigger");
+        assert!(cx.debug_bounds("chat-activity-chat-child").is_none());
+        let outside = gpui::point(px(5.0), px(5.0));
+        cx.simulate_mouse_down(outside, MouseButton::Left, gpui::Modifiers::default());
+        assert!(!activity.read_with(cx, |activity, _| activity.is_open()));
+    }
 
     fn chat(id: &str, parent: Option<&str>, minutes_ago: i64) -> Chat {
         serde_json::from_value(serde_json::json!({
@@ -1120,7 +1438,7 @@ mod tests {
         assert!(rows[1].frozen());
         // Spawn time comes from the turn that carried the chip.
         assert!((Utc::now() - rows[0].spawned_at).num_minutes() >= 2);
-        // Another chat's explorer sees nothing of this transcript.
+        // Another chat's activity menu sees nothing of this transcript.
         assert!(subagent_rows(&state, "other").is_empty());
     }
 
@@ -1185,7 +1503,7 @@ mod tests {
     }
 
     #[test]
-    fn body_budget_shares_the_footer_and_hands_slack_across() {
+    fn body_budget_shares_the_menu_and_hands_slack_across() {
         // Both fit: each takes what it wants.
         assert_eq!(
             body_budget(300.0, [100.0, 100.0], [true, true]),

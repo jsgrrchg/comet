@@ -26,6 +26,7 @@ struct SpaceView: View {
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                .sessionPinAction(chat: chat, model: model)
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button {
                         withAnimation(Motion.resort) {
@@ -133,9 +134,7 @@ struct NewSpaceSheet: View {
     @State private var creating = false
 
     private var devices: [DeviceRow] {
-        // Engines own folders; this phone can't. Offer every other device.
-        (model.demo?.devices ?? model.workspace?.devices ?? [])
-            .filter { $0.platform != "ios" }
+        model.executionDevices
     }
 
     private var selectedDeviceId: String? {

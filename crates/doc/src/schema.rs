@@ -3,11 +3,14 @@
 //! Container layout (MUST stay shape-compatible with the TS edge/tail materializer):
 //! - `meta`:     LoroMap  { chatId: string, schemaVersion: number }         (host-only writer)
 //! - `messages`: LoroList of LoroMap {
-//!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?, continuationOf? }
+//!   id, role, parts: LoroList<part map>, createdAt, deviceId, status?,
+//!   continuationOf?, durationMs? }
 //! - `commands`: LoroList of LoroMap {
 //!   id, kind, payload(json), issuedBy, issuedAt, basedOn?, expiresAt?, status, resolution? }
+//! - `queue`:    LoroMovableList of LoroMap {
+//!   id, text, attachments?, issuedBy, issuedAt, editedAt? }        (any device writes)
 //!
-//! Part maps: { id, kind: "text"|"reasoning"|"tool"|"input"|"error", text?: LoroText,
+//! Part maps: { id, kind: "text"|"reasoning"|"tool"|"input"|"error"|"image", text?: LoroText,
 //! reasoning?: LoroText, call?: json, isError?, questions?: json, resolved?, message? }.
 //! Text bodies are **LoroText** so streaming appends RLE-merge (1.03x oplog overhead vs
 //! 125x for whole-value rewrites).
@@ -51,6 +54,11 @@ pub struct SessionMessageEntry {
     pub status: Option<MessageStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continuation_of: Option<String>,
+    /// Wall-clock length of this assistant turn, stamped when the segment
+    /// finishes. Absent on user rows, live streams, and docs written before
+    /// the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
 }
 
 /// The doc-resident flat part map (`DocMessagePart` in TS). Distinct from the app-layer
@@ -60,6 +68,12 @@ pub struct SessionMessageEntry {
 struct DocPartJson {
     id: String,
     kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     /// Thinking body for `kind: "reasoning"` (additive). Deliberately NOT the
@@ -111,6 +125,19 @@ struct DocPartJson {
 /// App parts → doc part json (mirror of `toDocParts`).
 fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
     Ok(match part {
+        MessagePart::Image {
+            id,
+            path,
+            name,
+            mime_type,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "image".into(),
+            path: Some(path.clone()),
+            name: Some(name.clone()),
+            mime_type: Some(mime_type.clone()),
+            ..Default::default()
+        },
         MessagePart::Text { id, text } => DocPartJson {
             id: id.clone(),
             kind: "text".into(),
@@ -186,6 +213,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
 /// Doc part json → app part (mirror of `fromDocParts`; malformed degrades to empty text).
 fn from_doc_part(p: DocPartJson) -> MessagePart {
     match p.kind.as_str() {
+        "image" => image_part(p.id, p.path, p.name, p.mime_type),
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
             Some(call) => MessagePart::Tool {
                 id: p.id,
@@ -236,6 +264,35 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
     }
 }
 
+fn image_part(
+    id: String,
+    path: Option<String>,
+    name: Option<String>,
+    mime_type: Option<String>,
+) -> MessagePart {
+    match (path, name, mime_type) {
+        (Some(path), Some(name), Some(mime_type))
+            if !path.is_empty()
+                && !name.is_empty()
+                && matches!(
+                    mime_type.as_str(),
+                    "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+                ) =>
+        {
+            MessagePart::Image {
+                id,
+                path,
+                name,
+                mime_type,
+            }
+        }
+        _ => MessagePart::Error {
+            id,
+            message: "Generated image unavailable".into(),
+        },
+    }
+}
+
 /// A session doc handle: typed access over a LoroDoc with the schema above.
 pub struct SessionDoc {
     doc: LoroDoc,
@@ -259,6 +316,41 @@ impl SessionDoc {
 
     pub fn doc(&self) -> &LoroDoc {
         &self.doc
+    }
+
+    /// A single atomic value prevents tokens and capacity from tearing on sync.
+    pub fn context_usage(&self) -> Option<zeron_proto::ContextUsage> {
+        let loro::ValueOrContainer::Value(LoroValue::String(value)) =
+            self.doc.get_map("meta").get("contextUsage")?
+        else {
+            return None;
+        };
+        serde_json::from_str(&value).ok()
+    }
+
+    pub fn update_context_usage(
+        &self,
+        tokens: Option<u64>,
+        window: Option<u64>,
+    ) -> Result<(), DocError> {
+        let previous = self.context_usage().unwrap_or_default();
+        let next = zeron_proto::ContextUsage {
+            tokens: tokens.or(previous.tokens),
+            window: window.filter(|n| *n > 0).or(previous.window),
+        };
+        if next != previous {
+            self.doc
+                .get_map("meta")
+                .insert("contextUsage", serde_json::to_string(&next)?)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+    pub fn clear_context_usage(&self) -> Result<(), DocError> {
+        self.doc.get_map("meta").delete("contextUsage")?;
+        self.doc.commit();
+        Ok(())
     }
 
     pub fn chat_id(&self) -> Option<String> {
@@ -312,6 +404,54 @@ impl SessionDoc {
                 }
             })
             .collect())
+    }
+
+    /// Read a bounded suffix directly from the containers, without expanding
+    /// the full messages tree. For first paint only: the full watch must follow.
+    /// Limits count parts rather than joined messages (one turn can have tens
+    /// of thousands of parts). Never truncate a part's text or persisted data.
+    pub fn read_opening_tail(
+        &self,
+        max_parts: usize,
+    ) -> Result<Vec<SessionMessageEntry>, DocError> {
+        use loro::{Container, ValueOrContainer};
+        let messages = self.doc.get_list("messages");
+        let mut remaining = max_parts;
+        let mut entries = Vec::new();
+        for index in (0..messages.len()).rev() {
+            if remaining == 0 {
+                break;
+            }
+            let Some(ValueOrContainer::Container(Container::Map(map))) = messages.get(index) else {
+                continue;
+            };
+            let mut value = map.get_value().to_json_value();
+            let mut tail = Vec::new();
+            if let Some(ValueOrContainer::Container(Container::List(parts))) = map.get("parts") {
+                let count = remaining.min(parts.len());
+                for part_index in parts.len().saturating_sub(count)..parts.len() {
+                    if let Some(part) = parts.get(part_index) {
+                        tail.push(part.get_deep_value().to_json_value());
+                    }
+                }
+                remaining -= count.max(1).min(remaining);
+            } else {
+                remaining -= 1;
+            }
+            value["parts"] = serde_json::Value::Array(tail);
+            if let Ok(entry) = entry_from_json(value) {
+                entries.push(entry);
+            }
+        }
+        entries.reverse();
+        // Preserve the joined id even when the first included segment's root
+        // is outside the window, so its text rows survive the full reset.
+        if let Some(first) = entries.first_mut()
+            && let Some(root) = first.continuation_of.take()
+        {
+            first.id = root;
+        }
+        Ok(join_continuation_entries(entries))
     }
 
     /// Read the commands ledger.
@@ -630,6 +770,9 @@ fn write_entry_scalar_fields(map: &LoroMap, entry: &SessionMessageEntry) -> Resu
     if let Some(continuation_of) = &entry.continuation_of {
         map.insert("continuationOf", continuation_of.as_str())?;
     }
+    if let Some(duration_ms) = entry.duration_ms {
+        map.insert("durationMs", duration_ms)?;
+    }
     Ok(())
 }
 
@@ -656,6 +799,15 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
         // whole-value rewrites cost ~125x the oplog of a text append.
         let t = map.insert_container("reasoning", LoroText::new())?;
         t.insert(0, reasoning)?;
+    }
+    for (key, value) in [
+        ("path", &doc_part.path),
+        ("name", &doc_part.name),
+        ("mimeType", &doc_part.mime_type),
+    ] {
+        if let Some(value) = value {
+            map.insert(key, value.as_str())?;
+        }
     }
     if let Some(call) = &doc_part.call {
         map.insert("call", loro_value_from_json(call))?;
@@ -716,6 +868,8 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
         status: Option<MessageStatus>,
         #[serde(default)]
         continuation_of: Option<String>,
+        #[serde(default)]
+        duration_ms: Option<i64>,
     }
     match serde_json::from_value::<RawEntry>(v.clone()) {
         Ok(raw) => Ok(SessionMessageEntry {
@@ -726,6 +880,7 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
             device_id: raw.device_id,
             status: raw.status,
             continuation_of: raw.continuation_of,
+            duration_ms: raw.duration_ms,
         }),
         // 2026-08-10 incident rule: a missing field must cost AT MOST what
         // the field carried — never the entry, never the transcript. Rooms
@@ -790,6 +945,7 @@ fn salvage_entry(
             .get("status")
             .and_then(|s| serde_json::from_value(s.clone()).ok()),
         continuation_of: str_field("continuationOf"),
+        duration_ms: obj.get("durationMs").and_then(|x| x.as_i64()),
     })
 }
 
@@ -803,6 +959,15 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
         .and_then(|x| x.as_str())
         .map(str::to_owned)
         .unwrap_or_else(|| format!("{entry_id}#recovered-{ix}"));
+    if obj.get("kind").and_then(|v| v.as_str()) == Some("image") {
+        let field = |key| obj.get(key).and_then(|v| v.as_str()).map(str::to_owned);
+        return Some(image_part(
+            id,
+            field("path"),
+            field("name"),
+            field("mimeType"),
+        ));
+    }
     if let Some(reasoning) = obj.get("reasoning").and_then(|x| x.as_str()) {
         return Some(MessagePart::Reasoning {
             id,
@@ -866,6 +1031,9 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
             Some(root_id) => {
                 if let Some(&at) = root_index.get(root_id) {
                     out[at].parts.extend(entry.parts);
+                    if entry.duration_ms.is_some() {
+                        out[at].duration_ms = entry.duration_ms;
+                    }
                 } else {
                     // Orphan continuation — surface as its own entry rather than dropping.
                     out.push(entry);
@@ -897,6 +1065,7 @@ pub struct SegmentWriter<'a> {
     entry_index: usize,
     /// Mirror of what we've written so far (part id → app part).
     written: Vec<MessagePart>,
+    created_at: i64,
 }
 
 impl<'a> SegmentWriter<'a> {
@@ -920,6 +1089,7 @@ impl<'a> SegmentWriter<'a> {
                 device_id: device_id.into(),
                 status: Some(MessageStatus::Streaming),
                 continuation_of: None,
+                duration_ms: None,
             },
         )?;
         map.insert_container("parts", LoroList::new())?;
@@ -928,6 +1098,7 @@ impl<'a> SegmentWriter<'a> {
             doc,
             entry_index,
             written: Vec::new(),
+            created_at,
         })
     }
 
@@ -936,10 +1107,20 @@ impl<'a> SegmentWriter<'a> {
     /// the seam that lets a sink hold `(entry_index, written)` between
     /// coalesced flushes instead of a doc-borrowing writer.
     pub fn resume(doc: &'a SessionDoc, entry_index: usize, written: Vec<MessagePart>) -> Self {
+        let created_at = match doc.doc.get_list("messages").get(entry_index) {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => {
+                match map.get("createdAt") {
+                    Some(loro::ValueOrContainer::Value(LoroValue::I64(ms))) => ms,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        };
         Self {
             doc,
             entry_index,
             written,
+            created_at,
         }
     }
 
@@ -1033,11 +1214,19 @@ impl<'a> SegmentWriter<'a> {
         Ok(())
     }
 
-    /// Finish the stream: sync final parts and stamp a terminal status.
+    /// Finish the stream: sync final parts, stamp a terminal status, and
+    /// record how long the turn ran (`now - createdAt`).
     pub fn finish(mut self, folded: &[MessagePart], status: MessageStatus) -> Result<(), DocError> {
         self.sync(folded)?;
         let map = self.entry_map()?;
         map.insert("status", status_str(status))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(self.created_at);
+        if self.created_at > 0 {
+            map.insert("durationMs", (now - self.created_at).max(0))?;
+        }
         self.doc.doc.commit();
         Ok(())
     }
@@ -1053,6 +1242,15 @@ fn part_map_at(parts: &LoroList, index: usize) -> Result<LoroMap, DocError> {
 /// In-place field refresh for tool/input parts (and defensive text rewrite).
 fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError> {
     let doc_part = to_doc_part(part)?;
+    for (key, value) in [
+        ("path", &doc_part.path),
+        ("name", &doc_part.name),
+        ("mimeType", &doc_part.mime_type),
+    ] {
+        if let Some(value) = value {
+            map.insert(key, value.as_str())?;
+        }
+    }
     if let Some(call) = &doc_part.call {
         map.insert("call", loro_value_from_json(call))?;
     }
@@ -1114,7 +1312,7 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     Ok(())
 }
 
-fn loro_value_from_json(v: &serde_json::Value) -> LoroValue {
+pub(crate) fn loro_value_from_json(v: &serde_json::Value) -> LoroValue {
     LoroValue::from(v.clone())
 }
 
@@ -1157,6 +1355,88 @@ mod tests {
     use crate::parts::fold_event_into_parts;
     use zeron_proto::{AgentEvent, ToolCall};
 
+    #[test]
+    fn opening_tail_bounds_parts_and_preserves_continuation_ids() {
+        let doc = SessionDoc::init("whale").unwrap();
+        for segment in 0..4 {
+            doc.push_message(&SessionMessageEntry {
+                id: format!("segment-{segment}"),
+                role: MessageRole::Assistant,
+                parts: (0..100)
+                    .map(|part| MessagePart::Text {
+                        id: format!("part-{}", segment * 100 + part),
+                        text: "body".into(),
+                    })
+                    .collect(),
+                created_at: segment,
+                device_id: "device".into(),
+                status: Some(MessageStatus::Complete),
+                continuation_of: (segment > 0).then(|| "segment-0".into()),
+                duration_ms: None,
+            })
+            .unwrap();
+        }
+        let before = doc.export_snapshot().unwrap();
+        let tail = doc.read_opening_tail(128).unwrap();
+        assert_eq!(tail.len(), 1);
+        assert_eq!(tail[0].id, "segment-0");
+        assert_eq!(tail[0].parts.len(), 128);
+        assert_eq!(tail[0].parts[0].id(), "part-272");
+        assert_eq!(tail[0].parts.last().unwrap().id(), "part-399");
+        assert_eq!(
+            doc.read_opening_tail(1000).unwrap(),
+            join_continuation_entries(doc.read_entries().unwrap())
+        );
+        assert!(doc.read_opening_tail(0).unwrap().is_empty());
+        assert_eq!(
+            before,
+            doc.export_snapshot().unwrap(),
+            "preview never mutates storage"
+        );
+    }
+
+    #[test]
+    fn generated_image_persists_updates_and_salvages() {
+        let doc = SessionDoc::init("images").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![];
+        let event = AgentEvent::GeneratedImage {
+            id: "i:image".into(),
+            path: "/uploads/a.png".into(),
+            name: "generated.png".into(),
+            mime_type: "image/png".into(),
+        };
+        fold_event_into_parts(&mut parts, &event);
+        writer.sync(&parts).unwrap();
+        if let MessagePart::Image { path, .. } = &mut parts[0] {
+            *path = "/uploads/b.png".into();
+        }
+        writer.sync(&parts).unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, parts);
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        let loaded = SessionDoc::from_doc(imported);
+        assert_eq!(loaded.read_entries().unwrap()[0].parts, parts);
+        let valid = serde_json::json!({"kind":"image", "id":"i", "path":"/uploads/i.png", "name":"i.png", "mimeType":"image/png", "isError":42});
+        assert!(matches!(
+            salvage_part(&valid, "a", 0),
+            Some(MessagePart::Image { .. })
+        ));
+        for bad in [
+            serde_json::json!({"kind":"image", "id":"i"}),
+            serde_json::json!({"kind":"image", "id":"i", "path":"/x", "name":"x", "mimeType":"image/svg+xml"}),
+        ] {
+            assert!(matches!(
+                from_doc_part(serde_json::from_value(bad.clone()).unwrap()),
+                MessagePart::Error { .. }
+            ));
+            assert!(matches!(
+                salvage_part(&bad, "a", 0),
+                Some(MessagePart::Error { .. })
+            ));
+        }
+    }
+
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
             id: id.into(),
@@ -1169,6 +1449,7 @@ mod tests {
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            duration_ms: None,
         }
     }
 
@@ -1337,6 +1618,7 @@ mod tests {
             // The orphan case: the run died and recovery stamped the entry.
             status: Some(MessageStatus::Aborted),
             continuation_of: None,
+            duration_ms: None,
         })
         .unwrap();
         assert!(!doc.resolve_input("nope").unwrap());
@@ -1427,6 +1709,10 @@ mod tests {
         let entries = doc.read_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, Some(MessageStatus::Complete));
+        assert!(
+            entries[0].duration_ms.is_some(),
+            "finish stamps how long the turn ran"
+        );
         assert_eq!(entries[0].parts.len(), 2);
         match &entries[0].parts[0] {
             MessagePart::Text { text, .. } => assert_eq!(text, "Hello"),
@@ -1467,7 +1753,12 @@ mod tests {
             },
         );
         writer.sync(&folded).unwrap();
-        fold_event_into_parts(&mut folded, &AgentEvent::TextDelta { text: "Done".into() });
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::TextDelta {
+                text: "Done".into(),
+            },
+        );
         writer.sync(&folded).unwrap();
         writer.finish(&folded, MessageStatus::Complete).unwrap();
 
@@ -1595,6 +1886,7 @@ mod tests {
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            duration_ms: None,
         })
         .unwrap();
         let entries = doc.read_entries().unwrap();
@@ -1726,5 +2018,43 @@ mod tests {
         });
         let entry = entry_from_json(v).expect("strict");
         assert_eq!(entry.id, "m1");
+    }
+}
+
+#[cfg(test)]
+mod context_usage_tests {
+    use super::*;
+    #[test]
+    fn context_snapshot_survives_remote_import_restart_and_rebuild() {
+        let host = SessionDoc::init("context-chat").unwrap();
+        assert_eq!(host.context_usage(), None);
+        host.update_context_usage(Some(150_000), Some(200_000))
+            .unwrap();
+        let replica = SessionDoc::from_doc(LoroDoc::new());
+        replica
+            .doc()
+            .import(&host.export_snapshot().unwrap())
+            .unwrap();
+        assert_eq!(replica.context_usage(), host.context_usage());
+        let version = host.doc().oplog_vv();
+        // Compaction is a replacement, not an accumulating counter. Zero capacity is invalid.
+        host.update_context_usage(Some(0), Some(0)).unwrap();
+        replica
+            .doc()
+            .import(&host.doc().export(ExportMode::updates(&version)).unwrap())
+            .unwrap();
+        assert_eq!(
+            replica.context_usage(),
+            Some(zeron_proto::ContextUsage {
+                tokens: Some(0),
+                window: Some(200_000)
+            })
+        );
+        host.update_context_usage(None, Some(1_000_000)).unwrap();
+        assert_eq!(host.context_usage().unwrap().tokens, Some(0));
+        let rebuilt = crate::rebuild_thin_doc(&host).unwrap().doc;
+        assert_eq!(rebuilt.context_usage(), host.context_usage());
+        rebuilt.clear_context_usage().unwrap();
+        assert_eq!(rebuilt.context_usage(), None);
     }
 }

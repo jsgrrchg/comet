@@ -136,6 +136,77 @@ impl Harness for ScriptedHarness {
     }
 }
 
+/// Two-run harness for interrupt isolation. Run B stays parked until the test
+/// releases it, then records whether its own token was cancelled before it
+/// completes. This makes a cross-chat cancellation observable even if B has
+/// not yet had a chance to publish `Done` when A's interrupt returns.
+struct InterruptIsolationHarness {
+    release_b: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Harness for InterruptIsolationHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Interrupt isolation"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(8);
+        let release_b = self.release_b.clone();
+        let token = controls.interrupt.clone();
+        tokio::spawn(async move {
+            if tx
+                .send(Ok(AgentEvent::TextDelta {
+                    text: format!("{} started", request.prompt),
+                }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+
+            if request.prompt == "run-b" {
+                release_b.notified().await;
+                if token.is_cancelled() {
+                    let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+                } else {
+                    let _ = tx
+                        .send(Ok(AgentEvent::TextDelta {
+                            text: "; completed independently".into(),
+                        }))
+                        .await;
+                    let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                }
+            } else {
+                token.cancelled().await;
+                let _ = tx.send(Ok(done(DoneStatus::Interrupted))).await;
+            }
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
+}
+
 fn registry_with(harness: Arc<dyn Harness>) -> Arc<HarnessRegistry> {
     let registry = HarnessRegistry::new();
     registry.register(harness);
@@ -187,8 +258,12 @@ where
 }
 
 fn entries(core: &EngineCore) -> Vec<SessionMessageEntry> {
+    entries_for(core, CHAT)
+}
+
+fn entries_for(core: &EngineCore, chat_id: &str) -> Vec<SessionMessageEntry> {
     core.doc_host
-        .open(CHAT)
+        .open(chat_id)
         .expect("open chat")
         .doc()
         .read_entries()
@@ -446,6 +521,95 @@ async fn interrupt_stamps_streaming_entry_aborted() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn interrupt_is_scoped_to_the_target_chat() {
+    const CHAT_A: &str = "chat-interrupt-a";
+    const CHAT_B: &str = "chat-interrupt-b";
+
+    let dir = tempfile::tempdir().unwrap();
+    let release_b = Arc::new(tokio::sync::Notify::new());
+    let core = assemble(
+        dir.path(),
+        Arc::new(InterruptIsolationHarness {
+            release_b: release_b.clone(),
+        }),
+    );
+
+    for (chat_id, command_id, message_id, prompt) in [
+        (CHAT_A, "cmd-run-a", "message-a", "run-a"),
+        (CHAT_B, "cmd-run-b", "message-b", "run-b"),
+    ] {
+        let handle = core.doc_host.open(chat_id).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            command_id,
+            SessionCommandPayload::Run {
+                request: run_request(prompt),
+                message_id: message_id.into(),
+            },
+        );
+    }
+
+    wait_for(
+        || {
+            [CHAT_A, CHAT_B].into_iter().all(|chat_id| {
+                core.sessions.session_status(chat_id).map(|s| s.status)
+                    == Some(SessionStatus::Working)
+                    && entries_for(&core, chat_id)
+                        .iter()
+                        .any(|entry| entry.status == Some(MessageStatus::Streaming))
+            })
+        },
+        "both chats to be streaming",
+    )
+    .await;
+
+    assert!(core.sessions.interrupt(CHAT_A).await.unwrap());
+    assert_eq!(
+        core.sessions.session_status(CHAT_A).map(|s| s.status),
+        Some(SessionStatus::Idle)
+    );
+    assert!(
+        entries_for(&core, CHAT_A)
+            .iter()
+            .any(|entry| entry.status == Some(MessageStatus::Aborted))
+    );
+    assert!(
+        !core.sessions.interrupt(CHAT_A).await.unwrap(),
+        "a settled chat must report that there is no live run to interrupt"
+    );
+
+    // B has not observed any completion signal yet. Release it through its
+    // independent test control; it checks its own token before completing, so
+    // a cancellation leaked from A cannot hide behind an early status read.
+    assert_eq!(
+        core.sessions.session_status(CHAT_B).map(|s| s.status),
+        Some(SessionStatus::Working),
+        "interrupting chat A must leave chat B running"
+    );
+    assert!(
+        entries_for(&core, CHAT_B)
+            .iter()
+            .any(|entry| entry.status == Some(MessageStatus::Streaming))
+    );
+    release_b.notify_one();
+
+    wait_for(
+        || core.sessions.session_status(CHAT_B).map(|s| s.status) == Some(SessionStatus::Idle),
+        "chat B to complete independently",
+    )
+    .await;
+
+    let assistant_b = entries_for(&core, CHAT_B)
+        .into_iter()
+        .find(|entry| entry.role == MessageRole::Assistant)
+        .expect("chat B assistant entry");
+    assert_eq!(assistant_b.status, Some(MessageStatus::Complete));
+    assert!(assistant_b.parts.iter().any(|part| {
+        matches!(part, MessagePart::Text { text, .. } if text.contains("completed independently"))
+    }));
+}
+
 #[tokio::test]
 async fn steer_with_no_live_run_falls_back_to_new_turn() {
     let dir = tempfile::tempdir().unwrap();
@@ -646,9 +810,9 @@ async fn retry_reissues_a_swallowed_send() {
     .await;
     wait_for(
         || {
-            entries_now(&core)
-                .iter()
-                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "re-issued send runs to completion",
     )
@@ -708,6 +872,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             device_id: device_id.into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            duration_ms: None,
         })
         .unwrap();
         let mut writer = SegmentWriter::begin(&doc, "m-assist", device_id, 2).unwrap();
@@ -807,7 +972,10 @@ async fn rpc_surface_over_in_memory_transport() {
         .unwrap()
         .unwrap();
     // Delta protocol: the stream opens with a full reset frame.
-    assert_eq!(initial, serde_json::json!({ "reset": [] }));
+    assert_eq!(
+        initial,
+        serde_json::json!({ "reset": [], "contextUsage": null, "replayBaseline": {"entries": {}} })
+    );
 
     // QueueCommand (as this device's composer would over IPC).
     let command = serde_json::to_value(SessionCommandPayload::Run {
@@ -1852,9 +2020,9 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     );
     wait_for(
         || {
-            entries(&core)
-                .iter()
-                .any(|e| e.status == Some(MessageStatus::Complete))
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "run completes",
     )
@@ -2133,4 +2301,395 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
     )
     .await;
     assert_eq!(core.sessions.session_status(CHAT).unwrap().started_at, None);
+}
+
+#[tokio::test]
+async fn context_usage_settles_after_done_without_reopening_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::TextDelta {
+                    text: "Finished".into(),
+                },
+                AgentEvent::ContextUsage {
+                    tokens: Some(64000),
+                    window: Some(200000),
+                },
+                done(DoneStatus::Completed),
+                AgentEvent::Subagent {
+                    parent_tool_use_id: "child".into(),
+                    event: Box::new(AgentEvent::ContextUsage {
+                        tokens: Some(999999),
+                        window: Some(1000000),
+                    }),
+                },
+                AgentEvent::ContextUsage {
+                    tokens: Some(0),
+                    window: None,
+                },
+            ],
+            step_delay: Duration::from_millis(20),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "context-run",
+        SessionCommandPayload::Run {
+            request: run_request("measure context"),
+            message_id: "context-user".into(),
+        },
+    );
+    wait_for(
+        || {
+            handle
+                .doc()
+                .context_usage()
+                .is_some_and(|u| u.tokens == Some(0))
+        },
+        "post-turn context update",
+    )
+    .await;
+    assert_eq!(
+        handle.doc().context_usage(),
+        Some(zeron_proto::ContextUsage {
+            tokens: Some(0),
+            window: Some(200000)
+        })
+    );
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle)
+    );
+    assert_eq!(
+        entries(&core).len(),
+        2,
+        "usage does not create transcript rows"
+    );
+}
+
+/// Reproduce a steer accepted just before the old turn's Done. The harness
+/// confirms the new boundary later; only its eventual completion may notify.
+#[tokio::test]
+async fn pending_steer_handoff_does_not_publish_a_completion() {
+    struct ControlledHarness(
+        std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>>>,
+    );
+    #[async_trait]
+    impl Harness for ControlledHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Controlled"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[ReasoningLevel::Medium]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _: RunRequest,
+            controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let rx = self.0.lock().unwrap().take().unwrap();
+            // Keep the mailbox alive but let the test control confirmation.
+            Ok(
+                futures::stream::unfold((rx, controls), |(mut rx, controls)| async move {
+                    rx.recv().await.map(|event| (Ok(event), (rx, controls)))
+                })
+                .boxed(),
+            )
+        }
+    }
+    for routed_dispatch in [false, true] {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir = tempfile::tempdir().unwrap();
+        let core = assemble(
+            dir.path(),
+            Arc::new(ControlledHarness(std::sync::Mutex::new(Some(rx)))),
+        );
+        let handle = core.doc_host.open(CHAT).unwrap();
+        queue_as_viewer(
+            handle.doc(),
+            "cmd-completion",
+            SessionCommandPayload::Run {
+                request: run_request("opening"),
+                message_id: "user-opening".into(),
+            },
+        );
+        tx.send(mock_script()[0].clone()).unwrap();
+        wait_for(
+            || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+            "opening run",
+        )
+        .await;
+        if routed_dispatch {
+            core.sessions
+                .dispatch(
+                    CHAT,
+                    HarnessId::Mock,
+                    run_request("redirect"),
+                    Some("user-steer".into()),
+                )
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(
+                core.sessions
+                    .steer(CHAT, "redirect", Some("user-steer".into()))
+                    .await
+                    .unwrap(),
+                zeron_engine::sessions::SteerOutcome::Accepted
+            );
+        }
+        tx.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+            "internal handoff",
+        )
+        .await;
+        assert_eq!(
+            core.sessions
+                .session_status(CHAT)
+                .unwrap()
+                .last_completed_turn,
+            None
+        );
+        tx.send(AgentEvent::Steered {
+            assistant_message_id: Some("a-1".into()),
+            next_assistant_message_id: Some("a-steered".into()),
+        })
+        .unwrap();
+        tx.send(AgentEvent::TextDelta {
+            text: "redirected response".into(),
+        })
+        .unwrap();
+        tx.send(done(DoneStatus::Completed)).unwrap();
+        wait_for(
+            || {
+                core.sessions
+                    .session_status(CHAT)
+                    .and_then(|s| s.last_completed_turn)
+                    .as_deref()
+                    == Some("a-steered")
+            },
+            "real completion",
+        )
+        .await;
+        // A duplicate terminal frame from a parked runtime cannot ring twice.
+        let (_, mut events) = core.sessions.subscribe(CHAT, 0).unwrap();
+        tx.send(done(DoneStatus::Completed)).unwrap();
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(duplicate.event, AgentEvent::Done { .. }));
+        // drive_run publishes and settles synchronously before polling again.
+        tokio::task::yield_now().await;
+        drop(tx);
+        assert_eq!(
+            core.sessions
+                .session_status(CHAT)
+                .unwrap()
+                .last_completed_turn
+                .as_deref(),
+            Some("a-steered")
+        );
+        core.shutdown().await;
+    }
+}
+
+/// Real drive_run + journal + Loro, with an isolated Codex source root.
+#[tokio::test]
+async fn generated_image_is_materialized_before_publication_and_survives_reopen() {
+    use zeron_engine::{DocHost, DocHostConfig, SessionsEngine, Uploads};
+    let dir = tempfile::tempdir().unwrap();
+    let source_root = dir.path().join("codex/generated_images");
+    std::fs::create_dir_all(&source_root).unwrap();
+    let source = source_root.join("source.png");
+    let bytes = b"\x89PNG\r\n\x1a\nBASE64_SENTINEL_ONLY_IN_FILE";
+    std::fs::write(&source, bytes).unwrap();
+    let image = AgentEvent::GeneratedImage {
+        id: "image-1:image".into(),
+        path: source.to_string_lossy().into_owned(),
+        name: "untrusted".into(),
+        mime_type: "untrusted".into(),
+    };
+    let script = vec![
+        AgentEvent::ToolCall {
+            id: "image-1".into(),
+            call: ToolCall::Unknown {
+                name: "Generate image".into(),
+                input: None,
+            },
+        },
+        AgentEvent::ToolResult {
+            id: "image-1".into(),
+            is_error: false,
+            output: None,
+            diff: None,
+        },
+        image.clone(),
+        image.clone(),
+        done(DoneStatus::Completed),
+    ];
+    let registry = registry_with(Arc::new(MockHarness { script }));
+    let journal = Arc::new(RunJournal::open(dir.path().join("journals")).unwrap());
+    let sessions = SessionsEngine::new("host".into(), journal.clone(), registry);
+    let uploads = Uploads::from_root(&dir.path().join("profile/uploads"));
+    sessions.set_generated_images(uploads.clone(), source_root);
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let host = DocHost::new(
+        store,
+        DocHostConfig {
+            device_id: "host".into(),
+            default_harness: HarnessId::Mock,
+            edge: None,
+        },
+    );
+    sessions.set_doc_host(host.clone());
+    sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("image"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        "image completion",
+    )
+    .await;
+    let handle = host.open(CHAT).unwrap();
+    let entries = handle.doc().read_entries().unwrap();
+    let images: Vec<_> = entries
+        .iter()
+        .flat_map(|e| &e.parts)
+        .filter_map(|p| {
+            if let MessagePart::Image { path, .. } = p {
+                Some(path.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(images.len(), 1);
+    assert!(std::path::Path::new(&images[0]).starts_with(uploads.dir()));
+    let serialized = serde_json::to_string(&journal.replay(CHAT, 0).unwrap()).unwrap();
+    assert!(!serialized.contains(source.to_str().unwrap()));
+    assert!(!serialized.contains("BASE64_SENTINEL"));
+    let doc_json = serde_json::to_string(&entries).unwrap();
+    assert!(!doc_json.contains(source.to_str().unwrap()));
+    assert!(!doc_json.contains("BASE64_SENTINEL"));
+    std::fs::remove_file(&source).unwrap();
+    assert_eq!(std::fs::read(&images[0]).unwrap(), bytes);
+    let imported = loro::LoroDoc::new();
+    imported
+        .import(&handle.doc().export_snapshot().unwrap())
+        .unwrap();
+    assert_eq!(
+        SessionDoc::from_doc(imported).read_entries().unwrap(),
+        entries
+    );
+    // Resume echoes the successful completed item after Codex removed its source.
+    sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request("resume"), None)
+        .await
+        .unwrap();
+    wait_for(
+        || {
+            sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Idle)
+        },
+        "resume completion",
+    )
+    .await;
+    assert_eq!(
+        handle
+            .doc()
+            .read_entries()
+            .unwrap()
+            .iter()
+            .flat_map(|e| &e.parts)
+            .filter(|p| matches!(p, MessagePart::Image { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !handle
+            .doc()
+            .read_entries()
+            .unwrap()
+            .iter()
+            .flat_map(|e| &e.parts)
+            .any(|p| matches!(p, MessagePart::Error { .. }))
+    );
+    sessions.shutdown().await;
+}
+
+/// Real provider + engine smoke, opt-in because it consumes image quota.
+#[tokio::test]
+#[ignore = "requires authenticated Codex with image generation; consumes quota"]
+async fn real_image_generation_profile_smoke() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = EngineCore::assemble(
+        dir.path(),
+        registry_with(Arc::new(zeron_harness::CodexHarness::new())),
+        HarnessId::Codex,
+        None,
+    )
+    .unwrap();
+    core.sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Codex,
+            run_request("Generate an image of a small green goblin using image generation."),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(300), async {
+        while !entries_now(&core)
+            .iter()
+            .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+        {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let all = entries(&core);
+    let image = all
+        .iter()
+        .flat_map(|e| &e.parts)
+        .find_map(|p| {
+            if let MessagePart::Image { path, .. } = p {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .expect("generated image reaches document");
+    assert!(std::path::Path::new(image).starts_with(core.uploads.dir()));
+    assert!(std::path::Path::new(image).is_file());
+    assert!(
+        !serde_json::to_string(&all)
+            .unwrap()
+            .contains("generated_images/")
+    );
+    core.sessions.shutdown().await;
 }

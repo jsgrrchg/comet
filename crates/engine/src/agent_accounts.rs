@@ -31,8 +31,10 @@
 //!    Codex spawns `codex login` against a throwaway `CODEX_HOME` and polls
 //!    until its loopback callback lands.
 //!
-//! Usage probes: both providers expose the rate-limit view their own CLIs render
-//! (`/usage` in Claude Code, `/status` in Codex). Unlike zeron (fetch on every
+//! Usage probes: all three providers expose the rate-limit view their own CLIs render
+//! (`/usage` in Claude Code, `/status` in Codex; Cursor's key has no quota view,
+//! so the probe exchanges it for a dashboard session and reads the
+//! `GetCurrentPeriodUsage` call the Cursor app itself makes). Unlike zeron (fetch on every
 //! list, 60s cache), native only hits the network when `force_usage` is set —
 //! the default list stays offline-fast and deterministic; the UI passes
 //! `forceUsage` on page mount/refresh. Cached results (60s TTL) are served to
@@ -67,6 +69,9 @@ const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+/// The Cursor dashboard's current-period usage RPC (Connect-style POST).
+const CURSOR_CURRENT_PERIOD_USAGE: &str = "aiserver.v1.DashboardService/GetCurrentPeriodUsage";
+const CURSOR_DEFAULT_BACKEND: &str = "https://api2.cursor.sh";
 
 #[cfg(target_os = "macos")]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -201,7 +206,7 @@ enum LoginFlow {
     Spawned {
         harness: HarnessId,
         /// The login child; monitored (try_wait) + killable from cancel.
-        child: Arc<Mutex<Option<tokio::process::Child>>>,
+        child: Arc<Mutex<Option<zeron_harness::process::Child>>>,
         /// Throwaway credential dir, reclaimed on cancel/completion.
         home: PathBuf,
         started_at: Instant,
@@ -209,14 +214,30 @@ enum LoginFlow {
         /// `Some(code)` once the child exited (`None` code = killed by signal).
         exit: Arc<Mutex<Option<Option<i32>>>>,
     },
+    /// a sign-in the engine drives itself (antigravity's acp `authenticate`);
+    /// the task reports the browser url and its outcome through `state`.
+    Task {
+        harness: HarnessId,
+        started_at: Instant,
+        state: Arc<Mutex<TaskLoginState>>,
+        /// aborting drops the sign-in future, which kills its agent child.
+        handle: tokio::task::JoinHandle<()>,
+    },
+}
+
+#[derive(Default)]
+struct TaskLoginState {
+    url: Option<String>,
+    message: Option<String>,
+    outcome: Option<Result<(), String>>,
 }
 
 impl LoginFlow {
     fn started_at(&self) -> Instant {
         match self {
-            LoginFlow::Claude { started_at, .. } | LoginFlow::Spawned { started_at, .. } => {
-                *started_at
-            }
+            LoginFlow::Claude { started_at, .. }
+            | LoginFlow::Spawned { started_at, .. }
+            | LoginFlow::Task { started_at, .. } => *started_at,
         }
     }
 }
@@ -520,6 +541,7 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => Ok(self.start_claude_login()),
             HarnessId::Codex => self.start_codex_login().await,
             HarnessId::Cursor => self.start_cursor_login().await,
+            HarnessId::Antigravity => Ok(self.start_antigravity_login()),
             other => Err(EngineError::Other(format!(
                 "agent logins are not supported for {other:?}"
             ))),
@@ -565,7 +587,13 @@ impl AgentAccounts {
     fn reap_spawned_flows(&self, harness: HarnessId) {
         let stale: Vec<String> = lock(&self.inner.flows)
             .iter()
-            .filter(|(_, f)| matches!(f, LoginFlow::Spawned { harness: h, .. } if *h == harness))
+            .filter(|(_, f)| {
+                matches!(
+                    f,
+                    LoginFlow::Spawned { harness: h, .. } | LoginFlow::Task { harness: h, .. }
+                        if *h == harness
+                )
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {
@@ -584,13 +612,28 @@ impl AgentAccounts {
             .root_dir()
             .join(format!(".login-{login_id}"));
         std::fs::create_dir_all(&home)?;
-        let mut command = tokio::process::Command::new("codex");
+        // Resolve through the harness itself (`CODEX_EXECUTABLE`, PATH, the
+        // login-shell snapshot, install dirs — the Windows npm payload
+        // included) and compose the same child PATH a chat run gets, so
+        // account login never diverges from what the harness can launch.
+        let mut command = match zeron_harness::codex::login_command(&home) {
+            Ok(command) => command,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&home);
+                return Err(EngineError::Other(match err {
+                    zeron_harness::HarnessError::NotInstalled(hint) => {
+                        format!(
+                            "The `codex` CLI was not found on this device — install it first. ({hint})"
+                        )
+                    }
+                    other => format!("Could not resolve the codex CLI for login: {other}"),
+                }));
+            }
+        };
         command
-            .arg("login")
-            .env("CODEX_HOME", &home)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stdin(zeron_harness::process::Stdio::null())
+            .stdout(zeron_harness::process::Stdio::piped())
+            .stderr(zeron_harness::process::Stdio::piped());
         // The CLI opens the authorization tab itself (via the `webbrowser`
         // crate) AND the app opens the page when this start reply lands —
         // users got TWO identical auth.openai.com tabs. `webbrowser` prefers
@@ -638,6 +681,55 @@ impl AgentAccounts {
         })
     }
 
+    /// antigravity: the acp server's own google sign-in, run when the agent is
+    /// turned on rather than mid-chat. the start replies at once because a
+    /// first sign-in downloads a large server; polls carry the browser url
+    /// once the server prints it.
+    fn start_antigravity_login(&self) -> AgentLoginStart {
+        self.reap_spawned_flows(HarnessId::Antigravity);
+        let login_id = new_id();
+        let state = Arc::new(Mutex::new(TaskLoginState::default()));
+        #[cfg(unix)]
+        let browser = {
+            let root = self.inner.config.root_dir();
+            std::fs::create_dir_all(&root)
+                .ok()
+                .and_then(|()| ensure_noop_browser(&root))
+        };
+        #[cfg(not(unix))]
+        let browser = None;
+        let task_state = state.clone();
+        let handle = tokio::spawn(async move {
+            let progress_state = task_state.clone();
+            let outcome = zeron_harness::AcpHarness::antigravity()
+                .sign_in(browser, move |progress| {
+                    let mut state = lock(&progress_state);
+                    match progress {
+                        zeron_harness::acp::SignInProgress::OpenBrowser(url) => {
+                            state.message = Some("Finish signing in in your browser.".into());
+                            state.url = Some(url);
+                        }
+                    }
+                })
+                .await;
+            lock(&task_state).outcome = Some(outcome.map_err(|e| e.to_string()));
+        });
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::Task {
+                harness: HarnessId::Antigravity,
+                started_at: Instant::now(),
+                state,
+                handle,
+            },
+        );
+        AgentLoginStart {
+            login_id,
+            url: String::new(),
+            mode: AgentLoginMode::Browser,
+        }
+    }
+
     /// Cursor: the SDK's own PKCE browser flow, driven through the zeron shim
     /// in login mode. The minted key lands in a throwaway store file (never
     /// the live `~/.cursor/sdk/auth.json`), then snapshots into a slot on
@@ -657,12 +749,10 @@ impl AgentAccounts {
                 let _ = std::fs::remove_dir_all(&home);
                 EngineError::Other(format!("Could not start the Cursor login: {e}"))
             })?;
-        let child = match cmd
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
+        cmd.stdin(zeron_harness::process::Stdio::null())
+            .stdout(zeron_harness::process::Stdio::piped())
+            .stderr(zeron_harness::process::Stdio::piped());
+        let child = match cmd.spawn() {
             Ok(child) => child,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&home);
@@ -854,6 +944,9 @@ impl AgentAccounts {
 
     pub async fn poll_login(&self, login_id: &str) -> Result<AgentLoginPoll, EngineError> {
         self.sweep_flows();
+        if let Some(poll) = self.poll_task_login(login_id) {
+            return Ok(poll);
+        }
         let (harness, home, exit, output) = match lock(&self.inner.flows).get(login_id) {
             None => {
                 return Err(EngineError::Other(
@@ -864,8 +957,10 @@ impl AgentAccounts {
                 return Ok(AgentLoginPoll {
                     status: AgentLoginStatus::Pending,
                     message: None,
+                    url: None,
                 });
             }
+            Some(LoginFlow::Task { .. }) => unreachable!("task logins poll above"),
             Some(LoginFlow::Spawned {
                 harness,
                 home,
@@ -895,6 +990,7 @@ impl AgentAccounts {
             return Ok(AgentLoginPoll {
                 status: AgentLoginStatus::Done,
                 message: None,
+                url: None,
             });
         }
         let exited = *lock(&exit);
@@ -918,12 +1014,46 @@ impl AgentAccounts {
             return Ok(AgentLoginPoll {
                 status: AgentLoginStatus::Error,
                 message: Some(message),
+                url: None,
             });
         }
         Ok(AgentLoginPoll {
             status: AgentLoginStatus::Pending,
             message: None,
+            url: None,
         })
+    }
+
+    /// poll an engine-driven sign-in; `None` when `login_id` isn't one.
+    fn poll_task_login(&self, login_id: &str) -> Option<AgentLoginPoll> {
+        let state = match lock(&self.inner.flows).get(login_id) {
+            Some(LoginFlow::Task { state, .. }) => state.clone(),
+            _ => return None,
+        };
+        let poll = {
+            let state = lock(&state);
+            match &state.outcome {
+                None => {
+                    return Some(AgentLoginPoll {
+                        status: AgentLoginStatus::Pending,
+                        message: state.message.clone(),
+                        url: state.url.clone(),
+                    });
+                }
+                Some(Ok(())) => AgentLoginPoll {
+                    status: AgentLoginStatus::Done,
+                    message: None,
+                    url: None,
+                },
+                Some(Err(message)) => AgentLoginPoll {
+                    status: AgentLoginStatus::Error,
+                    message: Some(message.clone()),
+                    url: None,
+                },
+            }
+        };
+        lock(&self.inner.flows).remove(login_id);
+        Some(poll)
     }
 
     /// Drop a flow: kill a pending login child (`codex login` holds the fixed
@@ -931,11 +1061,15 @@ impl AgentAccounts {
     /// reclaim its throwaway home dir. Idempotent.
     pub fn cancel_login(&self, login_id: &str) {
         let flow = lock(&self.inner.flows).remove(login_id);
-        if let Some(LoginFlow::Spawned { child, home, .. }) = flow {
-            if let Some(c) = lock(&child).as_mut() {
-                let _ = c.start_kill();
+        match flow {
+            Some(LoginFlow::Spawned { child, home, .. }) => {
+                if let Some(c) = lock(&child).as_mut() {
+                    let _ = c.start_kill();
+                }
+                let _ = std::fs::remove_dir_all(&home);
             }
-            let _ = std::fs::remove_dir_all(&home);
+            Some(LoginFlow::Task { handle, .. }) => handle.abort(),
+            _ => {}
         }
     }
 
@@ -1174,60 +1308,55 @@ impl AgentAccounts {
         let usage = match harness {
             HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
             HarnessId::Codex => self.codex_usage(slot).await,
+            HarnessId::Cursor => self.cursor_usage(slot).await,
             _ => None,
         };
         lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
         usage
     }
 
-    async fn claude_usage(
-        &self,
-        slot: &Slot,
-        is_active: bool,
-    ) -> Option<UsageSnapshot> {
+    async fn claude_usage(&self, slot: &Slot, is_active: bool) -> Option<UsageSnapshot> {
         let oauth = slot.credentials.get("claudeAiOauth")?;
-        let mut access_token = str_field(oauth, "accessToken")?;
-        let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
-        if let Some(expires_at) = expires_at
-            && expires_at < now_ms() + 30_000
-        {
-            if is_active {
-                // The CLI owns this token pair — rotating its refresh token out
-                // from under a running Claude Code could force a re-login.
-                return None;
+        let access_token = str_field(oauth, "accessToken")?;
+        match self.claude_usage_request(&access_token).await {
+            Ok(usage) => usage,
+            // The stored expiry metadata can lie (a Claude Code regression
+            // wrote `expiresAt: 0` for fresh logins), so probe with the
+            // stored token first and rotate the slot-owned pair only after
+            // the endpoint actually rejected it. The active login is never
+            // rotated: the running CLI may hold its single-use refresh token.
+            Err(_) if !is_active => {
+                let fresh = self.refresh_claude_slot(slot).await?;
+                self.claude_usage_request(&fresh).await.ok().flatten()
             }
-            access_token = self.refresh_claude_slot(slot).await?;
+            Err(_) => None,
         }
-        let body: serde_json::Value = self
+    }
+
+    /// One usage probe: GET the endpoint and parse windows. `Err` means the
+    /// token was rejected (401/403) — the only case worth a refresh.
+    async fn claude_usage_request(&self, access_token: &str) -> Result<Option<UsageSnapshot>, ()> {
+        let response = self
             .inner
             .http
             .get(CLAUDE_USAGE_URL)
-            .bearer_auth(&access_token)
+            .bearer_auth(access_token)
             .header("anthropic-beta", "oauth-2025-04-20")
             .send()
             .await
-            .ok()?
+            .map_err(|_| ())?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            || response.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(());
+        }
+        let body: serde_json::Value = response
             .error_for_status()
-            .ok()?
+            .map_err(|_| ())?
             .json()
             .await
-            .ok()?;
-        let mut windows = Vec::new();
-        for (key, label) in [("five_hour", "Session"), ("seven_day", "Week")] {
-            if let Some(w) = body.get(key)
-                && let Some(utilization) = w.get("utilization").and_then(|v| v.as_f64())
-            {
-                windows.push(AgentUsageWindow {
-                    label: label.to_string(),
-                    used_fraction: (utilization / 100.0) as f32,
-                    resets_at: parse_when(w.get("resets_at")),
-                });
-            }
-        }
-        (!windows.is_empty()).then_some(UsageSnapshot {
-            windows,
-            plan_label: None,
-        })
+            .map_err(|_| ())?;
+        Ok(claude_usage_windows(&body))
     }
 
     async fn codex_usage(&self, slot: &Slot) -> Option<UsageSnapshot> {
@@ -1275,7 +1404,55 @@ impl AgentAccounts {
         // so a plan change shows up on the next forced refresh without a
         // re-login.
         let plan_label = codex_plan(str_field(&body, "plan_type").as_deref());
-        Some(UsageSnapshot { windows, plan_label })
+        Some(UsageSnapshot {
+            windows,
+            plan_label,
+        })
+    }
+
+    async fn cursor_usage(&self, slot: &Slot) -> Option<UsageSnapshot> {
+        // The SDK key tracks identity/expiry but has no quota view — the
+        // account numbers live on the dashboard API the Cursor app itself
+        // calls, reachable with a session minted from the key.
+        let api_key = str_field(&slot.credentials, "apiKey")?;
+        let backend = str_field(&slot.credentials, "backendUrl")
+            .unwrap_or_else(|| CURSOR_DEFAULT_BACKEND.to_string())
+            .trim_end_matches('/')
+            .to_string();
+        let session: serde_json::Value = self
+            .inner
+            .http
+            .post(format!("{backend}/auth/exchange_user_api_key"))
+            .bearer_auth(api_key)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let access_token = str_field(&session, "accessToken")?;
+        let body: serde_json::Value = self
+            .inner
+            .http
+            .post(format!("{backend}/{CURSOR_CURRENT_PERIOD_USAGE}"))
+            .bearer_auth(&access_token)
+            .header("Connect-Protocol-Version", "1")
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        cursor_usage_window(&body).map(|window| UsageSnapshot {
+            windows: vec![window],
+            plan_label: None,
+        })
     }
 
     /// Refresh a saved Claude slot's expired access token so its usage stays
@@ -1442,10 +1619,12 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Cursor => "cursor",
+        HarnessId::Devin => "devin",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
+        HarnessId::Antigravity => "antigravity",
         HarnessId::Mock => "mock",
     }
 }
@@ -1712,6 +1891,61 @@ fn parse_when(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
     }
 }
 
+/// Windows from Claude's `/api/oauth/usage`: the 5-hour session and weekly
+/// buckets, each a 0-100 `utilization` with an RFC3339 `resets_at`.
+fn claude_usage_windows(body: &serde_json::Value) -> Option<UsageSnapshot> {
+    let mut windows = Vec::new();
+    for (key, label) in [("five_hour", "Session"), ("seven_day", "Week")] {
+        if let Some(w) = body.get(key)
+            && let Some(utilization) = w.get("utilization").and_then(|v| v.as_f64())
+        {
+            windows.push(AgentUsageWindow {
+                label: label.to_string(),
+                used_fraction: (utilization / 100.0) as f32,
+                resets_at: parse_when(w.get("resets_at")),
+            });
+        }
+    }
+    (!windows.is_empty()).then_some(UsageSnapshot {
+        windows,
+        plan_label: None,
+    })
+}
+
+/// The billing-cycle window from Cursor's `GetCurrentPeriodUsage`. The blended
+/// percent is derived from spend/limit in cents: the payload's own
+/// `totalPercentUsed` disagrees with the number Cursor's UI narrates ("You've
+/// used 72% of your included usage" against `totalSpend`/`limit`, not the
+/// precomputed 11.5). proto3 JSON omits zero-valued fields, so an absent
+/// `limit` means unusable, not 0% — a synthetic 0% would render a healthy bar
+/// for an account whose usage nobody knows.
+fn cursor_usage_window(body: &serde_json::Value) -> Option<AgentUsageWindow> {
+    let plan = body.get("planUsage")?;
+    let limit = plan.get("limit").and_then(|v| v.as_f64())?;
+    if limit <= 0.0 {
+        return None;
+    }
+    let used = plan
+        .get("totalSpend")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    Some(AgentUsageWindow {
+        label: "Month".to_string(),
+        used_fraction: (used / limit) as f32,
+        resets_at: json_ms(body.get("billingCycleEnd")),
+    })
+}
+
+/// Unix-millis timestamp arriving as a JSON number or proto3 int64 string.
+fn json_ms(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
+    let ms = match value? {
+        serde_json::Value::Number(n) => n.as_i64()?,
+        serde_json::Value::String(s) => s.parse::<i64>().ok()?,
+        _ => return None,
+    };
+    DateTime::<Utc>::from_timestamp_millis(ms)
+}
+
 fn scan_openai_url(output: &str) -> Option<String> {
     let start = output.find("https://auth.openai.com/")?;
     let rest = &output[start..];
@@ -1752,7 +1986,7 @@ fn scan_shim_fatal(output: &str) -> Option<String> {
 }
 
 type LoginChildHandles = (
-    Arc<Mutex<Option<tokio::process::Child>>>,
+    Arc<Mutex<Option<zeron_harness::process::Child>>>,
     Arc<Mutex<String>>,
     Arc<Mutex<Option<Option<i32>>>>,
 );
@@ -1761,7 +1995,7 @@ type LoginChildHandles = (
 /// (the URL can land on either stream), and a monitor polls `try_wait` so the
 /// child is reaped without owning it — the cancel path needs concurrent kill
 /// access.
-fn wire_login_child(mut child: tokio::process::Child) -> LoginChildHandles {
+fn wire_login_child(mut child: zeron_harness::process::Child) -> LoginChildHandles {
     let output = Arc::new(Mutex::new(String::new()));
     for pipe in [
         child
@@ -1919,6 +2153,82 @@ mod tests {
         assert_eq!(codex_window_label(604_800), "Week");
         // Unknown/absent span falls back to the shortest label.
         assert_eq!(codex_window_label(0), "Session");
+    }
+
+    #[test]
+    fn claude_usage_windows_map_buckets_and_percent() {
+        let body = serde_json::json!({
+            "five_hour": { "utilization": 6.0, "resets_at": "2026-04-08T18:59:59Z" },
+            "seven_day": { "utilization": 35.0, "resets_at": "2026-04-14T16:59:59Z" },
+            "extra_usage": { "is_enabled": true },
+        });
+        let snapshot = claude_usage_windows(&body).expect("windows");
+        assert_eq!(snapshot.plan_label, None);
+        let labels: Vec<_> = snapshot.windows.iter().map(|w| w.label.as_str()).collect();
+        assert_eq!(labels, ["Session", "Week"]);
+        assert!((snapshot.windows[0].used_fraction - 0.06).abs() < 1e-6);
+        assert!((snapshot.windows[1].used_fraction - 0.35).abs() < 1e-6);
+        assert_eq!(
+            snapshot.windows[1].resets_at,
+            Some(
+                "2026-04-14T16:59:59Z"
+                    .parse::<chrono::DateTime<Utc>>()
+                    .unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn claude_usage_windows_none_without_any_bucket() {
+        // A 200 with only `extra_usage` (no rate windows) is not a snapshot —
+        // the UI then says "Usage unavailable" instead of showing nothing.
+        assert!(claude_usage_windows(&serde_json::json!({ "extra_usage": {} })).is_none());
+        assert!(claude_usage_windows(&serde_json::json!({ "five_hour": {} })).is_none());
+    }
+
+    #[test]
+    fn cursor_usage_window_derives_percent_from_spend_not_total_percent() {
+        // Real payload flavor (observed shape): proto3 JSON with string int64
+        // cycle bounds. `totalPercentUsed` (11.53) contradicts the derived
+        // 28846/40000 = 72.1% that Cursor's own UI narrates — derive.
+        let body = serde_json::json!({
+            "billingCycleStart": "1768399334000",
+            "billingCycleEnd": "1771077734000",
+            "planUsage": {
+                "totalSpend": 28846,
+                "includedSpend": 23222,
+                "bonusSpend": 5624,
+                "remaining": 11154,
+                "limit": 40000,
+                "totalPercentUsed": 11.5384,
+            },
+            "displayMessage": "You've used 72% of your included usage",
+        });
+        let window = cursor_usage_window(&body).expect("window");
+        assert_eq!(window.label, "Month");
+        assert!((window.used_fraction - 0.72115).abs() < 1e-5);
+        assert_eq!(
+            window.resets_at,
+            Some(chrono::DateTime::<Utc>::from_timestamp_millis(1_771_077_734_000).unwrap())
+        );
+    }
+
+    #[test]
+    fn cursor_usage_window_absent_limit_is_unusable_not_zero() {
+        // proto3 JSON omits zero-valued fields: an account with no usage-based
+        // spend simply lacks `limit` — never render a synthetic 0% bar.
+        assert!(cursor_usage_window(&serde_json::json!({ "planUsage": {} })).is_none());
+        assert!(cursor_usage_window(&serde_json::json!({ "planUsage": { "limit": 0 } })).is_none());
+    }
+
+    #[test]
+    fn cursor_usage_window_no_spend_is_zero_percent() {
+        let window = cursor_usage_window(&serde_json::json!({
+            "billingCycleEnd": 1771077734000i64,
+            "planUsage": { "limit": 40000 },
+        }))
+        .expect("window");
+        assert_eq!(window.used_fraction, 0.0);
     }
 
     #[test]

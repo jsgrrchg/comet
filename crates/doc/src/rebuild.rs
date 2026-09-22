@@ -53,6 +53,9 @@ pub fn rebuild_thin_doc(source: &SessionDoc) -> Result<ThinRebuild, DocError> {
         .get_map("meta")
         .insert("epoch", THIN_DOC_EPOCH as i64)?;
 
+    if let Some(usage) = source.context_usage() {
+        thin.update_context_usage(usage.tokens, usage.window)?;
+    }
     let mut sidecar = Vec::new();
     let entries = source.read_entries()?;
     let entry_count = entries.len();
@@ -186,6 +189,7 @@ mod tests {
             device_id: "dev-a".into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            duration_ms: None,
         }
     }
 

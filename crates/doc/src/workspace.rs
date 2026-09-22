@@ -106,6 +106,18 @@ impl WorkspaceDoc {
         set_opt_ms(&row, "lastSeenAt", device.last_seen_at)?;
         set_opt_ms(&row, "createdAt", device.created_at)?;
         set_opt_str(&row, "version", device.version.as_deref())?;
+        set_opt_str(
+            &row,
+            "cursorSdkVersion",
+            device.cursor_sdk_version.as_deref(),
+        )?;
+        // An old engine can update its app version without knowing SDK fields.
+        // Treat retained SDK metadata as unknown after such a downgrade.
+        set_opt_str(&row, "cursorSdkEngineVersion", device.version.as_deref())?;
+        row.insert(
+            "capabilities",
+            crate::schema::loro_value_from_json(&serde_json::json!(&device.capabilities)),
+        )?;
         self.doc.commit();
         Ok(())
     }
@@ -272,6 +284,7 @@ impl WorkspaceDoc {
         )?;
         set_opt_str(&row, "spaceId", chat.space_id.as_deref())?;
         set_opt_ms(&row, "lastSeenAt", chat.last_seen_at)?;
+        set_opt_str(&row, "parentChatId", chat.parent_chat_id.as_deref())?;
         self.doc.commit();
         Ok(())
     }
@@ -463,6 +476,11 @@ impl WorkspaceDoc {
         row.insert("chatId", session.chat_id.as_str())?;
         row.insert("deviceId", session.device_id.as_str())?;
         row.insert("status", status_str(session.status))?;
+        set_opt_str(
+            &row,
+            "lastCompletedTurn",
+            session.last_completed_turn.as_deref(),
+        )?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
         self.doc.commit();
@@ -595,10 +613,19 @@ pub(crate) struct RawDevice {
     created_at: Option<i64>,
     #[serde(default)]
     version: Option<String>,
+    #[serde(default)]
+    cursor_sdk_version: Option<String>,
+    #[serde(default)]
+    cursor_sdk_engine_version: Option<String>,
+    #[serde(default)]
+    capabilities: Vec<String>,
 }
 
 impl From<RawDevice> for Device {
     fn from(raw: RawDevice) -> Self {
+        let sdk_version = raw
+            .cursor_sdk_version
+            .filter(|_| raw.version.is_some() && raw.version == raw.cursor_sdk_engine_version);
         Device {
             id: raw.id,
             name: raw.name,
@@ -606,6 +633,8 @@ impl From<RawDevice> for Device {
             last_seen_at: raw.last_seen_at.map(dt),
             created_at: raw.created_at.map(dt),
             version: raw.version,
+            cursor_sdk_version: sdk_version,
+            capabilities: raw.capabilities,
         }
     }
 }
@@ -684,6 +713,8 @@ pub(crate) struct RawChat {
     last_seen_at: Option<i64>,
     #[serde(default)]
     room_gen: Option<u32>,
+    #[serde(default)]
+    parent_chat_id: Option<String>,
 }
 
 /// Decode a chat row's `config` leniently: unknown enum values (a newer
@@ -724,6 +755,7 @@ impl From<RawChat> for Chat {
             space_id: raw.space_id,
             last_seen_at: raw.last_seen_at.map(dt),
             room_gen: raw.room_gen,
+            parent_chat_id: raw.parent_chat_id,
         }
     }
 }
@@ -731,6 +763,8 @@ impl From<RawChat> for Chat {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RawSession {
+    #[serde(default)]
+    last_completed_turn: Option<String>,
     chat_id: String,
     device_id: String,
     status: SessionStatus,
@@ -743,6 +777,7 @@ pub(crate) struct RawSession {
 impl From<RawSession> for Session {
     fn from(raw: RawSession) -> Self {
         Session {
+            last_completed_turn: raw.last_completed_turn,
             chat_id: raw.chat_id,
             device_id: raw.device_id,
             status: raw.status,
@@ -769,7 +804,39 @@ mod tests {
             last_seen_at: Some(ts(1_000)),
             created_at: Some(ts(500)),
             version: Some("0.1.0".into()),
+            cursor_sdk_version: None,
+            capabilities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn remote_sdk_version_survives_sync_and_old_engines_remain_unknown() {
+        let local = WorkspaceDoc::new();
+        let mut row = device("remote", "remote engine");
+        row.cursor_sdk_version = Some("1.0.31".into());
+        local.upsert_device(&row).unwrap();
+        let remote = WorkspaceDoc::new();
+        remote
+            .doc()
+            .import(&local.export_snapshot().unwrap())
+            .unwrap();
+        assert_eq!(
+            remote.read_devices().unwrap()[0]
+                .cursor_sdk_version
+                .as_deref(),
+            Some("1.0.31")
+        );
+        // Simulate an older writer that only knows the app-version field.
+        remote
+            .row("devices", "remote")
+            .unwrap()
+            .insert("version", "0.0.1")
+            .unwrap();
+        remote.doc().commit();
+        assert_eq!(remote.read_devices().unwrap()[0].cursor_sdk_version, None);
+        row.cursor_sdk_version = None;
+        remote.upsert_device(&row).unwrap();
+        assert_eq!(remote.read_devices().unwrap()[0].cursor_sdk_version, None);
     }
 
     fn chat(id: &str, device_id: &str) -> Chat {
@@ -794,6 +861,7 @@ mod tests {
             created_at: ts(2_000),
             harness_session_id: None,
             harness_session_cwd: None,
+            parent_chat_id: Some("parent-chat".into()),
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -815,6 +883,7 @@ mod tests {
 
     fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
         Session {
+            last_completed_turn: None,
             chat_id: chat_id.into(),
             device_id: device_id.into(),
             status,
@@ -880,15 +949,34 @@ mod tests {
     }
 
     #[test]
+    fn completion_marker_survives_workspace_sync_and_legacy_rows() {
+        let ws = WorkspaceDoc::new();
+        let mut row = session("chat-1", "dev-a", SessionStatus::Idle);
+        row.last_completed_turn = Some("turn-one".into());
+        ws.upsert_session(&row).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![row.clone()]);
+        row.status = SessionStatus::Working;
+        ws.upsert_session(&row).unwrap();
+        assert_eq!(ws.read_sessions().unwrap(), vec![row]);
+        ws.row("sessions", "chat-1")
+            .unwrap()
+            .delete("lastCompletedTurn")
+            .unwrap();
+        assert_eq!(ws.read_sessions().unwrap()[0].last_completed_turn, None);
+    }
+
+    #[test]
     fn rows_round_trip() {
         let ws = WorkspaceDoc::new();
-        ws.upsert_device(&device("dev-a", "laptop")).unwrap();
+        let mut device = device("dev-a", "laptop");
+        device.capabilities = vec![zeron_proto::capabilities::MESSAGE_QUEUE_V1.into()];
+        ws.upsert_device(&device).unwrap();
         ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
         ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
             .unwrap();
 
         let state = ws.read_all().unwrap();
-        assert_eq!(state.devices, vec![device("dev-a", "laptop")]);
+        assert_eq!(state.devices, vec![device]);
         assert_eq!(state.chats, vec![chat("chat-1", "dev-a")]);
         assert_eq!(
             state.sessions,

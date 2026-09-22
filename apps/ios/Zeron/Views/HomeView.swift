@@ -8,13 +8,19 @@ import SwiftUI
 enum Route: Hashable {
     case space(String)
     case chat(String)
-    case newSession(spaceId: String)
+    case newSession(NewSessionDestination)
+
+    // Keep existing project navigation and launch/deep-link call sites valid.
+    static func newSession(spaceId: String) -> Route {
+        .newSession(.project(spaceId: spaceId))
+    }
 }
 
 struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var path: [Route] = []
     @State private var showNewSpace = false
+    @State private var showProjectlessDevices = false
     // "" = All. Sticky across launches; falls back to All if the space is gone.
     @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
 
@@ -43,23 +49,15 @@ struct HomeView: View {
                 switch route {
                 case .space(let id): SpaceView(spaceId: id, path: $path)
                 case .chat(let id): SessionView(chatId: id)
-                case .newSession(let spaceId): NewSessionView(spaceId: spaceId, path: $path)
+                case .newSession(let destination): NewSessionView(destination: destination, path: $path)
                 }
             }
             .toolbar {
-                // One leading item: a second topBarLeading entry gets folded
-                // into a "…" overflow next to the dropdown. The item's SHARED
-                // glass is hidden and the selector wears its own capsule, so
-                // the connect spinner sits bare on the bar beside it instead
-                // of inside the button's glass.
+                // Let the native toolbar own this glass surface and its menu
+                // morph. A second custom glass layer retains stale masks.
                 ToolbarItem(placement: .topBarLeading) {
                     HStack(spacing: 10) {
                         spaceDropdown
-                            // The hidden shared glass still reserves its
-                            // content inset, landing the capsule's edge at
-                            // ~30pt while the list rows' rail starts at 20 —
-                            // pull it back onto the content's left line.
-                            .padding(.leading, -10)
                         // In the bar, not the list: as a list row it appeared
                         // and vanished with the connection and shoved the
                         // content down. Degraded states are GRACED (4s of
@@ -74,7 +72,7 @@ struct HomeView: View {
                                     .fill(Theme.warning)
                                     .frame(width: 5, height: 5)
                                 Text("Offline — sends are saved")
-                                    .font(Theme.sans(11))
+                                    .font(Theme.sans(13))
                                     .foregroundStyle(Theme.textFaint)
                             }
                             .transition(.opacity)
@@ -84,7 +82,7 @@ struct HomeView: View {
                                     .controlSize(.mini)
                                     .tint(Theme.textMuted)
                                 Text("Reconnecting…")
-                                    .font(Theme.sans(11))
+                                    .font(Theme.sans(13))
                                     .foregroundStyle(Theme.textFaint)
                             }
                             .transition(.opacity)
@@ -100,7 +98,6 @@ struct HomeView: View {
                         }
                     }
                 }
-                .sharedBackgroundVisibility(.hidden)
                 ToolbarItem(placement: .topBarTrailing) {
                     newButton
                 }
@@ -118,6 +115,12 @@ struct HomeView: View {
             .sheet(isPresented: $showNewSpace) {
                 NewSpaceSheet { spaceId in
                     path.append(.space(spaceId))
+                }
+            }
+            .sheet(isPresented: $showProjectlessDevices) {
+                SessionHostPickerSheet { deviceId in
+                    spaceFilter = ""
+                    path.append(.newSession(.projectless(deviceId: deviceId)))
                 }
             }
             .task(id: model.overviewChats.map(\.id).joined()) {
@@ -166,7 +169,7 @@ struct HomeView: View {
         } label: {
             HStack(spacing: 5) {
                 Text(selectedSpace?.displayName ?? "All")
-                    .font(Theme.sans(14, weight: .semibold))
+                    .font(Theme.sans(16, weight: .semibold))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
                 Image(systemName: "chevron.down")
@@ -175,14 +178,19 @@ struct HomeView: View {
             }
             // Keep long space names from swallowing the whole bar; the owning
             // device lives on the menu rows ("@ mac"), not up here.
-            .frame(maxWidth: 220, alignment: .leading)
-            // Its own glass capsule (the item's shared glass is hidden so the
-            // connect spinner doesn't ride inside the button).
-            .padding(.horizontal, 16)
-            .frame(height: 44)
-            .glassEffect(.regular.interactive(), in: Capsule())
+            .frame(maxWidth: 200, alignment: .leading)
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 6)
+            .frame(minHeight: 32)
         }
+        // Put glass on the Menu control, not inside its captured label.
+        // UIKit morphs the menu's own surface and can restore its new width
+        // after selection; a label-level glass effect retained a stale mask.
+        .buttonStyle(.glass)
+        .buttonBorderShape(.capsule)
+        .fixedSize(horizontal: true, vertical: false)
         .accessibilityLabel("Filter by space")
+        .accessibilityIdentifier("space-filter")
     }
 
     private func deviceTag(_ space: Space) -> String {
@@ -209,42 +217,42 @@ struct HomeView: View {
         }
     }
 
-    /// "+" starts a session in the scoped space; under All it asks which
-    /// space first. With no spaces yet it falls through to space creation.
-    @ViewBuilder private var newButton: some View {
-        if let space = selectedSpace {
-            Button {
-                path.append(.newSession(spaceId: space.id))
-            } label: {
-                Image(systemName: "plus")
-            }
-            .accessibilityLabel("New session")
-        } else if model.spaces.isEmpty {
-            Button {
-                showNewSpace = true
-            } label: {
-                Image(systemName: "plus")
-            }
-            .accessibilityLabel("New space")
-        } else {
-            Menu {
+    /// Both destinations are available even when Home is scoped to a project
+    /// or the workspace has no projects yet.
+    private var newButton: some View {
+        Menu {
+            if let space = selectedSpace {
+                Button("New session in \(space.displayName)") {
+                    path.append(.newSession(spaceId: space.id))
+                }
+            } else if !model.spaces.isEmpty {
                 Section("New session in…") {
                     ForEach(model.spaces) { space in
                         Button {
                             path.append(.newSession(spaceId: space.id))
                         } label: {
-                            // Button rows render the second Text as the
-                            // subtitle line (same pattern as the space menu).
                             Text(space.displayName)
                             Text(deviceTag(space))
                         }
                     }
                 }
-            } label: {
-                Image(systemName: "plus")
             }
-            .accessibilityLabel("New session")
+            Button {
+                showProjectlessDevices = true
+            } label: {
+                Label("Session without a project…", systemImage: "xmark")
+            }
+            .accessibilityIdentifier("new-projectless-session")
+            Button {
+                showNewSpace = true
+            } label: {
+                Label("New space…", systemImage: "folder.badge.plus")
+            }
+        } label: {
+            Image(systemName: "plus")
         }
+        .accessibilityLabel("New session")
+        .accessibilityIdentifier("new-session")
     }
 
     // MARK: Sessions
@@ -253,9 +261,7 @@ struct HomeView: View {
         Section {
             let chats = selectedSpace.map { model.chats(in: $0.id) } ?? model.overviewChats
             if chats.isEmpty {
-                Text(model.spaces.isEmpty
-                    ? "No spaces yet — add one from a desktop device"
-                    : "No sessions yet")
+                Text("No sessions yet — start one with +")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
@@ -270,6 +276,7 @@ struct HomeView: View {
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
+                .sessionPinAction(chat: chat, model: model)
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button {
                         // withAnimation, not a value-keyed .animation: the row
@@ -350,7 +357,7 @@ struct ChatRow: View {
             HStack(spacing: 8) {
                 if showLocation {
                     Text(location)
-                        .font(Theme.sans(11))
+                        .font(Theme.sans(13))
                         .foregroundStyle(subline)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -364,12 +371,12 @@ struct ChatRow: View {
                             .fill(badge.color)
                             .frame(width: 6, height: 6)
                         Text(badge.label)
-                            .font(Theme.sans(10, weight: .medium))
+                            .font(Theme.sans(12, weight: .medium))
                             .foregroundStyle(badge.color)
                     }
                 } else if indicator == .idle {
                     Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
-                        .font(Theme.sans(10, weight: .medium))
+                        .font(Theme.sans(12, weight: .medium))
                         .foregroundStyle(subline)
                         .fixedSize()
                 } else {
@@ -378,11 +385,18 @@ struct ChatRow: View {
             }
 
             // Line 2: the session title.
-            Text(chat.displayTitle)
-                .font(Theme.sans(13))
-                .foregroundStyle(Theme.text)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(spacing: 6) {
+                if model.isPinned(chatId: chat.id) {
+                    Image(systemName: "pin.fill")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(Theme.textMuted)
+                }
+                Text(chat.displayTitle)
+                    .font(Theme.sans(17, weight: .medium))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             // Line 3: harness brand mark, then the branch when the engine
             // stamped one; the Working spinner rides bottom-right.
@@ -393,7 +407,7 @@ struct ChatRow: View {
                 if let branch = chat.branch?.trimmingCharacters(in: .whitespaces), !branch.isEmpty {
                     LineIconView(.gitBranch, size: 11, color: subline)
                     Text(branch)
-                        .font(Theme.sans(11))
+                        .font(Theme.sans(13))
                         .foregroundStyle(subline)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -415,10 +429,29 @@ struct ChatRow: View {
     /// space has been renamed, or when the session runs in a worktree off to
     /// the side. No offline marker: the dropdown carries device liveness.
     private var location: String {
-        let space = model.space(for: chat)?.displayName
-            ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
-            ?? "?"
+        let space = chat.spaceId == nil ? "No project" : (
+            model.space(for: chat)?.displayName
+                ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
+                ?? "?"
+        )
         return "\(space) @ \(model.deviceName(chat.deviceId))"
+    }
+}
+
+extension View {
+    func sessionPinAction(chat: Chat, model: AppModel) -> some View {
+        swipeActions(edge: .leading, allowsFullSwipe: true) {
+            let pinned = model.isPinned(chatId: chat.id)
+            Button {
+                withAnimation(Motion.resort) {
+                    model.setPinned(chatId: chat.id, pinned: !pinned)
+                }
+            } label: {
+                Label(pinned ? "Unpin" : "Pin", systemImage: pinned ? "pin.slash" : "pin")
+            }
+            .tint(Theme.accent)
+            .disabled(!model.pinsReady)
+        }
     }
 }
 

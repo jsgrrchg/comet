@@ -5,8 +5,8 @@
 //! (`delta`/`textDelta`, `exitCode`/`exit_code`, camelCase/snake_case item
 //! types) are accepted, and unknown item types map to nothing.
 
-use zeron_proto::{AgentEvent, TodoItem, ToolCall};
 use serde_json::Value;
+use zeron_proto::{AgentEvent, DoneStatus, TodoItem, ToolCall};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -32,6 +32,69 @@ pub(crate) fn delta_text(params: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .map(str::to_owned)
+}
+
+/// Codex streams independent reasoning items and indexed parts without text
+/// separators. Preserve those boundaries before the document folds deltas
+/// together; otherwise adjacent Markdown headings become `**one****two**`.
+/// One instance belongs to one thread, so child activity cannot split a
+/// parent's in-flight paragraph.
+#[derive(Default)]
+pub(crate) struct ReasoningStream {
+    last_part: Option<(String, bool, u64)>,
+    announced_summary: Option<(String, u64)>,
+    trailing_newlines: usize,
+}
+
+impl ReasoningStream {
+    pub(crate) fn map(&mut self, method: &str, params: &Value) -> Vec<AgentEvent> {
+        let id = item_id(params);
+        let summary = method != "item/reasoning/textDelta";
+        let index = field(
+            params,
+            if summary {
+                &["summaryIndex", "summary_index"]
+            } else {
+                &["contentIndex", "content_index"]
+            },
+        )
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            self.announced_summary
+                .as_ref()
+                .filter(|(item, _)| summary && item == &id)
+                .map(|(_, index)| *index)
+        })
+        .unwrap_or(0);
+        if method == "item/reasoning/summaryPartAdded" {
+            self.announced_summary = Some((id, index));
+            return Vec::new();
+        }
+        let Some(text) = delta_text(params) else {
+            return Vec::new();
+        };
+        let part = (id, summary, index);
+        let mut events = Vec::new();
+        if self.last_part.as_ref().is_some_and(|last| last != &part) {
+            let leading_newlines = text.chars().take_while(|&c| c == '\n').count();
+            let missing = 2usize.saturating_sub(self.trailing_newlines + leading_newlines);
+            if missing > 0 {
+                events.push(AgentEvent::ReasoningDelta {
+                    text: "\n".repeat(missing),
+                });
+                self.trailing_newlines += missing;
+            }
+        }
+        let trailing = text.chars().rev().take_while(|&c| c == '\n').count();
+        self.trailing_newlines = if trailing == text.len() {
+            self.trailing_newlines + trailing
+        } else {
+            trailing
+        };
+        self.last_part = Some(part);
+        events.push(AgentEvent::ReasoningDelta { text });
+        events
+    }
 }
 
 pub(crate) fn item_id(params: &Value) -> String {
@@ -72,6 +135,28 @@ pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
         input_tokens: count(&["inputTokens", "input_tokens"]),
         output_tokens: count(&["outputTokens", "output_tokens"]),
     })
+}
+
+pub(crate) fn context_usage_event(params: &Value) -> Option<AgentEvent> {
+    let usage = field(params, &["tokenUsage", "token_usage"])?;
+    let last = usage.get("last");
+    let tokens = last
+        .and_then(|last| field(last, &["totalTokens", "total_tokens"]).and_then(Value::as_u64))
+        .or_else(|| {
+            let last = last?;
+            let input = field(last, &["inputTokens", "input_tokens"])?.as_u64()?;
+            Some(
+                input.saturating_add(
+                    field(last, &["outputTokens", "output_tokens"])
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                ),
+            )
+        });
+    let window = field(usage, &["modelContextWindow", "model_context_window"])
+        .and_then(Value::as_u64)
+        .filter(|n| *n > 0);
+    (tokens.is_some() || window.is_some()).then_some(AgentEvent::ContextUsage { tokens, window })
 }
 
 /// Tool-shaped Codex items must always close the lifecycle they open: started
@@ -120,6 +205,34 @@ pub(crate) fn item_type(item: &Value) -> &str {
     item.get("type").and_then(Value::as_str).unwrap_or("")
 }
 
+pub(super) fn is_collab_spawn(item: &Value) -> bool {
+    matches!(
+        item_type(item),
+        "collabAgentToolCall" | "collab_agent_tool_call"
+    ) && matches!(
+        item.get("tool").and_then(Value::as_str),
+        Some("spawnAgent" | "spawn_agent")
+    )
+}
+
+/// A v1 spawn names its child in the completed result. Other collaboration
+/// tools can address several receivers, but only a spawn owns a transcript.
+pub(super) fn collab_spawn_child(item: &Value) -> Option<&str> {
+    if !is_collab_spawn(item)
+        || matches!(
+            item.get("status").and_then(Value::as_str),
+            Some("failed" | "errored")
+        )
+    {
+        return None;
+    }
+    let receivers = field(item, &["receiverThreadIds", "receiver_thread_ids"])?.as_array()?;
+    match receivers.as_slice() {
+        [child] => child.as_str().filter(|id| !id.is_empty()),
+        _ => None,
+    }
+}
+
 /// Map one `item/started` or `item/completed` payload's item to events.
 /// `agentMessage` and `reasoning` flow through their delta channels and are
 /// handled by the session loop, not here.
@@ -127,6 +240,67 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
     let id = str_field(item, &["id"]);
     let status = str_field(item, &["status"]);
     match item_type(item) {
+        "imageGeneration" | "image_generation" => {
+            let call = ToolCall::Unknown {
+                name: "Generate image".into(),
+                input: None,
+            };
+            if phase == Phase::Started {
+                return vec![AgentEvent::ToolCall { id, call }];
+            }
+            // `result` can be megabytes of inline media. Never inspect, clone,
+            // log, or forward it: savedPath is the sole supported source.
+            let path = str_field(item, &["savedPath", "saved_path"]);
+            let failure = item.get("failure").filter(|v| !v.is_null());
+            let error = if let Some(failure) = failure {
+                Some(
+                    if matches!(
+                        failure.get("type").and_then(Value::as_str),
+                        Some("usageLimitExceeded" | "usage_limit_exceeded")
+                    ) {
+                        "Image generation usage limit exceeded"
+                    } else {
+                        "Image generation failed"
+                    },
+                )
+            } else if matches!(status.as_str(), "failed" | "cancelled" | "canceled") {
+                Some("Image generation failed")
+            } else if path.trim().is_empty() {
+                Some("Image generation completed without a saved file")
+            } else {
+                None
+            };
+            let mut events = vec![
+                AgentEvent::ToolCall {
+                    id: id.clone(),
+                    call,
+                },
+                AgentEvent::ToolResult {
+                    id: id.clone(),
+                    is_error: error.is_some(),
+                    output: None,
+                    diff: None,
+                },
+            ];
+            if let Some(message) = error {
+                events.push(AgentEvent::Error {
+                    message: message.into(),
+                });
+            } else {
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("generated.png")
+                    .to_owned();
+                events.push(AgentEvent::GeneratedImage {
+                    id: format!("{id}:image"),
+                    path,
+                    name,
+                    mime_type: String::new(),
+                });
+            }
+            events
+        }
         "commandExecution" | "command_execution" => match phase {
             Phase::Started => vec![AgentEvent::ToolCall {
                 id,
@@ -214,11 +388,42 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
         "error" => vec![AgentEvent::Error {
             message: str_field(item, &["message"]),
         }],
+        "collabAgentToolCall" | "collab_agent_tool_call" => {
+            let tool = str_field(item, &["tool"]);
+            let name = if is_collab_spawn(item) {
+                "Agent".to_owned()
+            } else {
+                match tool.as_str() {
+                    "sendInput" | "send_input" => "Send agent message".to_owned(),
+                    "wait" => "Wait for agents".to_owned(),
+                    "closeAgent" | "close_agent" => "Close agent".to_owned(),
+                    "resumeAgent" | "resume_agent" => "Resume agent".to_owned(),
+                    _ => format!("Agent control: {tool}"),
+                }
+            };
+            tool_lifecycle(
+                phase,
+                id,
+                ToolCall::Unknown {
+                    name,
+                    input: Some(item.clone()),
+                },
+                matches!(status.as_str(), "failed" | "errored"),
+            )
+        }
         // A subagent spawn/lifecycle marker on the PARENT thread (multi-agent
         // v2, codex 0.146.x): the parent-feed chip for the child thread. The
         // child's own traffic routes separately (see `route_child_notification`
         // in mod.rs); this is only the spawn tool call the chip folds from.
         "subAgentActivity" | "sub_agent_activity" => {
+            // A lifecycle marker has its own item id. It is not another
+            // spawn; the child's turn notifications carry its terminal state.
+            if !matches!(
+                item.get("kind").and_then(Value::as_str),
+                Some("started" | "spawned")
+            ) {
+                return Vec::new();
+            }
             let name = str_field(item, &["agentPath"])
                 .rsplit('/')
                 .find(|s| !s.is_empty())
@@ -260,6 +465,156 @@ pub(crate) fn user_message_text(item: &Value) -> Option<String> {
         .collect::<Vec<_>>()
         .join("\n\n");
     (!joined.trim().is_empty()).then_some(joined)
+}
+
+/// Per-child stream state, retained across parent turns and follow-up tasks.
+/// Completion-only messages need the same text fallback as the root. Replayed
+/// user items must not reopen a finished document or duplicate a steering entry.
+#[derive(Default)]
+pub(super) struct ChildStream {
+    reasoning: ReasoningStream,
+    streamed_text: std::collections::HashSet<String>,
+    completed_items: std::collections::VecDeque<String>,
+    completed_turns: std::collections::VecDeque<String>,
+    settled: bool,
+}
+
+fn remember(ids: &mut std::collections::VecDeque<String>, id: String) -> bool {
+    if id.is_empty() {
+        return true;
+    }
+    if ids.contains(&id) {
+        return false;
+    }
+    if ids.len() == 256 {
+        ids.pop_front();
+    }
+    ids.push_back(id);
+    true
+}
+
+impl ChildStream {
+    pub(super) fn map(&mut self, child: &str, method: &str, params: &Value) -> Vec<AgentEvent> {
+        if method == "turn/started" {
+            let id = turn_id(params);
+            if !id.is_empty() && self.completed_turns.contains(&id) {
+                return Vec::new();
+            }
+            if self.settled {
+                self.settled = false;
+                // v2 followup_task starts a new child turn without echoing a
+                // userMessage. Reopen the existing document without inventing
+                // a user prompt or attributing an activity id as a new spawn.
+                return vec![AgentEvent::Steered {
+                    assistant_message_id: None,
+                    next_assistant_message_id: None,
+                }];
+            }
+            return Vec::new();
+        }
+        if matches!(method, "item/started" | "item/completed") {
+            let item = params.get("item").unwrap_or(&Value::Null);
+            let phase = if method == "item/started" {
+                Phase::Started
+            } else {
+                Phase::Completed
+            };
+            if phase == Phase::Completed
+                && !remember(&mut self.completed_items, str_field(item, &["id"]))
+            {
+                return Vec::new();
+            }
+            if matches!(item_type(item), "userMessage" | "user_message") {
+                return if phase == Phase::Completed {
+                    user_message_text(item)
+                        .map(|text| {
+                            self.settled = false;
+                            AgentEvent::UserMessage { text }
+                        })
+                        .into_iter()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            }
+            if self.settled {
+                return Vec::new();
+            }
+            if matches!(item_type(item), "agentMessage" | "agent_message") {
+                if phase == Phase::Started {
+                    return Vec::new();
+                }
+                let mut events = Vec::new();
+                if !self.streamed_text.remove(&str_field(item, &["id"])) {
+                    let text = str_field(item, &["text"]);
+                    if !text.is_empty() {
+                        events.push(AgentEvent::TextDelta { text });
+                    }
+                }
+                events.push(AgentEvent::TextDelta {
+                    text: "\n\n".into(),
+                });
+                return events;
+            }
+            return map_item(phase, item);
+        }
+        if self.settled {
+            return Vec::new();
+        }
+        match method {
+            "item/agentMessage/delta" => {
+                let id = item_id(params);
+                if !id.is_empty() && self.completed_items.contains(&id) {
+                    return Vec::new();
+                }
+                self.streamed_text.insert(id);
+                delta_text(params)
+                    .map(|text| AgentEvent::TextDelta { text })
+                    .into_iter()
+                    .collect()
+            }
+            "item/reasoning/textDelta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/summaryPartAdded" => self.reasoning.map(method, params),
+            "turn/completed" | "turn/failed" | "turn/aborted" | "thread/closed" => {
+                if method != "thread/closed"
+                    && !remember(&mut self.completed_turns, turn_id(params))
+                {
+                    return Vec::new();
+                }
+                self.settled = true;
+                self.streamed_text.clear();
+                let error = turn_error_message(params);
+                let status = if method == "turn/failed"
+                    || error.is_some()
+                    || params.pointer("/turn/status").and_then(Value::as_str) == Some("failed")
+                {
+                    DoneStatus::Errored
+                } else if method == "turn/aborted"
+                    || params.pointer("/turn/status").and_then(Value::as_str) == Some("interrupted")
+                {
+                    DoneStatus::Interrupted
+                } else {
+                    DoneStatus::Completed
+                };
+                vec![AgentEvent::Done {
+                    status,
+                    result: None,
+                    error,
+                    session_id: Some(child.to_owned()),
+                }]
+            }
+            "error" => vec![AgentEvent::Error {
+                message: params
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .or_else(|| params.get("message").and_then(Value::as_str))
+                    .unwrap_or("Codex subagent error")
+                    .to_owned(),
+            }],
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// The thread a notification is addressed to: `thread/started` carries it at
@@ -315,19 +670,19 @@ pub(crate) fn route_child_notification(method: &str) -> ChildRoute {
         | "item/agentMessage/delta"
         | "item/reasoning/textDelta"
         | "item/reasoning/summaryTextDelta"
+        | "item/reasoning/summaryPartAdded"
+        | "turn/started"
         | "turn/completed"
         | "turn/failed"
         | "turn/aborted"
         | "error"
         | "thread/closed" => ChildRoute::Subagent,
-        // Child turn/status bookkeeping with no subagent meaning: consumed
+        // Child status bookkeeping with no subagent meaning: consumed
         // so it can never settle the PARENT turn (the exact bug class the
         // explicit table exists for).
-        "turn/started"
-        | "thread/status/changed"
+        "thread/status/changed"
         | "thread/tokenUsage/updated"
         // Child chatter with no consumer on this wire.
-        | "item/reasoning/summaryPartAdded"
         | "item/commandExecution/outputDelta"
         | "item/fileChange/outputDelta"
         | "item/fileChange/patchUpdated"
@@ -352,6 +707,30 @@ pub(crate) fn route_child_notification(method: &str) -> ChildRoute {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn reasoning_parts_preserve_chunking_and_existing_paragraph_breaks() {
+        let mut stream = ReasoningStream::default();
+        let mut text = String::new();
+        for params in [
+            json!({"itemId":"r1", "contentIndex":0, "textDelta":"**First"}),
+            json!({"itemId":"r1", "contentIndex":0, "textDelta":" heading**\n"}),
+            json!({"itemId":"r1", "contentIndex":1, "delta":"\nSecond paragraph.\n\n"}),
+            // An empty delta must not consume the next item's boundary.
+            json!({"itemId":"r2", "contentIndex":0, "delta":""}),
+            json!({"item_id":"r2", "content_index":0, "delta":"Third paragraph."}),
+        ] {
+            for event in stream.map("item/reasoning/textDelta", &params) {
+                if let AgentEvent::ReasoningDelta { text: delta } = event {
+                    text.push_str(&delta);
+                }
+            }
+        }
+        assert_eq!(
+            text,
+            "**First heading**\n\nSecond paragraph.\n\nThird paragraph."
+        );
+    }
 
     #[test]
     fn user_message_text_accepts_both_shapes() {
@@ -482,6 +861,70 @@ mod tests {
     }
 
     #[test]
+    fn v1_spawns_and_controls_have_distinct_roles() {
+        for tool in ["spawnAgent", "spawn_agent"] {
+            let mut item = json!({"type":"collabAgentToolCall", "id":"spawn", "tool":tool,
+                "status":"completed", "receiverThreadIds":["child"], "model":"child-model"});
+            assert_eq!(collab_spawn_child(&item), Some("child"));
+            let events = map_item(Phase::Completed, &item);
+            assert!(matches!(&events[0], AgentEvent::ToolCall { call, .. }
+                if call.is_subagent_spawn() && call.subagent_model() == Some("child-model")));
+            assert!(matches!(
+                &events[1],
+                AgentEvent::ToolResult {
+                    is_error: false,
+                    ..
+                }
+            ));
+            item["status"] = "failed".into();
+            assert_eq!(collab_spawn_child(&item), None);
+            assert!(matches!(
+                map_item(Phase::Completed, &item).last(),
+                Some(AgentEvent::ToolResult { is_error: true, .. })
+            ));
+        }
+        for tool in [
+            "sendInput",
+            "send_input",
+            "wait",
+            "closeAgent",
+            "resumeAgent",
+            "futureControl",
+        ] {
+            let item = json!({"type":"collabAgentToolCall", "id":"control", "tool":tool,
+                "receiverThreadIds":["child"]});
+            assert_eq!(collab_spawn_child(&item), None);
+            assert!(
+                matches!(&map_item(Phase::Started, &item)[0], AgentEvent::ToolCall { call, .. } if !call.is_subagent_spawn())
+            );
+        }
+        for receivers in [json!([]), json!(["one", "two"]), json!([""])] {
+            assert_eq!(
+                collab_spawn_child(
+                    &json!({"type":"collabAgentToolCall", "tool":"spawnAgent", "receiverThreadIds":receivers})
+                ),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn activity_updates_are_not_spawns_in_either_item_phase() {
+        for kind in [
+            "interacted",
+            "completed",
+            "failed",
+            "errored",
+            "futureActivity",
+        ] {
+            let item = json!({"type":"subAgentActivity", "id":"activity", "kind":kind,
+                "agentThreadId":"child", "agentPath":"/root/alpha"});
+            assert!(map_item(Phase::Started, &item).is_empty());
+            assert!(map_item(Phase::Completed, &item).is_empty());
+        }
+    }
+
+    #[test]
     fn sub_agent_activity_maps_to_a_named_parent_chip() {
         let started = map_item(
             Phase::Started,
@@ -496,7 +939,7 @@ mod tests {
         ));
         let completed = map_item(
             Phase::Completed,
-            &json!({"type": "subAgentActivity", "id": "call_1", "kind": "completed",
+            &json!({"type": "subAgentActivity", "id": "call_1", "kind": "started",
                     "agentThreadId": "child-1", "agentPath": "/root/alpha"}),
         );
         assert!(matches!(
@@ -523,11 +966,11 @@ mod tests {
         for m in ["turn/completed", "turn/aborted", "turn/failed"] {
             assert_eq!(route_child_notification(m), ChildRoute::Subagent, "{m}");
         }
-        // …while turn/started stays consumed — and NONE of them may reach
-        // the parent turn router.
+        // A child turn start can reopen a completed assignment. It must never
+        // reach the parent turn router.
         assert_eq!(
             route_child_notification("turn/started"),
-            ChildRoute::Consumed
+            ChildRoute::Subagent
         );
         // Child-owned thread lifecycle would rewrite parent state — consumed.
         for m in ["thread/archived", "thread/compacted", "thread/started"] {
@@ -551,10 +994,16 @@ mod tests {
             Some("th-c".into())
         );
         assert_eq!(
-            notification_thread_id("turn/completed", &json!({"threadId": "th-1", "turn": {"id": "t"}})),
+            notification_thread_id(
+                "turn/completed",
+                &json!({"threadId": "th-1", "turn": {"id": "t"}})
+            ),
             Some("th-1".into())
         );
-        assert_eq!(notification_thread_id("error", &json!({"message": "x"})), None);
+        assert_eq!(
+            notification_thread_id("error", &json!({"message": "x"})),
+            None
+        );
     }
 
     #[test]
@@ -565,5 +1014,123 @@ mod tests {
         );
         assert_eq!(turn_error_message(&json!({"turn": {"id": "t"}})), None);
         assert_eq!(turn_error_message(&json!({"turn": {"error": null}})), None);
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn context_uses_latest_call_not_thread_total() {
+        assert_eq!(
+            context_usage_event(&json!({"tokenUsage": {
+                "last": {"totalTokens": 42000}, "total": {"totalTokens": 900000}, "modelContextWindow": 200000
+            }})),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(42000),
+                window: Some(200000)
+            })
+        );
+        assert_eq!(
+            context_usage_event(&json!({"token_usage": {
+                "last": {"input_tokens": 0, "output_tokens": 0}, "model_context_window": 0
+            }})),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(0),
+                window: None
+            })
+        );
+        assert_eq!(
+            context_usage_event(&json!({"tokenUsage": {"total": {"totalTokens": 100}}})),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod generated_image_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn image_generation_lifecycle_ignores_inline_result_and_preserves_ids() {
+        for (kind, path_key) in [
+            ("imageGeneration", "savedPath"),
+            ("image_generation", "saved_path"),
+        ] {
+            let mut item = json!({"id":"img-1", "type":kind, "status":"completed", "result":"INLINE_IMAGE_SENTINEL".repeat(200_000), "revisedPrompt":"private prompt", "failure":null});
+            item[path_key] = json!("/codex/generated_images/picture.png");
+            let started = map_item(Phase::Started, &item);
+            assert_eq!(
+                started,
+                vec![AgentEvent::ToolCall {
+                    id: "img-1".into(),
+                    call: ToolCall::Unknown {
+                        name: "Generate image".into(),
+                        input: None
+                    }
+                }]
+            );
+            let completed = map_item(Phase::Completed, &item);
+            assert_eq!(completed.len(), 3);
+            assert_eq!(completed[0], started[0]);
+            assert!(
+                matches!(&completed[1], AgentEvent::ToolResult { id, is_error: false, output: None, .. } if id == "img-1")
+            );
+            assert!(
+                matches!(&completed[2], AgentEvent::GeneratedImage { id, path, name, .. } if id == "img-1:image" && path == "/codex/generated_images/picture.png" && name == "picture.png")
+            );
+            assert_eq!(map_item(Phase::Completed, &item), completed);
+            let wire = serde_json::to_string(&completed).unwrap();
+            assert!(wire.len() < 500);
+            assert!(!wire.contains("INLINE_IMAGE_SENTINEL"));
+            assert!(!wire.contains("private prompt"));
+        }
+    }
+
+    #[test]
+    fn image_generation_errors_resolve_the_chip_without_an_image() {
+        for (extra, expected) in [
+            (
+                json!({"failure":{"type":"usageLimitExceeded"}, "savedPath":"/must/not/use.png"}),
+                "Image generation usage limit exceeded",
+            ),
+            (
+                json!({"failure":{"type":"futureFailure","message":"untrusted payload"}}),
+                "Image generation failed",
+            ),
+            (
+                json!({"status":"failed", "savedPath":"/must/not/use.png"}),
+                "Image generation failed",
+            ),
+            (
+                json!({"savedPath":null}),
+                "Image generation completed without a saved file",
+            ),
+            (
+                json!({"savedPath":"  "}),
+                "Image generation completed without a saved file",
+            ),
+            (json!({}), "Image generation completed without a saved file"),
+        ] {
+            let mut item = json!({"type":"imageGeneration", "id":"i", "status":"completed", "result":"INLINE_SENTINEL"});
+            item.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let events = map_item(Phase::Completed, &item);
+            assert_eq!(events.len(), 3);
+            assert!(matches!(events[0], AgentEvent::ToolCall { .. }));
+            assert!(matches!(
+                events[1],
+                AgentEvent::ToolResult { is_error: true, .. }
+            ));
+            assert_eq!(
+                events[2],
+                AgentEvent::Error {
+                    message: expected.into()
+                }
+            );
+        }
     }
 }

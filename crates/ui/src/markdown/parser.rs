@@ -12,6 +12,7 @@
 //! through both paths and assert equality.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
@@ -27,6 +28,24 @@ pub struct InlineStyle {
     pub code: bool,
     pub strikethrough: bool,
     /// Destination URL when inside a link.
+    pub link: Option<String>,
+    pub image: Option<InlineImage>,
+    pub task: Option<TaskMarker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskMarker {
+    pub checked: bool,
+    /// Byte range of `[ ]`, `[x]` or `[X]` in the original document.
+    pub range: Range<usize>,
+}
+
+/// An image remains inline in the AST; hosts can opt in to visual media.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlineImage {
+    pub source: String,
+    pub alt: String,
+    pub title: String,
     pub link: Option<String>,
 }
 
@@ -87,7 +106,9 @@ pub struct TopBlock {
 /// The parse result: top-level blocks in document order.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BlockTree {
-    pub blocks: Vec<TopBlock>,
+    // Completed blocks are immutable. Canonical/display trees and old/new
+    // transcript rows share their contents across streamed tail updates.
+    pub blocks: Vec<Arc<TopBlock>>,
 }
 
 impl BlockTree {
@@ -110,8 +131,13 @@ fn options() -> Options {
 
 /// Parse a whole source into a [`BlockTree`].
 pub fn parse_full(source: &str) -> BlockTree {
+    parse_at(source, 0)
+}
+
+fn parse_at(source: &str, offset: usize) -> BlockTree {
     let events: Vec<(Event, Range<usize>)> = Parser::new_ext(source, options())
         .into_offset_iter()
+        .map(|(event, range)| (event, range.start + offset..range.end + offset))
         .collect();
     let mut cur = Cursor {
         events: &events,
@@ -123,17 +149,17 @@ pub fn parse_full(source: &str) -> BlockTree {
         match event {
             Event::Rule => {
                 cur.bump();
-                blocks.push(TopBlock {
+                blocks.push(Arc::new(TopBlock {
                     range,
                     block: Block::Rule,
-                });
+                }));
             }
             Event::Start(_) => {
                 for block in parse_started_block(&mut cur) {
-                    blocks.push(TopBlock {
+                    blocks.push(Arc::new(TopBlock {
                         range: range.clone(),
                         block,
-                    });
+                    }));
                 }
             }
             // Stray inline events at top level (shouldn't happen): skip.
@@ -385,6 +411,7 @@ fn parse_inline_container(cur: &mut Cursor, style: &InlineStyle) -> Vec<InlineRu
 }
 
 fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &InlineStyle) {
+    let range = cur.peek().map(|(_, range)| range.clone());
     let Some(event) = cur.next_event() else {
         return;
     };
@@ -403,11 +430,18 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
         Event::SoftBreak => push(runs, " ".into(), style.clone()),
         Event::HardBreak => push(runs, "\n".into(), style.clone()),
         Event::Html(t) | Event::InlineHtml(t) => push(runs, t.into_string(), style.clone()),
-        Event::TaskListMarker(done) => push(
-            runs,
-            if done { "[x] ".into() } else { "[ ] ".into() },
-            style.clone(),
-        ),
+        Event::TaskListMarker(done) => {
+            let mut style = style.clone();
+            style.task = Some(TaskMarker {
+                checked: done,
+                range: range.unwrap(),
+            });
+            push(
+                runs,
+                if done { "[x] ".into() } else { "[ ] ".into() },
+                style,
+            );
+        }
         Event::FootnoteReference(t) => push(runs, format!("[{t}]"), style.clone()),
         Event::Start(tag) => {
             let mut inner = style.clone();
@@ -415,7 +449,27 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
                 Tag::Emphasis => inner.italic = true,
                 Tag::Strong => inner.bold = true,
                 Tag::Strikethrough => inner.strikethrough = true,
-                Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
+                Tag::Image {
+                    dest_url, title, ..
+                } => {
+                    let alt: String = parse_inline_container(cur, style)
+                        .iter()
+                        .map(|run| run.text.as_str())
+                        .collect();
+                    inner.image = Some(InlineImage {
+                        source: dest_url.to_string(),
+                        alt: alt.clone(),
+                        title: title.to_string(),
+                        link: style.link.clone(),
+                    });
+                    inner.link = Some(dest_url.into_string());
+                    runs.push(InlineRun {
+                        text: alt,
+                        style: inner,
+                    });
+                    return;
+                }
+                Tag::Link { dest_url, .. } => {
                     inner.link = Some(dest_url.into_string());
                 }
                 _ => {}
@@ -527,7 +581,9 @@ fn merge_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
     let mut out: Vec<InlineRun> = Vec::with_capacity(runs.len());
     for run in runs {
         match out.last_mut() {
-            Some(last) if last.style == run.style => last.text.push_str(&run.text),
+            Some(last) if last.style == run.style && run.style.image.is_none() => {
+                last.text.push_str(&run.text)
+            }
             _ => out.push(run),
         }
     }
@@ -559,7 +615,7 @@ pub struct IncrementalParser {
     /// has hanging inline markers ([`super::mend`]): `None` means the display
     /// tree is exactly [`Self::tree`]. Never fed back into the incremental
     /// state — the canonical tree stays parity-exact with `parse_full`.
-    display_tail: Option<Vec<TopBlock>>,
+    display_tail: Option<Vec<Arc<TopBlock>>>,
     /// Link-reference definitions act at a distance — full reparses only.
     full_only: bool,
     /// Bytes fed through `parse_full` by the most recent `set_text`/`append`/
@@ -587,7 +643,7 @@ impl IncrementalParser {
     /// The tree to render while streaming: the canonical tree with the last
     /// block swapped for its mended parse when inline markers hang (an
     /// unclosed `**bold`, a half-streamed `[link](url…`). Same shape and cost
-    /// as `tree().clone()` — the stable prefix is copied either way; only a
+    /// as `tree().clone()` — the stable prefix shares its blocks; only a
     /// hanging tail adds one O(tail) reparse, done at append time.
     pub fn display_tree(&self) -> BlockTree {
         let Some(tail) = &self.display_tail else {
@@ -613,13 +669,13 @@ impl IncrementalParser {
     /// Set the source: appends take the incremental path, anything else resets.
     pub fn set_text(&mut self, text: &str) {
         if text.len() >= self.source.len() && text.starts_with(self.source.as_str()) {
-            let delta = text[self.source.len()..].to_string();
+            let delta = &text[self.source.len()..];
             if delta.is_empty() {
                 self.last_parse_bytes = 0;
                 self.stable_prefix_blocks = self.tree.blocks.len();
                 return;
             }
-            self.append(&delta);
+            self.append(delta);
         } else {
             self.reset(text);
         }
@@ -673,13 +729,11 @@ impl IncrementalParser {
             .map(|i| i + 1)
             .unwrap_or(0);
 
-        let tail = parse_full(&self.source[boundary..]);
+        let tail = parse_at(&self.source[boundary..], boundary);
         self.last_parse_bytes = self.source.len() - boundary;
         self.tree.blocks.retain(|b| b.range.start < boundary);
         self.stable_prefix_blocks = self.tree.blocks.len();
-        for mut top in tail.blocks {
-            top.range.start += boundary;
-            top.range.end += boundary;
+        for top in tail.blocks {
             self.tree.blocks.push(top);
         }
         self.remend();
@@ -711,12 +765,12 @@ impl IncrementalParser {
         // Count toward the O(tail) instrumentation — this is real parse work,
         // in the same bound as the reparse that produced the block.
         self.last_parse_bytes += mended.len();
-        let mut tail = parse_full(&mended).blocks;
+        let mut tail = parse_at(&mended, start).blocks;
         for top in &mut tail {
+            let top = Arc::make_mut(top);
             // Display ranges point back into the unmended source; synthetic
             // closers at the end clamp away.
-            top.range.start += start;
-            top.range.end = (top.range.end + start).min(self.source.len());
+            top.range.end = top.range.end.min(self.source.len());
         }
         self.display_tail = Some(tail);
     }
@@ -734,6 +788,69 @@ fn has_link_defs(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_ranges_survive_nested_lists_unicode_crlf_and_streaming() {
+        let source = "Título 🦀\r\n\r\nIntro\r\n\r\n- [ ] repetida\r\n  - [X] repetida\r\n\r\n> - [x] citada\r\n\r\n```md\r\n- [ ] literal\r\n```\r\n";
+        fn collect(block: &Block, tasks: &mut Vec<TaskMarker>) {
+            match block {
+                Block::Paragraph { runs } => {
+                    tasks.extend(runs.iter().filter_map(|run| run.style.task.clone()))
+                }
+                Block::List { items, .. } => items
+                    .iter()
+                    .flatten()
+                    .for_each(|block| collect(block, tasks)),
+                Block::BlockQuote { children } => {
+                    children.iter().for_each(|block| collect(block, tasks))
+                }
+                _ => {}
+            }
+        }
+        let tree = parse_full(source);
+        let mut tasks = Vec::new();
+        for top in &tree.blocks {
+            collect(&top.block, &mut tasks);
+        }
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| &source[task.range.clone()])
+                .collect::<Vec<_>>(),
+            ["[ ]", "[X]", "[x]"]
+        );
+        let mut stream = IncrementalParser::new();
+        for ch in source.chars() {
+            stream.append(&ch.to_string());
+            assert_eq!(stream.tree(), &parse_full(stream.source()));
+        }
+    }
+
+    #[test]
+    fn display_snapshots_share_stable_blocks_without_mutating_old_frames() {
+        let mut parser = IncrementalParser::new();
+        parser.set_text("first **bold** paragraph\n\nsecond paragraph\n\nlast **open");
+        let before = parser.display_tree();
+        let frozen = format!("{before:?}");
+        assert!(Arc::ptr_eq(&before.blocks[0], &parser.tree().blocks[0]));
+        parser.append(" tail**\n\nnext paragraph");
+        let after = parser.display_tree();
+        assert!(Arc::ptr_eq(&before.blocks[0], &after.blocks[0]));
+        assert_eq!(
+            format!("{before:?}"),
+            frozen,
+            "old paint snapshot is immutable"
+        );
+        assert_eq!(parser.tree(), &parse_full(parser.source()));
+        parser.reset("replacement");
+        assert_eq!(
+            format!("{before:?}"),
+            frozen,
+            "reset cannot alter an old frame"
+        );
+        assert_eq!(parser.tree(), &parse_full("replacement"));
+    }
 
     fn stream(chunks: usize, text: &str) -> IncrementalParser {
         let mut p = IncrementalParser::new();
@@ -1186,5 +1303,26 @@ mod closing_quote_blocks {
         for (a, b) in p.tree().blocks.iter().zip(full.blocks.iter()) {
             assert_eq!(a.range, b.range);
         }
+    }
+}
+
+#[cfg(test)]
+mod image_model_tests {
+    use super::*;
+    #[test]
+    fn images_preserve_alt_title_position_links_and_empty_alt() {
+        let tree =
+            parse_full("Before [![**alt**](a.png \"Title\")](next.md) after ![](b.png) ![](b.png)");
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("paragraph");
+        };
+        let images: Vec<_> = runs.iter().filter_map(|r| r.style.image.as_ref()).collect();
+        assert_eq!(images.len(), 3);
+        assert_eq!(images[0].alt, "alt");
+        assert_eq!(images[0].title, "Title");
+        assert_eq!(images[0].link.as_deref(), Some("next.md"));
+        assert_eq!(images[1].source, "b.png");
+        assert!(images[1].alt.is_empty());
+        assert_eq!(runs.first().unwrap().text, "Before ");
     }
 }

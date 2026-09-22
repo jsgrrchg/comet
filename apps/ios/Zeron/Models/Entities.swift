@@ -16,6 +16,21 @@ struct DeviceRow: Identifiable, Hashable {
     /// Engine version stamped by the device ("0.2.12"); gates the queued-
     /// attachment flow and other capability checks. nil reads as "too old".
     var version: String?
+    /// Explicit feature declarations; unlike semver, these distinguish a
+    /// personal integration build from upstream built at the same version.
+    var capabilities: [String] = []
+
+    func supports(_ capability: String) -> Bool {
+        capabilities.contains(capability)
+    }
+}
+
+enum EngineCapability {
+    static let messageQueueV1 = "message-queue-v1"
+    static let messageQueueActionsV1 = "message-queue-actions-v1"
+    static let messageQueueAttachmentsV1 = "message-queue-attachments-v1"
+    static let messageQueueCleanAttachmentTextV1 = "message-queue-clean-attachment-text-v1"
+    static let messageQueueEditLeaseV1 = "message-queue-edit-lease-v1"
 }
 
 /// proto/src/lib.rs version_triple: parse a leading major.minor.patch,
@@ -195,6 +210,20 @@ func sortActive(_ chats: [Chat]) -> [Chat] {
     }
 }
 
+/// Place known pins in their shared manual order, then preserve the automatic
+/// recency order for every unpinned session. Archived/deleted ids are harmless
+/// because callers pass only the rows visible in the current active scope.
+func sortPinnedFirst(_ chats: [Chat], pinnedSessionIds: [String]) -> [Chat] {
+    let recent = sortActive(chats)
+    let byId = Dictionary(uniqueKeysWithValues: recent.map { ($0.id, $0) })
+    var seen = Set<String>()
+    let pinned = pinnedSessionIds.compactMap { id -> Chat? in
+        guard seen.insert(id).inserted else { return nil }
+        return byId[id]
+    }
+    return pinned + recent.filter { seen.insert($0.id).inserted }
+}
+
 // MARK: - Session doc entries
 
 enum MessageRole: String {
@@ -231,7 +260,22 @@ struct RenderToolCall: Hashable {
     var string: (String) -> String? { { key in self.fields[key] as? String } }
 }
 
+/// Durable metadata only; bytes remain on the message owner's device.
+struct GeneratedImageReference: Hashable {
+    var path: String
+    var name: String
+    var mimeType: String
+
+    static let supportedMimeTypes: Set<String> = ["image/png", "image/jpeg", "image/webp", "image/gif"]
+
+    var isValid: Bool {
+        path.hasPrefix("/") && !path.contains("\0") && !name.isEmpty
+            && Self.supportedMimeTypes.contains(mimeType)
+    }
+}
+
 enum MessagePart: Hashable, Identifiable {
+    case image(id: String, reference: GeneratedImageReference)
     case text(id: String, text: String)
     case tool(id: String, call: RenderToolCall, isError: Bool, resolved: Bool)
     case input(id: String, requestId: String, questions: [UserInputQuestion], resolved: Bool)
@@ -239,7 +283,7 @@ enum MessagePart: Hashable, Identifiable {
 
     var id: String {
         switch self {
-        case .text(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _):
+        case .text(let id, _), .image(let id, _), .tool(let id, _, _, _), .input(let id, _, _, _), .error(let id, _):
             return id
         }
     }

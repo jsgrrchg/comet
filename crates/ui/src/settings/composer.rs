@@ -5,11 +5,12 @@
 //! is saved debounced from its own boot-time copy, so the composer keeps its
 //! own file rather than racing it): last harness, last model per harness
 //! (id + label, so the chip names the pick before the model list loads),
-//! and last reasoning level. Written synchronously on every pick (picks are
-//! rare); corrupt or missing files fall back to defaults.
+//! last reasoning level, and last model option picks per harness. Written
+//! synchronously on every pick (picks are rare); corrupt or missing files fall
+//! back to defaults.
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,9 @@ use serde::{Deserialize, Serialize};
 use zeron_proto::{HarnessId, ReasoningLevel};
 
 const FILE_NAME: &str = "composer-defaults.json";
+
+/// Model option picks: option id → choice id (the `ChatConfig` shape).
+pub type ModelOptions = serde_json::Map<String, serde_json::Value>;
 
 /// Remembered model per harness — id plus display label, mirroring zeron's
 /// `modelByHarness` storing the full `Model` object "so the pill never flashes
@@ -46,6 +50,11 @@ pub struct ComposerDefaults {
     pub model_by_harness: HashMap<HarnessId, RememberedModel>,
     /// Last reasoning level picked (global, like zeron's `reasoning` key).
     pub reasoning: Option<ReasoningLevel>,
+    /// Last non-default model option picks (option id → choice id), per
+    /// harness and model id. Model-scoped because each pick was validated
+    /// against that model's catalog row, so it stays safe to send before the
+    /// catalog reloads (the Claude harness appends `[1m]` to any model id).
+    pub model_options_by_model: HashMap<HarnessId, HashMap<String, ModelOptions>>,
     /// Every model label ever seen (id → label), fed from catalog loads.
     /// The chip's fallback while a harness's list is still loading — a
     /// session whose configured model differs from the remembered pick
@@ -81,11 +90,27 @@ impl ComposerDefaults {
     pub fn save(&self, data_dir: &Path) -> io::Result<()> {
         std::fs::create_dir_all(data_dir)?;
         let path = Self::path(data_dir);
-        let tmp = path.with_extension("json.tmp");
-        let json = serde_json::to_string_pretty(self)
+        // Each writer owns its temporary file; overlapping windows must not
+        // truncate or rename one another's in-progress writes.
+        let tmp = path.with_extension(format!("json.{}.tmp", uuid::Uuid::new_v4()));
+        let json = serde_json::to_vec_pretty(self)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(&json)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)?;
+            #[cfg(unix)]
+            std::fs::File::open(data_dir)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     pub fn path(data_dir: &Path) -> PathBuf {
@@ -102,6 +127,20 @@ impl ComposerDefaults {
         self.harness = Some(harness);
         self.model_by_harness
             .insert(harness, RememberedModel { id, label });
+    }
+
+    /// The remembered option picks for one model, if any.
+    pub fn model_options_for(&self, harness: HarnessId, model: &str) -> Option<&ModelOptions> {
+        self.model_options_by_model.get(&harness)?.get(model)
+    }
+
+    /// Mutable option picks for one model, created empty on first use.
+    pub fn model_options_mut(&mut self, harness: HarnessId, model: &str) -> &mut ModelOptions {
+        self.model_options_by_model
+            .entry(harness)
+            .or_default()
+            .entry(model.to_string())
+            .or_default()
     }
 
     /// The cached display label for a model id, if ever seen.
@@ -169,6 +208,9 @@ mod tests {
             "Fable 5".into(),
         );
         defaults.remember_model(HarnessId::Codex, "gpt-5.2-codex".into(), "GPT-5.2".into());
+        defaults
+            .model_options_mut(HarnessId::ClaudeCode, "claude-fable-5")
+            .insert("contextWindow".into(), "1m".into());
         defaults.save(dir.path()).unwrap();
         let loaded = ComposerDefaults::load(dir.path());
         assert_eq!(loaded, defaults);
@@ -190,6 +232,31 @@ mod tests {
             ComposerDefaults::load(dir.path()),
             ComposerDefaults::default()
         );
+    }
+
+    #[test]
+    fn concurrent_projectless_saves_leave_a_complete_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let path = dir.path();
+                scope.spawn(move || {
+                    let defaults = ComposerDefaults {
+                        device: Some(format!("device-{i}")),
+                        no_project: true,
+                        ..Default::default()
+                    };
+                    for _ in 0..10 {
+                        defaults.save(path).unwrap();
+                        let saved = ComposerDefaults::load(path);
+                        assert!(saved.no_project);
+                        assert!(saved.project.is_none());
+                        assert!(saved.device.is_some());
+                    }
+                });
+            }
+        });
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

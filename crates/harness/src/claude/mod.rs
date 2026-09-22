@@ -32,11 +32,11 @@
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
 pub mod catalog;
+mod discovery;
 mod normalize;
 mod wire;
 
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +45,6 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use zeron_proto::{
@@ -53,54 +52,28 @@ use zeron_proto::{
     SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
+use crate::process::{Child, ChildStdin, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use catalog::{apply_ultrathink, static_models, to_effort};
+use catalog::{apply_ultrathink, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 
-/// Locate the device's installed Claude Code CLI: `CLAUDE_CODE_EXECUTABLE`,
-/// then our own PATH, then the login-shell PATH snapshot (the user's shell
-/// init shapes PATH in ways a GUI/service launch never sees — see
-/// [`crate::shell_env`]), then known install locations as a last resort.
-/// Resolved per call — cheap after the snapshot is cached.
+/// Locate the device's installed Claude Code CLI: our own PATH, then the
+/// login-shell PATH snapshot (the user's shell init shapes PATH in ways a
+/// GUI/service launch never sees — see [`crate::shell_env`]), then known
+/// install locations as a last resort. The `CLAUDE_CODE_EXECUTABLE` override
+/// is applied by [`ClaudeHarness::resolve_executable`], so availability and
+/// launches agree on one resolution order. Resolved per call — cheap after
+/// the snapshot is cached.
 fn resolve_claude_executable() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
-        && !p.is_empty()
-    {
-        return Some(PathBuf::from(p));
+    let mut extra = Vec::new();
+    if let Some(home) = crate::executable::home_dir() {
+        extra.push(home.join(".claude").join("local").join("claude"));
+        extra.push(home.join(".local").join("bin").join("claude"));
     }
-    let exe = if cfg!(windows) {
-        "claude.exe"
-    } else {
-        "claude"
-    };
-    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shell_path) = crate::shell_env::login_shell_path() {
-        candidates.extend(
-            std::env::split_paths(shell_path)
-                .filter(|d| !d.as_os_str().is_empty())
-                .map(|d| d.join(exe)),
-        );
-    }
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        candidates.push(home.join(".claude").join("local").join("claude"));
-        candidates.push(home.join(".local").join("bin").join("claude"));
-    }
-    candidates.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    candidates.push(PathBuf::from("/usr/local/bin/claude"));
-    candidates.extend(
-        crate::node_version_manager_bins()
-            .into_iter()
-            .map(|d| d.join(exe)),
-    );
-    candidates.into_iter().find(|p| p.exists())
+    extra.push(PathBuf::from("/opt/homebrew/bin/claude"));
+    extra.push(PathBuf::from("/usr/local/bin/claude"));
+    crate::executable::find_on_paths("claude", extra)
 }
 
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
@@ -119,9 +92,9 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    initialize: discovery::InitializeCache,
+    models_cache: crate::catalog::Catalog,
+    workspace_commands: crate::skills::CommandDiscovery,
 }
 
 impl Default for ClaudeHarness {
@@ -130,7 +103,9 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
+            initialize: discovery::InitializeCache::default(),
+            models_cache: crate::catalog::Catalog::default(),
+            workspace_commands: crate::skills::CommandDiscovery::default(),
         }
     }
 }
@@ -155,14 +130,20 @@ impl ClaudeHarness {
 
     fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
         if let Some(p) = &self.executable {
-            return Ok(p.clone());
+            return crate::executable::validate_native_override(p);
+        }
+        if let Some(p) = std::env::var_os("CLAUDE_CODE_EXECUTABLE")
+            && !p.is_empty()
+        {
+            return crate::executable::validate_native_override(&PathBuf::from(p));
         }
         resolve_claude_executable().ok_or_else(|| {
             HarnessError::NotInstalled(
                 "claude (searched PATH, the login shell's PATH, ~/.claude/local, \
                  ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, and \
-                 fnm/nvm/volta/pnpm/bun install dirs; set CLAUDE_CODE_EXECUTABLE \
-                 to override)"
+                 fnm/nvm/volta/pnpm/bun install dirs; Windows also checks USERPROFILE \
+                 and explicit NVM_SYMLINK/VOLTA_HOME/PNPM_HOME; set \
+                 CLAUDE_CODE_EXECUTABLE to override)"
                     .into(),
             )
         })
@@ -245,14 +226,34 @@ impl ClaudeHarness {
         cmd
     }
 
-    /// Short-lived discovery probe: spawn the CLI in stream-json mode, send
-    /// the `initialize` control request, and read the commands out of its
-    /// control_response. No user message is ever written, so no turn (and no
-    /// API call) happens; the child is torn down as soon as the response
-    /// lands.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// Share the complete initialize response between model and command discovery.
+    /// No user message is written; the short-lived child is retired after initialize.
+    async fn initialize(&self) -> Result<Value, HarnessError> {
+        self.initialize
+            .get(
+                || self.model_context().map(|c| c.unwrap().key()),
+                || self.probe_initialize(None),
+            )
+            .await
+    }
+
+    async fn discover_commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
+        let response = match cwd {
+            Some(cwd) => self.probe_initialize(Some(cwd)).await?,
+            None => self.initialize().await?,
+        };
+        Ok(parse_initialize_commands(&response))
+    }
+
+    async fn probe_initialize(&self, cwd: Option<&std::path::Path>) -> Result<Value, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         crate::compose_child_path(&mut cmd, &exe);
         cmd.args([
             "--print",
@@ -270,7 +271,7 @@ impl ClaudeHarness {
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
+                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
             } else {
                 HarnessError::Io(e)
             }
@@ -310,7 +311,7 @@ impl ClaudeHarness {
                         .unwrap_or("initialize control request failed");
                     return Err(HarnessError::Protocol(msg.into()));
                 }
-                return Ok(parse_initialize_commands(&response));
+                return Ok(response);
             }
             Err(HarnessError::Protocol(
                 "claude exited before answering the initialize control request".into(),
@@ -320,7 +321,7 @@ impl ClaudeHarness {
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
-            Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
+            Err(_) => Err(HarnessError::Protocol("Claude initialize timed out".into())),
         }
     }
 }
@@ -382,19 +383,46 @@ impl Harness for ClaudeHarness {
         ]
     }
     fn installed(&self) -> bool {
-        self.executable.is_some() || resolve_claude_executable().is_some()
+        // The launch resolver, not bare discovery: a valid CLAUDE_CODE_EXECUTABLE
+        // (or a test `executable`) must report installed, and an invalid one
+        // must not — availability and launches share one resolution.
+        self.resolve_executable().is_ok()
     }
     /// Done is the CLI's own terminal frame, for wake turns too.
     fn deterministic_turn_end(&self) -> bool {
         true
     }
 
-    /// The curated static catalog (see [`catalog`]); requires an installed CLI
-    /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here,
-    /// like the discovery call would.
+    /// Credential and executable identity scopes both initialize and catalog caches.
+    fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
+        crate::model_context::context(self.id(), &self.resolve_executable()?, &[]).map(Some)
+    }
+    fn fallback_models(&self) -> Vec<Model> {
+        catalog::configured_models()
+    }
+    async fn model_catalog(&self, force: bool) -> Result<crate::ModelCatalog, HarnessError> {
+        self.model_context()?.unwrap().log();
+        self.models_cache
+            .get_with_timeout(
+                force,
+                Duration::from_secs(35),
+                || self.model_context().map(|c| c.unwrap().key()),
+                || async {
+                    let response = self.initialize().await?;
+                    catalog::with_discovered_models(catalog::configured_models(), &response)
+                },
+            )
+            .await
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        Ok(static_models())
+        match self.model_catalog(false).await {
+            Ok(catalog) => Ok(catalog.models),
+            Err(error) => {
+                tracing::warn!(%error, source = "static", "Claude model discovery failed");
+                Ok(self.fallback_models())
+            }
+        }
     }
 
     /// Slash commands from the CLI's `initialize` control-request handshake —
@@ -402,11 +430,49 @@ impl Harness for ClaudeHarness {
     /// carries every command with description + argument hint and involves no
     /// model turn (verified live, 2.1.228: the control_response is the first
     /// stdout line, well before any API traffic). Cached on success.
+    async fn skills(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Result<Option<Vec<zeron_proto::invocation::Skill>>, HarnessError> {
+        let (skills, commands) = tokio::try_join!(
+            crate::skills::discover(self.id(), cwd),
+            self.workspace_commands
+                .get(cwd, self.discover_commands(Some(cwd)))
+        )?;
+        // The native advertised catalog controls availability (including plugin
+        // enablement and skillOverrides). Shared Agent Skills can use file delivery.
+        Ok(Some(
+            skills
+                .into_iter()
+                .filter_map(|mut skill| {
+                    if crate::skills::is_shared_skill(&skill.path) {
+                        // Shared files are not Claude command definitions. A
+                        // same-named built-in must not replace their identity.
+                        Some(skill)
+                    } else if zeron_proto::invocation::valid_skill_command_name(&skill.name)
+                        && commands.iter().any(|command| command.name == skill.name)
+                    {
+                        skill.command = Some(zeron_proto::invocation::SkillCommand {
+                            name: skill.name.clone(),
+                            harness: self.id(),
+                        });
+                        Some(skill)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        ))
+    }
+
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.commands
-            .get_or_try_init(|| self.discover_commands())
+        self.discover_commands(None).await
+    }
+
+    async fn commands_for(&self, cwd: &std::path::Path) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.workspace_commands
+            .get(cwd, self.discover_commands(Some(cwd)))
             .await
-            .cloned()
     }
 
     async fn run(
@@ -414,11 +480,48 @@ impl Harness for ClaudeHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.run_with_mode(request, controls, false).await
+    }
+
+    async fn run_title(
+        &self,
+        mut request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        request.resume = None;
+        request.worktree = None;
+        request.attachments.clear();
+        request.model_options.clear();
+        request.auto_approve = false;
+        self.run_with_mode(request, controls, true).await
+    }
+}
+
+impl ClaudeHarness {
+    async fn run_with_mode(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+        title_only: bool,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = self.build_command(&exe, &request);
+        if title_only {
+            cmd.args([
+                "--system-prompt",
+                crate::TITLE_INSTRUCTIONS,
+                "--tools",
+                "",
+                "--strict-mcp-config",
+                "--mcp-config",
+                "{\"mcpServers\":{}}",
+                "--setting-sources",
+                "",
+            ]);
+        }
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
+                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
             } else {
                 HarnessError::Io(e)
             }
@@ -462,6 +565,7 @@ impl Harness for ClaudeHarness {
 
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
+            title_only,
             child,
             stdout_lines: BufReader::new(stdout).lines(),
             stdin_tx,
@@ -585,8 +689,9 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
 }
 
 struct Session {
+    title_only: bool,
     child: Child,
-    stdout_lines: tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
+    stdout_lines: tokio::io::Lines<BufReader<crate::process::ChildStdout>>,
     stdin_tx: mpsc::UnboundedSender<StdinMsg>,
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
@@ -601,6 +706,7 @@ struct Session {
 /// mailbox, the interrupt token, and consumer liveness.
 async fn run_session(session: Session) {
     let Session {
+        title_only,
         mut child,
         mut stdout_lines,
         stdin_tx,
@@ -642,7 +748,14 @@ async fn run_session(session: Session) {
                         }
                     };
                     if let Frame::ControlRequest(req) = frame {
-                        handle_control_request(req, &request_input, &stdin_tx);
+                        if title_only {
+                            let line = control_response_line(&req.request_id, serde_json::json!({
+                                "behavior": "deny", "message": "Tools are disabled for title generation"
+                            }));
+                            let _ = stdin_tx.send(StdinMsg::Line(line));
+                        } else {
+                            handle_control_request(req, &request_input, &stdin_tx);
+                        }
                         continue;
                     }
                     for ev in norm.normalize(frame, interrupted) {
@@ -697,12 +810,12 @@ async fn run_session(session: Session) {
                 // Escalate if the CLI doesn't wind down within the grace
                 // periods: SIGTERM (kills bash trees, runs SessionEnd hooks),
                 // then SIGKILL. Aborted once the child is reaped.
-                if let Some(pid) = child.id() {
+                if let Some(pid) = crate::process::signal_target(&child) {
                     escalation = Some(tokio::spawn(async move {
                         tokio::time::sleep(interrupt_grace).await;
-                        send_signal(pid, Signal::Term);
+                        send_signal(&pid, Signal::Term);
                         tokio::time::sleep(kill_grace).await;
-                        send_signal(pid, Signal::Kill);
+                        send_signal(&pid, Signal::Kill);
                     }));
                 }
             },

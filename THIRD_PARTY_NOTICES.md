@@ -1,7 +1,6 @@
 # Third-party notices
 
-Zeron bundles the following syntax-highlighting components. Their parsers and
-queries are consumed from the pinned Rust crates listed in `Cargo.lock`.
+Zeron bundles the following syntax-highlighting components. Unless noted otherwise, their parsers and queries are consumed from the pinned Rust crates listed in `Cargo.lock`. The Kotlin highlight query is maintained as Zeron source code and is not attributed to the grammar crate.
 
 | Component | Version | License | Source |
 | --- | --- | --- | --- |
@@ -11,9 +10,25 @@ queries are consumed from the pinned Rust crates listed in `Cargo.lock`.
 | Tree-sitter JavaScript grammar and queries | 0.25.0 | MIT | https://github.com/tree-sitter/tree-sitter-javascript |
 | Tree-sitter TypeScript grammar and queries | 0.23.2 | MIT | https://github.com/tree-sitter/tree-sitter-typescript |
 | Tree-sitter Python, Go, JSON, Bash, HTML, CSS, C, C++, C#, Java, Ruby and PHP grammars and queries | pinned in `Cargo.lock` | MIT | https://github.com/tree-sitter |
-| Tree-sitter TOML, Markdown, YAML, Kotlin, Swift, SQL, Lua, Nix, Make and Containerfile grammars and queries | pinned in `Cargo.lock` | MIT-compatible; see each crate | Crate repositories recorded in `Cargo.lock` |
+| Tree-sitter TOML, Markdown, YAML, Swift, SQL, Lua, Nix, Make and Containerfile grammars and queries | pinned in `Cargo.lock` | MIT-compatible; see each crate | Crate repositories recorded in `Cargo.lock` |
+| Tree-sitter Kotlin grammar | 1.1.0 | MIT | https://github.com/tree-sitter-grammars/tree-sitter-kotlin |
 
-The full Zeron distribution remains licensed under the terms in `LICENSE`.
+Zeron also uses the following editor foundations from the pinned `zeronsh/gpui-component` fork. The fork aligns these crates with the same GPUI revision used by Comet.
+
+| Component | Version | License | Source |
+| --- | --- | --- | --- |
+| gpui-base | 0.5.2 (`ed27327`) | Apache-2.0 | https://github.com/zeronsh/gpui-component |
+| mermaid-rs-renderer | 0.3.1 | MIT | https://github.com/1jehuang/mermaid-rs-renderer |
+| Ropey | 2.0.0-beta.1 | MIT | https://github.com/cessen/ropey |
+
+Zeron's own source code is licensed under the terms in `LICENSE`. Bundled third-party components retain their respective licenses and notices.
+
+## Symbols
+
+Zeron bundles the SVG icon set and filename/folder associations from
+[Symbols](https://github.com/miguelsolorio/vscode-symbols/tree/296ef1b62287fb2315cb5651e552e09e8c8e1de8).
+Symbols is MIT licensed. The complete upstream license and copyright notice is
+retained at `crates/ui/assets/file-icons/LICENSE.symbols`.
 
 ## Bundled theme palette adaptations
 
@@ -90,3 +105,39 @@ The common MIT permission notice for the adaptations above follows:
 
 The pinned Shades of Purple license additionally says that anything built with
 it should also be MIT licensed. Zeron is distributed under MIT terms.
+
+## mermaid-rs-renderer
+
+MIT License
+
+Copyright (c) 2026 mermaid-rs-renderer contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+## Native browser host
+
+The macOS browser uses [Wry 0.56.0](https://github.com/tauri-apps/wry/tree/wry-v0.56.0)
+(MIT OR Apache-2.0) to host the system WebKit engine, with the `objc2` family
+of bindings (MIT) and `block2` (MIT). Exact versions and transitive dependencies
+are pinned in `Cargo.lock`. The browser integration is independently written
+Zeron code.
+
+The Zui native overlay renderer adapts Apache-2.0 GPUI code from
+[`egoist/zed` at `57bd4fe`](https://github.com/egoist/zed/tree/57bd4fe181639797d395978d5de17bc9e10a6219/crates/gpui_macos).
+Attribution is retained in the pinned Zui dependency’s `NOTICE`.

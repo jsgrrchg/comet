@@ -3,8 +3,8 @@
 //! [`zeron_sync::chat_client::CheckpointFetcher`], binding a
 //! [`crate::doc_host::ChatDocHandle`]'s live doc to a chat2 room.
 //!
-//! The C2 rule is enforced HERE: every sink method persists doc content AND
-//! the room cursor in one `save_snapshot_with_cursor` transaction, so a
+//! The C2 rule is enforced by the coalescing persister: doc content AND its
+//! applied cursor commit in one transaction (at most once per second during replay), so a
 //! restored backup can never disagree with its own cursor — the root cause
 //! of the redownload-forever class the old s2 clients suffered.
 
@@ -12,10 +12,11 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use zeron_doc::SessionDoc;
-use zeron_sync::chat_client::{ChatDocSink, CheckpointFetcher};
+use zeron_sync::chat_client::{ChatDocSink, CheckpointFetcher, RowImportOutcome};
 use zeron_sync::{DocsStore, SyncError};
 
 use crate::doc_host::EdgeConfig;
+use crate::http_error::describe_http_error;
 
 /// Doc epoch stamped on every chat2-synced snapshot (docs/chat2-sync.md M1:
 /// thin docs are lineage epoch 2; M3 readers discard-and-adopt below it).
@@ -37,57 +38,60 @@ pub struct EngineChatSink {
     doc: std::sync::Weak<SessionDoc>,
     store: Arc<DocsStore>,
     chat_id: String,
+    handle: std::sync::Weak<crate::doc_host::ChatDocHandle>,
+    persistence: Arc<crate::chat_persistence::ChatPersistence>,
 }
 
 impl EngineChatSink {
     pub fn new(doc: &Arc<SessionDoc>, store: Arc<DocsStore>, chat_id: impl Into<String>) -> Self {
+        let chat_id = chat_id.into();
+        let cursor = store.snapshot_cursor(&chat_id).unwrap_or(0);
+        let persistence = crate::chat_persistence::ChatPersistence::new(
+            doc,
+            store.clone(),
+            chat_id.clone(),
+            cursor,
+        );
         Self {
             doc: Arc::downgrade(doc),
             store,
-            chat_id: chat_id.into(),
+            chat_id,
+            persistence,
+            handle: std::sync::Weak::new(),
         }
     }
 
-    /// Export the CURRENT doc and persist it with `cursor` in one tx.
-    fn persist_with_cursor(&self, cursor: u64) {
-        let Some(doc) = self.doc.upgrade() else {
-            return;
-        };
-        match doc.export_snapshot() {
-            Ok(bytes) => {
-                if let Err(err) = self.store.save_snapshot_with_cursor(
-                    &self.chat_id,
-                    &bytes,
-                    cursor,
-                    CHAT2_DOC_EPOCH,
-                ) {
-                    tracing::warn!(chat = %self.chat_id, error = %err,
-                        "chat2 sink: snapshot persist failed (will retry on next change)");
-                }
-            }
-            Err(err) => {
-                tracing::warn!(chat = %self.chat_id, error = %err,
-                    "chat2 sink: snapshot export failed");
-            }
+    pub(crate) fn with_handle(
+        mut self,
+        handle: std::sync::Weak<crate::doc_host::ChatDocHandle>,
+    ) -> Self {
+        if let Some(owner) = handle.upgrade()
+            && let Some(persistence) = &owner.persistence
+        {
+            self.persistence = persistence.clone();
         }
+        self.handle = handle;
+        self
     }
-}
 
-impl ChatDocSink for EngineChatSink {
-    fn apply_row(&self, bytes: &[u8], cursor: u64) {
+    fn import_row(&self, bytes: &[u8], cursor: u64, replay: bool) -> RowImportOutcome {
         let Some(doc) = self.doc.upgrade() else {
-            return;
+            return RowImportOutcome::Applied;
         };
-        match doc.doc().import(bytes) {
+        let origin = if replay {
+            crate::transcript_history::REPLAY_ORIGIN
+        } else {
+            ""
+        };
+        match doc.doc().import_with(bytes, origin) {
             Ok(status) => {
                 if status.pending.is_some() {
-                    // Missing causal deps: loro parked these ops invisibly.
-                    // The client's cursor contiguity rule keeps `cursor`
-                    // honest (it never jumps a gap), so persisting is safe —
-                    // this warn is the tripwire that the 2026-08-19
-                    // empty-doc/advanced-cursor wedge shape was seen live.
+                    // Room sequence contiguity does not prove causal history
+                    // is present. Snapshot export omits parked operations;
+                    // advancing its cursor would lose them after restart.
                     tracing::warn!(chat = %self.chat_id, cursor,
-                        "chat2 sink: row parked on missing deps (gap repair should follow)");
+                        "chat2 sink: row parked on missing deps; requesting repair");
+                    return RowImportOutcome::PendingDependencies;
                 }
             }
             Err(err) => {
@@ -98,16 +102,93 @@ impl ChatDocSink for EngineChatSink {
                     "chat2 sink: row import failed; skipping row");
             }
         }
-        self.persist_with_cursor(cursor);
+        self.persistence.applied(cursor, false);
+        RowImportOutcome::Applied
+    }
+
+    /// Checkpoint/ACK boundaries bypass the debounce but still queue the
+    /// export and transaction off the networking runtime.
+    fn persist_with_cursor(&self, cursor: u64) {
+        self.persistence.applied(cursor, true);
+    }
+}
+
+impl ChatDocSink for EngineChatSink {
+    fn cursor_is_verified(&self) -> bool {
+        self.persistence.initial_cursor_verified
+    }
+    fn reset_cursor(&self, cursor: u64) {
+        self.persistence.reset_cursor(cursor);
+    }
+
+    fn pending_updates(&self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let rejected = self
+            .store
+            .rejected_chat_updates(&self.chat_id)
+            .map_err(|e| e.to_string())?;
+        let pending = self
+            .store
+            .pending_chat_updates(&self.chat_id)
+            .map_err(|e| e.to_string())?;
+        let mut updates = Vec::new();
+        for (id, bytes) in pending {
+            if bytes.len() > zeron_sync::chat_client::MAX_PUSH_BYTES {
+                self.store
+                    .reject_chat_update(&self.chat_id, &id)
+                    .map_err(|e| e.to_string())?;
+            } else if !rejected.iter().any(|(r, _)| r == &id) {
+                updates.push((id, bytes));
+            }
+        }
+        Ok(updates)
+    }
+    fn reject_update(&self, batch_id: &str) -> Result<(), String> {
+        self.store
+            .reject_chat_update(&self.chat_id, batch_id)
+            .map_err(|e| e.to_string())
+    }
+    fn persist_update(&self, batch_id: &str, bytes: &[u8]) -> Result<(), String> {
+        self.store
+            .enqueue_chat_update(&self.chat_id, batch_id, bytes)
+            .map_err(|e| e.to_string())
+    }
+    fn acknowledge_update(&self, batch_id: &str) -> Result<(), String> {
+        self.store
+            .acknowledge_chat_update(&self.chat_id, batch_id)
+            .map_err(|e| e.to_string())
+    }
+
+    fn apply_row(&self, bytes: &[u8], cursor: u64) -> RowImportOutcome {
+        match self.handle.upgrade() {
+            Some(handle) => handle.import_transcript(|| self.import_row(bytes, cursor, false)),
+            None => self.import_row(bytes, cursor, false),
+        }
+    }
+
+    fn apply_replay_row(&self, bytes: &[u8], cursor: u64) -> RowImportOutcome {
+        match self.handle.upgrade() {
+            Some(handle) => handle.import_transcript(|| self.import_row(bytes, cursor, true)),
+            None => self.apply_row(bytes, cursor),
+        }
     }
 
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
-        let doc = self.doc.upgrade().ok_or("doc evicted")?;
-        doc.doc()
-            .import(bytes)
-            .map_err(|e| format!("checkpoint import: {e}"))?;
-        self.persist_with_cursor(cursor);
-        Ok(())
+        let import = || {
+            let doc = self.doc.upgrade().ok_or("doc evicted")?;
+            let status = doc
+                .doc()
+                .import_with(bytes, crate::transcript_history::REPLAY_ORIGIN)
+                .map_err(|e| format!("checkpoint import: {e}"))?;
+            if status.pending.is_some() {
+                return Err("checkpoint is missing causal dependencies".into());
+            }
+            self.persist_with_cursor(cursor);
+            Ok(())
+        };
+        match self.handle.upgrade() {
+            Some(handle) => handle.import_transcript(import),
+            None => import(),
+        }
     }
 
     fn contains_frontier(&self, frontier: &[u8]) -> bool {
@@ -182,22 +263,25 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
         Box::pin(async move {
             let mut got: Vec<u8> = Vec::new();
             let mut seen_seq: Option<String> = None;
+            let mut last_failure = None;
             // Range-resume loop: each attempt continues at the byte where
             // the last one stopped. Attempt count bounds a flapping link;
             // the ChatClient's own deadline bounds wall clock.
             for _attempt in 0..4 {
-                let bearer = edge
-                    .bearer()
-                    .await
-                    .ok_or_else(|| SyncError::Auth("signed out".into()))?;
-                let mut req = http.get(&url).bearer_auth(&bearer);
+                let bearer = edge.bearer().await.map_err(SyncError::from)?;
+                let mut req = http
+                    .get(&url)
+                    .bearer_auth(&bearer)
+                    .timeout(std::time::Duration::from_secs(300));
                 if !got.is_empty() {
                     req = req.header("range", format!("bytes={}-", got.len()));
                 }
                 let res = match req.send().await {
                     Ok(res) => res,
                     Err(err) => {
+                        let err = describe_http_error(err);
                         tracing::warn!(error = %err, "chat2 checkpoint fetch attempt failed");
+                        last_failure = Some(err);
                         continue;
                     }
                 };
@@ -237,20 +321,24 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
                         Ok(None) => return Ok(got),
                         Err(err) => {
                             // Mid-body drop: keep the bytes, resume via Range.
+                            let err = describe_http_error(err);
                             tracing::warn!(error = %err, resumed_at = got.len(),
                                 "chat2 checkpoint stream dropped; resuming");
+                            last_failure = Some(err);
                             break;
                         }
                     }
                 }
             }
-            Err(SyncError::Protocol(
-                "checkpoint fetch exhausted resume attempts".into(),
-            ))
+            let mut message = "checkpoint fetch exhausted resume attempts".to_string();
+            if let Some(failure) = last_failure {
+                message.push_str(": ");
+                message.push_str(&failure);
+            }
+            Err(SyncError::Protocol(message))
         })
     }
 }
-
 
 /// Plain-HTTPS chat pull/push (the airplane-wifi transport): GET/POST
 /// `/chat2/{id}/rows` with the same bearer auth the checkpoint fetcher uses.
@@ -292,24 +380,24 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
         let url = self.rows_url();
         let device = self.device_id.clone();
         Box::pin(async move {
-            let bearer = edge
-                .bearer()
-                .await
-                .ok_or_else(|| SyncError::Auth("signed out".into()))?;
+            let bearer = edge.bearer().await.map_err(SyncError::from)?;
             let res = http
                 .get(&url)
                 .query(&[("after", after.to_string()), ("device", device)])
                 .bearer_auth(&bearer)
                 .send()
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+                .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             if !res.status().is_success() {
-                return Err(SyncError::Protocol(format!("chat pull http {}", res.status())));
+                return Err(SyncError::Protocol(format!(
+                    "chat pull http {}",
+                    res.status()
+                )));
             }
             let bytes = res
                 .bytes()
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+                .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             Ok(bytes.to_vec())
         })
     }
@@ -324,10 +412,7 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
         let url = self.rows_url();
         let device = self.device_id.clone();
         Box::pin(async move {
-            let bearer = edge
-                .bearer()
-                .await
-                .ok_or_else(|| SyncError::Auth("signed out".into()))?;
+            let bearer = edge.bearer().await.map_err(SyncError::from)?;
             let res = http
                 .post(&url)
                 .query(&[("batchId", batch_id), ("device", device)])
@@ -335,13 +420,16 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
                 .body(bytes)
                 .send()
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+                .map_err(|e| SyncError::WebSocket(describe_http_error(e)))?;
             if !res.status().is_success() {
-                return Err(SyncError::Protocol(format!("chat push http {}", res.status())));
+                return Err(SyncError::Protocol(format!(
+                    "chat push http {}",
+                    res.status()
+                )));
             }
             res.text()
                 .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))
+                .map_err(|e| SyncError::WebSocket(describe_http_error(e)))
         })
     }
 }
@@ -351,6 +439,26 @@ mod frontier_tests {
     use super::*;
     use std::sync::Arc;
 
+    #[tokio::test]
+    async fn http_sync_and_exhausted_checkpoint_retries_retain_dns_cause() {
+        use crate::http_error::test_support::FailingDns;
+        use zeron_sync::chat_client::ChatTransport;
+
+        let dns = Arc::new(FailingDns::default());
+        let edge = EdgeConfig::with_static_token("https://edge.invalid", "token-secret");
+        let transport = EdgeChatTransport::new(dns.client(), edge.clone(), "chat", "device");
+        let pull = transport.fetch_rows(0).await.unwrap_err();
+        let push = transport.push("batch".into(), vec![]).await.unwrap_err();
+        let checkpoint = EdgeCheckpointFetcher::new(dns.client(), edge, "chat")
+            .fetch()
+            .await
+            .unwrap_err();
+        for error in [pull, push, checkpoint] {
+            let message = error.to_string();
+            assert!(message.contains("injected DNS lookup failure"), "{message}");
+            assert!(!message.contains("token-secret"), "{message}");
+        }
+    }
     /// The empty-frontier-means-contained shortcut skipped the chat's
     /// founding ops for every fresh reader of a room whose checkpoint
     /// carries an empty frontier label, parking all dependent rows
@@ -388,13 +496,98 @@ mod frontier_tests {
         );
         // A real, contained frontier still short-circuits the fetch — the
         // doc needs actual ops, or its own frontier is the vacuous-empty one.
-        doc.doc()
-            .get_map("meta")
-            .insert("k", "v")
-            .expect("insert");
+        doc.doc().get_map("meta").insert("k", "v").expect("insert");
         doc.doc().commit();
         let vv = doc.doc().oplog_vv().encode();
         assert!(sink.contains_frontier(&vv));
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parked_rows_do_not_persist_a_cursor_until_their_history_arrives() {
+        let source = SessionDoc::init("chat").unwrap();
+        let text = source.doc().get_text("body");
+        text.insert(0, "parent").unwrap();
+        source.doc().commit();
+        let checkpoint = source.export_snapshot().unwrap();
+        let frontier = source.doc().oplog_vv();
+        text.insert(6, " child").unwrap();
+        source.doc().commit();
+        let row = source
+            .doc()
+            .export(loro::ExportMode::updates(&frontier))
+            .unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let target = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        let sink = EngineChatSink::new(&target, store.clone(), "chat");
+        sink.persist_with_cursor(0);
+        assert_eq!(
+            sink.apply_row(&row, 1),
+            RowImportOutcome::PendingDependencies
+        );
+        let (_, cursor, _) = store.load_snapshot_with_cursor("chat").unwrap().unwrap();
+        assert_eq!(cursor, 0, "a restart must retry the invisible update");
+
+        sink.apply_checkpoint(&checkpoint, 0).unwrap();
+        assert_eq!(sink.apply_row(&row, 1), RowImportOutcome::Applied);
+        let (snapshot, cursor, _) = store.load_snapshot_with_cursor("chat").unwrap().unwrap();
+        assert_eq!(cursor, 1);
+        let restored = loro::LoroDoc::new();
+        restored.import(&snapshot).unwrap();
+        assert_eq!(restored.get_text("body").to_string(), "parent child");
+
+        let incomplete = Arc::new(SessionDoc::from_doc(loro::LoroDoc::new()));
+        let incomplete_sink = EngineChatSink::new(&incomplete, store.clone(), "incomplete");
+        assert!(incomplete_sink.apply_checkpoint(&row, 1).is_err());
+        assert!(
+            store
+                .load_snapshot_with_cursor("incomplete")
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+/// Replay a legacy document in bounded rows. Splitting by operation range
+/// preserves IDs; Loro safely parks cross-peer dependencies until replay completes.
+pub(crate) fn publication_updates(doc: &loro::LoroDoc) -> Result<Vec<Vec<u8>>, String> {
+    fn split(
+        doc: &loro::LoroDoc,
+        peer: u64,
+        start: i32,
+        end: i32,
+        out: &mut Vec<Vec<u8>>,
+    ) -> Result<(), String> {
+        let bytes = doc
+            .export(loro::ExportMode::updates_in_range(vec![loro::IdSpan::new(
+                peer, start, end,
+            )]))
+            .map_err(|e| e.to_string())?;
+        if bytes.len() <= zeron_sync::chat_client::MAX_PUSH_BYTES || end - start <= 1 {
+            // An indivisible oversized op remains durable until checkpointed.
+            out.push(bytes);
+        } else {
+            let middle = start + (end - start) / 2;
+            split(doc, peer, start, middle, out)?;
+            split(doc, peer, middle, end, out)?;
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    let vv = doc.oplog_vv();
+    let mut peers: Vec<_> = vv.iter().collect();
+    peers.sort_by_key(|(peer, _)| **peer);
+    for (&peer, &end) in peers {
+        if end > 0 {
+            split(doc, peer, 0, end, &mut out)?;
+        }
+    }
+    Ok(out)
 }

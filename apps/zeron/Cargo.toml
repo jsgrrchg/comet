@@ -14,6 +14,7 @@ zeron-engine.workspace = true
 zeron-rpc.workspace = true
 zeron-ui.workspace = true
 zeron-update.workspace = true
+zeron-mcp.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
@@ -27,5 +28,11 @@ tracing-subscriber.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 mimalloc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
 [dev-dependencies]
 tempfile.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.11"

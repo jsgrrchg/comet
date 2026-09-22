@@ -1,8 +1,8 @@
 // Composer — the floating glass shell in the t3 mobile composer's shape: a
 // collapsed capsule (editor + send circle) that morphs into an expanded card
 // with a toolbar ROW below it (attach circle · scrolling chips · pinned send)
-// when the editor takes focus. Carries the desktop's Send→Steer→Stop
-// semantics: live run + text = steer (same up-arrow), live run + empty = stop.
+// when the editor takes focus. A live run plus text queues the message;
+// a live run with an empty composer offers Stop.
 //
 // Expansion is focus-driven like t3's, with the old deterministic content
 // triggers kept as a floor (attachments, newline, >26 chars) — content-size
@@ -17,6 +17,11 @@ struct ComposerShell<Chips: View>: View {
     @Binding var draft: String
     var placeholder = "Message"
     var sendEnabled: Bool
+    var sendLabel = "Send message"
+    /// Treat an empty box as sendable. Only the queue-edit path wants this:
+    /// emptying a queued message is how you throw it away, so the button has
+    /// to stay live with nothing typed.
+    var allowEmptySend = false
     var showStop: Bool
     var busy = false
     /// New-session composers stay expanded — the picker chips ARE the page.
@@ -28,6 +33,7 @@ struct ComposerShell<Chips: View>: View {
     var keepExpanded = false
     var onSend: () -> Void
     var onStop: () -> Void = {}
+    var onAdvanceQueue: () -> Void = {}
     /// Staged image attachments (attachment-ui.tsx AttachmentStrip inside the
     /// pill). Non-empty forces the expanded layout, like focus.
     var attachments: [StagedAttachment] = []
@@ -39,7 +45,10 @@ struct ComposerShell<Chips: View>: View {
     var autoFocus = false
     @ViewBuilder var chips: Chips
 
-    @FocusState private var focused: Bool
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    private var compact: Bool { verticalSizeClass == .compact }
+    @State private var focused = false
+    @State private var editor = ComposerEditorController()
 
     private var expanded: Bool {
         alwaysExpanded || keepExpanded || focused || !attachments.isEmpty
@@ -57,7 +66,7 @@ struct ComposerShell<Chips: View>: View {
     // the compact↔expanded flip — an if/else here would tear down and rebuild
     // the TextField, dropping keyboard focus mid-type.
     private var shellLayout: AnyLayout {
-        expanded
+        expanded && !compact
             ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0))
             : AnyLayout(HStackLayout(alignment: .center, spacing: 12))
     }
@@ -67,7 +76,7 @@ struct ComposerShell<Chips: View>: View {
             // Focus-widen: margins pull in slightly while typing (chat-session.tsx).
             .padding(.horizontal, focused ? 10 : 16)
             .motionAnimation(Motion.resize, value: focused)
-            .motionAnimation(Motion.collapse, value: expanded)
+            .motionAnimation(Motion.resize, value: expanded)
             .onAppear {
                 guard autoFocus else { return }
                 Task { @MainActor in
@@ -91,7 +100,9 @@ struct ComposerShell<Chips: View>: View {
                 .padding(.leading, expanded ? 4 : 13)
                 .padding(.trailing, expanded ? 4 : 0)
                 .padding(.vertical, expanded ? 4 : 5)
-                .frame(minHeight: expanded ? 64 : nil, alignment: .topLeading)
+                .frame(minWidth: compact ? 140 : nil,
+                       minHeight: expanded && !compact ? 64 : nil, alignment: .topLeading)
+                .fixedSize(horizontal: false, vertical: true)
             if expanded {
                 HStack(spacing: 8) {
                     if onAttach != nil {
@@ -104,10 +115,18 @@ struct ComposerShell<Chips: View>: View {
                         }
                     }
                     .scrollClipDisabled(false)
+                    .mask {
+                        HStack(spacing: 0) {
+                            Rectangle()
+                            LinearGradient(colors: [.black, .clear],
+                                           startPoint: .leading, endPoint: .trailing)
+                                .frame(width: 24)
+                        }
+                    }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     actionButton
                 }
-                .padding(.top, 8)
+                .padding(.top, compact ? 0 : 8)
             } else {
                 actionButton
             }
@@ -130,12 +149,27 @@ struct ComposerShell<Chips: View>: View {
     }
 
     private var input: some View {
-        TextField(placeholder, text: $draft, axis: .vertical)
-            .font(Theme.sans(16))
-            .foregroundStyle(Theme.text)
-            .tint(Theme.text)
-            .lineLimit(1...7)
-            .focused($focused)
+        ComposerEditor(text: $draft, focused: $focused, placeholder: placeholder,
+                       maxLines: compact ? 2 : 7, controller: editor,
+                       onModifiedSubmit: {
+                           guard !busy else { return }
+                           editor.commit()
+                           if hasContent {
+                               if sendEnabled { onSend() }
+                           } else {
+                               onAdvanceQueue()
+                           }
+                           editor.apply(text: draft)
+                       })
+            .overlay(alignment: .topLeading) {
+                if draft.isEmpty {
+                    Text(placeholder)
+                        .font(Theme.sans(17))
+                        .foregroundStyle(Theme.text.opacity(0.3))
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
     }
 
     private var attachButton: some View {
@@ -145,18 +179,20 @@ struct ComposerShell<Chips: View>: View {
             Image(systemName: "plus")
                 .font(.system(size: 16, weight: .medium))
                 .foregroundStyle(Theme.textMuted)
-                .frame(width: 40, height: 40)
+                .frame(width: 44, height: 44)
                 .background(whiteAlpha(0.06), in: Circle())
                 .overlay(Circle().strokeBorder(whiteAlpha(0.08), lineWidth: 1))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .disabled(busy)
+        .accessibilityLabel("Attach photos")
     }
 
     /// Attachments count as content: an image-only send is a send, never a stop.
     private var hasContent: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+        allowEmptySend || !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !attachments.isEmpty
     }
 
     private var actionButton: some View {
@@ -166,7 +202,9 @@ struct ComposerShell<Chips: View>: View {
                 onStop()
             } else {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                editor.commit()
                 onSend()
+                editor.apply(text: draft)
             }
         } label: {
             Group {
@@ -184,12 +222,14 @@ struct ComposerShell<Chips: View>: View {
                         .foregroundStyle(buttonActive ? Theme.bg : Theme.textFaint)
                 }
             }
-            .frame(width: 40, height: 40)
+            .frame(width: 44, height: 44)
             .background(buttonActive ? AnyShapeStyle(Theme.text) : AnyShapeStyle(whiteAlpha(0.10)),
                         in: Circle())
             .contentShape(Circle())
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(showStop && !hasContent ? "Stop response" : sendLabel)
+        .accessibilityIdentifier("composer-send")
         .disabled(!buttonActive)
         .motionAnimation(Motion.fadeQuick, value: showStop)
     }
@@ -218,8 +258,17 @@ struct ComposerView: View {
     @State private var uploadError: String?
     @State private var showModelPicker = false
     @State private var showTraitPicker = false
+    @State private var showOptionPicker: ModelOptionInfo?
     /// Live catalog for the chat's harness from its space's device.
     @State private var catalogs: [String: [ModelInfo]] = [:]
+    @State private var queueEdit: QueueComposerEdit?
+    private var editingQueuedId: String? { queueEdit?.lease.rowId }
+    private var queueEditLease: QueueEditLease? { queueEdit?.lease }
+    @State private var queueEditBusy = false
+    @State private var queueEditInstanceId = UUID().uuidString.lowercased()
+    /// Distinguishes a live composer from an async acquire that completed
+    /// after navigation removed this view.
+    @State private var queueEditorVisible = false
 
     private var harness: String { chat.config?.harness ?? "claude-code" }
 
@@ -228,7 +277,7 @@ struct ComposerView: View {
     }
 
     private var currentModel: ModelInfo {
-        models.first { $0.id == chat.config?.model } ?? HarnessCatalog.defaultModel(for: harness)
+        HarnessCatalog.resolve(modelId: chat.config?.model, in: models, harness: harness)
     }
 
     private var currentReasoning: String? {
@@ -237,13 +286,20 @@ struct ComposerView: View {
         return HarnessCatalog.defaultReasoning(for: currentModel)
     }
 
+    private func currentChoice(for option: ModelOptionInfo) -> ModelOptionChoiceInfo {
+        HarnessCatalog.selectedChoice(
+            for: option,
+            selectedId: chat.config?.modelOptions[option.id]?.stringValue
+        )
+    }
+
     var body: some View {
         // Subscribe to the connectivity pulse so the degraded caption follows
         // the graced stream (1Hz only while something is degraded/pending).
         let _ = model.connectivity.pulse
         return VStack(spacing: 6) {
-            if let uploadError {
-                Text(uploadError)
+            if let error = uploadError ?? store.queueActionError {
+                Text(error)
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.danger)
                     .lineLimit(2)
@@ -271,16 +327,46 @@ struct ComposerView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .transition(.opacity)
             }
+            // What is waiting to be sent, stacked directly above the box it
+            // was typed in.
+            if !store.queue.isEmpty {
+                QueuePanel(store: store,
+                           editingId: editingQueuedId,
+                           onEdit: { item in Task { await beginQueueEdit(item) } },
+                           onCancelEdit: { Task { await cancelQueueEdit() } },
+                           supportsActions: supportsQueueActions,
+                           onAction: performQueueAction)
+            }
+            if editingQueuedId != nil {
+                Button(queueEdit?.terminal == true ? "Copy edit and stop editing" : "Stop editing") {
+                    if queueEdit?.terminal == true {
+                        UIPasteboard.general.string = text
+                        finishLocalQueueEdit(.finished, failure: "")
+                    } else {
+                        Task { await cancelQueueEdit() }
+                    }
+                }
+                .buttonStyle(.plain)
+                .font(Theme.sans(12))
+                .foregroundStyle(Theme.textMuted)
+                .disabled(queueEditBusy)
+                .accessibilityHint(queueEdit?.terminal == true ? "Copies the edit and restores your previous draft" : "")
+            }
             ComposerShell(
                 draft: $text,
+                placeholder: editingQueuedId == nil ? "Message" : "Edit queued message",
                 sendEnabled: true,
+                sendLabel: editingQueuedId != nil ? "Save queued message"
+                    : (runLive ? "Queue message" : "Send message"),
+                allowEmptySend: editingQueuedId != nil,
                 showStop: runLive,
-                busy: uploading,
-                keepExpanded: showModelPicker || showTraitPicker,
+                busy: uploading || queueEditBusy,
+                keepExpanded: showModelPicker || showTraitPicker || showOptionPicker != nil,
                 onSend: send,
                 onStop: { store.sendInterrupt() },
-                attachments: attachments,
-                onAttach: { showPicker = true },
+                onAdvanceQueue: advanceQueue,
+                attachments: editingQueuedId == nil ? attachments : [],
+                onAttach: editingQueuedId == nil ? { showPicker = true } : nil,
                 onRemoveAttachment: { id in attachments.removeAll { $0.id == id } },
                 autoFocus: model.launchFocusComposer
             ) {
@@ -297,6 +383,11 @@ struct ComposerView: View {
                 if let currentReasoning {
                     ComposerChip(label: HarnessCatalog.reasoningLabel(currentReasoning)) {
                         showTraitPicker = true
+                    }
+                }
+                ForEach(currentModel.options) { option in
+                    ComposerChip(label: currentChoice(for: option).label) {
+                        showOptionPicker = option
                     }
                 }
             }
@@ -331,25 +422,76 @@ struct ComposerView: View {
                 levels: currentModel.reasoningLevels
             )
         }
-        .task(id: "\(chat.id)/\(harness)") {
-            guard let space = model.space(for: chat) else { return }
-            catalogs[harness] = await model.listModels(space: space, harness: harness)
+        .sheet(item: $showOptionPicker) { option in
+            ModelOptionPickerSheet(option: option, choiceId: Binding(
+                get: { currentChoice(for: option).id },
+                set: { writeOption(option: option, choiceId: $0) }
+            ))
+        }
+        .task(id: "\(chat.id)/\(chat.deviceId)/\(harness)") {
+            let catalog = await model.listModels(deviceId: chat.deviceId, harness: harness)
+            guard !Task.isCancelled else { return }
+            catalogs[harness] = catalog
+        }
+        .task(id: queueEdit?.terminal == true ? nil : queueEditLease?.leaseId) {
+            guard let lease = queueEditLease, queueEdit?.terminal != true else { return }
+            while !Task.isCancelled, queueEditLease?.leaseId == lease.leaseId {
+                try? await Task.sleep(for: .seconds(20))
+                guard !Task.isCancelled else { return }
+                if !(await store.renewQueuedEdit(lease)) {
+                    uploadError = "Edit protection may have expired — review before sending."
+                }
+            }
         }
         .onAppear {
+            queueEditorVisible = true
             if model.launchSheet == "config" {
                 model.launchSheet = nil
                 showModelPicker = true
             }
         }
+        .onDisappear {
+            queueEditorVisible = false
+            guard let lease = queueEditLease else { return }
+            text = queueEdit?.originalDraft ?? ""
+            queueEdit = nil
+            queueEditBusy = false
+            Task { _ = await store.finishQueuedEdit(lease, action: "cancel") }
+        }
     }
 
     /// Merge a model/effort change into the chat's config row (LWW; the host
-    /// picks it up on the next run dispatch). Copies preserve modelOptions.
+    /// picks it up on the next run dispatch). Compatible model options survive
+    /// edits; changing model prunes traits the destination does not advertise.
     private func writeConfig(model newModel: String?, reasoning newReasoning: String?) {
         var config = chat.config ?? ChatConfig(harness: harness, model: nil,
                                                reasoning: nil, sandbox: "workspace-write")
+        let changedModel = newModel != nil && newModel != config.model
         config.model = newModel
         config.reasoning = newReasoning
+        if changedModel, let newModel,
+           let target = models.first(where: { $0.id == newModel }) {
+            var compatible: [String: JSONValue] = [:]
+            for option in target.options {
+                guard let selected = config.modelOptions[option.id]?.stringValue,
+                      selected != option.defaultChoice,
+                      option.choices.contains(where: { $0.id == selected }) else { continue }
+                compatible[option.id] = .string(selected)
+            }
+            config.modelOptions = compatible
+        }
+        model.setChatConfig(chatId: chat.id, config: config)
+    }
+
+    private func writeOption(option: ModelOptionInfo, choiceId: String) {
+        var config = chat.config ?? ChatConfig(harness: harness, model: currentModel.id,
+                                               reasoning: currentReasoning,
+                                               sandbox: "workspace-write")
+        if choiceId == option.defaultChoice {
+            config.modelOptions.removeValue(forKey: option.id)
+        } else {
+            config.modelOptions[option.id] = .string(choiceId)
+        }
         model.setChatConfig(chatId: chat.id, config: config)
     }
 
@@ -377,17 +519,105 @@ struct ComposerView: View {
         }
     }
 
+    /// Retype a queued message in the composer. Whatever was already in the box
+    /// steps aside rather than being lost.
+    @MainActor
+    private func beginQueueEdit(_ item: QueuedMessage) async {
+        guard editingQueuedId == nil, !queueEditBusy else { return }
+        guard model.hostSupportsQueueEditLease(chat) else {
+            uploadError = "Update the chat host to edit queued messages safely."
+            return
+        }
+        queueEditBusy = true
+        let result = await store.beginQueuedEdit(id: item.id, instanceId: queueEditInstanceId)
+        queueEditBusy = false
+        switch result {
+        case .acquired(let lease):
+            guard queueEditorVisible else {
+                // Navigation won the race with the host ACK. Release the
+                // newly acquired lease instead of leaving a ghost editor.
+                _ = await store.finishQueuedEdit(lease, action: "cancel")
+                return
+            }
+            queueEdit = QueueComposerEdit(lease: lease, originalDraft: text,
+                                          hasAttachments: !item.attachments.isEmpty)
+            text = MessageQueue.visibleText(lease.text, attachments: item.attachments)
+            uploadError = nil
+        case .locked:
+            uploadError = "That queued message is being edited on another device."
+        case .missing:
+            uploadError = "That queued message is no longer available."
+        case .unavailable:
+            uploadError = "Connect to the chat host to edit this message."
+        }
+    }
+
+    @MainActor
+    private func cancelQueueEdit() async {
+        guard let lease = queueEditLease, !queueEditBusy else { return }
+        queueEditBusy = true
+        let result = await store.finishQueuedEdit(lease, action: "cancel")
+        queueEditBusy = false
+        finishLocalQueueEdit(result, failure: "Couldn't cancel the protected edit.")
+    }
+
+    @MainActor
+    private func commitQueueEdit() async {
+        guard let lease = queueEditLease, !queueEditBusy else { return }
+        let edited = queueEdit?.textToCommit(text)
+        queueEditBusy = true
+        let result: QueueEditFinishResult
+        if let edited {
+            result = await store.finishQueuedEdit(lease, action: "commit", text: edited)
+        } else {
+            result = await store.finishQueuedEdit(lease, action: "discard")
+        }
+        queueEditBusy = false
+        finishLocalQueueEdit(result, failure: "Couldn't save the protected edit.")
+    }
+
+    @MainActor
+    private func finishLocalQueueEdit(_ result: QueueEditFinishResult, failure: String) {
+        queueEdit?.receive(result)
+        switch result {
+        case .finished:
+            text = queueEdit?.originalDraft ?? ""
+            queueEdit = nil
+            uploadError = nil
+        case .conflict:
+            uploadError = "This message changed on another device; your edit is still here."
+        case .missing:
+            uploadError = "Message removed. Stop editing to copy your text and restore your draft."
+        case .lost:
+            uploadError = "Edit protection changed. Stop editing to copy your text and restore your draft."
+        case .unavailable:
+            uploadError = failure
+        }
+    }
+
     private func send() {
-        let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Editing a queued row: the button saves that row rather than sending
+        // anything new.
+        if editingQueuedId != nil {
+            Task { await commitQueueEdit() }
+            return
+        }
+        let submittedText = text
+        let prompt = submittedText.trimmingCharacters(in: .whitespacesAndNewlines)
         let staged = attachments
+        guard !runLive || model.hostSupportsMessageQueue(chat, attachments: !staged.isEmpty) else {
+            uploadError = "Update the chat's engine to queue messages during a response."
+            return
+        }
         guard !prompt.isEmpty || !staged.isEmpty else { return }
 
         if staged.isEmpty {
             deliver(content: prompt, paths: [])
-            clearDraft()
+            clearDraft(matching: submittedText)
             return
         }
-        if model.hostSupportsQueuedAttachments(chat) {
+        if model.hostSupportsQueuedAttachments(chat)
+            && !(runLive && model.hostSupportsMessageQueue(chat, attachments: true)) {
             // Queued flow (host ≥ 0.2.12): the send is a durable local write
             // NOW — pending:// refs in the doc, bytes escorted afterwards
             // with retry-forever — so an image send survives a dead link
@@ -407,7 +637,7 @@ struct ComposerView: View {
             store.sendWithTransfers(prompt: prompt, chat: chat, live: runLive,
                                     transfers: transfers)
             attachments = []
-            clearDraft()
+            clearDraft(matching: submittedText)
             return
         }
         // Legacy host-staged flow (host < 0.2.12): upload first, send after —
@@ -438,7 +668,7 @@ struct ComposerView: View {
                 }
                 deliver(content: withAttachments(text: prompt, paths: paths), paths: paths)
                 attachments = []
-                clearDraft()
+                clearDraft(matching: submittedText)
             } catch {
                 uploadError = "Attachment upload failed — \(error.localizedDescription)"
             }
@@ -446,23 +676,52 @@ struct ComposerView: View {
     }
 
     private func deliver(content: String, paths: [String]) {
+        // All active-turn messages wait in the shared queue.
         if runLive {
-            store.sendSteer(prompt: content)
+            let queueText = model.hostSupportsCleanQueueAttachmentText(chat)
+                ? MessageQueue.visibleText(content, attachments: paths)
+                : content
+            store.enqueueMessage(text: queueText, attachments: paths, holdForTurnEnd: true)
         } else {
             store.sendRun(prompt: content, chat: chat, attachments: paths)
         }
     }
 
-    private func clearDraft() {
+    private var supportsQueueActions: Bool {
+        model.workspace?.deviceSupports(chat.deviceId, EngineCapability.messageQueueActionsV1) ?? false
+    }
+
+    private func advanceQueue() {
+        guard editingQueuedId == nil, !queueEditBusy, !uploading,
+              let head = store.queue.first,
+              let action = MessageQueue.primaryAction(
+                for: head,
+                supportsActions: supportsQueueActions,
+                pending: store.queueActionsPending.contains(head.id)) else { return }
+        performQueueAction(head, action)
+    }
+
+    private func performQueueAction(_ item: QueuedMessage, _ action: QueueAction) {
+        guard supportsQueueActions, !queueEditBusy else { return }
+        uploadError = nil
+        // Discard while the lease still blocks delivery; cancelling it first
+        // would open a window in which the host could send the old text.
+        if action == .remove, editingQueuedId == item.id, let lease = queueEditLease {
+            queueEditBusy = true
+            Task { @MainActor in
+                let result = await store.finishQueuedEdit(lease, action: "discard")
+                queueEditBusy = false
+                finishLocalQueueEdit(result, failure: "Couldn't remove the protected message.")
+            }
+            return
+        }
+        Task { await store.performQueueAction(id: item.id, action: action) }
+    }
+
+    private func clearDraft(matching submittedText: String) {
+        // A legacy attachment upload can finish after the user edits the draft.
+        guard text == submittedText else { return }
         text = ""
-        // The clear above is unconditional, so a prompt left sitting in the
-        // composer after a successful send is not this path failing to run —
-        // it is the text view writing the pre-send string back. A focused
-        // multiline TextField commits pending autocorrect/marked text through
-        // the binding AFTER a programmatic change, which restores the prompt.
-        // Re-clear once that has drained; a keystroke can't land inside the
-        // same main-actor turn, so this can never eat real input.
-        Task { @MainActor in text = "" }
     }
 }
 

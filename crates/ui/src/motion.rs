@@ -59,8 +59,31 @@ const PULSE_LEASE: Duration = Duration::from_millis(300);
 
 struct PulseClock {
     epoch: Instant,
-    leases: HashMap<EntityId, Instant>,
+    leases: HashMap<EntityId, PulseLease>,
+    tick: u64,
     running: bool,
+}
+
+struct PulseLease {
+    until: Instant,
+    stride: u64,
+}
+
+impl PulseLease {
+    fn renew(&mut self, now: Instant, stride: u64) {
+        self.until = now + PULSE_LEASE;
+        self.stride = self.stride.min(stride);
+    }
+
+    fn take_tick(&mut self, tick: u64) -> bool {
+        if !tick.is_multiple_of(self.stride) {
+            return false;
+        }
+        // Each paint re-establishes the fastest mounted animation. A retired
+        // 30Hz animation must not permanently pull a 15Hz loader up to 30Hz.
+        self.stride = u64::MAX;
+        true
+    }
 }
 
 impl Global for PulseClock {}
@@ -70,6 +93,7 @@ impl Default for PulseClock {
         Self {
             epoch: Instant::now(),
             leases: HashMap::new(),
+            tick: 0,
             running: false,
         }
     }
@@ -81,27 +105,89 @@ impl Default for PulseClock {
 /// loaders stay phase-locked. Reduced motion returns a static 0 and schedules
 /// nothing.
 pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
+    pulse_delta_every(spec, view, 1, cx)
+}
+
+/// Coarser cell loaders on the shell need only 15Hz; their wall-clock period
+/// and phase stay identical. Text dissolves still use the full 30Hz clock.
+pub fn pulse_delta_slow(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
+    pulse_delta_every(spec, view, 2, cx)
+}
+
+fn pulse_delta_every(spec: &MotionSpec, view: EntityId, stride: u64, cx: &mut App) -> f32 {
     if cx.reduce_motion() {
         return 0.0;
     }
+    pulse_lease_every(view, stride, cx);
     let clock = cx.default_global::<PulseClock>();
-    clock.leases.insert(view, Instant::now() + PULSE_LEASE);
-    let period = spec.total().as_secs_f32();
-    let phase = (clock.epoch.elapsed().as_secs_f32() / period).fract();
+    (clock.epoch.elapsed().as_secs_f32() / spec.total().as_secs_f32()).fract()
+}
+
+/// Schedule cosmetic animation through the same bounded clock as loaders.
+/// Renew only while painting an active animation; the clock parks after the
+/// last lease expires, including when a view is hidden or removed.
+pub fn pulse_lease(view: EntityId, cx: &mut App) {
+    pulse_lease_every(view, 1, cx);
+}
+
+fn pulse_lease_every(view: EntityId, stride: u64, cx: &mut App) {
+    if cx.reduce_motion() {
+        return;
+    }
+    let clock = cx.default_global::<PulseClock>();
+    let now = Instant::now();
+    clock
+        .leases
+        .entry(view)
+        .or_insert(PulseLease {
+            until: now + PULSE_LEASE,
+            stride,
+        })
+        .renew(now, stride);
     if !clock.running {
         clock.running = true;
         cx.spawn(async move |cx| {
+            #[cfg(windows)]
+            let mut precise_clock = if cx
+                .background_executor()
+                .scheduler_executor()
+                .scheduler()
+                .as_test()
+                .is_none()
+            {
+                windows_pulse::Clock::new(PULSE_TICK)
+            } else {
+                // A deterministic scheduler must own its timers and wakeups;
+                // an OS thread cannot schedule its thread-local tasks safely.
+                None
+            };
             loop {
-                cx.background_executor().timer(PULSE_TICK).await;
+                #[cfg(windows)]
+                let precise_tick = if let Some(clock) = precise_clock.as_mut() {
+                    clock.tick().await
+                } else {
+                    false
+                };
+                #[cfg(not(windows))]
+                let precise_tick = false;
+                if !precise_tick {
+                    cx.background_executor().timer(PULSE_TICK).await;
+                }
                 let parked = cx.update(|cx| {
                     let clock = cx.default_global::<PulseClock>();
                     let now = Instant::now();
-                    clock.leases.retain(|_, until| *until > now);
+                    clock.leases.retain(|_, lease| lease.until > now);
                     if clock.leases.is_empty() {
                         clock.running = false;
                         return true;
                     }
-                    let views: Vec<EntityId> = clock.leases.keys().copied().collect();
+                    clock.tick = clock.tick.wrapping_add(1);
+                    let tick = clock.tick;
+                    let views: Vec<EntityId> = clock
+                        .leases
+                        .iter_mut()
+                        .filter_map(|(view, lease)| lease.take_tick(tick).then_some(*view))
+                        .collect();
                     for view in views {
                         cx.notify(view);
                     }
@@ -114,7 +200,6 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
         })
         .detach();
     }
-    phase
 }
 
 // ---------------------------------------------------------------------------
@@ -213,8 +298,10 @@ pub const EASE_OUT_EXPO: CubicBezier = CubicBezier::new(0.16, 1.0, 0.3, 1.0);
 pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
 /// CSS `ease` — quick fades, menu/dialog pops.
 pub const EASE: CubicBezier = CubicBezier::new(0.25, 0.1, 0.25, 1.0);
-/// Sidebar resort glide — CSS `cubic-bezier(0.22, 1, 0.36, 1)` (used from M3b).
-pub const EASE_RESORT: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
+/// `easeOutQuint` — CSS `cubic-bezier(0.22, 1, 0.36, 1)`.
+pub const EASE_OUT_QUINT: CubicBezier = CubicBezier::new(0.22, 1.0, 0.36, 1.0);
+/// Sidebar resort glide (used from M3b).
+pub const EASE_RESORT: CubicBezier = EASE_OUT_QUINT;
 /// CSS `ease-in-out` — the transcript scroll glide (browser smooth-scroll
 /// shape: gentle start, cruise, gentle landing).
 pub const EASE_IN_OUT: CubicBezier = CubicBezier::new(0.42, 0.0, 0.58, 1.0);
@@ -298,6 +385,11 @@ pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_OUT);
 pub const TAB_SLIDE: MotionSpec = MotionSpec::new(150, EASE_OUT);
 /// Diff-pane per-file collapse: 180ms height (§1.11).
 pub const COLLAPSE: MotionSpec = MotionSpec::new(180, EASE_OUT);
+/// Reversible new-thread ↔ session handoff. The shared composer moves and
+/// morphs on a fast-starting, soft-landing curve while the canvas/transcript
+/// crossfade is staged around it. Slightly longer than a utility transition,
+/// but still short enough to acknowledge a send immediately.
+pub const NEW_THREAD_TRANSITION: MotionSpec = MotionSpec::new(420, EASE_RESORT);
 /// Diff-pane chevron rotate: 200ms (§1.11; approximated as a crossfade — gpui
 /// divs have no rotation transform at the pinned rev, same caveat as scale).
 pub const CHEVRON: MotionSpec = MotionSpec::new(200, EASE);
@@ -317,6 +409,91 @@ pub const ZERON_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
 pub const GRADIENT_SPIN: MotionSpec = MotionSpec::new(750, EASE);
 
 // ---------------------------------------------------------------------------
+// Resize-edge feedback
+// ---------------------------------------------------------------------------
+
+/// Pane resize limits acknowledge a held pointer without persisting an
+/// out-of-range size. The small displacement is shared by the shell panes and
+/// nested surface splits so every seam has the same physical response.
+pub const RESIZE_EDGE_NUDGE: f32 = 5.0;
+pub const RESIZE_EDGE_BOUNCE_MS: u64 = 220;
+pub const RESIZE_EDGE_BOUNCE_OUT_FRACTION: f32 = 0.32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeEdge {
+    Min,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResizeDragSample {
+    pub width: f32,
+    pub edge: Option<ResizeEdge>,
+    pub starts_bounce: bool,
+}
+
+/// Clamp a resize sample while latching its constrained edge. A held pointer
+/// starts one bounce rather than restarting it for every drag event.
+pub fn resize_drag_sample(
+    requested: f32,
+    min: f32,
+    max: f32,
+    latched_edge: Option<ResizeEdge>,
+    reduced_motion: bool,
+) -> ResizeDragSample {
+    debug_assert!(min <= max);
+    let edge = if requested <= min {
+        Some(ResizeEdge::Min)
+    } else if requested >= max {
+        Some(ResizeEdge::Max)
+    } else {
+        None
+    };
+    ResizeDragSample {
+        width: requested.clamp(min, max),
+        starts_bounce: !reduced_motion && edge.is_some() && edge != latched_edge,
+        edge,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ResizeEdgeBounce {
+    pub edge: ResizeEdge,
+    pub started: Instant,
+}
+
+impl ResizeEdgeBounce {
+    pub fn new(edge: ResizeEdge) -> Self {
+        Self {
+            edge,
+            started: Instant::now(),
+        }
+    }
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Rounded two-phase pulse: ease out to the overshoot, then take a little
+/// longer to ease home. Both joins have zero velocity.
+pub fn resize_bounce_offset(edge: ResizeEdge, raw: f32) -> f32 {
+    let raw = raw.clamp(0.0, 1.0);
+    let magnitude = if raw < RESIZE_EDGE_BOUNCE_OUT_FRACTION {
+        smoothstep(raw / RESIZE_EDGE_BOUNCE_OUT_FRACTION)
+    } else {
+        1.0 - smoothstep(
+            (raw - RESIZE_EDGE_BOUNCE_OUT_FRACTION) / (1.0 - RESIZE_EDGE_BOUNCE_OUT_FRACTION),
+        )
+    } * RESIZE_EDGE_NUDGE;
+    match edge {
+        ResizeEdge::Min => -magnitude,
+        ResizeEdge::Max => magnitude,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Element helpers (paint-layer entrances/exits)
 // ---------------------------------------------------------------------------
 
@@ -327,6 +504,19 @@ where
 {
     element.with_animation(id, FADE_IN.animation(), |el, t| {
         el.relative().opacity(t).top(px(4.0 * (1.0 - t)))
+    })
+}
+
+/// New-thread composition entrance: opacity 0→1 while settling 10px down into
+/// place over [`FADE_IN`]. Keeping the logo, target selectors, composer, and
+/// checkout row under one animation makes the blank canvas arrive as a single
+/// object instead of four independently moving pieces.
+pub fn settle_down<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
+where
+    E: Styled + IntoElement + 'static,
+{
+    element.with_animation(id, FADE_IN.animation(), |el, t| {
+        el.relative().opacity(t).top(px(-10.0 * (1.0 - t)))
     })
 }
 
@@ -643,6 +833,30 @@ pub fn reduced_motion(cx: &App) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn pulse_stride_reestablishes_after_each_paint() {
+        let now = Instant::now();
+        let mut lease = PulseLease {
+            until: now + PULSE_LEASE,
+            stride: 2,
+        };
+        assert!(!lease.take_tick(1), "slow loader skips odd ticks");
+        assert!(lease.take_tick(2));
+        lease.renew(now, 2);
+        lease.renew(now, 1);
+        assert!(lease.take_tick(3), "fast animation wins while mounted");
+        lease.renew(now, 2);
+        assert!(lease.take_tick(4));
+        lease.renew(now, 2);
+        assert!(
+            !lease.take_tick(5),
+            "retired fast animation leaves no sticky stride"
+        );
+        assert!(lease.take_tick(6));
+        assert!(!lease.take_tick(7), "unpainted view cannot renew itself");
+        assert!(lease.until <= now + PULSE_LEASE);
+    }
+
+    #[test]
     fn eval_never_escapes_unit_interval_dense_sweep() {
         // Regression: f32 rounding produced 1.000000119 near the tail of
         // EASE_OUT_EXPO, tripping gpui's `delta ∈ [0,1]` assert (SIGABRT on
@@ -759,10 +973,13 @@ mod tests {
         assert_eq!(RESIZE.duration_ms, 200);
         assert_eq!(TAB_SLIDE.duration_ms, 150);
         assert_eq!(COLLAPSE.duration_ms, 180);
+        assert_eq!(NEW_THREAD_TRANSITION.duration_ms, 420);
+        assert_eq!(NEW_THREAD_TRANSITION.curve, EASE_RESORT);
         assert_eq!(CHEVRON.duration_ms, 200);
         assert_eq!(ZERON_PULSE.duration_ms, 2400);
         assert_eq!(GRADIENT_SPIN.duration_ms, 750);
         assert_eq!(EASE_OUT_EXPO, CubicBezier::new(0.16, 1.0, 0.3, 1.0));
+        assert_eq!(EASE_OUT_QUINT, CubicBezier::new(0.22, 1.0, 0.36, 1.0));
     }
 
     #[test]
@@ -940,4 +1157,18 @@ mod tests {
         let mid_rise = gspin_opacity(0.96, 0.1);
         assert!(mid_rise > 0.1 && mid_rise < 1.0, "eases up");
     }
+}
+
+#[cfg(windows)]
+#[path = "motion/windows_pulse.rs"]
+mod windows_pulse;
+
+/// A bounded activation sheen for Fast service tier; GPUI handles reduced motion.
+pub fn fast_tier(
+    id: impl Into<ElementId>,
+    element: impl IntoElement + gpui::Styled + 'static,
+) -> impl IntoElement {
+    element.with_animation(id, Animation::new(Duration::from_millis(700)), |el, t| {
+        el.opacity(1.0 - 0.35 * (1.0 - t) * (std::f32::consts::PI * t).sin())
+    })
 }

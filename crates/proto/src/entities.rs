@@ -8,6 +8,70 @@ use serde::{Deserialize, Serialize};
 
 use crate::{HarnessId, ReasoningLevel, SandboxLevel};
 
+/// Admission limit for new pins. Concurrent offline additions may exceed it;
+/// existing pins remain visible, reorderable and removable without truncation.
+pub const MAX_SIDEBAR_PINS: usize = 200;
+
+/// Validate an optimistic projection without truncating concurrent overflow.
+pub fn validate_sidebar_pin_update(
+    current: &[String],
+    next: &[String],
+) -> Result<(), &'static str> {
+    let mut seen = std::collections::HashSet::new();
+    if next.iter().any(|id| id.is_empty() || !seen.insert(id)) {
+        return Err("Sidebar pins must be non-empty and unique");
+    }
+    if next.len() > MAX_SIDEBAR_PINS && next.iter().any(|id| !current.contains(id)) {
+        return Err("You can pin up to 200 sessions");
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidebarPreferences {
+    #[serde(default)]
+    pub pinned_session_ids: Vec<String>,
+    #[serde(default)]
+    pub sections: Vec<SidebarSection>,
+}
+
+/// A user-named sidebar section. Archived sessions retain membership so restoring
+/// them restores their section; deleting the section never deletes sessions.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SidebarSection {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub session_ids: Vec<String>,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// Watch payload for pins. `initialized` records known cached state, including
+/// an empty list; `synced` records receipt of an authoritative registry state.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SidebarPreferencesState {
+    /// Monotonic within one engine attachment, not a cross-device order key.
+    /// Lets clients reject older watch frames after a mutation response.
+    #[serde(default)]
+    pub revision: u64,
+    pub synced: bool,
+    pub initialized: bool,
+    #[serde(default)]
+    pub pinned_session_ids: Vec<String>,
+    #[serde(default)]
+    pub sections: Vec<SidebarSection>,
+}
+
+impl SidebarPreferencesState {
+    /// A cached initialized row remains editable offline. An unknown list does not.
+    pub fn can_edit(&self) -> bool {
+        self.synced || self.initialized
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Device {
@@ -23,6 +87,19 @@ pub struct Device {
     /// glance (Devices page). Optional so pre-existing docs stay readable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Cursor SDK selected by the owning engine; absent on older engines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_sdk_version: Option<String>,
+    /// Protocol/document features supported by the engine currently owning
+    /// this device row. Missing on older builds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+}
+
+impl Device {
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities.iter().any(|value| value == capability)
+    }
 }
 
 /// A synced (device, folder) pair — the unit of organization in the sidebar.
@@ -148,6 +225,11 @@ pub struct Chat {
     /// dials the room the registry names. Per-chat and instantly revertible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_gen: Option<u32>,
+    /// The chat whose agent created this one (via the Zeron MCP server):
+    /// a parent → child link for orchestration trees. Absent for chats a
+    /// human started; a dangling id (parent deleted) is tolerated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_chat_id: Option<String>,
 }
 
 impl Chat {
@@ -208,6 +290,11 @@ pub enum SessionStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Session {
+    /// Last successfully completed assistant turn. Retained while the next turn
+    /// runs so coalesced status watches do not lose normal queue completions.
+    /// Interrupts, failures and liveness expiry never advance this marker.
+    #[serde(default)]
+    pub last_completed_turn: Option<String>,
     pub chat_id: String,
     pub device_id: String,
     pub status: SessionStatus,
@@ -269,16 +356,39 @@ pub struct GitHistoryCommit {
     pub refs: Vec<GitHistoryRef>,
 }
 
+/// Divergence between the checked-out branch and the repository's integration
+/// branch. Counts are computed only from locally available refs; callers must
+/// fetch explicitly when they want newer remote state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistoryComparison {
+    /// The local remote-tracking ref used as the comparison base, e.g.
+    /// `upstream/main`.
+    pub base: String,
+    /// Commits reachable from HEAD but not from [`Self::base`].
+    pub ahead: usize,
+    /// Commits reachable from [`Self::base`] but not from HEAD.
+    pub behind: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GitHistoryPage {
     pub commits: Vec<GitHistoryCommit>,
+    /// Deduplicated tips of every public local/remote branch. Populated with
+    /// the first page so clients can switch to the compact overview without
+    /// another round trip or loading the complete history.
+    #[serde(default)]
+    pub branch_tips: Vec<GitHistoryCommit>,
     pub head_sha: Option<String>,
     pub next_cursor: Option<usize>,
     pub total_count: Option<usize>,
     /// Number of commits reachable from the active checkout's HEAD.
     #[serde(default)]
     pub head_commit_count: Option<usize>,
+    /// Current branch divergence from the preferred integration branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<GitHistoryComparison>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -339,6 +449,266 @@ pub struct FileSearchMatch {
     pub is_dir: bool,
 }
 
+/// Identifies the local checkout used by workspace file operations.
+/// Exactly one of `chat_id` and `space_id` must be present.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceTarget {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_path: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListWorkspaceDirectoryRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    #[serde(default)]
+    pub directory: String,
+    #[serde(default)]
+    pub include_ignored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceDirectoryPage {
+    pub directory: String,
+    pub entries: Vec<WorkspaceEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceEntry {
+    pub path: String,
+    pub name: String,
+    pub kind: WorkspaceEntryKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<DateTime<Utc>>,
+    pub ignored: bool,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceEntryKind {
+    File,
+    Directory,
+    Symlink,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchWorkspaceFilesRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub query: String,
+    #[serde(default)]
+    pub include_ignored: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileSearchMatch {
+    pub path: String,
+    pub name: String,
+    pub kind: WorkspaceEntryKind,
+    pub score: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadWorkspaceFileRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub path: String,
+}
+
+/// Workspace images travel in bounded relay frames, independently of text reads.
+pub const MAX_WORKSPACE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+pub const WORKSPACE_IMAGE_CHUNK_BYTES: usize = 384 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReadWorkspaceImageRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub path: String,
+    pub expected_checkout_id: String,
+    pub offset: usize,
+    pub expected_content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceImageChunk {
+    pub checkout_id: String,
+    pub content_hash: String,
+    pub mime_type: String,
+    pub data: String,
+    pub next_offset: usize,
+    pub size: usize,
+    pub done: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileText {
+    /// Identity of the checkout this snapshot was read from.
+    pub checkout_id: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<DateTime<Utc>>,
+    pub encoding: WorkspaceTextEncoding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_ending: Option<WorkspaceLineEnding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_reason: Option<WorkspaceReadOnlyReason>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceTextEncoding {
+    Utf8,
+    Utf8Bom,
+    Binary,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceLineEnding {
+    Lf,
+    Crlf,
+    Mixed,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceReadOnlyReason {
+    Binary,
+    UnsupportedEncoding,
+    MixedLineEndings,
+    Symlink,
+    TooLarge,
+    PermissionDenied,
+    NotRegularFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteWorkspaceFileRequest {
+    /// Must match the read snapshot, even if the chat has since changed cwd.
+    pub expected_checkout_id: String,
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub path: String,
+    pub text: String,
+    pub expected_content_hash: String,
+    pub encoding: WorkspaceWritableEncoding,
+    pub line_ending: WorkspaceWritableLineEnding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceWritableEncoding {
+    Utf8,
+    Utf8Bom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceWritableLineEnding {
+    Lf,
+    Crlf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "camelCase")]
+pub enum WriteWorkspaceFileOutcome {
+    #[serde(rename_all = "camelCase")]
+    Written { file: WorkspaceFileWriteResult },
+    #[serde(rename_all = "camelCase")]
+    Conflict {
+        reason: WorkspaceFileConflictReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_content_hash: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        current_modified_at: Option<DateTime<Utc>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileWriteResult {
+    pub path: String,
+    pub content_hash: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceFileConflictReason {
+    Changed,
+    Deleted,
+    Replaced,
+    NotRegularFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchWorkspaceFilesRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileChanges {
+    pub sequence: u64,
+    pub resync_required: bool,
+    pub changes: Vec<WorkspaceFileChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceFileChange {
+    pub kind: WorkspaceFileChangeKind,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceFileChangeKind {
+    Created,
+    Modified,
+    Removed,
+    Renamed,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffFileSummary {
@@ -351,6 +721,50 @@ pub struct DiffFileSummary {
     pub deletions: u32,
     #[serde(default)]
     pub binary: bool,
+}
+
+/// Git porcelain states, independent of patch size and line counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitFileState {
+    Unchanged,
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    Unmerged,
+    Untracked,
+    TypeChanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileStatus {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub index: GitFileState,
+    pub worktree: GitFileState,
+}
+
+/// Latest status only: never contains file content or a patch. `complete = false`
+/// means unavailable/partial, not clean. Revision covers only these statuses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutGitStatus {
+    pub checkout_id: String,
+    pub device_id: String,
+    pub revision: String,
+    pub complete: bool,
+    pub files: Vec<GitFileStatus>,
+}
+
+/// Keep unavailable updates inside an object: the RPC envelope uses JSON null
+/// for a missing item, so a bare optional snapshot cannot signal invalidation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceGitStatusFrame {
+    pub status: Option<CheckoutGitStatus>,
 }
 
 /// Working-tree diff for a checkout — latest-only sidecar, 3MiB patch cap.
@@ -541,6 +955,10 @@ pub struct AgentLoginPoll {
     pub status: AgentLoginStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// a sign-in page that only became known after the start reply (the
+    /// agent had to install first); the app opens it once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -559,6 +977,67 @@ pub struct AgentUsageWindow {
     /// 0.0..=1.0
     pub used_fraction: f32,
     pub resets_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProjectActionIcon {
+    Play,
+    Test,
+    Lint,
+    Configure,
+    Build,
+    Debug,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectAction {
+    pub id: String,
+    pub name: String,
+    pub command: String,
+    pub icon: ProjectActionIcon,
+    pub run_on_worktree_create: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectActionDraft {
+    pub name: String,
+    pub command: String,
+    pub icon: ProjectActionIcon,
+    #[serde(default)]
+    pub run_on_worktree_create: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectActionsSnapshot {
+    pub space_id: String,
+    pub actions: Vec<ProjectAction>,
+    pub importable_actions: Vec<ProjectActionDraft>,
+    pub project_file_issue: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectActionRun {
+    pub action_id: String,
+    pub action_name: String,
+    pub terminal: TerminalSession,
+}
+
+/// Result of creating a worktree. The worktree remains flattened so this is
+/// wire-compatible with both legacy callers and legacy engine replies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateWorktreeOutcome {
+    #[serde(flatten)]
+    pub worktree: Worktree,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_action: Option<ProjectActionRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_error: Option<String>,
 }
 
 /// An open PTY session on the owning device (`OpenTerminal` reply).
@@ -712,6 +1191,140 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<GetCheckoutFileDiffTextRequest>(value).unwrap(),
             request
+        );
+    }
+
+    #[test]
+    fn create_worktree_outcome_accepts_legacy_reply_and_stays_flattened() {
+        let legacy = serde_json::json!({
+            "repoPath": "/repo",
+            "path": "/worktree",
+            "branch": "zeron/branch",
+            "name": "branch",
+            "checkoutId": "checkout",
+        });
+        let outcome: CreateWorktreeOutcome = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(outcome.worktree.path, "/worktree");
+        assert!(outcome.setup_action.is_none());
+        assert!(outcome.setup_error.is_none());
+
+        let encoded = serde_json::to_value(outcome).unwrap();
+        assert_eq!(encoded["path"], legacy["path"]);
+        assert!(encoded.get("worktree").is_none());
+        assert!(encoded.get("setupAction").is_none());
+        assert!(encoded.get("setupError").is_none());
+        assert!(serde_json::from_value::<Worktree>(encoded).is_ok());
+    }
+
+    #[test]
+    fn workspace_file_requests_flatten_target_and_omit_options() {
+        let request = ListWorkspaceDirectoryRequest {
+            target: WorkspaceTarget {
+                chat_id: Some("chat-1".into()),
+                space_id: None,
+                checkout_path: None,
+            },
+            directory: "src/日本語".into(),
+            include_ignored: false,
+            cursor: None,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "chatId": "chat-1",
+                "directory": "src/日本語",
+                "includeIgnored": false,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ListWorkspaceDirectoryRequest>(value).unwrap(),
+            request
+        );
+
+        let requests = [
+            serde_json::to_value(SearchWorkspaceFilesRequest {
+                target: request.target.clone(),
+                query: "main".into(),
+                include_ignored: false,
+                limit: None,
+            })
+            .unwrap(),
+            serde_json::to_value(ReadWorkspaceFileRequest {
+                target: request.target.clone(),
+                path: "src/main.rs".into(),
+            })
+            .unwrap(),
+            serde_json::to_value(WatchWorkspaceFilesRequest {
+                target: request.target,
+            })
+            .unwrap(),
+        ];
+        assert!(requests.iter().all(|value| value["chatId"] == "chat-1"));
+    }
+
+    #[test]
+    fn workspace_write_outcomes_have_stable_tags() {
+        let written = WriteWorkspaceFileOutcome::Written {
+            file: WorkspaceFileWriteResult {
+                path: "src/emoji-🛰️.rs".into(),
+                content_hash: "hash-2".into(),
+                size: 12,
+                modified_at: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&written).unwrap(),
+            serde_json::json!({
+                "status": "written",
+                "file": {
+                    "path": "src/emoji-🛰️.rs",
+                    "contentHash": "hash-2",
+                    "size": 12,
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<WriteWorkspaceFileOutcome>(
+                serde_json::to_value(&written).unwrap()
+            )
+            .unwrap(),
+            written
+        );
+
+        let conflict = WriteWorkspaceFileOutcome::Conflict {
+            reason: WorkspaceFileConflictReason::Changed,
+            current_content_hash: Some("hash-3".into()),
+            current_modified_at: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&conflict).unwrap(),
+            serde_json::json!({
+                "status": "conflict",
+                "reason": "changed",
+                "currentContentHash": "hash-3",
+            })
+        );
+    }
+
+    #[test]
+    fn workspace_file_change_contract_is_camel_case() {
+        let changes = WorkspaceFileChanges {
+            sequence: 4,
+            resync_required: false,
+            changes: vec![WorkspaceFileChange {
+                kind: WorkspaceFileChangeKind::Renamed,
+                path: "src/new.rs".into(),
+                old_path: Some("src/old.rs".into()),
+            }],
+        };
+        let value = serde_json::to_value(&changes).unwrap();
+        assert_eq!(value["resyncRequired"], false);
+        assert_eq!(value["changes"][0]["kind"], "renamed");
+        assert_eq!(value["changes"][0]["oldPath"], "src/old.rs");
+        assert_eq!(
+            serde_json::from_value::<WorkspaceFileChanges>(value).unwrap(),
+            changes
         );
     }
 }

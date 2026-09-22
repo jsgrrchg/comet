@@ -6,7 +6,44 @@ import Foundation
 import Network
 import Observation
 import SwiftUI
+import UIKit
 import os
+
+private final class BackgroundFlushState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+    private var cancelled = false
+
+    func setIdentifier(_ identifier: UIBackgroundTaskIdentifier) {
+        lock.lock()
+        self.identifier = identifier
+        lock.unlock()
+    }
+
+    func cancel() -> UIBackgroundTaskIdentifier {
+        lock.lock()
+        cancelled = true
+        let identifier = self.identifier
+        self.identifier = .invalid
+        lock.unlock()
+        return identifier
+    }
+
+    func finish() -> UIBackgroundTaskIdentifier {
+        lock.lock()
+        let identifier = self.identifier
+        self.identifier = .invalid
+        lock.unlock()
+        return identifier
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        let cancelled = self.cancelled
+        lock.unlock()
+        return cancelled
+    }
+}
 
 @MainActor
 @Observable
@@ -20,10 +57,14 @@ final class AppModel {
     var phase: Phase = .signedOut
     var workspace: WorkspaceStore?
     var demo: DemoDataset?
+    var demoPinnedSessionIds: [String] = []
     /// Graced connectivity truth — one stream every consumer inherits calm
     /// from (home pill, composer notice, Queued/Failed badges).
     let connectivity = ConnectivityCenter()
     private var sessionStores: [String: SessionStore] = [:]
+    @ObservationIgnored private var storeLastUsed: [String: UInt64] = [:]
+    @ObservationIgnored private var usageClock: UInt64 = 0
+    @ObservationIgnored private var memoryWarningObserver: NSObjectProtocol?
     private var config: AppConfig?
     @ObservationIgnored private var pathMonitor: NWPathMonitor?
     @ObservationIgnored private var lastPathKey: String?
@@ -34,6 +75,24 @@ final class AppModel {
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
     @ObservationIgnored @AppStorage("orgId") var storedOrgId = ""
     @ObservationIgnored @AppStorage("deviceId") var storedDeviceId = ""
+
+    init() {
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.evictForMemoryWarning()
+            }
+        }
+    }
+
+    deinit {
+        if let memoryWarningObserver {
+            NotificationCenter.default.removeObserver(memoryWarningObserver)
+        }
+    }
 
     var deviceId: String {
         if storedDeviceId.isEmpty {
@@ -94,6 +153,17 @@ final class AppModel {
         }
         if args.contains("-demo") {
             enterDemoMode()
+            // Simulator fixtures for both empty-workspace and viewer-only
+            // accounts. Apply before Home resolves its initial destination.
+            override("-sethomefilter") { UserDefaults.standard.set($0, forKey: "homeSpaceFilter") }
+            if args.contains("-no-projects") {
+                demo?.spaces = []
+                demo?.chats = []
+                demo?.sessions = [:]
+            }
+            if args.contains("-ios-only") {
+                demo?.devices = [DeviceRow(id: "ios-demo", name: "iPhone", platform: "ios")]
+            }
             if let ix = args.firstIndex(of: "-route"), ix + 1 < args.count {
                 let spec = args[ix + 1]
                 if spec.hasPrefix("chat:") {
@@ -119,9 +189,9 @@ final class AppModel {
                     if args.contains("-stream"), let demo {
                         // Screenshot rig: kick off the scripted streaming reply.
                         let store = demo.sessionStore(for: chatId)
-                        Task { @MainActor in
+                        Task { @MainActor [weak store] in
                             try? await Task.sleep(nanoseconds: 2_000_000_000)
-                            store.demoResponder?("Show me the streamed reply path.")
+                            store?.demoResponder?("Show me the streamed reply path.")
                         }
                     }
                 } else if spec.hasPrefix("space:") {
@@ -139,9 +209,9 @@ final class AppModel {
                 let store = demo.sessionStore(for: lateId)
                 let full = store.entries
                 store.setEntries([])
-                Task { @MainActor in
+                Task { @MainActor [weak store] in
                     try? await Task.sleep(nanoseconds: 2_500_000_000)
-                    store.setEntries(full)
+                    store?.setEntries(full)
                 }
             }
             // Animation rig: "-archive-after chatId:secs" / "-unarchive-after
@@ -226,6 +296,7 @@ final class AppModel {
 
     func enterDemoMode() {
         demo = DemoDataset.standard()
+        demoPinnedSessionIds = []
         phase = .ready
     }
 
@@ -234,8 +305,10 @@ final class AppModel {
         workspace = nil
         sessionStores.values.forEach { $0.stop() }
         sessionStores.removeAll()
+        storeLastUsed.removeAll()
         config = nil
         demo = nil
+        demoPinnedSessionIds = []
         Keychain.delete(key: "accessToken")
         Keychain.delete(key: "refreshToken")
         DocDisk.wipeAll()  // local doc state belongs to the signed-in identity
@@ -268,10 +341,14 @@ final class AppModel {
             guard let self, self.demo == nil, let workspace = self.workspace else { return true }
             return workspace.connected
         }
+        connectivity.registryRetryAt = { [weak self] in
+            self?.workspace?.retryAt
+        }
         connectivity.chatRooms = { [weak self] in
             guard let self else { return [] }
             return self.sessionStores.compactMap { id, store in
-                store.roomActive ? (id: id, connected: store.connected) : nil
+                store.roomActive ? (id: id, connected: store.connected,
+                                    retryAt: store.retryAt) : nil
             }
         }
         connectivity.hasPendingSends = { [weak self] in
@@ -283,6 +360,8 @@ final class AppModel {
     // MARK: Unified data accessors (demo or live — one path for views)
 
     var spaces: [Space] { demo?.spaces ?? workspace?.spaces ?? [] }
+    var devices: [DeviceRow] { demo?.devices ?? workspace?.devices ?? [] }
+    var executionDevices: [DeviceRow] { devices.filter(\.canHostSessions) }
 
     // "Connected" for the header spinner means "server state has reached this
     // session" — over the socket OR the HTTPS pull (which lands in ~1 RTT and
@@ -292,15 +371,18 @@ final class AppModel {
     var overviewChats: [Chat] {
         if let demo {
             let liveIds = Set(demo.spaces.map(\.id))
-            let live = demo.chats.filter { !$0.archived && $0.spaceId.map(liveIds.contains) == true }
-            return sortActive(live)
+            let live = demo.chats.filter { !$0.archived && ($0.spaceId.map(liveIds.contains) ?? true) }
+            return sortPinnedFirst(live, pinnedSessionIds: demoPinnedSessionIds)
         }
         return workspace?.overviewChats ?? []
     }
 
     func chats(in spaceId: String) -> [Chat] {
         if let demo {
-            return sortActive(demo.chats.filter { !$0.archived && $0.spaceId == spaceId })
+            return sortPinnedFirst(
+                demo.chats.filter { !$0.archived && $0.spaceId == spaceId },
+                pinnedSessionIds: demoPinnedSessionIds
+            )
         }
         return workspace?.chats(in: spaceId) ?? []
     }
@@ -343,31 +425,39 @@ final class AppModel {
         return workspace?.deviceOnline(deviceId) ?? false
     }
 
-    /// Live harness catalog from the space's owning device (Settings → Agents
+    /// Live harness catalog from the selected execution device (Settings → Agents
     /// gates which agents a device offers); static pair when unreachable.
-    func listHarnesses(space: Space) async -> [HarnessInfo] {
+    func listHarnesses(deviceId: String) async -> [HarnessInfo] {
         if demo != nil {
             try? await Task.sleep(nanoseconds: 100_000_000)
             return HarnessCatalog.harnesses
         }
-        if let live = await workspace?.listHarnesses(deviceId: space.deviceId),
+        if let live = await workspace?.listHarnesses(deviceId: deviceId),
            !live.isEmpty {
             return live
         }
         return HarnessCatalog.harnesses
     }
 
-    /// Live model catalog from the space's owning device (the desktop's
+    /// Live model catalog from the selected execution device (the desktop's
     /// "catalog source = the device that runs the session" rule); static
     /// fallback when the device is unreachable.
-    func listModels(space: Space, harness: String) async -> [ModelInfo] {
+    func listModels(deviceId: String, harness: String) async -> [ModelInfo] {
         if demo != nil {
             try? await Task.sleep(nanoseconds: 100_000_000)
             return HarnessCatalog.models(for: harness)
         }
-        if let live = await workspace?.listModels(deviceId: space.deviceId, harness: harness),
+        if let live = await workspace?.listModels(deviceId: deviceId, harness: harness),
            !live.isEmpty {
-            return live
+            let normalized = HarnessCatalog.normalize(harness: harness, models: live)
+            if !normalized.isEmpty {
+                _ = DocDisk.saveModels(normalized, deviceId: deviceId, harness: harness)
+                return normalized
+            }
+        }
+        if let cached = DocDisk.loadModels(deviceId: deviceId, harness: harness),
+           !cached.isEmpty {
+            return cached
         }
         return HarnessCatalog.models(for: harness)
     }
@@ -437,21 +527,39 @@ final class AppModel {
             return demo.createWorktree(spacePath: space.path, base: base)
         }
         return await workspace?.createWorktree(deviceId: space.deviceId,
+                                               spaceId: space.id,
                                                repoPath: space.path, branch: base)
     }
 
     @discardableResult
     func createChat(space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) -> String? {
+        createChat(deviceId: space.deviceId, space: space, config: chatConfig,
+                   branch: branch, cwd: cwd)
+    }
+
+    @discardableResult
+    func createProjectlessChat(deviceId: String, config: ChatConfig) -> String? {
+        guard executionDevices.contains(where: { $0.id == deviceId }) else { return nil }
+        return createChat(deviceId: deviceId, space: nil, config: config)
+    }
+
+    private func createChat(deviceId: String, space: Space?, config chatConfig: ChatConfig,
+                            branch: String? = nil, cwd: String? = nil) -> String? {
         if let demo {
             let id = "chat-\(UUID().uuidString.lowercased().prefix(8))"
-            demo.chats.append(Chat(id: id, deviceId: space.deviceId, title: nil, archived: false,
-                                   cwd: cwd ?? space.path, branch: branch, checkoutId: nil,
+            demo.chats.append(Chat(id: id, deviceId: deviceId, title: nil, archived: false,
+                                   cwd: space.map { cwd ?? $0.path } ?? "~",
+                                   branch: branch, checkoutId: nil,
                                    config: chatConfig, lastMessagePreview: nil, lastMessageAt: nil,
-                                   createdAt: nowMs(), spaceId: space.id, lastSeenAt: nowMs()))
+                                   createdAt: nowMs(), spaceId: space?.id, lastSeenAt: nowMs(),
+                                   roomGen: 2))
             return id
         }
-        return workspace?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
+        if let space {
+            return workspace?.createChat(space: space, config: chatConfig, branch: branch, cwd: cwd)
+        }
+        return workspace?.createProjectlessChat(deviceId: deviceId, config: chatConfig)
     }
 
     /// Browse folders on a remote device (the desktop add-space palette's data
@@ -494,6 +602,30 @@ final class AppModel {
     func archive(chatId: String) { setArchived(chatId: chatId, archived: true) }
     func unarchive(chatId: String) { setArchived(chatId: chatId, archived: false) }
 
+    var pinsReady: Bool {
+        if demo != nil { return true }
+        guard let workspace else { return false }
+        return workspace.synced || workspace.sidebarPreferencesInitialized
+    }
+
+    func isPinned(chatId: String) -> Bool {
+        (demo != nil ? demoPinnedSessionIds : workspace?.pinnedSessionIds ?? []).contains(chatId)
+    }
+
+    func setPinned(chatId: String, pinned: Bool) {
+        if demo != nil {
+            if pinned {
+                guard !demoPinnedSessionIds.contains(chatId),
+                      demoPinnedSessionIds.count < WorkspaceStore.maxSidebarPins else { return }
+                demoPinnedSessionIds.append(chatId)
+            } else {
+                demoPinnedSessionIds.removeAll { $0 == chatId }
+            }
+            return
+        }
+        workspace?.setPinned(chatId: chatId, pinned: pinned)
+    }
+
     private func setArchived(chatId: String, archived: Bool) {
         if let demo {
             if let ix = demo.chats.firstIndex(where: { $0.id == chatId }) {
@@ -527,7 +659,30 @@ final class AppModel {
     /// Persist every open doc now (app backgrounding).
     func flushDocs() {
         workspace?.flushToDisk()
-        sessionStores.values.forEach { $0.flushToDisk() }
+        let orderedIDs = Array(Self.evictionOrder(lastUsed: storeLastUsed) { _ in false }.reversed())
+        let knownIDs = Set(orderedIDs)
+        let missingIDs = sessionStores.keys.filter { !knownIDs.contains($0) }
+        let stores = (orderedIDs + missingIDs).compactMap { sessionStores[$0] }
+        guard !stores.isEmpty else { return }
+
+        let state = BackgroundFlushState()
+        let identifier = UIApplication.shared.beginBackgroundTask(withName: "zeron.flushDocs") {
+            let identifier = state.cancel()
+            if identifier != .invalid {
+                UIApplication.shared.endBackgroundTask(identifier)
+            }
+        }
+        state.setIdentifier(identifier)
+        stores.forEach { $0.retireSaverTimers() }
+        Task { @MainActor [stores, state] in
+            for store in stores where !state.isCancelled && !store.stopped {
+                await store.flushToDiskAsync()
+            }
+            let identifier = state.finish()
+            if identifier != .invalid {
+                UIApplication.shared.endBackgroundTask(identifier)
+            }
+        }
     }
 
     /// Foreground hook: kick every room NOW (see ChatRoomClient.kick) — after
@@ -572,20 +727,23 @@ final class AppModel {
             // Dial-held stores stay held: a kick force-dials, and sweeping 46
             // of them on every foreground/path flap is the stampede the warm
             // cap exists to prevent. Held chats reconnect on open.
-            guard let store = sessionStores[chat.id], !store.isDialHeld else { continue }
+            guard let store = sessionStores[chat.id],
+                  !store.isDialHeld || !store.outbox.isEmpty else { continue }
             kicked.insert(chat.id)
-            scheduleKick(store, afterNs: delay)
+            scheduleKick(chatId: chat.id, afterNs: delay)
             delay += 200_000_000
         }
-        for (id, store) in sessionStores where !kicked.contains(id) && !store.isDialHeld {
-            scheduleKick(store, afterNs: delay)
+        for (id, store) in sessionStores
+            where !kicked.contains(id) && (!store.isDialHeld || !store.outbox.isEmpty) {
+            scheduleKick(chatId: id, afterNs: delay)
             delay += 200_000_000
         }
     }
 
-    private func scheduleKick(_ store: SessionStore, afterNs delay: UInt64) {
-        Task { @MainActor in
+    private func scheduleKick(chatId: String, afterNs delay: UInt64) {
+        Task { @MainActor [weak self] in
             if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            guard let self, let store = self.sessionStores[chatId] else { return }
             store.kickRoom()
         }
     }
@@ -641,21 +799,29 @@ final class AppModel {
         if let demo { return demo.sessionStore(for: chat.id) }
         guard let config else { return nil }
         if let existing = sessionStores[chat.id] {
-            existing.hostDeviceId = chat.deviceId
-            // The registry flip to chat2 can land while the store is open —
-            // views re-derive `chat` from the registry on every change, so
-            // this accessor is the flip's delivery path.
-            existing.updateRoomGen(chat.roomGen)
-            // An open view wants live sync NOW — any preload dial-hold ends.
-            existing.releaseDial()
-            return existing
+            if existing.stopped {
+                sessionStores.removeValue(forKey: chat.id)
+                storeLastUsed.removeValue(forKey: chat.id)
+            } else {
+                touchStore(chat.id)
+                existing.hostDeviceId = chat.deviceId
+                // The registry flip to chat2 can land while the store is open —
+                // views re-derive `chat` from the registry on every change, so
+                // this accessor is the flip's delivery path.
+                existing.updateRoomGen(chat.roomGen)
+                // An open view wants live sync NOW — any preload dial-hold ends.
+                existing.releaseDial()
+                return existing
+            }
         }
         let store = SessionStore(chatId: chat.id, config: config)
+        store.onPersisted = { [weak self] in self?.evictColdStores() }
         store.hostDeviceId = chat.deviceId
         store.hostLiveness = { [weak self] deviceId in
             self?.workspace?.peerLiveness(deviceId) ?? .unknown
         }
         sessionStores[chat.id] = store
+        touchStore(chat.id)
         store.start()
         store.updateRoomGen(chat.roomGen)
         return store
@@ -675,6 +841,31 @@ final class AppModel {
     func hostSupportsQueuedAttachmentsOn(deviceId: String) -> Bool {
         guard demo == nil else { return false }
         return workspace?.deviceVersionAtLeast(deviceId, Self.queuedAttachmentsMin) ?? false
+    }
+
+    /// The visible message queue is a personal-cut capability, not a semver
+    /// promise: an upstream host can have the same version without its doc/RPC
+    /// surface. Attachments require the stronger queue capability.
+    func hostSupportsMessageQueue(_ chat: Chat, attachments: Bool = false) -> Bool {
+        guard demo == nil else { return false }
+        let capability = attachments
+            ? EngineCapability.messageQueueAttachmentsV1
+            : EngineCapability.messageQueueV1
+        return workspace?.deviceSupports(chat.deviceId, capability) ?? false
+    }
+
+    func hostSupportsCleanQueueAttachmentText(_ chat: Chat) -> Bool {
+        guard demo == nil else { return false }
+        return workspace?.deviceSupports(
+            chat.deviceId,
+            EngineCapability.messageQueueCleanAttachmentTextV1
+        ) ?? false
+    }
+
+    func hostSupportsQueueEditLease(_ chat: Chat) -> Bool {
+        guard demo == nil else { return false }
+        return workspace?.deviceSupports(chat.deviceId, EngineCapability.messageQueueEditLeaseV1)
+            ?? false
     }
 
     /// Whether a send to this chat would queue rather than deliver promptly:
@@ -706,7 +897,15 @@ final class AppModel {
     }
 
     func releaseSessionStore(chatId: String) {
-        // Preloaded stores stay warm — nothing to evict on navigation.
+        guard let store = sessionStores[chatId] else { return }
+        store.detachView()
+        touchStore(chatId)
+        evictColdStores()
+    }
+
+    func attachSessionView(chatId: String) {
+        guard demo == nil else { return }
+        sessionStores[chatId]?.attachView()
     }
 
     /// Warm every non-archived session: stores hydrate from disk instantly
@@ -724,24 +923,190 @@ final class AppModel {
     /// an undialed chat's row stays live regardless, and opening it releases
     /// its dial instantly.
     static let warmDialCap = 8
+    static let warmStoreCap = 12
+    static let residentByteBudget = 80 * 1024 * 1024
+    static let residentBytesPerSnapshotByte = 6
+    static let residentFloorBytes = 512 * 1024
+
+    nonisolated static func residentEstimate(snapshotBytes: Int) -> Int {
+        max(snapshotBytes * residentBytesPerSnapshotByte, residentFloorBytes)
+    }
+
+    nonisolated static func warmPreloadIDs(
+        chats: [Chat],
+        hasPendingOutbox: (String) -> Bool,
+        cap: Int,
+        snapshotBytes: (String) -> Int = { _ in 0 },
+        byteBudget: Int = .max
+    ) -> [String] {
+        let limit = max(0, cap)
+        var ids: [String] = []
+        var selected = Set<String>()
+        var bytes = 0
+        for chat in chats where selected.insert(chat.id).inserted {
+            let pending = hasPendingOutbox(chat.id)
+            let estimate = residentEstimate(snapshotBytes: snapshotBytes(chat.id))
+            if pending {
+                ids.append(chat.id)
+                bytes += estimate
+            } else if ids.count < limit, bytes + estimate <= byteBudget {
+                ids.append(chat.id)
+                bytes += estimate
+            }
+        }
+        return ids
+    }
+
+    nonisolated static func warmDialIDs(
+        ids: [String],
+        hasPendingOutbox: (String) -> Bool,
+        cap: Int
+    ) -> [String] {
+        let limit = max(0, cap)
+        var released: [String] = []
+        var selected = Set<String>()
+        for id in ids.prefix(limit) where selected.insert(id).inserted {
+            released.append(id)
+        }
+        for id in ids.dropFirst(limit)
+            where hasPendingOutbox(id) && selected.insert(id).inserted {
+            released.append(id)
+        }
+        return released
+    }
+
+    nonisolated static func evictionOrder(
+        lastUsed: [String: UInt64],
+        protected: (String) -> Bool
+    ) -> [String] {
+        lastUsed.keys
+            .filter { !protected($0) }
+            .sorted {
+                let lhs = lastUsed[$0] ?? 0
+                let rhs = lastUsed[$1] ?? 0
+                return lhs == rhs ? $0 < $1 : lhs < rhs
+            }
+    }
+
+    nonisolated static func evictionPlan(
+        lastUsed: [String: UInt64],
+        estimates: [String: Int],
+        protected: (String) -> Bool,
+        countCap: Int,
+        byteBudget: Int
+    ) -> [String] {
+        let newest = lastUsed.max { $0.value < $1.value }?.key
+        var remainingCount = estimates.count
+        var remainingBytes = estimates.values.reduce(0, +)
+        guard remainingCount > countCap || remainingBytes > byteBudget else { return [] }
+        var plan: [String] = []
+        let order = evictionOrder(lastUsed: lastUsed) { id in
+            id == newest || protected(id)
+        }
+        for id in order {
+            guard remainingCount > countCap || remainingBytes > byteBudget else { break }
+            guard let estimate = estimates[id] else { continue }
+            plan.append(id)
+            remainingCount -= 1
+            remainingBytes -= estimate
+        }
+        return plan
+    }
+
+    private func touchStore(_ id: String) {
+        usageClock &+= 1
+        storeLastUsed[id] = usageClock
+        let warmIDs = Set(storeLastUsed.sorted { $0.value > $1.value }
+            .prefix(3).map(\.key))
+        for (storeID, store) in sessionStores {
+            store.keepsParseCacheWarm = warmIDs.contains(storeID)
+        }
+    }
+
+    private func storeIsProtected(_ store: SessionStore) -> Bool {
+        !store.pendingSends.isEmpty
+            || !store.outbox.isEmpty
+            || store.entries.last?.status == .streaming
+    }
+
+    private func evictColdStores() {
+        let estimates = sessionStores.mapValues { Self.residentEstimate(snapshotBytes: $0.snapshotBytes) }
+        let plan = Self.evictionPlan(
+            lastUsed: storeLastUsed,
+            estimates: estimates,
+            protected: { [weak self] id in
+            guard let self, let store = self.sessionStores[id] else { return false }
+            return self.storeIsProtected(store)
+            },
+            countCap: Self.warmStoreCap,
+            byteBudget: Self.residentByteBudget
+        )
+        guard !plan.isEmpty else { return }
+        var removed = 0
+        for id in plan {
+            guard let store = sessionStores.removeValue(forKey: id) else { continue }
+            store.stop()
+            storeLastUsed.removeValue(forKey: id)
+            removed += 1
+        }
+        if removed > 0 {
+            roomLog.info("session store eviction removed \(removed, privacy: .public) cold store(s)")
+        }
+    }
+
+    private func evictForMemoryWarning() {
+        let newest = storeLastUsed.max { $0.value < $1.value }?.key
+        let before = sessionStores.count
+        let order = Self.evictionOrder(lastUsed: storeLastUsed) { [weak self] id in
+            guard let self, let store = self.sessionStores[id] else { return true }
+            return id == newest || self.storeIsProtected(store)
+        }
+        for id in order {
+            guard let store = sessionStores.removeValue(forKey: id) else { continue }
+            store.stop()
+            storeLastUsed.removeValue(forKey: id)
+        }
+        roomLog.info("memory warning evicted \(before - self.sessionStores.count, privacy: .public) of \(before, privacy: .public) session store(s)")
+    }
 
     func preloadSessions() {
         guard demo == nil, let config else { return }
         var stagger: UInt64 = 0
-        var released = 0
-        for chat in overviewChats where sessionStores[chat.id] == nil {
+        let preloadIDs = Self.warmPreloadIDs(
+            chats: overviewChats,
+            hasPendingOutbox: { DocDisk.chat2HasPendingOutbox(id: $0) },
+            cap: Self.warmStoreCap,
+            snapshotBytes: { DocDisk.chat2SnapshotSize(id: $0) },
+            byteBudget: Self.residentByteBudget
+        )
+        for chat in overviewChats where preloadIDs.contains(chat.id) {
+            if sessionStores[chat.id]?.stopped == true {
+                sessionStores.removeValue(forKey: chat.id)
+                storeLastUsed.removeValue(forKey: chat.id)
+            }
+            guard sessionStores[chat.id] == nil else { continue }
             let store = SessionStore(chatId: chat.id, config: config)
+            store.onPersisted = { [weak self] in self?.evictColdStores() }
             store.hostDeviceId = chat.deviceId
             store.hostLiveness = { [weak self] deviceId in
                 self?.workspace?.peerLiveness(deviceId) ?? .unknown
             }
             sessionStores[chat.id] = store
+            touchStore(chat.id)
             store.start(holdDial: true)
             store.updateRoomGen(chat.roomGen)
-            guard released < Self.warmDialCap else { continue }
-            released += 1
+        }
+        let warmDialIDs = Self.warmDialIDs(
+            ids: preloadIDs,
+            hasPendingOutbox: { sessionStores[$0]?.outbox.isEmpty == false },
+            cap: Self.warmDialCap
+        )
+        for id in warmDialIDs {
+            guard let chat = overviewChats.first(where: { $0.id == id }),
+                  let store = sessionStores[id], store.isDialHeld else { continue }
             let delay = stagger
-            Task { @MainActor in
+            Task { @MainActor [weak self, weak store] in
+                guard let self else { return }
                 // The registry (the sidebar the user is looking at) gets the
                 // pipe to itself first: on a 240kbps link, warm chat dials
                 // racing the registry's own handshake+state pushed the
@@ -753,6 +1118,7 @@ final class AppModel {
                     try? await Task.sleep(nanoseconds: 200_000_000)
                 }
                 if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+                guard let store, self.sessionStores[chat.id] === store else { return }
                 store.releaseDial()
             }
             stagger += 300_000_000

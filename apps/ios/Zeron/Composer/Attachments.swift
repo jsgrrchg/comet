@@ -10,9 +10,11 @@
 // back out to render thumbnails. RunRequest.attachments additionally carries
 // the paths so a harness can inline the bytes.
 
+import ImageIO
 import Photos
 import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Text transport (message-attachments.ts)
 
@@ -33,6 +35,7 @@ struct UserImageAttachment: Identifiable, Hashable {
     let id: String
     let path: String
     let name: String
+    var appshot: AppshotPresentation? = nil
 }
 
 struct ParsedUserMessage {
@@ -48,6 +51,7 @@ private func nameFromPath(_ path: String) -> String {
 /// message-attachments.ts `parseUserMessageImages`: split the visible prompt
 /// from its attachment-ref trailer (case-insensitive marker, `- path` lines).
 func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
+    let presentations = AppshotContext.presentations(content)
     let lines = content.components(separatedBy: "\n")
     var markerIx: Int?
     for (ix, raw) in lines.enumerated() where ix > 0 {
@@ -60,7 +64,7 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
         }
     }
     guard let markerIx else {
-        return ParsedUserMessage(text: content, attachments: [])
+        return ParsedUserMessage(text: AppshotContext.visibleText(content), attachments: [])
     }
     let attachments = lines[(markerIx + 1)...].compactMap { line -> String? in
         let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -68,14 +72,15 @@ func parseUserMessageImages(_ content: String) -> ParsedUserMessage {
         let path = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
         return path.isEmpty ? nil : path
     }.enumerated().map { ix, path in
-        UserImageAttachment(id: "\(ix):\(path)", path: path, name: nameFromPath(path))
+        UserImageAttachment(id: "\(ix):\(path)", path: path, name: nameFromPath(path), appshot: presentations[path])
     }
     guard !attachments.isEmpty else {
-        return ParsedUserMessage(text: content, attachments: [])
+        return ParsedUserMessage(text: AppshotContext.visibleText(content), attachments: [])
     }
     let body = lines[..<(markerIx - 1)].joined(separator: "\n")
         .trimmingCharacters(in: .whitespacesAndNewlines)
-    return ParsedUserMessage(text: body == attachmentOnlyText ? "" : body,
+    let visible = AppshotContext.visibleText(body)
+    return ParsedUserMessage(text: visible == attachmentOnlyText ? "" : visible,
                              attachments: attachments)
 }
 
@@ -261,8 +266,9 @@ func uploadAttachmentChunked(relay: DeviceRelayClient, name: String, data: Data,
 
 /// Decoded transcript images keyed by `(deviceId, path)`, loaded over the
 /// owning device's relay in 45KB base64 chunks, seeded locally after a send
-/// so own bubbles never round-trip. Bounded by an encoded-byte LRU budget;
-/// failed loads retry on the 2s→15s ladder.
+/// so own bubbles never round-trip. Generated images count decoded memory
+/// toward the LRU budget; ordinary attachments retain their existing accounting.
+/// Failed loads retry on the 2s→15s ladder.
 @MainActor
 @Observable
 final class AttachmentImageCache {
@@ -277,6 +283,9 @@ final class AttachmentImageCache {
     private struct Key: Hashable {
         let deviceId: String
         let path: String
+        // A generated image must pass its declared raster policy even if a
+        // generic attachment for the same path is already cached.
+        var expectedMimeType: String? = nil
     }
 
     private enum Entry {
@@ -301,15 +310,17 @@ final class AttachmentImageCache {
         }
     }
 
-    func snapshot(deviceId: String, path: String) -> Snapshot {
-        switch entries[Key(deviceId: deviceId, path: path)] {
+    func snapshot(deviceId: String, path: String, expectedMimeType: String? = nil) -> Snapshot {
+        switch entries[Key(deviceId: deviceId, path: path, expectedMimeType: expectedMimeType)] {
         case .loaded(let name, let image, _, _):
             return .loaded(name: name, image: image)
         case .error(let attempts, let at)
             where Date().timeIntervalSince(at) < Self.retryDelay(attempts):
             return .error
         case .error:
-            return .loading  // ladder elapsed; the next load() attempt owns it
+            // Generated-image fallback selection must still see a failed
+            // owner after backoff expires; load() owns the retry transition.
+            return expectedMimeType == nil ? .loading : .error
         case .loading, .none:
             return .loading
         }
@@ -317,8 +328,8 @@ final class AttachmentImageCache {
 
     /// Kick a load if this source isn't already loaded/loading (errored
     /// sources retry only after their backoff).
-    func load(deviceId: String, path: String) {
-        let key = Key(deviceId: deviceId, path: path)
+    func load(deviceId: String, path: String, expectedMimeType: String? = nil) {
+        let key = Key(deviceId: deviceId, path: path, expectedMimeType: expectedMimeType)
         let attempts: Int
         switch entries[key] {
         case .loaded, .loading:
@@ -337,8 +348,8 @@ final class AttachmentImageCache {
             return client
         }()
         Task { @MainActor [weak self] in
-            let loaded = await Self.readImage(relay: relay, path: path)
-            guard let self else { return }
+            let loaded = await Self.readImage(relay: relay, path: path, expectedMimeType: expectedMimeType)
+            guard let self, case .loading? = self.entries[key] else { return }
             if let loaded {
                 self.store(key: key, name: loaded.name, image: loaded.image, bytes: loaded.bytes)
             } else {
@@ -349,9 +360,15 @@ final class AttachmentImageCache {
 
     /// Seed after a successful upload (composer send path) so the just-sent
     /// bubble renders from local bytes instead of a round-trip.
-    func seed(deviceId: String, path: String, name: String, data: Data) {
-        guard let image = UIImage(data: data) else { return }
-        store(key: Key(deviceId: deviceId, path: path), name: name, image: image, bytes: data.count)
+    func seed(deviceId: String, path: String, name: String, data: Data, expectedMimeType: String? = nil) {
+        if let expectedMimeType {
+            guard let loaded = Self.decodeGeneratedImage(data, mimeType: expectedMimeType) else { return }
+            store(key: Key(deviceId: deviceId, path: path, expectedMimeType: expectedMimeType),
+                  name: name, image: loaded.image, bytes: loaded.bytes)
+        } else {
+            guard let image = UIImage(data: data) else { return }
+            store(key: Key(deviceId: deviceId, path: path), name: name, image: image, bytes: data.count)
+        }
     }
 
     private func store(key: Key, name: String, image: UIImage, bytes: Int) {
@@ -379,7 +396,7 @@ final class AttachmentImageCache {
 
     /// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded,
     /// with a stuck-offset guard).
-    private static func readImage(relay: DeviceRelayClient, path: String)
+    private static func readImage(relay: DeviceRelayClient, path: String, expectedMimeType: String?)
         async -> (name: String, image: UIImage, bytes: Int)? {
         struct Chunk: Decodable {
             var name: String
@@ -397,6 +414,10 @@ final class AttachmentImageCache {
                 method: "ReadAttachmentChunk",
                 params: ["path": path, "offset": offset],
                 timeoutSeconds: 20) else { return nil }
+            if let expectedMimeType {
+                guard chunk.mimeType == expectedMimeType,
+                      b64.utf8.count + chunk.data.utf8.count <= Self.generatedMaxBytes / 3 * 4 else { return nil }
+            }
             name = chunk.name
             b64 += chunk.data
             done = chunk.done
@@ -404,10 +425,42 @@ final class AttachmentImageCache {
             guard chunk.nextOffset > offset else { return nil }
             offset = chunk.nextOffset
         }
-        guard done, let data = Data(base64Encoded: b64), let image = UIImage(data: data) else {
-            return nil
+        guard done, let data = Data(base64Encoded: b64) else { return nil }
+        let displayName = name.isEmpty ? nameFromPath(path) : name
+        if let expectedMimeType {
+            // ImageIO decompression must not block scrolling on the main actor.
+            guard let loaded = await Task.detached(priority: .utility, operation: {
+                Self.decodeGeneratedImage(data, mimeType: expectedMimeType)
+            }).value else { return nil }
+            return (displayName, loaded.image, loaded.bytes)
         }
-        return (name.isEmpty ? nameFromPath(path) : name, image, data.count)
+        guard let image = UIImage(data: data) else { return nil }
+        return (displayName, image, data.count)
+    }
+
+    nonisolated static let generatedMaxBytes = 24 * 1024 * 1024
+
+    /// Decode one static frame with bounded dimensions, then downsample for
+    /// mobile. The source metadata is read without allocating the full raster.
+    nonisolated static func decodeGeneratedImage(_ data: Data, mimeType: String)
+        -> (image: UIImage, bytes: Int)? {
+        guard data.count <= generatedMaxBytes,
+              GeneratedImageReference.supportedMimeTypes.contains(mimeType),
+              let source = CGImageSourceCreateWithData(data as CFData,
+                  [kCGImageSourceShouldCache: false] as CFDictionary),
+              let type = CGImageSourceGetType(source),
+              UTType(type as String)?.preferredMIMEType == mimeType,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              (1...4096).contains(width.intValue), (1...4096).contains(height.intValue),
+              let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceShouldCacheImmediately: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 2048,
+              ] as CFDictionary) else { return nil }
+        return (UIImage(cgImage: image), image.bytesPerRow * image.height)
     }
 }
 
@@ -464,16 +517,37 @@ struct UserAttachmentsStrip: View {
     let attachments: [UserImageAttachment]
 
     var body: some View {
-        HStack(spacing: 8) {
-            Spacer(minLength: 0)
-            ForEach(attachments) { att in
-                AttachmentThumbView(deviceId: deviceId, path: att.path)
+        if attachments.contains(where: { $0.appshot != nil }) {
+            // Each capture remains reachable on a phone, including mixed
+            // ordinary images. Fixed card width avoids squeezing three into
+            // one clipped row; scrolling does not alter transcript height.
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: 8) {
+                    ForEach(attachments) { att in
+                        if let source = att.appshot {
+                            AppshotCardView(deviceId: deviceId, attachment: att, source: source)
+                                .frame(width: 220)
+                        } else {
+                            AttachmentThumbView(deviceId: deviceId, path: att.path)
+                        }
+                    }
+                }
             }
+            .defaultScrollAnchor(.trailing)
+            .frame(height: 196)
+            .accessibilityLabel("Appshots and images")
+            .accessibilityIdentifier("appshot-attachments")
+        } else {
+            HStack(spacing: 8) {
+                Spacer(minLength: 0)
+                ForEach(attachments) { att in
+                    AttachmentThumbView(deviceId: deviceId, path: att.path)
+                }
+            }
+            .frame(height: 80)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .clipped()
         }
-        // Fixed height: load-state flips never shift the transcript.
-        .frame(height: 80)
-        .frame(maxWidth: .infinity, alignment: .trailing)
-        .clipped()
     }
 }
 
@@ -526,6 +600,117 @@ struct AttachmentThumbView: View {
     }
 }
 
+// MARK: - Generated images
+
+/// Inline generated output. Reuses the attachment cache/relay and full-screen
+/// viewer while keeping the original aspect ratio instead of a cropped thumb.
+struct GeneratedImageView: View {
+    let owner: String
+    let host: String
+    let reference: GeneratedImageReference
+    var onResize: () -> Void = {}
+
+    private let cache = AttachmentImageCache.shared
+    @State private var preview: AttachmentPreview?
+
+    static func devices(owner: String, host: String) -> [String] {
+        var ids: [String] = []
+        for id in [owner, host] where !id.isEmpty && !ids.contains(id) { ids.append(id) }
+        return ids
+    }
+
+    private var devices: [String] { Self.devices(owner: owner, host: host) }
+
+    private var source: (device: String, snapshot: AttachmentImageCache.Snapshot)? {
+        var pending: (String, AttachmentImageCache.Snapshot)?
+        for device in devices {
+            let snapshot = cache.snapshot(deviceId: device, path: reference.path,
+                                          expectedMimeType: reference.mimeType)
+            switch snapshot {
+            case .loaded: return (device, snapshot)
+            case .loading: if pending == nil { pending = (device, snapshot) }
+            case .error: break
+            }
+        }
+        return pending ?? devices.first.map { ($0, .error) }
+    }
+
+    private var isLoaded: Bool {
+        if let source, case .loaded = source.snapshot { return true }
+        return false
+    }
+
+    private struct LoadRequest: Hashable {
+        var devices: [String]
+        var reference: GeneratedImageReference
+        var needsLoad: Bool
+    }
+
+    var body: some View {
+        Group {
+            switch source?.snapshot ?? .error {
+            case .loaded(_, let image):
+                Button {
+                    preview = AttachmentPreview(name: reference.name, image: image)
+                } label: {
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .frame(maxWidth: 512, maxHeight: 420)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Preview generated image")
+                .accessibilityHint(reference.name)
+            case .loading:
+                ProgressView()
+                    .tint(Theme.textFaint)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 220)
+                    .background(whiteAlpha(0.035), in: RoundedRectangle(cornerRadius: 12))
+                    .accessibilityLabel("Loading generated image")
+            case .error:
+                Button {
+                    if let device = source?.device {
+                        cache.load(deviceId: device, path: reference.path,
+                                   expectedMimeType: reference.mimeType)
+                    }
+                } label: {
+                    Label("Generated image unavailable", systemImage: "photo.badge.exclamationmark")
+                        .font(.footnote)
+                        .foregroundStyle(Theme.textFaint)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 220)
+                        .background(whiteAlpha(0.035), in: RoundedRectangle(cornerRadius: 12))
+                }
+                .buttonStyle(.plain)
+                .accessibilityHint("Tap to retry")
+            }
+        }
+        .frame(maxWidth: 512)
+        .frame(maxWidth: .infinity)
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { _ in onResize() }
+        .task(id: LoadRequest(devices: devices, reference: reference, needsLoad: !isLoaded)) {
+            // Retry while visible; disappearing or changing sources cancels
+            // the timer. A cached image needs no timer or relay request.
+            while !Task.isCancelled && !isLoaded {
+                guard !devices.isEmpty else { return }
+                for device in devices {
+                    let snapshot = cache.snapshot(deviceId: device, path: reference.path,
+                                                  expectedMimeType: reference.mimeType)
+                    cache.load(deviceId: device, path: reference.path,
+                               expectedMimeType: reference.mimeType)
+                    // Give an untried owner the first attempt. Once it has
+                    // failed, also try the host while the owner backs off.
+                    if case .loading = snapshot { break }
+                }
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+            }
+        }
+        .fullScreenCover(item: $preview) { AttachmentLightbox(preview: $0) }
+    }
+}
+
 // MARK: - Lightbox (attachments.rs lightbox: dim scrim, image ≤85vh/90vw,
 // name under it, any tap closes)
 
@@ -558,6 +743,15 @@ struct AttachmentLightbox: View {
             }
             .contentShape(Rectangle())
             .onTapGesture { dismiss() }
+            .overlay(alignment: .topTrailing) {
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark").font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(.white).frame(width: 44, height: 44)
+                        .background(.black.opacity(0.6), in: Circle())
+                }
+                .accessibilityLabel("Close image preview")
+                .padding(12)
+            }
         }
         .presentationBackground(.clear)
     }

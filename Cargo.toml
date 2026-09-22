@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/theme",
     "crates/proto",
+    "crates/preview",
     "crates/doc",
     "crates/sync",
     "crates/harness",
@@ -11,17 +12,19 @@ members = [
     "crates/update",
     "crates/ui",
     "crates/syntax",
+    "crates/mcp",
     "apps/zeron",
 ]
 
 [workspace.package]
-version = "0.2.31"
+version = "0.2.84"
 edition = "2024"
 license = "MIT"
 publish = false
 
 [workspace.dependencies]
 zeron-proto = { path = "crates/proto" }
+zeron-preview = { path = "crates/preview" }
 zeron-doc = { path = "crates/doc" }
 zeron-sync = { path = "crates/sync" }
 zeron-harness = { path = "crates/harness" }
@@ -31,6 +34,7 @@ zeron-update = { path = "crates/update" }
 zeron-ui = { path = "crates/ui" }
 zeron-syntax = { path = "crates/syntax" }
 zeron-theme = { path = "crates/theme" }
+zeron-mcp = { path = "crates/mcp" }
 
 # CRDT
 loro = "1.13"
@@ -39,7 +43,10 @@ loro = "1.13"
 # frames, cross-checked by its js_snapshots tests).
 loro-protocol = "0.3"
 
-# gpui — the wingleeio/zed fork: upstream f14fea9 + commits on
+# gpui — zeronsh/zui, extracted from wingleeio/zed e2ddcc6 with identical
+# crate sources; adds bounded blur passes and shared Gaussian weights.
+# Removes GPL tracing crates and composites deferred GPUI content above native macOS views.
+# Preserved fork history: upstream f14fea9 + commits on
 # `comet/edge-fade-horizontal` (tip of `comet/line-wrap-closing-punctuation`
 # + 5d1f83d horizontal per-pixel EdgeFade for quads/images; rebase when bumping the
 # upstream rev): a6bf17c fixes BOTH wrap-rule copies (LineWrapper +
@@ -59,14 +66,17 @@ loro-protocol = "0.3"
 # stopped vending CABackdropLayer for Selection — window blur went dead);
 # b68970e rasterizes BackdropBlur in the wgpu renderer (frosted floats on
 # Linux — the Metal path's snapshot/blur/composite, ported).
-gpui = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
-gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a", features = [
+# Paint-time rounded image masks (#9), bounded Windows backdrop blur and
+# translucent compositing, plus blur-aware scene batching (#10).
+gpui = { git = "https://github.com/zeronsh/zui", rev = "c2d273dc3dadcb260b0fa7c35fc2fe02a14f5add" }
+gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "c2d273dc3dadcb260b0fa7c35fc2fe02a14f5add", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
+gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "c2d273dc3dadcb260b0fa7c35fc2fe02a14f5add" }
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "03cd9947a6aa07921cb284ad66c87fd6735e55b0" }
 
 # diffs
 similar = "2"
@@ -84,6 +94,9 @@ async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json5 = "0.4"
+# antigravity writes `settings.json` but reads it back with `hjson.load`, so a
+# user's comments and unquoted keys have to survive our read of the same file.
+deser-hjson = "2.2"
 plist = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 
@@ -107,11 +120,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
+zip = { version = "7.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 notify = "7"
 portable-pty = "0.8"
 alacritty_terminal = "0.26"
 pulldown-cmark = "0.12"
 unicode-segmentation = "1"
+unicode-width = "0.2"
 fontdb = "0.23"
 ttf-parser = "0.25.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
@@ -130,3 +145,11 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Temporary renderer override for the companion per-pixel text fade PR.
+# Replace with an upstream revision once it merges.
+[patch."https://github.com/zeronsh/zui"]
+gpui = { git = "https://github.com/gaelcado/zui", rev = "53869c204efb866d19af292cab8b1773898eeedd" }
+gpui_macros = { git = "https://github.com/gaelcado/zui", rev = "53869c204efb866d19af292cab8b1773898eeedd" }
+gpui_platform = { git = "https://github.com/gaelcado/zui", rev = "53869c204efb866d19af292cab8b1773898eeedd" }
+gpui_tokio = { git = "https://github.com/gaelcado/zui", rev = "53869c204efb866d19af292cab8b1773898eeedd" }

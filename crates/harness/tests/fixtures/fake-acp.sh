@@ -79,6 +79,13 @@ else
   exit 1
 fi
 
+if [ -f .command-fixture ]; then
+  expected=$(pwd -P)
+  has "$line" "\"cwd\":\"$expected\"" || exit 1
+  name=$(cat .command-fixture)
+  emit "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[{\"name\":\"$name\",\"description\":\"Project command\"}]}}}"
+fi
+
 # ---- model/config sets (0..n), then the first turn ---------------------------
 CONFIG_SETS=""
 MODEL_SETS=""
@@ -377,43 +384,6 @@ case "$promptline" in
   sleep 3
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"steered tail"}}'
   update '{"sessionUpdate":"usage_update","used":21884,"size":200000,"cost":{"amount":0.02,"currency":"USD"},"_meta":{"_claude/origin":{"kind":"human"}}}'
-  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
-  ;;
-
-*scenario:quiet-starve*)
-  # Blanket dropped-reply settle, no adapter-specific evidence: content
-  # streamed, no open tool, then silence — the response never comes. The
-  # harness must settle off the generic quiet window (tests set
-  # ZERON_ACP_QUIET_SETTLE_MS small), well before this stream's 8s EOF.
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
-  sleep 8
-  exit 0
-  ;;
-
-*scenario:quiet-tool-guard*)
-  # The guard: an OPEN tool call makes silence legitimate. Quiet stretch is
-  # far past the test's settle window, but the pending tool must hold the
-  # settle off; the turn then ends normally — exactly one Done.
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
-  update '{"sessionUpdate":"tool_call","toolCallId":"slow-1","title":"slow build","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
-  sleep 4
-  update '{"sessionUpdate":"tool_call_update","toolCallId":"slow-1","status":"completed","content":[]}'
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"finished"}}'
-  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
-  ;;
-
-*scenario:quiet-thinking*)
-  # The 2026-08-13 false settle: every tool RESOLVED, then a long silent
-  # thinking stretch (claude-agent-acp forwards no thinking traffic), then
-  # the turn continues and ends normally. This is exactly the "looks
-  # finished" state the blanket settle keys on; Claude must hold through
-  # it — a false settle here orphans the real turn (its response lands on
-  # a closed channel; the session strands Working).
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
-  update '{"sessionUpdate":"tool_call","toolCallId":"th-1","title":"quick read","kind":"read","status":"pending","rawInput":{"path":"/w/src/x.rs"}}'
-  update '{"sessionUpdate":"tool_call_update","toolCallId":"th-1","status":"completed","content":[]}'
-  sleep 4
-  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"finished"}}'
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 

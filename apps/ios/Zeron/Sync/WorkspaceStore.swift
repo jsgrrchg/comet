@@ -2,8 +2,9 @@
 // host (crates/doc/src/registry.rs + crates/engine WorkspaceHost). Joins the
 // per-user `/registry/{orgId}/ws` room, projects the row table into typed
 // rows, and performs the writes the writer discipline allows a viewer device:
-// chat creates, archives, renames and seen marks. iOS is a viewport, not an
-// engine device, so it owns no device row; it does publish a presence beat
+// chat creates, archives, renames, seen marks and sidebar preferences. iOS is
+// a viewport, not an engine device, so it owns no device row; it does publish
+// a presence beat
 // (registry presence replaced the old ws room's ephemeral store).
 //
 // Reads are OVERLAY reads: the server's authoritative rows plus the pending
@@ -17,13 +18,18 @@ import Observation
 @MainActor
 @Observable
 final class WorkspaceStore {
+    static let maxSidebarPins = 200
+
     private(set) var devices: [DeviceRow] = []
     private(set) var spaces: [Space] = []
     private(set) var chats: [Chat] = []
     private(set) var sessions: [String: SessionRow] = [:]
+    private(set) var pinnedSessionIds: [String] = []
+    private(set) var sidebarPreferencesInitialized = false
     private(set) var presence: [String: Int64] = [:]  // deviceId → last beat ms
     private(set) var changeRequestSnapshots: [ChangeRequestWatchKey: CheckoutChangeRequestStatus] = [:]
     private(set) var connected = false
+    private(set) var retryAt: Date?
     /// True once ANY transport delivered server state this session (socket
     /// state frame or HTTPS pull). Drives the "connecting" spinner: with the
     /// pull-first bootstrap this flips in ~1 round trip, while the socket
@@ -50,9 +56,10 @@ final class WorkspaceStore {
     @ObservationIgnored private var registryJoinedAt: Int64?
     private let config: AppConfig
 
-    init(config: AppConfig) {
+    init(config: AppConfig, doc: RegistryDoc? = nil) {
         self.config = config
-        self.doc = RegistryDoc(deviceId: config.deviceId)
+        self.doc = doc ?? RegistryDoc(deviceId: config.deviceId)
+        project()
     }
 
     func start() {
@@ -216,12 +223,14 @@ final class WorkspaceStore {
                 presence[device] = at
                 presenceReceivedAt[device] = now
             }
-            project()
-            saver?.poke()
             synced = true
+            project()
+            pruneDeletedPinsIfNeeded()
+            saver?.poke()
         case .connected:
             let reconnected = !connected
             connected = true
+            retryAt = nil
             registryJoinedAt = nowMs()
             if reconnected {
                 restartChangeRequestStreams(resetUnsupported: true)
@@ -233,6 +242,7 @@ final class WorkspaceStore {
             // every suspension, so convergence is quick without forcing one.
             _ = doc.applyRows(seq: seq, rows: rows)
             project()
+            pruneDeletedPinsIfNeeded()
             saver?.poke()
         case .ack(let batch, let seq, _):
             // Rows for this batch already arrived (server orders rows before
@@ -244,8 +254,9 @@ final class WorkspaceStore {
         case .presence(let device, let at):
             presence[device] = at
             presenceReceivedAt[device] = nowMs()
-        case .disconnected:
+        case .disconnected(let retryAfterMs):
             connected = false
+            retryAt = Date().addingTimeInterval(TimeInterval(retryAfterMs) / 1_000)
             registryJoinedAt = nil
             doc.markDisconnected()
         }
@@ -264,6 +275,19 @@ final class WorkspaceStore {
         if !connected {
             Task { await self.pushPendingOverHTTP() }
         }
+    }
+
+    /// Keep archived ids (unarchive restores their position), but once an
+    /// authoritative registry state has landed, remove ids whose chat row was
+    /// actually deleted. Cache readiness even when this first snapshot is empty.
+    private func pruneDeletedPinsIfNeeded() {
+        guard synced else { return }
+        let known = Set(chats.map(\.id))
+        let initialized = doc.sidebarPinsInitialized
+        doc.initializeSidebarPins()
+        let removed = pinnedSessionIds.filter { !known.contains($0) }
+        for id in removed { doc.changeSidebarPin(id: id, pinned: false) }
+        if !initialized || !removed.isEmpty { afterLocalWrite() }
     }
 
     // MARK: Presence
@@ -304,6 +328,10 @@ final class WorkspaceStore {
         return v >= min
     }
 
+    func deviceSupports(_ deviceId: String, _ capability: String) -> Bool {
+        devices.first(where: { $0.id == deviceId })?.supports(capability) ?? false
+    }
+
     // MARK: Projection (rows → typed entities)
 
     private func project() {
@@ -315,7 +343,9 @@ final class WorkspaceStore {
                              platform: f["platform"]?.stringValue ?? "",
                              lastSeenAt: f["lastSeenAt"]?.int64Value,
                              createdAt: f["createdAt"]?.int64Value,
-                             version: f["version"]?.stringValue)
+                             version: f["version"]?.stringValue,
+                             capabilities: (f["capabilities"]?.arrayValue ?? [])
+                                .compactMap(\.stringValue))
         }.sorted { $0.name < $1.name }
 
         spaces = doc.overlayRows(kind: "spaces").compactMap { row in
@@ -368,17 +398,25 @@ final class WorkspaceStore {
                                       updatedAt: f["updatedAt"]?.int64Value ?? 0)
         }
         sessions = rows
+
+        if doc.sidebarPinsInitialized {
+            sidebarPreferencesInitialized = true
+            pinnedSessionIds = doc.orderedSidebarPins.map(\.id)
+        } else {
+            sidebarPreferencesInitialized = false
+            pinnedSessionIds = []
+        }
         reconcileChangeRequestStreams()
     }
 
     // MARK: Derived views
 
-    /// state.rs `overview_chats`: every non-archived chat of a live space,
+    /// state.rs `overview_chats`: every non-archived projectless chat or chat of a live space,
     /// attention-sorted.
     var overviewChats: [Chat] {
         let liveSpaceIds = Set(spaces.map(\.id))
-        let live = chats.filter { !$0.archived && $0.spaceId.map(liveSpaceIds.contains) == true }
-        return sortActive(live)
+        let live = chats.filter { !$0.archived && ($0.spaceId.map(liveSpaceIds.contains) ?? true) }
+        return sortPinnedFirst(live, pinnedSessionIds: pinnedSessionIds)
     }
 
     /// A space's sessions, in the sidebar's Sessions order (recency).
@@ -388,7 +426,10 @@ final class WorkspaceStore {
     /// no tabs — a space opens into the same list, with the same rows, as the
     /// Sessions section — so it follows that list's ordering instead.
     func chats(in spaceId: String) -> [Chat] {
-        sortActive(chats.filter { !$0.archived && $0.spaceId == spaceId })
+        sortPinnedFirst(
+            chats.filter { !$0.archived && $0.spaceId == spaceId },
+            pinnedSessionIds: pinnedSessionIds
+        )
     }
 
     /// Archived chats under an optional space scope, recency order — feeds the
@@ -525,7 +566,7 @@ final class WorkspaceStore {
         do {
             return try await listFoldersDetailed(deviceId: deviceId, path: path)
         } catch {
-            lastRelayError = error.localizedDescription
+            lastRelayError = describeTransportError(error)
             return nil
         }
     }
@@ -554,6 +595,8 @@ final class WorkspaceStore {
             var name: String
             var installed: Bool?
             var enabled: Bool?
+            var supportsSteering: Bool?
+            var steeringMode: String?
         }
         let wire: [WireHarness]? = try? await relay(for: deviceId)
             .call(method: "ListHarnesses", params: [:])
@@ -563,23 +606,45 @@ final class WorkspaceStore {
                     && (h.installed ?? true)
                     && (h.enabled ?? ["claude-code", "codex"].contains(h.id))
             }
-            .map { HarnessInfo(id: $0.id, label: $0.name) }
+            .map { HarnessInfo(id: $0.id, label: $0.name,
+                               supportsSteering: $0.supportsSteering, steeringMode: $0.steeringMode) }
         }
     }
 
     func listModels(deviceId: String, harness: String) async -> [ModelInfo]? {
+        struct WireChoice: Decodable {
+            var id: String
+            var label: String
+        }
+        struct WireOption: Decodable {
+            var id: String
+            var label: String
+            var choices: [WireChoice]
+            var defaultChoice: String
+        }
         struct WireModel: Decodable {
             var id: String
             var label: String
             var description: String?
             var reasoningLevels: [String]?
+            var options: [WireOption]?
         }
         let wire: [WireModel]? = try? await relay(for: deviceId)
             .call(method: "ListModels", params: ["harness": harness])
         return wire.map { models in
             models.map {
                 ModelInfo(id: $0.id, label: $0.label, description: $0.description,
-                          reasoningLevels: $0.reasoningLevels ?? [])
+                          reasoningLevels: $0.reasoningLevels ?? [],
+                          options: ($0.options ?? []).map { option in
+                              ModelOptionInfo(
+                                  id: option.id,
+                                  label: option.label,
+                                  choices: option.choices.map {
+                                      ModelOptionChoiceInfo(id: $0.id, label: $0.label)
+                                  },
+                                  defaultChoice: option.defaultChoice
+                              )
+                          })
             }
         }
     }
@@ -593,16 +658,19 @@ final class WorkspaceStore {
                 .call(method: "SwitchRef", params: ["repoPath": repoPath, "refName": refName])
             return nil
         } catch {
-            return error.localizedDescription
+            return describeTransportError(error)
         }
     }
 
     /// CreateWorktree — a fresh isolated worktree off the base ref; returns
     /// its path.
-    func createWorktree(deviceId: String, repoPath: String, branch: String) async -> String? {
+    func createWorktree(deviceId: String, spaceId: String,
+                        repoPath: String, branch: String) async -> String? {
         struct Reply: Decodable { var path: String }
         let reply: Reply? = try? await relay(for: deviceId)
-            .call(method: "CreateWorktree", params: ["repoPath": repoPath, "branch": branch])
+            .call(method: "CreateWorktree", params: ["repoPath": repoPath,
+                                                       "branch": branch,
+                                                       "spaceId": spaceId])
         return reply?.path
     }
 
@@ -620,18 +688,30 @@ final class WorkspaceStore {
     @discardableResult
     func createChat(space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) -> String {
+        createChat(deviceId: space.deviceId, spaceId: space.id, cwd: cwd ?? space.path,
+                   config: chatConfig, branch: branch)
+    }
+
+    /// Same local registry write and offline outbox as project sessions.
+    @discardableResult
+    func createProjectlessChat(deviceId: String, config: ChatConfig) -> String {
+        createChat(deviceId: deviceId, spaceId: nil, cwd: "~", config: config, branch: nil)
+    }
+
+    private func createChat(deviceId: String, spaceId: String?, cwd: String,
+                            config chatConfig: ChatConfig, branch: String?) -> String {
         let chatId = UUID().uuidString.lowercased()
         var set: [String: JSONValue] = [
             "id": .string(chatId),
-            "deviceId": .string(space.deviceId),
+            "deviceId": .string(deviceId),
             "archived": .bool(false),
-            "cwd": .string(cwd ?? space.path),
-            "spaceId": .string(space.id),
+            "cwd": .string(cwd),
             "createdAt": .int(nowMs()),
             // Born on chat2 (workspace_host.rs create_chat): a brand-new
             // chat has an empty doc — nothing to seed, no migration race.
             "roomGen": .int(2),
         ]
+        if let spaceId { set["spaceId"] = .string(spaceId) }
         if let branch {
             set["branch"] = .string(branch)
         }
@@ -679,6 +759,18 @@ final class WorkspaceStore {
 
     func setArchived(chatId: String, archived: Bool) {
         updateChat(chatId, set: ["archived": .bool(archived)])
+    }
+
+    func setPinned(chatId: String, pinned: Bool) {
+        guard chats.contains(where: { $0.id == chatId }) else { return }
+        // Known cached pins are editable offline. A fresh install waits for
+        // an authoritative snapshot before making membership/capacity decisions.
+        guard synced || sidebarPreferencesInitialized else { return }
+        guard pinnedSessionIds.contains(chatId) != pinned else { return }
+        guard !pinned || pinnedSessionIds.count < Self.maxSidebarPins else { return }
+        doc.initializeSidebarPins()
+        guard doc.changeSidebarPin(id: chatId, pinned: pinned, after: pinnedSessionIds.last) else { return }
+        afterLocalWrite()
     }
 
     /// Synced seen marker (LWW) with a monotonic guard: no write when the

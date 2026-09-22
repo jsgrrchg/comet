@@ -25,21 +25,28 @@ mod server;
 pub use client::{RpcClient, RpcSubscription, connect_ws};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenSource, decode_device_frame,
-    device_room_ws_url, encode_device_frame,
+    NudgeHandler, PeerLiveness, PeerLivenessProbe, StaticToken, TokenError, TokenSource,
+    decode_device_frame, device_room_ws_url, encode_device_frame,
 };
 pub use server::{serve_connection, serve_ws_listener};
 
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
+    pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";
+    pub const CANCEL_INSTALL: &str = "CancelInstall";
+    pub const INSTALL_HARNESS: &str = "InstallHarness";
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.
+    pub const GET_TITLE_SETTINGS: &str = "GetTitleSettings";
+    pub const SET_TITLE_SETTINGS: &str = "SetTitleSettings";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
+    pub const LIST_SKILLS: &str = "ListSkills";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
+    pub const TAKE_PROJECT_ACTION_SETUP: &str = "TakeProjectActionSetup";
     /// Peer-to-peer delivery fallback: the SENDER's engine forwards a queued
     /// command entry (client-minted id and all) straight over the device-room
     /// link when its chat2 rows can't reach the edge but the host's peer link
@@ -52,6 +59,28 @@ pub mod methods {
     /// per pending command. Params `{chatId}`; IPC-only.
     pub const RETRY_DELIVERY: &str = "RetryDelivery";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    /// Messages typed while the agent was busy, held on the chat doc so every
+    /// device sees the same queue. `{ chatId }` → `{ items: QueuedMessage[] }`.
+    pub const WATCH_QUEUE: &str = "WatchQueue";
+    /// Append to the queue. `{ chatId, text, attachments?, holdForTurnEnd? }` → `{ id }`.
+    pub const QUEUE_MESSAGE: &str = "QueueMessage";
+    /// Retype a queued message; empty text deletes it.
+    /// `{ chatId, id, text }` → `{ changed }`.
+    pub const UPDATE_QUEUED_MESSAGE: &str = "UpdateQueuedMessage";
+    /// Acquire a host-authoritative edit lease for one queued row.
+    pub const BEGIN_QUEUED_MESSAGE_EDIT: &str = "BeginQueuedMessageEdit";
+    /// Renew an acquired queue edit lease.
+    pub const RENEW_QUEUED_MESSAGE_EDIT: &str = "RenewQueuedMessageEdit";
+    /// Commit, cancel, discard, or explicitly release an acquired edit.
+    pub const FINISH_QUEUED_MESSAGE_EDIT: &str = "FinishQueuedMessageEdit";
+    /// Reorder. `{ chatId, id, toIndex }` → `{ changed }`.
+    pub const MOVE_QUEUED_MESSAGE: &str = "MoveQueuedMessage";
+    pub const REMOVE_QUEUED_MESSAGE: &str = "RemoveQueuedMessage";
+    /// Interrupt whatever is running and send this one. `{ chatId, id }` → `{ sent }`.
+    pub const SEND_QUEUED_MESSAGE_NOW: &str = "SendQueuedMessageNow";
+    /// Steer this row into the live turn without interrupting it.
+    /// `{ chatId, id }` → `{ sent }`.
+    pub const STEER_QUEUED_MESSAGE_NOW: &str = "SteerQueuedMessageNow";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
@@ -70,6 +99,7 @@ pub mod methods {
     /// the sending thumbnail's percent-ring feed. No params; IPC-only.
     pub const WATCH_TRANSFERS: &str = "WatchTransfers";
     pub const WATCH_CHATS: &str = "WatchChats";
+    pub const WATCH_SIDEBAR_PREFERENCES: &str = "WatchSidebarPreferences";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";
     /// Spaces registry (device+folder pairs) from the workspace doc.
@@ -111,6 +141,10 @@ pub mod methods {
     pub const LIST_BRANCHES: &str = "ListBranches";
     pub const LIST_REFS: &str = "ListRefs";
     pub const LIST_GIT_HISTORY: &str = "ListGitHistory";
+    /// Fuzzy commit-subject / SHA search over the complete public history.
+    pub const SEARCH_GIT_HISTORY: &str = "SearchGitHistory";
+    /// Resolve hosted profile images for a page of Git commit authors.
+    pub const RESOLVE_GIT_AVATARS: &str = "ResolveGitAvatars";
     /// Update remote-tracking refs without changing HEAD, the index, or files.
     pub const FETCH_ALL: &str = "FetchAll";
     pub const SWITCH_REF: &str = "SwitchRef";
@@ -119,8 +153,21 @@ pub mod methods {
     pub const LIST_DRIVES: &str = "ListDrives";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
+    // Device-local workspace filesystem operations. All are relay-forwardable;
+    // WatchWorkspaceFiles is the only streaming method in this group.
+    pub const LIST_WORKSPACE_DIRECTORY: &str = "ListWorkspaceDirectory";
+    pub const SEARCH_WORKSPACE_FILES: &str = "SearchWorkspaceFiles";
+    pub const READ_WORKSPACE_IMAGE: &str = "ReadWorkspaceImage";
+    pub const READ_WORKSPACE_FILE: &str = "ReadWorkspaceFile";
+    pub const WRITE_WORKSPACE_FILE: &str = "WriteWorkspaceFile";
+    pub const WATCH_WORKSPACE_FILES: &str = "WatchWorkspaceFiles";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
+    // Project Actions are private state on the device that owns the project.
+    pub const LIST_PROJECT_ACTIONS: &str = "ListProjectActions";
+    pub const UPSERT_PROJECT_ACTION: &str = "UpsertProjectAction";
+    pub const DELETE_PROJECT_ACTION: &str = "DeleteProjectAction";
+    pub const RUN_PROJECT_ACTION: &str = "RunProjectAction";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
@@ -130,6 +177,7 @@ pub mod methods {
     /// Checkout-diff stream for the target device's chats (DataRpc,
     /// relay-forwardable — diffs are produced where the checkout lives).
     pub const WATCH_CHECKOUT_DIFFS: &str = "WatchCheckoutDiffs";
+    pub const WATCH_WORKSPACE_GIT_STATUS: &str = "WatchWorkspaceGitStatus";
     /// Current pull request for one checkout, resolved on the checkout's host device.
     pub const WATCH_CHECKOUT_CHANGE_REQUEST: &str = "WatchCheckoutChangeRequest";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";

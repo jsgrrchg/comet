@@ -10,6 +10,7 @@
 import Foundation
 
 enum RowKind {
+    case generatedImage(owner: String, reference: GeneratedImageReference)
     case user(text: String)
     case markdown(block: MDBlock, streaming: Bool)
     case toolGroup(tools: [ToolItem], autoOpen: Bool)
@@ -177,6 +178,18 @@ enum TranscriptRowBuilder {
                     first = false
                 }
 
+            case .image(let partId, let reference):
+                flushTools(lastIx: ix - 1)
+                var version = fnv1a("\(entry.deviceId)\0\(reference.path)\0\(reference.name)\0\(reference.mimeType)")
+                if settled, ix == lastPartIx { version ^= 1 << 62 }
+                rows.append(TranscriptRow(id: "\(entry.id)#\(partId)", version: version,
+                                          turnStart: first,
+                                          kind: .generatedImage(owner: entry.deviceId, reference: reference),
+                                          entryId: entry.id,
+                                          timestamp: settled && ix == lastPartIx ? entry.createdAt : nil,
+                                          partKey: nil))
+                first = false
+
             case .input(let partId, _, let questions, let resolved):
                 flushTools(lastIx: ix - 1)
                 let header = questions.first?.header ?? "Question"
@@ -290,6 +303,14 @@ extension RenderToolCall {
             let server = string("server").map { "\($0) · " } ?? ""
             return server + (string("tool") ?? "")
         default: return string("name") ?? ""
+        }
+    }
+
+    /// Preserve full paths in the expanded row and on the clipboard.
+    var expandedDetail: String {
+        switch tag {
+        case "readFile", "writeFile", "editFile": return string("path") ?? ""
+        default: return chipDetail
         }
     }
 

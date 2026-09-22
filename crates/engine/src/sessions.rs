@@ -35,7 +35,7 @@ use zeron_proto::{
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
-use crate::registry::HarnessRegistry;
+use crate::registry::{HarnessDescriptor, HarnessRegistry};
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
 
@@ -154,6 +154,7 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
+    generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
@@ -192,6 +193,7 @@ impl SessionsEngine {
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
+                generated_images: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
         }
@@ -212,6 +214,15 @@ impl SessionsEngine {
     /// already treats a missing doc host as "not wired".
     pub fn clear_doc_host(&self) {
         lock(&self.inner.doc_host).take();
+    }
+
+    /// Bind generated-image intake to the same profile store used by attachment RPCs.
+    pub fn set_generated_images(
+        &self,
+        uploads: crate::uploads::Uploads,
+        allowed_root: std::path::PathBuf,
+    ) {
+        let _ = self.inner.generated_images.set((uploads, allowed_root));
     }
 
     /// Wire the chat auto-titler (called once at engine assembly). After each
@@ -248,15 +259,33 @@ impl SessionsEngine {
         lock(&self.inner.statuses).get(chat_id).cloned()
     }
 
+    /// Whether this harness takes a prompt *during* a turn, rather than only at
+    /// the boundary between turns. The queue drain's central question: a
+    /// mid-turn agent gets the message now, everything else holds it until the
+    /// turn ends. Catalog lookup only — never spawns.
+    pub fn steers_mid_turn(&self, harness: HarnessId) -> bool {
+        self.inner
+            .registry
+            .descriptors()
+            .iter()
+            .find(|d| d.id == harness)
+            .is_some_and(HarnessDescriptor::steers_mid_turn)
+    }
+
+    /// Whether this chat has a turn in flight — streaming, or parked on a
+    /// question it is still owed an answer to (see [`is_active`]). A persistent
+    /// session parked BETWEEN turns is not: it holds a warm child with nothing
+    /// outstanding, and takes the next prompt straight through its mailbox.
+    pub fn turn_in_flight(&self, chat_id: &str) -> bool {
+        lock(&self.inner.statuses)
+            .get(chat_id)
+            .is_some_and(is_active)
+    }
+
     /// Any run currently working or blocked on input — the auto-updater's
     /// "don't restart from under a session" gate.
     pub fn any_active(&self) -> bool {
-        lock(&self.inner.statuses).values().any(|s| {
-            matches!(
-                s.status,
-                zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput
-            )
-        })
+        lock(&self.inner.statuses).values().any(is_active)
     }
 
     /// The last request dispatched for a chat (steer→new-turn fallback).
@@ -332,6 +361,10 @@ impl SessionsEngine {
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
+        // Native-only catalog entries have no portable file fallback. Reject
+        // cross-harness delivery before recording or routing the user turn.
+        zeron_proto::invocation::validate_harness_invocations(&request.prompt, harness_id)
+            .map_err(EngineError::Other)?;
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -344,20 +377,35 @@ impl SessionsEngine {
             )
         });
         if let Some((run_id, steerable, same_runtime, steer_tx, ledger)) = routed {
-            let message = SteerMessage {
-                prompt: request.prompt.clone(),
-                message_id: message_id.clone(),
+            let user_id = message_id.clone().unwrap_or_else(new_id);
+            let accepted = if steerable && same_runtime {
+                // Warm dispatch uses the same mailbox as explicit steering.
+                // Register acceptance before a fast boundary can retire it.
+                let mut pending = lock(&ledger);
+                let message = SteerMessage {
+                    // OpenCode must see the canonical selection before it
+                    // decodes the provider command: a project-scoped command
+                    // can disappear between composer discovery and delivery.
+                    prompt: if harness_id == HarnessId::Opencode {
+                        request.prompt.clone()
+                    } else {
+                        zeron_proto::invocation::harness_prompt(&request.prompt, harness_id)
+                    },
+                    message_id: Some(user_id.clone()),
+                };
+                if steer_tx.try_send(message).is_ok() {
+                    pending.push_back(RoutedSteer {
+                        prompt: request.prompt.clone(),
+                        message_id: user_id.clone(),
+                    });
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             };
-            if steerable && same_runtime && steer_tx.try_send(message).is_ok() {
-                // The run can vanish between the send and here (the idle
-                // reaper, a parked child death): the ledger entry below is
-                // the at-least-once guarantee — the run task's exit drain
-                // re-dispatches any accepted steer no `Steered` confirmed.
-                let user_id = message_id.clone().unwrap_or_else(new_id);
-                lock(&ledger).push_back(RoutedSteer {
-                    prompt: request.prompt.clone(),
-                    message_id: user_id.clone(),
-                });
+            if accepted {
                 let handle = self.doc_handle(chat_id)?;
                 handle.write_user_message(&user_id, &request.prompt, now_ms())?;
                 if self.is_live(chat_id, &run_id) {
@@ -508,30 +556,37 @@ impl SessionsEngine {
             .map(|h| {
                 (
                     h.run_id.clone(),
+                    h.runtime_config.harness_id,
                     h.steer_tx.clone(),
                     h.routed_steers.clone(),
                 )
             });
-        let Some((run_id, steer_tx, ledger)) = target else {
+        let Some((run_id, harness_id, steer_tx, ledger)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
-        let message = SteerMessage {
-            prompt: prompt.to_string(),
-            message_id: message_id.clone(),
-        };
-        if steer_tx.try_send(message).is_err() {
-            return Ok(SteerOutcome::NotSteerable);
-        }
-        // Accepted: ledger first (at-least-once across a dying run), then the
-        // user entry (client-minted id), then Working BEFORE the
-        // lastMessageAt bump — same causal-order invariant as the dispatch
-        // route (an observer must never hold [new message, settled status]:
-        // the phantom "completed" flash, 2026-07-31).
+        zeron_proto::invocation::validate_harness_invocations(prompt, harness_id)
+            .map_err(EngineError::Other)?;
         let user_id = message_id.unwrap_or_else(new_id);
-        lock(&ledger).push_back(RoutedSteer {
-            prompt: prompt.to_string(),
-            message_id: user_id.clone(),
-        });
+        let message = SteerMessage {
+            prompt: if harness_id == HarnessId::Opencode {
+                prompt.to_owned()
+            } else {
+                zeron_proto::invocation::harness_prompt(prompt, harness_id)
+            },
+            message_id: Some(user_id.clone()),
+        };
+        {
+            // Serialize mailbox acceptance with confirmation and Done-time
+            // inspection: a fast consumer must never outrun its ledger entry.
+            let mut pending = lock(&ledger);
+            if steer_tx.try_send(message).is_err() {
+                return Ok(SteerOutcome::NotSteerable);
+            }
+            pending.push_back(RoutedSteer {
+                prompt: prompt.to_string(),
+                message_id: user_id.clone(),
+            });
+        }
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, prompt, now_ms())?;
         // A routed steer is a turn too. Fired here (not only on the confirmed
@@ -576,17 +631,17 @@ impl SessionsEngine {
         let Some((run_id, token, cancel, pending)) = target else {
             return Ok(false);
         };
-        // Unpark any blocked question FIRST (mirrors zeron: harness teardown can await a
-        // parked question callback — a run stuck on a question would deadlock the stop).
+        // Publish cancellation BEFORE waking the harness. Otherwise a fast
+        // EOF after token.cancel() can beat this watch notification and be
+        // classified as an error instead of an interrupted turn.
+        let _ = cancel.send(true);
+        // Unpark questions before harness teardown, which can await them.
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
         }
         // Harness-level interrupt (protocol + child teardown) …
         token.cancel();
-        // … plus the engine-side grace deadline in the run task, so a harness that
-        // ignores its token still settles with a synthesized Done{interrupted}.
-        let _ = cancel.send(true);
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
         for _ in 0..500 {
             if !self.is_live(chat_id, &run_id) {
@@ -778,6 +833,88 @@ impl SessionsEngine {
 
 impl Inner {
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
+    /// Sanitize before ANY journal/publish path, including nested subagent events.
+    async fn prepare_generated_image(
+        &self,
+        chat_id: &str,
+        event: AgentEvent,
+        seen: &mut std::collections::HashSet<String>,
+    ) -> Vec<AgentEvent> {
+        let mut parents = Vec::new();
+        let mut leaf = event;
+        while let AgentEvent::Subagent {
+            parent_tool_use_id,
+            event,
+        } = leaf
+        {
+            parents.push(parent_tool_use_id);
+            leaf = *event;
+        }
+        let events = if let AgentEvent::GeneratedImage { id, path, .. } = leaf {
+            let key = std::iter::once(chat_id)
+                .chain(parents.iter().map(String::as_str))
+                .chain(std::iter::once(id.as_str()))
+                .collect::<Vec<_>>()
+                .join("\0");
+            if seen.contains(&key) {
+                return vec![];
+            }
+            let result = if let Some((uploads, allowed_root)) = self.generated_images.get() {
+                let uploads = uploads.clone();
+                let root = allowed_root.clone();
+                let stable_key = key.clone();
+                tokio::task::spawn_blocking(move || {
+                    uploads.import_generated_image(std::path::Path::new(&path), &root, &stable_key)
+                })
+                .await
+                .unwrap_or_else(|err| Err(EngineError::Other(err.to_string())))
+            } else {
+                Err(EngineError::Other(
+                    "Generated image intake is not configured".into(),
+                ))
+            };
+            match result {
+                Ok(image) => {
+                    seen.insert(key);
+                    vec![AgentEvent::GeneratedImage {
+                        id,
+                        path: image.path,
+                        name: image.name,
+                        mime_type: image.mime_type,
+                    }]
+                }
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "generated image import failed");
+                    vec![
+                        AgentEvent::ToolResult {
+                            id: id.strip_suffix(":image").unwrap_or(&id).into(),
+                            is_error: true,
+                            output: None,
+                            diff: None,
+                        },
+                        AgentEvent::Error {
+                            message: "Generated image unavailable".into(),
+                        },
+                    ]
+                }
+            }
+        } else {
+            vec![leaf]
+        };
+        events
+            .into_iter()
+            .map(|mut event| {
+                for parent in parents.iter().rev() {
+                    event = AgentEvent::Subagent {
+                        parent_tool_use_id: parent.clone(),
+                        event: Box::new(event),
+                    };
+                }
+                event
+            })
+            .collect()
+    }
+
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
         let seq = match self.journal.append(chat_id, event) {
             Ok(seq) => seq,
@@ -827,12 +964,32 @@ impl Inner {
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
+        self.set_status_with_completion(chat_id, status, fresh_start, None);
+    }
+
+    fn has_pending_steers(&self, chat_id: &str, run_id: &str) -> bool {
+        lock(&self.runs)
+            .get(chat_id)
+            .filter(|h| h.run_id == run_id)
+            .is_some_and(|h| !lock(&h.routed_steers).is_empty())
+    }
+
+    /// Publish the completion marker atomically with the settled status. Keep
+    /// it on subsequent Working/heartbeat rows for coalesced and remote watches.
+    fn set_status_with_completion(
+        &self,
+        chat_id: &str,
+        status: SessionStatus,
+        fresh_start: bool,
+        completed_turn: Option<String>,
+    ) {
         let now = Utc::now();
         let session = {
             let mut statuses = lock(&self.statuses);
             let entry = statuses
                 .entry(chat_id.to_string())
                 .or_insert_with(|| Session {
+                    last_completed_turn: None,
                     chat_id: chat_id.to_string(),
                     device_id: self.device_id.clone(),
                     status,
@@ -849,6 +1006,9 @@ impl Inner {
                 entry.status,
                 SessionStatus::Working | SessionStatus::AwaitingInput
             );
+            if let Some(turn) = completed_turn {
+                entry.last_completed_turn = Some(turn);
+            }
             entry.status = status;
             entry.updated_at = now;
             match status {
@@ -991,6 +1151,16 @@ impl Inner {
 
 // ── run task ────────────────────────────────────────────────────────────────
 
+/// A turn is in flight: streaming, or parked on a question it is still owed an
+/// answer to. Notably NOT a persistent session that has parked between turns —
+/// that holds a warm child with nothing outstanding.
+fn is_active(session: &Session) -> bool {
+    matches!(
+        session.status,
+        SessionStatus::Working | SessionStatus::AwaitingInput
+    )
+}
+
 // ── subagent docs ───────────────────────────────────────────────────────────
 
 /// The per-subagent doc id: `{chatId}--sub--{suffix}`. Constrained by the
@@ -1098,6 +1268,7 @@ impl SubagentSink {
             device_id: device_id.to_owned(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            duration_ms: None,
         };
         if let Err(err) = self.doc.push_message(&entry) {
             tracing::warn!(doc = %self.doc_id, error = %err, "subagent steer write failed");
@@ -1242,7 +1413,7 @@ fn finish_segment<'a>(
 }
 
 /// `~` / `~/…` → this host's home directory. Anything else passes through.
-fn expand_home(cwd: &str) -> String {
+pub(crate) fn expand_home(cwd: &str) -> String {
     match cwd.strip_prefix("~") {
         Some("") => crate::repos::home_dir().to_string_lossy().into_owned(),
         Some(rest) if rest.starts_with('/') => crate::repos::home_dir()
@@ -1264,13 +1435,75 @@ struct RunResumeState {
     startup_retry: bool,
 }
 
+fn cursor_unstarted_history(
+    doc: &SessionDoc,
+    current_id: &str,
+    prompt: &str,
+    has_session: bool,
+) -> Result<String, DocError> {
+    // Convert each message before JSON encoding. Rewriting canonical chips in
+    // the encoded envelope can introduce unescaped quotes or newlines and can
+    // cause Cursor's current message to be converted twice.
+    let prompt = zeron_proto::invocation::harness_prompt(prompt, HarnessId::Cursor);
+    let entries = doc.read_entries()?;
+    let preceding: Vec<_> = entries
+        .iter()
+        .take_while(|entry| entry.id != current_id)
+        .collect();
+    // With an existing session, only bridge the tail whose assistant never
+    // produced content. A process can die before writing its SDK-side receipt,
+    // even though an older session ID still exists.
+    let after = if has_session {
+        preceding
+            .iter()
+            .rposition(|entry| {
+                entry.role == MessageRole::Assistant
+                    && entry.parts.iter().any(|part| match part {
+                        MessagePart::Text { text, .. } | MessagePart::Reasoning { text, .. } => {
+                            !text.is_empty()
+                        }
+                        MessagePart::Tool { .. } | MessagePart::Input { .. } => true,
+                        _ => false,
+                    })
+            })
+            .map_or(0, |i| i + 1)
+    } else {
+        0
+    };
+    let previous: Vec<String> = preceding
+        .iter()
+        .skip(after)
+        .filter(|entry| entry.role == MessageRole::User)
+        .map(|entry| {
+            entry
+                .parts
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.is_empty())
+        .map(|text| zeron_proto::invocation::harness_prompt(&text, HarnessId::Cursor))
+        .collect();
+    if previous.is_empty() {
+        return Ok(prompt);
+    }
+    Ok(format!(
+        "The preceding user messages may not have reached a Cursor checkpoint before startup stopped. Retain this JSON as conversation history; do not rerun prior tools or side effects. Respond to the current message.\n{}",
+        serde_json::json!({"previousUserMessages": previous, "currentUserMessage": prompt})
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
     chat_id: String,
     run_id: String,
     harness: Arc<dyn Harness>,
-    request: RunRequest,
+    mut request: RunRequest,
     doc: Arc<SessionDoc>,
     controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
@@ -1282,6 +1515,9 @@ async fn drive_run(
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
+    if request.resume.is_none() {
+        let _ = doc.clear_context_usage();
+    }
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
     // the event loop) can take ownership.
@@ -1289,7 +1525,33 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
-    let mut stream = match harness.run(request, controls).await {
+    // Startup can stop before the SDK saves user text, with no new session
+    // ID or receipt. Bridge that unacknowledged tail from our transcript;
+    // a fresh session needs all prior user text, not just the latest tail.
+    let prepared = if harness_id == HarnessId::Cursor {
+        cursor_unstarted_history(
+            &doc,
+            &resume_state.user_message_id,
+            &request.prompt,
+            request.resume.is_some(),
+        )
+        .map(|prompt| request.prompt = prompt)
+        .map_err(|e| zeron_harness::HarnessError::Protocol(e.to_string()))
+    } else {
+        Ok(())
+    };
+    let started = match prepared {
+        Ok(()) => {
+            let mut wire_request = request;
+            if !matches!(harness_id, HarnessId::Cursor | HarnessId::Opencode) {
+                wire_request.prompt =
+                    zeron_proto::invocation::harness_prompt(&wire_request.prompt, harness_id);
+            }
+            harness.run(wire_request, controls).await
+        }
+        Err(error) => Err(error),
+    };
+    let mut stream = match started {
         Ok(stream) => stream,
         Err(err) => {
             let message = err.to_string();
@@ -1323,6 +1585,18 @@ async fn drive_run(
     // folding the echo would mint an orphan chip mid-text in the NEXT
     // segment — the mid-word transcript splits.
     let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_images = std::collections::HashSet::new();
+    for entry in doc_ref.read_entries().unwrap_or_default() {
+        for part in entry.parts {
+            if let MessagePart::Image { id, .. } = part {
+                seen_images.insert(format!("{chat_id}\0{id}"));
+                if let Some(tool_id) = id.strip_suffix(":image") {
+                    seen_tools.insert(tool_id.to_owned());
+                }
+            }
+        }
+    }
+    let mut prepared_events = std::collections::VecDeque::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
@@ -1370,8 +1644,11 @@ async fn drive_run(
     // RETIRED for native drivers: a harness whose every turn shape ends with
     // a deterministic wire Done (claude/codex/cursor native) needs no
     // quiesce backstop — arming one only risks false parks on long silent
-    // work. The env knob still forces a window on for diagnostics.
+    // work. The env knob can configure a diagnostic window, but a prompt
+    // with an authoritative completion signal must still await that signal.
+    // ACP retains the watchdog only for unowned self-continued activity.
     let deterministic_turn_end = harness.deterministic_turn_end();
+    let authoritative_prompt_end = harness.authoritative_prompt_end();
     let quiesce_after: Option<std::time::Duration> = match std::env::var("ZERON_TURN_QUIESCE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -1414,151 +1691,176 @@ async fn drive_run(
     let mut subagents: std::collections::HashMap<String, SubagentSink> =
         std::collections::HashMap::new();
 
+    let mut final_completed_turn = None;
     let final_status = loop {
-        let event: AgentEvent = tokio::select! {
-            biased;
-            changed = cancel_rx.changed(), if !interrupted => {
-                let _ = changed;
-                interrupted = true;
-                interrupt_deadline = Some(
-                    tokio::time::Instant::now() + std::time::Duration::from_secs(3),
-                );
-                continue;
-            }
-            _ = tokio::time::sleep_until(
-                interrupt_deadline.unwrap_or_else(tokio::time::Instant::now)
-            ), if interrupt_deadline.is_some() => AgentEvent::Done {
-                status: DoneStatus::Interrupted,
-                result: None,
-                error: None,
-                session_id: None,
-            },
-            _ = live_heartbeat.tick() => {
-                inner.touch_session(&chat_id);
-                continue;
-            }
-            // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
-            // nobody returned to in 30 minutes releases its child. The turn
-            // was finalized at Done, so this end is clean — no aborted stamp.
-            _ = tokio::time::sleep_until(
-                idle_since.map(|at| at + SESSION_IDLE).unwrap_or_else(tokio::time::Instant::now)
-            ), if idle_since.is_some() => {
-                tracing::info!(chat = %chat_id, "reaping idle persistent session");
-                if let Some(token) = lock(&inner.runs)
-                    .get(&chat_id)
-                    .filter(|h| h.run_id == run_id)
-                    .map(|h| h.interrupt_token.clone())
-                {
-                    token.cancel();
+        let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
+            event
+        } else {
+            let raw_event = tokio::select! {
+                biased;
+                changed = cancel_rx.changed(), if !interrupted => {
+                    let _ = changed;
+                    interrupted = true;
+                    interrupt_deadline = Some(
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(3),
+                    );
+                    continue;
                 }
-                break SessionStatus::Idle;
-            }
-            Some(event) = engine_rx.recv() => event,
-            next = stream.next() => match next {
-                Some(Ok(event)) => event,
-                // A stream error while PARKED is a post-turn child death —
-                // the turn was already finalized, so the run ends clean
-                // instead of stamping a completed session Errored.
-                Some(Err(err)) if idle_since.is_some() => {
-                    tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
-                    break SessionStatus::Idle;
-                }
-                Some(Err(err)) => AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some(err.to_string()),
-                    session_id: None,
-                },
-                None if interrupted => AgentEvent::Done {
+                _ = tokio::time::sleep_until(
+                    interrupt_deadline.unwrap_or_else(tokio::time::Instant::now)
+                ), if interrupt_deadline.is_some() => AgentEvent::Done {
                     status: DoneStatus::Interrupted,
                     result: None,
                     error: None,
                     session_id: None,
                 },
-                // Stream end while PARKED idle: a per-turn adapter closing
-                // after its final Done — a clean end, not a crash (the turn
-                // was already finalized). Persistent adapters keep the
-                // stream open and never hit this.
-                None if idle_since.is_some() => break SessionStatus::Idle,
-                None => AgentEvent::Done {
-                    status: DoneStatus::Errored,
-                    result: None,
-                    error: Some("harness stream ended without Done".into()),
-                    session_id: None,
+                _ = live_heartbeat.tick() => {
+                    inner.touch_session(&chat_id);
+                    continue;
+                }
+                // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
+                // nobody returned to in 30 minutes releases its child. The turn
+                // was finalized at Done, so this end is clean — no aborted stamp.
+                _ = tokio::time::sleep_until(
+                    idle_since.map(|at| at + SESSION_IDLE).unwrap_or_else(tokio::time::Instant::now)
+                ), if idle_since.is_some() => {
+                    tracing::info!(chat = %chat_id, "reaping idle persistent session");
+                    if let Some(token) = lock(&inner.runs)
+                        .get(&chat_id)
+                        .filter(|h| h.run_id == run_id)
+                        .map(|h| h.interrupt_token.clone())
+                    {
+                        token.cancel();
+                    }
+                    break SessionStatus::Idle;
+                }
+                Some(event) = engine_rx.recv() => event,
+                next = stream.next() => match next {
+                    Some(Ok(event)) => event,
+                    // A stream error while PARKED is a post-turn child death —
+                    // the turn was already finalized, so the run ends clean
+                    // instead of stamping a completed session Errored.
+                    Some(Err(err)) if idle_since.is_some() => {
+                        tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
+                        break SessionStatus::Idle;
+                    }
+                    Some(Err(err)) => AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(err.to_string()),
+                        session_id: None,
+                    },
+                    None if interrupted => AgentEvent::Done {
+                        status: DoneStatus::Interrupted,
+                        result: None,
+                        error: None,
+                        session_id: None,
+                    },
+                    // Stream end while PARKED idle: a per-turn adapter closing
+                    // after its final Done — a clean end, not a crash (the turn
+                    // was already finalized). Persistent adapters keep the
+                    // stream open and never hit this.
+                    None if idle_since.is_some() => break SessionStatus::Idle,
+                    None => AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some("harness stream ended without Done".into()),
+                        session_id: None,
+                    },
                 },
-            },
-            _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
-                // Coalesced STREAM_COMMIT_MS tick: one doc commit per window
-                // (parent + any dirty subagent docs).
-                if dirty {
-                    if let Err(err) = sync_segment(
-                        doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
-                    ) {
-                        tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                _ = tokio::time::sleep_until(flush_at), if dirty || subagents.values().any(|s| s.dirty) => {
+                    // Coalesced STREAM_COMMIT_MS tick: one doc commit per window
+                    // (parent + any dirty subagent docs).
+                    if dirty {
+                        if let Err(err) = sync_segment(
+                            doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
+                        ) {
+                            tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
+                        }
+                        dirty = false;
                     }
+                    for sink in subagents.values_mut() {
+                        sink.flush(&device_id);
+                    }
+                    continue;
+                }
+                // Turn-quiesce watchdog (see the knob above). Armed only when the
+                // fold says nothing is in flight: an unresolved tool part is a
+                // command still running (legitimately silent for minutes — the
+                // rejected stall-timeout case), an unresolved input part is a
+                // question awaiting the user. The live-plan chip is exempt from
+                // the tool check: it is a singleton that never resolves. An EMPTY
+                // fold still arms — a Steered boundary that no output ever
+                // follows is one of the wedge shapes — it just parks without
+                // writing a segment (an empty finalize would leave a stub entry).
+                _ = tokio::time::sleep_until({
+                    let mut window = quiesce_after.unwrap_or_default();
+                    if self_continued_turn && let Some(short) = self_quiesce_after {
+                        window = window.min(short);
+                    }
+                    last_stream_activity + window
+                }), if quiesce_after.is_some()
+                    && (self_continued_turn || !authoritative_prompt_end)
+                    && idle_since.is_none()
+                    && !interrupted
+                    && steerable
+                    && !folded.iter().any(|p| match p {
+                        MessagePart::Tool { id, resolved: false, .. } => {
+                            id != zeron_proto::LIVE_PLAN_TOOL_ID
+                        }
+                        MessagePart::Input { resolved: false, .. } => true,
+                        _ => false,
+                    }) =>
+                {
+                    tracing::warn!(
+                        chat = %chat_id,
+                        quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
+                        "turn quiesced: stream silent after completed output with no \
+                         turn-end; parking (suspected missing harness Done)"
+                    );
+                    // Some adapters close a completed response through this
+                    // engine watchdog instead of a native Done. Preserve that
+                    // completion notice, but never notify for an empty boundary
+                    // or while an accepted steer still awaits delivery.
+                    let completed_turn = ((!folded.is_empty() || writer.is_some())
+                        && !inner.has_pending_steers(&chat_id, &run_id))
+                        .then(|| entry_id.clone());
+                    if !folded.is_empty() || writer.is_some() {
+                        if let Err(err) = finish_segment(
+                            doc_ref,
+                            writer.take(),
+                            &entry_id,
+                            &device_id,
+                            segment_started,
+                            &folded,
+                            MessageStatus::Complete,
+                        ) {
+                            tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
+                        }
+                        inner.note_message(&chat_id, &folded_text(&folded));
+                    }
+                    folded.clear();
                     dirty = false;
+                    entry_id = new_id();
+                    segment_started = now_ms();
+                    idle_since = Some(tokio::time::Instant::now());
+                    self_continued_turn = false;
+                    inner.set_status_with_completion(
+                        &chat_id, SessionStatus::Idle, false, completed_turn,
+                    );
+                    continue;
                 }
-                for sink in subagents.values_mut() {
-                    sink.flush(&device_id);
-                }
+            };
+
+            prepared_events.extend(
+                inner
+                    .prepare_generated_image(&chat_id, raw_event, &mut seen_images)
+                    .await,
+            );
+            let Some(event) = prepared_events.pop_front() else {
                 continue;
-            }
-            // Turn-quiesce watchdog (see the knob above). Armed only when the
-            // fold says nothing is in flight: an unresolved tool part is a
-            // command still running (legitimately silent for minutes — the
-            // rejected stall-timeout case), an unresolved input part is a
-            // question awaiting the user. The live-plan chip is exempt from
-            // the tool check: it is a singleton that never resolves. An EMPTY
-            // fold still arms — a Steered boundary that no output ever
-            // follows is one of the wedge shapes — it just parks without
-            // writing a segment (an empty finalize would leave a stub entry).
-            _ = tokio::time::sleep_until({
-                let mut window = quiesce_after.unwrap_or_default();
-                if self_continued_turn && let Some(short) = self_quiesce_after {
-                    window = window.min(short);
-                }
-                last_stream_activity + window
-            }), if quiesce_after.is_some()
-                && idle_since.is_none()
-                && !interrupted
-                && steerable
-                && !folded.iter().any(|p| match p {
-                    MessagePart::Tool { id, resolved: false, .. } => {
-                        id != zeron_proto::LIVE_PLAN_TOOL_ID
-                    }
-                    MessagePart::Input { resolved: false, .. } => true,
-                    _ => false,
-                }) =>
-            {
-                tracing::warn!(
-                    chat = %chat_id,
-                    quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
-                    "turn quiesced: stream silent after completed output with no \
-                     turn-end; parking (suspected missing harness Done)"
-                );
-                if !folded.is_empty() || writer.is_some() {
-                    if let Err(err) = finish_segment(
-                        doc_ref,
-                        writer.take(),
-                        &entry_id,
-                        &device_id,
-                        segment_started,
-                        &folded,
-                        MessageStatus::Complete,
-                    ) {
-                        tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
-                    }
-                    inner.note_message(&chat_id, &folded_text(&folded));
-                }
-                folded.clear();
-                dirty = false;
-                entry_id = new_id();
-                segment_started = now_ms();
-                idle_since = Some(tokio::time::Instant::now());
-                self_continued_turn = false;
-                inner.set_status(&chat_id, SessionStatus::Idle, false);
-                continue;
-            }
+            };
+            event
         };
 
         // ── subagent routing ───────────────────────────────────────────
@@ -1576,7 +1878,10 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
-            let is_steer = matches!(sub_event.as_ref(), AgentEvent::UserMessage { .. });
+            let is_steer = matches!(
+                sub_event.as_ref(),
+                AgentEvent::UserMessage { .. } | AgentEvent::Steered { .. }
+            );
             if is_steer {
                 settled_subagents.remove(parent_tool_use_id);
             } else if settled_subagents.contains(parent_tool_use_id)
@@ -1744,6 +2049,13 @@ async fn drive_run(
                 continue;
             }
         }
+        // Capacity/occupancy can settle after Done; updating it must not reopen a turn.
+        if let AgentEvent::ContextUsage { tokens, window } = &event {
+            if let Err(err) = doc_ref.update_context_usage(*tokens, *window) {
+                tracing::warn!(%chat_id, error = %err, "context usage write failed");
+            }
+            continue;
+        }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
         // re-opens the session; everything else stays gated. The ACP child
         // keeps forwarding `session/update` frames after a turn completes,
@@ -1768,6 +2080,7 @@ async fn drive_run(
         // self-continued turn starts a whole new agent round trip (seconds
         // at minimum, minutes in the incident). Inside the gate everything
         // non-boundary stays inert, exactly as before.
+        let turn_was_active = idle_since.is_none();
         const RESUME_GATE: std::time::Duration = std::time::Duration::from_secs(1);
         if idle_since.is_some() {
             let self_continued = idle_since
@@ -2057,6 +2370,15 @@ async fn drive_run(
             {
                 titles.maybe_generate(&chat_id, harness_id, &user_prompt, &run_cwd);
             }
+            // An accepted steer awaiting its boundary owns the continuation:
+            // the previous Done is an internal handoff, not a completion ping.
+            // Ordinary queued rows are not in this ledger and still notify.
+            let pending_steer = inner.has_pending_steers(&chat_id, &run_id);
+            let completed_turn = (*status == DoneStatus::Completed
+                && !interrupted
+                && turn_was_active
+                && !pending_steer)
+                .then(|| entry_id.clone());
             // PERSISTENT SESSION: a cleanly completed turn on a steerable
             // harness PARKS instead of ending — child + mailbox stay warm for
             // the next routed dispatch; per-turn state resets for it.
@@ -2069,9 +2391,15 @@ async fn drive_run(
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
                 self_continued_turn = false;
-                inner.set_status(&chat_id, SessionStatus::Idle, false);
+                inner.set_status_with_completion(
+                    &chat_id,
+                    SessionStatus::Idle,
+                    false,
+                    completed_turn,
+                );
                 continue;
             }
+            final_completed_turn = completed_turn;
             break match status {
                 DoneStatus::Errored => SessionStatus::Errored,
                 _ => SessionStatus::Idle,
@@ -2113,7 +2441,7 @@ async fn drive_run(
         .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
         .unwrap_or_default();
     inner.remove_run(&chat_id, &run_id);
-    inner.set_status(&chat_id, final_status, false);
+    inner.set_status_with_completion(&chat_id, final_status, false, final_completed_turn);
     if !interrupted && !orphans.is_empty() {
         // The dying run accepted these into its mailbox but never confirmed a
         // Steered boundary (idle-reaper race, a mid-turn error discarding
@@ -2162,8 +2490,161 @@ async fn drive_run(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cursor_recovery_converts_rich_messages_before_json_encoding() {
+        let doc = zeron_doc::SessionDoc::init("cursor-rich-recovery").unwrap();
+        let skill = zeron_proto::invocation::Invocation::Skill {
+            name: "review \"quoted\"".into(),
+            path: "/repo/quoted \"path\"/SKILL.md".into(),
+            command: None,
+        }
+        .link();
+        let previous = format!("Previous {skill}\nSecond line with \\ and \"quotes\"");
+        doc.push_message(&zeron_doc::SessionMessageEntry {
+            id: "u1".into(),
+            role: zeron_doc::MessageRole::User,
+            parts: vec![zeron_doc::MessagePart::Text {
+                id: "u1-text".into(),
+                text: previous.clone(),
+            }],
+            created_at: 0,
+            device_id: "test".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        })
+        .unwrap();
+        let current = format!("Current {skill}\nKeep **Markdown**");
+        let delivered = super::cursor_unstarted_history(&doc, "u2", &current, false).unwrap();
+        let (_, json) = delivered.split_once('\n').unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            parsed["currentUserMessage"],
+            zeron_proto::invocation::harness_prompt(&current, zeron_proto::HarnessId::Cursor)
+        );
+        assert_eq!(
+            parsed["previousUserMessages"][0],
+            zeron_proto::invocation::harness_prompt(&previous, zeron_proto::HarnessId::Cursor)
+        );
+    }
+
+    #[test]
+    fn cursor_without_a_session_id_retains_only_preceding_user_messages() {
+        let doc = zeron_doc::SessionDoc::init("cursor-unstarted").unwrap();
+        for (id, role, text) in [
+            (
+                "u1",
+                zeron_doc::MessageRole::User,
+                "first interrupted request",
+            ),
+            ("a1", zeron_doc::MessageRole::Assistant, "partial output"),
+            ("u2", zeron_doc::MessageRole::User, "current request"),
+            ("u3", zeron_doc::MessageRole::User, "future pending request"),
+        ] {
+            doc.push_message(&zeron_doc::SessionMessageEntry {
+                id: id.into(),
+                role,
+                parts: vec![zeron_doc::MessagePart::Text {
+                    id: format!("{id}-text"),
+                    text: text.into(),
+                }],
+                created_at: 0,
+                device_id: "test".into(),
+                status: None,
+                continuation_of: None,
+                duration_ms: None,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            super::cursor_unstarted_history(&doc, "u1", "first interrupted request", false)
+                .unwrap(),
+            "first interrupted request"
+        );
+        let prompt = super::cursor_unstarted_history(&doc, "u2", "current request", false).unwrap();
+        assert!(prompt.contains("first interrupted request"));
+        assert!(prompt.contains("current request"));
+        assert!(!prompt.contains("partial output"));
+        assert!(!prompt.contains("future pending request"));
+        assert!(prompt.contains("do not rerun prior tools or side effects"));
+        assert_eq!(
+            super::cursor_unstarted_history(&doc, "u2", "current request", true).unwrap(),
+            "current request",
+            "content from the preceding turn is already in the native session"
+        );
+        assert!(
+            super::cursor_unstarted_history(&doc, "u3", "future pending request", true)
+                .unwrap()
+                .contains("current request"),
+            "an unacknowledged prompt after an older checkpoint must survive"
+        );
+        assert_eq!(doc.read_entries().unwrap().len(), 4);
+    }
+
     use super::{RuntimeConfig, subagent_doc_id};
     use zeron_proto::{HarnessId, RunRequest, SandboxLevel};
+
+    #[tokio::test]
+    async fn generated_image_failure_is_sanitized_even_inside_subagents() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        let source = "/outside/private/source.png";
+        let event = AgentEvent::Subagent {
+            parent_tool_use_id: "child".into(),
+            event: Box::new(AgentEvent::GeneratedImage {
+                id: "i:image".into(),
+                path: source.into(),
+                name: "secret".into(),
+                mime_type: "bad".into(),
+            }),
+        };
+        let events = sessions
+            .inner
+            .prepare_generated_image("chat", event, &mut std::collections::HashSet::new())
+            .await;
+        assert_eq!(events.len(), 2);
+        let mut parts = vec![];
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "i".into(),
+                call: zeron_proto::ToolCall::Unknown {
+                    name: "Generate image".into(),
+                    input: None,
+                },
+            },
+        );
+        for event in &events {
+            sessions.inner.publish("chat", event);
+            let AgentEvent::Subagent {
+                parent_tool_use_id,
+                event,
+            } = event
+            else {
+                panic!("lost owner")
+            };
+            assert_eq!(parent_tool_use_id, "child");
+            fold_event_into_parts(&mut parts, event);
+        }
+        assert!(matches!(
+            parts[0],
+            MessagePart::Tool {
+                is_error: true,
+                resolved: true,
+                ..
+            }
+        ));
+        assert!(matches!(parts[1], MessagePart::Error { .. }));
+        let journal =
+            serde_json::to_string(&sessions.inner.journal.replay("chat", 0).unwrap()).unwrap();
+        assert!(!journal.contains(source));
+        assert!(!journal.contains("secret"));
+    }
 
     fn request() -> RunRequest {
         RunRequest {

@@ -19,11 +19,15 @@ pub mod agent_accounts;
 pub mod auth;
 pub mod change_requests;
 pub mod chat2_host;
+mod chat_persistence;
 pub mod diff_sync;
 pub mod doc_host;
+mod http_error;
 pub mod instance_lock;
 pub mod local_import;
+mod model_catalogs;
 pub mod profile;
+pub mod project_actions;
 pub mod registry;
 pub mod repos;
 pub mod rpc;
@@ -33,7 +37,9 @@ pub mod source_control;
 pub mod spaces;
 pub mod terminals;
 pub mod titles;
+mod transcript_history;
 pub mod uploads;
+pub mod workspace_files;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -47,6 +53,7 @@ pub use diff_sync::{
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
+pub use project_actions::ProjectActionsStore;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
 pub use repos::{CheckoutIdentity, Repos, worktree_branch_from_title};
 pub use rpc::EngineRpc;
@@ -61,6 +68,7 @@ pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
+pub use workspace_files::WorkspaceFiles;
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
@@ -69,6 +77,8 @@ pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
 
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
+    #[error(transparent)]
+    Token(#[from] zeron_rpc::TokenError),
     #[error("doc: {0}")]
     Doc(#[from] zeron_doc::DocError),
     #[error("journal: {0}")]
@@ -120,7 +130,10 @@ pub struct EngineCore {
     pub workspace: WorkspaceHost,
     pub registry: Arc<HarnessRegistry>,
     pub repos: Repos,
+    pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
+    pub project_actions: ProjectActionsStore,
+    pub previews: zeron_preview::PreviewService,
     pub change_requests: CheckoutChangeRequests,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
@@ -240,7 +253,17 @@ impl EngineCore {
         let repos = Repos::new(data_dir, &device_id);
         doc_host.set_repos(repos.clone());
         let change_requests = CheckoutChangeRequests::start(repos.clone(), &device_id);
+        let workspace_files =
+            WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         let terminals = Terminals::new();
+        let project_actions = ProjectActionsStore::open(profile.store_root())?;
+        doc_host.set_project_action_runtime(project_actions.clone(), terminals.clone());
+        let previews = zeron_preview::PreviewService::new(
+            profile.store_root().join("previews.json"),
+            device_id.clone(),
+            local_device_name(&device_id),
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))?;
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
@@ -257,6 +280,11 @@ impl EngineCore {
         // Queued-attachment support: the doc host resolves `pending://` refs
         // against this store and pushes staged bytes to remote hosts.
         doc_host.set_uploads(uploads.clone());
+        let agent_accounts_config = AgentAccountsConfig::detect(data_dir);
+        sessions.set_generated_images(
+            uploads.clone(),
+            agent_accounts_config.codex_home.join("generated_images"),
+        );
         let local_import = (profile.scope() == WorkspaceScope::Synced).then(|| {
             local_import::LocalImporter::new(
                 data_dir,
@@ -269,7 +297,7 @@ impl EngineCore {
                 uploads.clone(),
             )
         });
-        let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
+        let agent_accounts = AgentAccounts::new(agent_accounts_config);
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -288,7 +316,10 @@ impl EngineCore {
             workspace,
             registry,
             repos,
+            workspace_files,
             terminals,
+            project_actions,
+            previews,
             change_requests,
             diff_sync,
             spaces_sync,
@@ -418,14 +449,17 @@ impl EngineCore {
             self.workspace.clone(),
             self.registry.clone(),
             self.repos.clone(),
+            self.workspace_files.clone(),
             self.terminals.clone(),
+            self.project_actions.clone(),
             self.change_requests.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
             self.workspace_scope,
         )
-        .with_auth(self.auth());
+        .with_auth(self.auth())
+        .with_previews(self.previews.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
@@ -442,6 +476,7 @@ impl EngineCore {
     /// draining. Connected sockets remain authorized by their handshake, so
     /// clearing credentials alone is not a security boundary.
     pub fn disconnect_edge(&self) {
+        self.previews.stop();
         if let Some(links) = self.links() {
             links.disconnect_all();
         }
@@ -453,6 +488,11 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        self.previews.shutdown().await;
+        // A run interruption transitions its chat to Idle, and Idle normally
+        // releases the next queued row. Freeze first so quitting never starts
+        // recovered work while the engine is being torn down.
+        self.doc_host.pause_all_queues();
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
@@ -478,6 +518,7 @@ impl EngineCore {
             updater.shutdown().await;
         }
         self.diff_sync.shutdown().await;
+        self.workspace_files.shutdown().await;
         self.spaces_sync.shutdown().await;
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
@@ -657,6 +698,8 @@ impl Engine {
         Ok(EngineInfo {
             device_id: load_or_create_device_id(&config.data_dir)?,
             workspace_scope,
+            cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
+            capabilities: zeron_proto::capabilities::current(),
         })
     }
 
@@ -725,6 +768,7 @@ impl Engine {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
         });
 
+        let preview_org = profile.org_id().to_string();
         let core = match lock {
             Some(lock) => EngineCore::assemble_with_profile_locked(
                 profile,
@@ -741,7 +785,33 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
-        if edge_enabled {
+        let preview_workspace = core.workspace.clone();
+        let preview_device = core.device_id.clone();
+        let projects = Arc::new(move || {
+            preview_workspace
+                .read_chats()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|chat| chat.device_id == preview_device)
+                .filter_map(|chat| chat.cwd.map(std::path::PathBuf::from))
+                .collect()
+        });
+        let preview_signaling = edge_enabled.then(|| zeron_preview::signaling::Config {
+            edge_url: config.edge_url.clone(),
+            org_id: preview_org,
+            tokens: Arc::new(auth.clone()),
+        });
+        core.previews.start(projects, preview_signaling).await;
+        // Portable Windows packages explicitly configure an update feed; users
+        // should not need to enable workspace sync to receive application updates.
+        let check_updates = edge_enabled;
+        #[cfg(windows)]
+        let check_updates = check_updates
+            || matches!(
+                zeron_update::detect_install(),
+                zeron_update::InstallKind::WindowsPortable { .. }
+            );
+        if check_updates {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
             // installs with ZERON_AUTO_UPDATE=1 apply + restart themselves — gated
             // on quiescence so a restart never lands under a live run or open PTY.

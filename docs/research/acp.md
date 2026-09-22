@@ -45,12 +45,38 @@
   ride pi's own provider config (catalog advertises a `default` pass-through
   entry); thinking ladder minimal→max maps onto zeron's levels via the
   generic `thought_level` preference ladder ("off" has no zeron tier).
+- **Devin registered** (2026-08-15): `AcpHarness::devin()` runs Cognition's
+  native ACP server (`devin acp`; install via
+  `curl -fsSL https://cli.devin.ai/install.sh | bash` or
+  `brew install --cask devin-cli` — no npm fallback, so resolution is
+  PATH/`~/.local/bin`/homebrew bins only, `DEVIN_EXECUTABLE` overrides; the
+  agent is also in the official ACP registry, id `devin`). No
+  `_session/steering` extension → turn-boundary steering. No `thought_level`
+  config option — effort is baked into the advertised model ids
+  (`claude-5-fable-high`), so the descriptor ladder stays empty; the model
+  list is discovered over ACP (below) with two flagship rows as the static
+  fallback. Unattended parity rides the mode select's `bypass` value (added
+  to the generic no-prompts preference list). CLI 3000.6.14 also exposes
+  subagent lifecycle and child transcript updates when the client advertises
+  `cognition.ai/subagentSupport`; Zeron correlates the child agent id back to
+  the parent's `run_subagent` tool-call id and routes the tagged messages,
+  thoughts and tools into a nested transcript. The separate
+  `cognition.ai/subagentControl` extension stays disabled until Zeron has a
+  foreground/background control surface.
+  Resume quirks verified live (3000.6.14): `session/load` replays the full
+  history (dropped, the doc has it) and then continues normally; a turn that
+  was cancelled leaves its user message in Devin's history with no reply, so
+  the next prompt after a resume may answer BOTH the new prompt and the stale
+  one (SWE-1.7 did exactly that). `session/load` also refuses with
+  `-32015 "already open in another process"` while a previous `devin acp`
+  still holds the session — the shared driver's fresh-session fallback covers
+  that, at the cost of Devin-side context.
 - **ACP is the source of truth for model lists** (2026-08-08; preference
   order inverted 2026-08-09): `models()` runs a short-lived probe
   (initialize → `session/new`, the `discover_commands` pattern) and reads
   the `model` config option's choices FIRST, falling back to the legacy
   first-class `models` state (SessionModelState) only when no model config
-  option is advertised. The original paseo order (legacy state first) put
+  option is advertised. The original order (legacy state first) put
   one row per model × effort in the picker: codex-acp enumerates
   `gpt-5.6-sol[low]`…`[ultra]` on the deprecated surface while its
   `configOptions` carry base ids with effort as a separate `thought_level`
@@ -143,3 +169,54 @@ agentclientprotocol.com (v1 spec + schema), agentclientprotocol org repos
 (claude-agent-acp v0.66.0, codex-acp v1.1.14 — steering wire shape),
 agent-client-protocol-schema 1.3.0 (serde tags), ACP registry entry
 `grok-build`, live `grok agent stdio` initialize handshake (2026-08-07).
+
+## Pending prompts and silence (#296, 2026-09-09)
+
+A completed tool result, partial assistant message, or usage update can precede
+another model request. None proves that `session/prompt` has finished. The old
+30-second blanket quiet settlement discarded the outstanding response future,
+then allowed another prompt into an agent that was still busy. The next request
+could fail with `Invalid request` and its specific `error.data` was discarded.
+
+The ACP quiet timer and `ZERON_ACP_QUIET_SETTLE_MS` override are retired. Pending
+prompts retain their response futures; boundary steers remain queued. Explicit
+completion extensions and `noRunningTurn` recovery retain their existing roles.
+Cancellation still sends `session/cancel`, awaits completion, and escalates to
+process termination if needed. The engine also exempts authoritative pending
+prompts from its quiet watchdog, including when a diagnostic window is set;
+unowned self-continued activity retains its fallback. RPC errors include their
+code and non-null data, preserving the agent's explanation in the terminal event.
+
+Regression checks:
+
+```sh
+cargo test -p zeron-harness
+cargo test -p zeron-engine --test acp_lifecycle
+```
+
+The stateful Python peer rejects overlapping prompts. Coverage includes quiet
+periods after four completed reads, partial text, reasoning, usage, open tools,
+multiple queued follow-ups, EOF without a response, cancellation, an unresponsive
+agent, and structured error details. The engine test checks Working status and
+transcript boundaries with a 100ms watchdog, then verifies autonomous activity
+still settles.
+
+For real-model testing, configure an isolated authenticated Pi agent directory,
+select a model in its settings, and load
+`crates/harness/tests/fixtures/pi-slow-model.ts` (for example, symlink it into that
+agent directory's `extensions/` directory). The extension waits 35 seconds before
+sending the next model request after a completed tool. It does not delay tool
+results or synthesize an ACP completion. Then run:
+
+```sh
+PI_CODING_AGENT_DIR=/path/to/isolated/pi-agent \
+PI_ACP_PI_COMMAND=/path/to/pi \
+ACP_TEST_RUNS=3 \
+cargo test -p zeron-harness --test real_acp_lifecycle -- --ignored --nocapture
+```
+
+These tests require successful real calls; missing authentication or an unloaded
+delay extension fails rather than skips. Verified locally with pi-acp 0.0.33,
+Pi 0.85.1, and `gpt-5.6-luna`: three sessions each completed the original turn and
+two queued follow-ups after 36.6–36.8-second post-tool gaps; cancellation during a
+32-second post-tool gap also completed as Interrupted.

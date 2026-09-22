@@ -43,6 +43,37 @@ The workflow uses the `AC_API_KEY_P8`, `AC_API_KEY_ID`, and
   explore the UI with no infrastructure. Launch args for screenshot rigs:
   `-demo [-route chat:<id>|space:<id>] [-stream]`.
 
+### Sessions without a project
+
+Home's **+ → Session without a project…** opens the execution-device picker,
+including when the account has no projects. Choose a desktop host (offline
+hosts are allowed); the draft shows **No project** and the host name. Tap the
+host above the composer to change it before sending. Catalogs and attachment
+delivery use that host, and Git/ref/worktree controls are hidden.
+
+Creation uses the same local registry outbox and durable session command
+ledger as project sessions: `spaceId` is omitted, `deviceId` names the selected
+host, `cwd` is `"~"`, and `roomGen` is `2`. Home's **All** list includes these
+sessions, including ones synchronized from desktop. A project filter excludes
+them. Active sessions pointing to a deleted/missing project remain hidden;
+the archived shelf retains its existing behavior.
+
+Regression coverage lives in `ProjectlessSessionTests` (registry persistence,
+incoming desktop rows, destination selection, configuration and first command)
+and `ProjectlessSessionUITests` (create/send/reopen, empty accounts, host changes,
+project filters and the existing project flow). Run on an Xcode 26+ Mac:
+
+```sh
+cd apps/ios
+xcodebuild -project Zeron.xcodeproj -scheme Zeron \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+  -only-testing:ZeronTests/ProjectlessSessionTests \
+  -only-testing:ZeronUITests/ProjectlessSessionUITests test
+```
+
+Demo fixtures accept `-no-projects` (empty spaces/chats), `-ios-only` (no
+execution hosts), and `-sethomefilter <spaceId>` (an empty value selects All).
+
 ## Architecture
 
 ```
@@ -62,16 +93,17 @@ Markdown/
                         from the 2nd-to-last top-level block; link-defs force
                         full parses) — parser.rs port
   Highlight.swift       line tokenizer with carry state, paint-only
-  MarkdownBlockView.swift  desktop metrics: body 14/22, headings 19/27…14/22,
-                        code 12.5/18 (analytic line rows), violet inline code,
+  MarkdownBlockView.swift  mobile metrics: body 17/26, headings 23/31…17/26,
+                        code 14/21 (Dynamic Type scaled line rows), violet inline code,
                         accent blockquotes, hairline tables
 Transcript/
   TranscriptRows.swift  rows_for_entry port: block-granularity rows, stable
                         ids ({msg}#{part}.{block}, {msg}#g{n}), fingerprint
                         versions, consecutive-tool grouping
-  TranscriptView.swift  lazy stack + stick-to-bottom (pin breaks only on user
-                        scroll, 70pt re-engage band, 320pt jump button),
-                        tool-group folds, error/input chips
+  NativeTranscriptTable.swift  UIKit row reuse, gesture anchoring and
+                        animated local-send runway retained across navigation
+  TranscriptView.swift  SwiftUI message content, user-message folding, follow
+                        (70pt re-engage, 140pt jump), tool activity rail
   Veil.swift            paint-only streaming fade (EMA-tracked duration,
                         1−(1−p)^1.6 curve)
 Composer/               glass pill, Send→Steer→Stop morph, QuestionPanel
@@ -95,19 +127,44 @@ Theme/                  theme.rs port: oklch→sRGB converter, exact palette,
 | Add-space palette (device + folder browser) | New-space sheet: device tabs + remote folder browser (ListFolders over the device-room relay, git repos badged) |
 | ControlRpc over device-room relay | `DeviceRelayClient` — binary `uleb128(len)+header+payload` frames, `{"s","k","to","from"}` header, ndjson ControlRpc; used for ListFolders + direct-to-host `Mutate {createSpace}` (local doc-write fallback when the host is offline) |
 | Hover timestamps / copy | Context menus |
-| gpui `list()` sum-tree virtualization | `LazyVStack` + stable row ids + version fingerprints |
-| Stick-to-bottom spring, wheel-up breaks pin | Scroll-phase-gated pin + spring scrollTo, same 70/320pt thresholds |
+| Long user messages: Show more / Show less | Five-line preview, 44pt disclosure target, expansion retained per session |
+| gpui `list()` sum-tree virtualization | Native table row reuse with SwiftUI content, stable row ids and version fingerprints |
+| Stick-to-bottom spring, wheel-up breaks pin | Gesture-owned follow, composer-sized viewport with glass underlap, retained local prompt runway |
 
-Status colors, fonts, spacing, markdown metrics, veil timing, command-ledger
-shapes, and the wire protocol are ports, not approximations — constants match
-the desktop sources cited in each file header.
+Status colors, font families, veil timing, command-ledger shapes, and wire
+protocol follow desktop. Text sizes and touch targets are adapted for phones;
+see [mobile polish and simulator coverage](../../docs/mobile-polish.md).
 
 ### Writer discipline (what the phone writes)
 
-- Workspace doc: its own device row, chat creates (host = the space's owning
-  device), `archived`/`title`/`lastSeenAt` LWW sets, presence heartbeats.
-- Session docs: command ledger appends only (`run`/`steer`/`interrupt`/
-  `respondInput`), with client-minted message ids for optimistic echo. The
-  host writes all transcript entries and command outcomes.
+- Workspace registry: chat creates (host = the project's owning device or
+  the explicitly selected projectless host), `archived`/`title`/`lastSeenAt`
+  LWW sets, presence heartbeats. The phone owns no engine device row.
+- Session docs: append commands (`run`/`steer`/`interrupt`/`respondInput`)
+  with client-minted message ids for optimistic echo; add and reorder shared
+  queue rows. Queue edits and removals require host acknowledgement. The host
+  writes all transcript entries and command outcomes.
 - After queuing a command it POSTs `/device/{host}/nudge` so a cold host
   opens the doc and drains — delivery stays durable in the doc regardless.
+
+### Shared message queue
+
+Messages submitted during an active turn use the host's shared queue when it
+advertises support. The composer toolbar's **Queue / Steer** menu persists the
+phone's preference; **Queue** remains the default. Steer allows automatic
+mid-turn delivery when the provider supports it. Attachments wait for a turn
+that can accept files.
+
+Rows offer **Steer** for a host-advertised mid-turn provider and text-only
+messages, or **Send now** (interrupt) otherwise. Unknown provider capabilities
+leave delivery actions unavailable. Edits require a host lease; removal waits
+for the host's acknowledgement and keeps the row inert while pending. Failed
+or unconfirmed actions show an error above the composer and trigger sync repair.
+Deleting an actively edited row discards it without first releasing its lease.
+
+With an external keyboard, **Command+Return** submits the draft (including
+attachment-only drafts), saves an active queue edit, or activates the first
+queued row when the composer is empty. It never skips a blocked head or stops
+the agent merely because the draft is empty.
+
+Queue editing on iOS changes text only and preserves queued attachments, including when the text is cleared. Draft photos are hidden and the attachment picker is unavailable during editing. If the row disappears or its lease is superseded, **Copy edit and stop editing** saves the edited text to the clipboard and restores the original draft and photos.

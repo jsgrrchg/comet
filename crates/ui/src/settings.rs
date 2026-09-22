@@ -798,7 +798,8 @@ pub struct UiSettings {
     /// Agent-sent Markdown fences: wrap long lines to the chat width instead
     /// of exposing their horizontal scroll plane.
     pub code_fences_fit_content: bool,
-    /// Maximum conversation width in logical pixels; composer width is independent.
+    /// Maximum message and docked composer surface width in logical pixels.
+    /// The centered new-chat composer keeps its own width.
     pub transcript_width: f32,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,

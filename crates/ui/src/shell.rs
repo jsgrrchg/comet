@@ -64,6 +64,7 @@ mod command_palette;
 mod files_panel;
 mod project_icon;
 mod sidebar_pins;
+mod sidebar_sections;
 mod spaces;
 mod tabs;
 
@@ -75,6 +76,7 @@ actions!(
         SaveFile,
         ToggleSidebar,
         ToggleChanges,
+        ToggleFiles,
         AddSpacePalette,
         ToggleCommandPalette,
         OpenModelPicker,
@@ -342,6 +344,11 @@ pub fn apply_keymap(
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_changes, "mod-r"),
             ToggleChanges,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.toggle_files, "mod-e"),
+            ToggleFiles,
             None,
         ),
         KeyBinding::new(
@@ -814,10 +821,11 @@ struct SidebarSessionDrag {
     profile_key: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SidebarSessionDrop {
     Pinned(usize),
     Regular,
+    Section(String),
 }
 
 struct SidebarSessionTransfer {
@@ -898,6 +906,7 @@ struct PinnedSessionDragState {
 type SidebarKeyedRow = (String, f32, AnyElement);
 
 struct SidebarSessionRows {
+    custom_count: usize,
     regular_count: usize,
     rows: Vec<SidebarKeyedRow>,
     pinned_count: usize,
@@ -1552,12 +1561,19 @@ pub struct Shell {
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
+    sidebar_section_migration: Option<(String, crate::state::EngineHandle)>,
+    section_dialog: Option<sidebar_sections::SectionDialog>,
+    section_menu: Option<(String, Point<Pixels>)>,
+    section_header_hover: Option<String>,
+    section_menu_focus: FocusHandle,
+    section_menu_active: Option<usize>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
     delete_space_confirm: Option<String>,
     /// The add-space palette (device tabs + folder search), `Some`
     /// while open.
     add_space: Option<AddSpaceFlow>,
     command_palette: Option<command_palette::CommandPalette>,
+    pending_workspace_command: Option<crate::composer::WorkspaceCommand>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
     /// Hover/drag + scroll-linger state of the dropdown's floating rail.
@@ -1756,6 +1772,10 @@ impl Shell {
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
             move |this: &mut Shell, _, event: &ComposerEvent, cx| match event {
+                ComposerEvent::WorkspaceCommand(command) => {
+                    this.pending_workspace_command = Some(*command);
+                    cx.notify();
+                }
                 ComposerEvent::NewThreadTransitionStarted => {
                     // Route observation drives the dock once selection commits.
                     cx.notify();
@@ -1974,9 +1994,16 @@ impl Shell {
             delete_confirm: None,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
+            sidebar_section_migration: None,
+            section_dialog: None,
+            section_menu: None,
+            section_header_hover: None,
+            section_menu_focus: cx.focus_handle(),
+            section_menu_active: None,
             delete_space_confirm: None,
             add_space: None,
             command_palette: None,
+            pending_workspace_command: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),
             sidebar_view_menu: popover::Popup::default(),
@@ -2258,6 +2285,7 @@ impl Shell {
                     device_id: "local".into(),
                     status: None,
                     continuation_of: None,
+                    duration_ms: None,
                 };
                 state.update(cx, |s, cx| {
                     s.push_echo(&chat_id, echo);
@@ -3780,6 +3808,8 @@ impl Shell {
         self.settings.code_font_family = current.code_font_family;
         self.settings.code_font_size = current.code_font_size;
         self.settings.transcript_width = current.transcript_width;
+        self.settings.skill_completion_by_harness = current.skill_completion_by_harness;
+        self.settings.skills_in_slash_menu = current.skills_in_slash_menu;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -3870,6 +3900,11 @@ impl Shell {
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
         }
+        if section == SettingsSection::Shortcuts
+            && let Some(page) = &self.shortcuts_page
+        {
+            page.update(cx, |page, cx| page.load_completion_harnesses(cx));
+        }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
         self.close_user_menu(cx);
@@ -3913,6 +3948,11 @@ impl Shell {
                 }
             }
             NavEntry::Settings(section) => {
+                if section == SettingsSection::Shortcuts
+                    && let Some(page) = &self.shortcuts_page
+                {
+                    page.update(cx, |page, cx| page.load_completion_harnesses(cx));
+                }
                 self.route = Route::Settings(section);
             }
         }
@@ -4222,6 +4262,7 @@ impl Shell {
 
     fn reconcile_sidebar_pins(&mut self, cx: &mut Context<Self>) {
         self.discard_stale_sidebar_pin_writes(cx);
+        self.migrate_sidebar_sections(cx);
         let Some(profile_key) = self.active_sidebar_pin_profile_key(cx) else {
             return;
         };
@@ -4254,6 +4295,17 @@ impl Shell {
     }
 
     fn active_sidebar_pins(&self, cx: &App) -> Vec<String> {
+        let mut pins = self.raw_sidebar_pins(cx);
+        let sections = self.active_sidebar_sections(cx);
+        pins.retain(|id| {
+            !sections
+                .iter()
+                .any(|section| section.session_ids.contains(id))
+        });
+        pins
+    }
+
+    fn raw_sidebar_pins(&self, cx: &App) -> Vec<String> {
         if let Some(pins) = self.optimistic_sidebar_pins(cx) {
             return pins;
         }
@@ -4311,10 +4363,10 @@ impl Shell {
         change: zeron_proto::SidebarPinChange,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mut pinned_session_ids = self.active_sidebar_pins(cx);
+        let mut pinned_session_ids = self.raw_sidebar_pins(cx);
         change.project(&mut pinned_session_ids);
         if !self.validate_sidebar_pin_change(&profile_key, &pinned_session_ids, cx)
-            || self.active_sidebar_pins(cx) == pinned_session_ids
+            || self.raw_sidebar_pins(cx) == pinned_session_ids
         {
             return false;
         }
@@ -4358,18 +4410,28 @@ impl Shell {
         if pins.contains(&chat_id) == pinned {
             return;
         }
+        if pinned && self.raw_sidebar_pins(cx).contains(&chat_id) {
+            self.assign_sidebar_section(&chat_id, None, cx);
+            cx.notify();
+            return;
+        }
         let change = if pinned {
             zeron_proto::SidebarPinChange::Pin {
-                session_id: chat_id,
+                session_id: chat_id.clone(),
                 after: pins.last().cloned(),
                 before: None,
             }
         } else {
             zeron_proto::SidebarPinChange::Unpin {
-                session_id: chat_id,
+                session_id: chat_id.clone(),
             }
         };
-        self.apply_sidebar_pin_change(profile_key, change, cx);
+        if self.apply_sidebar_pin_change(profile_key, change, cx)
+            && pinned
+            && self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local)
+        {
+            self.assign_sidebar_section(&chat_id, None, cx);
+        }
         cx.notify();
     }
 
@@ -4422,6 +4484,8 @@ impl Shell {
     /// stranding it over a session the user never picked.
     pub(super) fn overlay_owns_keyboard(&self, cx: &App) -> bool {
         self.command_palette.is_some()
+            || self.section_dialog.is_some()
+            || self.section_menu.is_some()
             || self.add_space.is_some()
             || self.composer.read(cx).pickers().read(cx).is_open()
     }
@@ -6695,18 +6759,20 @@ impl Shell {
             .moving_row
             .map(|(row, height)| self.render_moving_sidebar_session(row, height, theme));
         let pinned_count = session_rows.pinned_count;
+        let custom_count = session_rows.custom_count;
+        let regular_start = pinned_count + custom_count;
         let keyed = session_rows.rows;
         let regular_count = session_rows.regular_count;
         let ungrouped = self.settings.sidebar_organization == SidebarOrganization::InOneList;
         let regular_body_height = spaces::SIDEBAR_DISCLOSURE_BODY_INSET
             + keyed
                 .iter()
-                .skip(pinned_count)
+                .skip(regular_start)
                 .map(|(_, height, _)| height)
                 .sum::<f32>()
-            + SIDEBAR_LIST_GAP * keyed.len().saturating_sub(pinned_count + 1) as f32;
+            + SIDEBAR_LIST_GAP * keyed.len().saturating_sub(regular_start + 1) as f32;
         let regular_body_height =
-            if keyed.len() == pinned_count && self.sidebar_session_transfer.is_some() {
+            if keyed.len() == regular_start && self.sidebar_session_transfer.is_some() {
                 spaces::SIDEBAR_DISCLOSURE_BODY_INSET
                     + 48.0
                     + self.sidebar_transfer_extra_gap("regular")
@@ -6743,11 +6809,15 @@ impl Shell {
             ));
         }
         for (ix, (key, height, _)) in keyed.iter().enumerate() {
-            if ungrouped && ix == pinned_count {
+            if ungrouped && ix == regular_start {
                 order.push((
                     "sidebar-sessions-header".into(),
                     spaces::SIDEBAR_DISCLOSURE_HEADER_HEIGHT
-                        + if show_pinned_section { 12.0 } else { 0.0 }
+                        + if show_pinned_section || custom_count > 0 {
+                            12.0
+                        } else {
+                            0.0
+                        }
                         + if self.sessions_open {
                             spaces::SIDEBAR_DISCLOSURE_BODY_INSET - SIDEBAR_LIST_GAP
                         } else {
@@ -6755,7 +6825,7 @@ impl Shell {
                         },
                 ));
             }
-            if ungrouped && ix >= pinned_count && !self.sessions_open {
+            if ungrouped && ix >= regular_start && !self.sessions_open {
                 continue;
             }
             if ix < pinned_count && !self.pinned_open {
@@ -6873,45 +6943,39 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let (user_line, trigger_subline, menu_identity): (
-            SharedString,
-            Option<SharedString>,
-            SharedString,
-        ) = match workspace_scope {
+        let (user_line, menu_identity): (SharedString, SharedString) = match workspace_scope {
             Some(WorkspaceScope::Local) => {
                 let line = if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
                     "Sync ready after restart"
                 } else {
                     "Local only"
                 };
-                (line.into(), None, "Stored on this device".into())
+                (line.into(), "Stored on this device".into())
             }
-            Some(WorkspaceScope::Development) => (
-                "Development".into(),
-                Some("Local development runtime".into()),
-                "Authentication disabled".into(),
-            ),
+            Some(WorkspaceScope::Development) => {
+                ("Development".into(), "Authentication disabled".into())
+            }
             Some(WorkspaceScope::Synced) | None => {
                 let line: SharedString = user
                     .as_ref()
                     .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-                    .unwrap_or_else(|| SharedString::from("Not signed in"));
+                    .unwrap_or_else(|| "Not signed in".into());
                 let email = user
                     .as_ref()
                     .map(|u| SharedString::from(u.email.clone()))
                     .unwrap_or_else(|| line.clone());
-                (line, Some("Alpha".into()), email)
+                (line, email)
             }
         };
-        let user_menu =
-            self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
+        let user_menu = self.render_user_menu(user_line, menu_identity, theme, cx);
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
         let active_list = if !list_items.is_empty() {
             let mut pinned_items = list_items;
-            let regular_items = pinned_items.split_off(pinned_count);
+            let mut custom_items = pinned_items.split_off(pinned_count);
+            let regular_items = custom_items.split_off(custom_count);
             let regular_empty = regular_items.is_empty();
             let pinned_group = show_pinned_section
                 .then(|| self.render_pinned_section(pinned_items, pinned_body_height, theme, cx));
@@ -6922,6 +6986,7 @@ impl Shell {
                 .gap(px(SIDEBAR_LIST_GAP))
                 .pb(px(Theme::SPACE_SM))
                 .when_some(pinned_group, |el, group| el.child(group))
+                .children(custom_items)
                 .when(
                     !regular_items.is_empty() || self.sidebar_session_transfer.is_some(),
                     |el| {
@@ -6991,7 +7056,7 @@ impl Shell {
                                     .into_any_element(),
                                 regular_body_height,
                                 regular_count,
-                                show_pinned_section,
+                                show_pinned_section || custom_count > 0,
                                 theme,
                                 cx,
                             ),
@@ -7273,7 +7338,6 @@ impl Shell {
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
-        trigger_subline: Option<SharedString>,
         menu_identity: SharedString,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -7281,9 +7345,9 @@ impl Shell {
         let theme = &theme.for_popup();
         let open = self.user_menu.is_open();
         let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
-        // Bottom-of-sidebar identity: avatar circle + scope/account label and
-        // its secondary status line.
+        // Only the compact avatar button is interactive; footer whitespace is not.
         let initial: SharedString = user_line
+            .trim()
             .chars()
             .next()
             .map(|c| c.to_uppercase().to_string())
@@ -7291,14 +7355,18 @@ impl Shell {
             .into();
         let mut trigger = div()
             .id("user-menu")
+            .debug_selector(|| "user-menu".into())
+            .role(gpui::Role::Button)
+            .aria_label(format!("Account menu: {user_line}"))
+            .relative()
+            .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE + 8.0))
             .flex_none()
-            .rounded(px(8.0))
-            .px(px(Theme::SPACE_SM))
-            .py(px(Theme::SPACE_SM))
+            .rounded_full()
+            .p(px(4.0))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(10.0))
+            .justify_center()
             .cursor_pointer()
             // user-menu.tsx trigger: hover `bg-white/[0.04]`, open state
             // (`data-[state=open]`) the slightly stronger `bg-white/[0.06]`;
@@ -7330,51 +7398,22 @@ impl Shell {
             .child(
                 // Avatar: white circle, initial in near-black (zeron user-menu.tsx).
                 div()
-                    .size(px(28.0))
+                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
                     .flex_none()
                     .rounded_full()
                     .bg(theme.text)
                     .flex()
                     .items_center()
                     .justify_center()
-                    .text_size(crate::typography::ui_rems(12.0))
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(9.0))
+                    .line_height(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
                     .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.bg)
-                    .child(initial),
-            )
-            .child(
-                // Name with an optional status line underneath — no chip on the right.
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(crate::typography::ui_rems(13.0))
-                            .line_height(px(17.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .truncate()
-                            .child(user_line.clone()),
-                    )
-                    .when_some(trigger_subline, |identity, subline| {
-                        identity.child(
-                            div()
-                                .text_size(crate::typography::ui_rems(11.0))
-                                .line_height(px(15.0))
-                                .text_color(theme.text_muted)
-                                .child(subline),
-                        )
-                    }),
+                    .child(div().w_full().text_center().child(initial)),
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
-            // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
-            // (exactly as wide as the trigger row — sidebar minus its p-2
-            // gutters), `flex-col gap-0.5`, then: one small muted email line
-            // (`px-2 pb-1 pt-1.5 text-[11px] text-muted-foreground/70`),
-            // the action selected by the runtime scope, then "Settings".
             let menu = popover::popover_card(theme)
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -7460,7 +7499,7 @@ impl Shell {
                         .child(SharedString::from("Settings")),
                 )
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu_above(
+            trigger = trigger.child(popover::anchored_menu_right(
                 "user-menu-popover",
                 menu,
                 closing,
@@ -8235,6 +8274,7 @@ impl Shell {
         }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
+        overlays.extend(self.render_section_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_command_palette(viewport, window, cx) {
             overlays.push(overlay);
         }
@@ -10603,6 +10643,32 @@ impl Render for Shell {
                 });
             }));
         }
+        if let Some(command) = self.pending_workspace_command.take() {
+            use crate::composer::WorkspaceCommand;
+            match command {
+                WorkspaceCommand::Model => self
+                    .composer
+                    .update(cx, |c, cx| c.open_model_menu(window, cx)),
+                WorkspaceCommand::New => self.open_new_session(cx),
+                WorkspaceCommand::Resume => self.toggle_command_palette(window, cx),
+                WorkspaceCommand::Settings => self.open_settings(SettingsSection::Devices, cx),
+                WorkspaceCommand::Diff if !self.active_chat.is_empty() => self.add_diff_surface(cx),
+                WorkspaceCommand::Files if !self.active_chat.is_empty() => {
+                    self.add_files_surface(window, cx)
+                }
+                WorkspaceCommand::Terminal if !self.active_chat.is_empty() => {
+                    self.add_terminal_surface(cx)
+                }
+                WorkspaceCommand::Rename if !self.active_chat.is_empty() => {
+                    self.open_rename_chat(self.active_chat.clone(), cx)
+                }
+                WorkspaceCommand::Stop => {
+                    self.composer.update(cx, |c, cx| c.interrupt_selected(cx))
+                }
+                _ => {}
+            }
+        }
+
         self.render_time = Some(std::time::Instant::now());
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()
@@ -10882,6 +10948,13 @@ impl Render for Shell {
                     }
                 }
             }))
+            // The explorer's own toggle (the titlebar tree button): docks or
+            // undocks the explorer portion without touching the surface host.
+            .on_action(cx.listener(|this, _: &ToggleFiles, window, cx| {
+                if matches!(this.route, Route::Chat) {
+                    this.toggle_files_panel(window, cx);
+                }
+            }))
             // Chat-scoped like the panel toggles: Settings has no current
             // session to archive. Quiet under an open popover, like the other
             // session-nav shortcuts.
@@ -10964,7 +11037,7 @@ impl Render for Shell {
                 if self.debug_dialog.as_deref() == Some("model") {
                     self.debug_dialog = None;
                     self.composer
-                        .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
+                        .update(cx, |c, cx| c.open_model_menu(window, cx));
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
                 let viewport = f32::from(window.viewport_size().width);
@@ -12595,6 +12668,13 @@ mod exit_regressions {
                         settings.code_font_family = code_family.clone();
                         settings.code_font_size = code_size;
                         settings.transcript_width = transcript_width;
+                        settings.skill_completion_by_harness.insert(
+                            zeron_proto::HarnessId::ClaudeCode,
+                            settings::SkillCompletionSettings {
+                                dollar: open_links_in_zeron,
+                                separate_from_slash: true,
+                            },
+                        );
                     });
                     for step in 0..3 {
                         shell.settings.sidebar_width = 290.0 + step as f32;
@@ -12610,6 +12690,17 @@ mod exit_regressions {
                         assert_eq!(current.code_font_family, code_family);
                         assert_eq!(current.code_font_size, code_size);
                         assert_eq!(current.transcript_width, transcript_width);
+                        assert_eq!(
+                            current
+                                .skill_completion(zeron_proto::HarnessId::ClaudeCode)
+                                .dollar,
+                            open_links_in_zeron
+                        );
+                        assert!(
+                            current
+                                .skill_completion(zeron_proto::HarnessId::ClaudeCode)
+                                .separate_from_slash
+                        );
                     }
                     settings::flush(cx);
                     let loaded = settings::UiSettings::load(dir.path());
@@ -12627,6 +12718,60 @@ mod exit_regressions {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn workspace_slash_commands_open_existing_zeron_surfaces(cx: &mut TestAppContext) {
+        use crate::composer::WorkspaceCommand;
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                shell.pending_workspace_command = Some(WorkspaceCommand::Settings);
+                let _ = shell.render(window, cx);
+                assert!(matches!(shell.route, Route::Settings(_)));
+                shell.pending_workspace_command = Some(WorkspaceCommand::New);
+                let _ = shell.render(window, cx);
+                assert!(matches!(shell.route, Route::Chat));
+                assert!(shell.state.read(cx).selected_chat.is_none());
+                shell.pending_workspace_command = Some(WorkspaceCommand::Resume);
+                let _ = shell.render(window, cx);
+                assert!(shell.command_palette.is_some());
+                shell.close_command_palette(window, cx);
+                shell.pending_workspace_command = Some(WorkspaceCommand::Model);
+                let _ = shell.render(window, cx);
+                assert!(shell.composer.read(cx).pickers().read(cx).is_open());
+                assert!(shell.pending_workspace_command.is_none());
+            })
+            .unwrap();
     }
 
     #[gpui::test]

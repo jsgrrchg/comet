@@ -624,14 +624,22 @@ impl Render for ChatActivity {
         if self.chat_id.is_empty() {
             return div().into_any_element();
         }
-        if std::mem::take(&mut self.focus_pending) {
-            window.focus(&self.search.focus_handle(cx), cx);
-        }
         let theme = Theme::of(cx).clone();
         let state = self.state.read(cx);
         let agents = subagent_rows(state, &self.chat_id).len();
         let chats = child_chat_rows(state, &self.chat_id, Utc::now()).len();
         let count = agents + chats;
+        if count == 0 {
+            self.menu = popover::Popup::default();
+            self.focus_pending = false;
+            if self.focus.contains_focused(window, cx) {
+                window.focus(&self.composer_focus, cx);
+            }
+            return gpui::Empty.into_any_element();
+        }
+        if std::mem::take(&mut self.focus_pending) {
+            window.focus(&self.search.focus_handle(cx), cx);
+        }
         let label = format!("Subagents and side chats: {agents} subagents, {chats} side chats");
         let mut trigger = div()
             .id("chat-activity-trigger")
@@ -1051,11 +1059,43 @@ mod tests {
             assert!(activity.search.read(cx).text().is_empty());
         });
 
-        click(cx, "chat-activity-trigger");
+        assert!(cx.debug_bounds("chat-activity-trigger").is_none());
         assert!(cx.debug_bounds("chat-activity-chat-child").is_none());
+        let state = activity.read_with(cx, |activity, _| activity.state.clone());
+        state.update(cx, |state, cx| {
+            state.chats.push(chat("other-child", Some("other"), 1));
+            cx.notify();
+        });
+        click(cx, "chat-activity-trigger");
+        assert!(cx.debug_bounds("chat-activity-chat-other-child").is_some());
         let outside = gpui::point(px(5.0), px(5.0));
         cx.simulate_mouse_down(outside, MouseButton::Left, gpui::Modifiers::default());
         assert!(!activity.read_with(cx, |activity, _| activity.is_open()));
+
+        activity.update(cx, |activity, cx| {
+            activity.menu = popover::Popup::default();
+            cx.notify();
+        });
+        click(cx, "chat-activity-trigger");
+        state.update(cx, |state, cx| {
+            state.chats.last_mut().unwrap().archived = true;
+            cx.notify();
+        });
+        assert!(cx.debug_bounds("chat-activity-trigger").is_none());
+        assert!(cx.debug_bounds("chat-activity-menu").is_none());
+        assert!(!activity.read_with(cx, |activity, _| activity.is_open()));
+
+        state.update(cx, |state, cx| {
+            state.transcript = vec![entry(vec![spawn(
+                "t2",
+                "Agent: verify",
+                Some("sub-2"),
+                Some(SubagentStatus::Running),
+            )])];
+            cx.notify();
+        });
+        click(cx, "chat-activity-trigger");
+        assert!(cx.debug_bounds("chat-activity-subagent-sub-2").is_some());
     }
 
     fn chat(id: &str, parent: Option<&str>, minutes_ago: i64) -> Chat {

@@ -141,6 +141,10 @@ struct ChatMenuState {
     page: ChatMenuPage,
 }
 
+const CHAT_MENU_UNREAD_ID: &str = "chat-menu-unread";
+const CHAT_MENU_UNREAD_LABEL: &str = "Unread";
+const CHAT_MENU_UNREAD_ICON: &str = icons::EYE_CLOSED;
+
 /// Interruptible height tween for the sidebar's device/archive disclosures.
 /// The rendered element owns the frame clock; this state preserves the current
 /// interpolated height when a second click reverses an in-flight transition.
@@ -7968,13 +7972,13 @@ impl Shell {
                     .child({
                         let row =
                             popover::menu_row(&theme, false, format!("chat-menu-unread-{chat_id}"))
-                                .id("chat-menu-unread")
+                                .id(CHAT_MENU_UNREAD_ID)
                                 .child(
-                                    icon(icons::EYE_CLOSED)
+                                    icon(CHAT_MENU_UNREAD_ICON)
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Unread"));
+                                .child(SharedString::from(CHAT_MENU_UNREAD_LABEL));
                         if unread_enabled {
                             row.on_click(cx.listener(move |this, _, _, cx| {
                                 this.mark_chat_unread(unread_id.clone(), cx)
@@ -12240,6 +12244,20 @@ mod tests {
         tween.started = std::time::Instant::now() - motion::COLLAPSE.total().mul_f32(2.0);
         assert_eq!(tween.current(), 0.0);
         assert!(!tween.animating());
+    }
+
+    #[test]
+    fn unread_row_has_the_committed_structure_and_order() {
+        assert_eq!(CHAT_MENU_UNREAD_LABEL, "Unread");
+        assert_eq!(CHAT_MENU_UNREAD_ICON, icons::EYE_CLOSED);
+        let source = include_str!("shell.rs");
+        let pin = source.find(".id(\"chat-menu-pin\")").unwrap();
+        let unread = source.find(".id(CHAT_MENU_UNREAD_ID)").unwrap();
+        let archive = source.find(".id(\"chat-menu-archive\")").unwrap();
+        assert!(pin < unread && unread < archive);
+        let unread_block = &source[unread..archive];
+        assert!(unread_block.contains("if unread_enabled"));
+        assert!(unread_block.contains("mark_chat_unread"));
     }
 }
 

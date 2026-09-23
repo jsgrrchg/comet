@@ -135,14 +135,16 @@ final class SessionStoreDurabilityTests: XCTestCase {
     }
 
     func testCommitAsyncRetiresDebounceWhileExporting() async {
+        let scheduler = ManualDocSaverScheduler()
         let started = expectation(description: "detached export started")
         let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
         var saves = 0
         var wrote = false
         let saver = DocSaver(save: {
             saves += 1
             return true
-        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000, scheduler: scheduler)
         saver.poke()
 
         let task = Task { @MainActor in
@@ -159,8 +161,8 @@ final class SessionStoreDurabilityTests: XCTestCase {
             )
         }
 
-        await fulfillment(of: [started], timeout: 1)
-        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        await fulfillment(of: [started], timeout: 5)
+        await scheduler.advance(by: 2_000_000_000)
         XCTAssertEqual(saves, 0)
         XCTAssertFalse(wrote)
 
@@ -172,29 +174,32 @@ final class SessionStoreDurabilityTests: XCTestCase {
     }
 
     func testRetireTimersLeavesDirtyAndCancelsDebounce() async {
+        let scheduler = ManualDocSaverScheduler()
         var saves = 0
         let saver = DocSaver(save: {
             saves += 1
             return true
-        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000, scheduler: scheduler)
         saver.poke()
         saver.retireTimers()
 
-        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        await scheduler.advance(by: 11_000_000_000)
         XCTAssertTrue(saver.isDirty)
         XCTAssertEqual(saves, 0)
     }
 
     func testCommitAsyncRetiresRetryWhileExporting() async {
+        let scheduler = ManualDocSaverScheduler()
         let started = expectation(description: "detached export started")
         let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
         var saves = 0
         var shouldSucceed = false
         var wrote = false
         let saver = DocSaver(save: {
             saves += 1
             return shouldSucceed
-        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000, scheduler: scheduler)
         saver.poke()
         XCTAssertFalse(saver.commitNow())
         XCTAssertEqual(saves, 1)
@@ -213,8 +218,8 @@ final class SessionStoreDurabilityTests: XCTestCase {
             )
         }
 
-        await fulfillment(of: [started], timeout: 1)
-        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        await fulfillment(of: [started], timeout: 5)
+        await scheduler.advance(by: 2_500_000_000)
         XCTAssertEqual(saves, 1)
         XCTAssertFalse(wrote)
 
@@ -227,8 +232,10 @@ final class SessionStoreDurabilityTests: XCTestCase {
     }
 
     func testAsyncFlushesRetireBothTimers() async {
+        let scheduler = ManualDocSaverScheduler()
         let started = expectation(description: "first detached export started")
         let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
         var aSaves = 0
         var bSaves = 0
         var aWrote = false
@@ -236,11 +243,11 @@ final class SessionStoreDurabilityTests: XCTestCase {
         let a = DocSaver(save: {
             aSaves += 1
             return true
-        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000, scheduler: scheduler)
         let b = DocSaver(save: {
             bSaves += 1
             return true
-        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000)
+        }, quietDebounceNs: 1_500_000_000, maxDeferralNs: 10_000_000_000, scheduler: scheduler)
         a.poke()
         b.poke()
         a.retireTimers()
@@ -267,8 +274,8 @@ final class SessionStoreDurabilityTests: XCTestCase {
             )
         }
 
-        await fulfillment(of: [started], timeout: 1)
-        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        await fulfillment(of: [started], timeout: 5)
+        await scheduler.advance(by: 11_000_000_000)
         XCTAssertEqual(aSaves, 0)
         XCTAssertEqual(bSaves, 0)
 
@@ -314,57 +321,84 @@ final class SessionStoreDurabilityTests: XCTestCase {
     }
 
     func testQuietDebounceCoalescesContinuousPokes() async {
+        let scheduler = ManualDocSaverScheduler()
         var saves = 0
+        var callbacks = 0
         let saver = DocSaver(save: {
             saves += 1
             return true
-        }, quietDebounceNs: 300_000_000, maxDeferralNs: 10_000_000_000)
+        }, quietDebounceNs: 300_000_000, maxDeferralNs: 10_000_000_000, scheduler: scheduler)
+        saver.onSaved = { callbacks += 1 }
 
         for _ in 0..<40 {
             saver.poke()
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            await scheduler.advance(by: 50_000_000)
+            XCTAssertEqual(saves, 0, "Every poke must restart the quiet period")
         }
-        try? await Task.sleep(nanoseconds: 500_000_000)
-
+        // The last poke was 50 ms ago: stop one nanosecond before its deadline.
+        await scheduler.advance(by: 249_999_999)
+        XCTAssertEqual(saves, 0)
+        XCTAssertTrue(saver.isDirty)
+        await scheduler.advance(by: 1)
         XCTAssertEqual(saves, 1)
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertFalse(saver.isDirty)
+
+        // Superseded quiet timers and the old maximum deadline cannot save again.
+        await scheduler.advance(by: 10_000_000_000)
+        XCTAssertEqual(saves, 1)
+        XCTAssertEqual(callbacks, 1)
     }
 
     func testMaxDeferralFlushesDuringContinuousPokes() async {
+        let scheduler = ManualDocSaverScheduler()
         var saves = 0
+        var backgroundFlushes = 0
         let saver = DocSaver(save: {
             saves += 1
             return true
         }, quietDebounceNs: 5_000_000_000, maxDeferralNs: 400_000_000,
-        staleRetryNs: 400_000_000)
-        var backgroundFlushes = 0
+        staleRetryNs: 400_000_000, scheduler: scheduler)
         saver.background = {
             backgroundFlushes += 1
-            saves += 1
             return true
         }
 
-        for _ in 0..<20 {
+        // A new dirty cycle must get its own bounded deadline.
+        for cycle in 1...2 {
+            for _ in 0..<7 {
+                saver.poke()
+                await scheduler.advance(by: 50_000_000)
+                XCTAssertEqual(backgroundFlushes, cycle - 1)
+            }
             saver.poke()
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            await scheduler.advance(by: 49_999_999)
+            XCTAssertEqual(backgroundFlushes, cycle - 1)
+            await scheduler.advance(by: 1)
+            XCTAssertEqual(backgroundFlushes, cycle)
+            XCTAssertFalse(saver.isDirty)
         }
-
-        XCTAssertGreaterThanOrEqual(saves, 1)
-        XCTAssertGreaterThanOrEqual(backgroundFlushes, 1)
+        await scheduler.advance(by: 5_000_000_000)
+        XCTAssertEqual(backgroundFlushes, 2)
+        XCTAssertEqual(saves, 0, "The deadline must use the background hook")
     }
 
     func testStaleBackgroundExportRearmsBoundedDeadline() async {
+        let scheduler = ManualDocSaverScheduler()
         let started = expectation(description: "deadline export started")
         let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
         var exports = 0
         var writes = 0
         var callbacks = 0
         let saver = DocSaver(save: { true },
                              quietDebounceNs: 5_000_000_000,
-                             maxDeferralNs: 100_000_000,
-                             staleRetryNs: 300_000_000)
+                             maxDeferralNs: 400_000_000,
+                             staleRetryNs: 300_000_000, scheduler: scheduler)
         saver.onSaved = { callbacks += 1 }
-        saver.background = {
-            await saver.commitAsync(
+        saver.background = { [weak saver] in
+            guard let saver else { return false }
+            return await saver.commitAsync(
                 export: {
                     exports += 1
                     if exports == 1 {
@@ -381,37 +415,71 @@ final class SessionStoreDurabilityTests: XCTestCase {
         }
 
         saver.poke()
-        await fulfillment(of: [started], timeout: 1)
+        // Run the due action separately so the test can invalidate its blocked export.
+        let deadline = Task { await scheduler.advance(by: 400_000_000) }
+        await fulfillment(of: [started], timeout: 5)
         saver.poke()
         gate.signal()
-        try? await Task.sleep(nanoseconds: 100_000_000)
+        await deadline.value
 
         XCTAssertEqual(writes, 1)
         XCTAssertTrue(saver.isDirty)
         XCTAssertEqual(callbacks, 0)
 
-        let deadline = Date().addingTimeInterval(1.5)
-        while Date() < deadline, writes < 2 {
+        for _ in 0..<5 {
             saver.poke()
-            try? await Task.sleep(nanoseconds: 50_000_000)
+            await scheduler.advance(by: 50_000_000)
+            XCTAssertEqual(writes, 1)
         }
-        XCTAssertGreaterThanOrEqual(writes, 2)
+        saver.poke()
+        await scheduler.advance(by: 49_999_999)
+        XCTAssertEqual(writes, 1)
+        await scheduler.advance(by: 1)
+        XCTAssertEqual(exports, 2)
+        XCTAssertEqual(writes, 2)
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertFalse(saver.isDirty)
     }
 
-    func testDebounceUsesBackgroundHook() async {
+    func testFailedSaveRetriesAfterTwoSeconds() async {
+        let scheduler = ManualDocSaverScheduler()
+        var saves = 0
+        var callbacks = 0
+        let saver = DocSaver(save: {
+            saves += 1
+            return saves > 1
+        }, scheduler: scheduler)
+        saver.onSaved = { callbacks += 1 }
+        saver.poke()
+        XCTAssertFalse(saver.commitNow())
+        await scheduler.advance(by: 1_999_999_999)
+        XCTAssertEqual(saves, 1)
+        XCTAssertEqual(callbacks, 0)
+        XCTAssertTrue(saver.isDirty)
+        await scheduler.advance(by: 1)
+        XCTAssertEqual(saves, 2)
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertFalse(saver.isDirty)
+        await scheduler.advance(by: 300_000_000_000)
+        XCTAssertEqual(saves, 2)
+    }
+
+    func testRealTimerDebounceUsesBackgroundHook() async {
+        let saved = expectation(description: "real debounce invokes the background hook")
         var saves = 0
         var backgroundFlushes = 0
         let saver = DocSaver(save: {
             saves += 1
             return true
-        }, quietDebounceNs: 100_000_000, maxDeferralNs: 10_000_000_000)
+        }, quietDebounceNs: 10_000_000, maxDeferralNs: 10_000_000_000)
         saver.background = {
             backgroundFlushes += 1
             return true
         }
+        saver.onSaved = { saved.fulfill() }
 
         saver.poke()
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        await fulfillment(of: [saved], timeout: 5)
 
         XCTAssertEqual(saves, 0)
         XCTAssertEqual(backgroundFlushes, 1)

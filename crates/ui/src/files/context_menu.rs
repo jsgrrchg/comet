@@ -138,9 +138,14 @@ impl FilesSurface {
             .flex_col()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_tree_context_menu(cx)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        for (index, label) in ["Add to chat", "Copy path", "Rename…", "Delete…"]
-            .into_iter()
-            .enumerate()
+        for (index, (label, icon_path)) in [
+            ("Add to chat", icons::CHAT_ROUND_LINE),
+            ("Copy path", icons::COPY),
+            ("Rename…", icons::PEN),
+            ("Delete…", icons::TRASH_BIN_MINIMALISTIC),
+        ]
+        .into_iter()
+        .enumerate()
         {
             if index == 2 {
                 card = card.child(popover::menu_separator());
@@ -151,13 +156,7 @@ impl FilesSurface {
                     .id(gpui::SharedString::from(format!("tree-menu-{index}")))
                     .role(gpui::Role::MenuItem)
                     .aria_label(label)
-                    .when(index == 3, |row| {
-                        row.text_color(theme.danger).child(
-                            crate::icons::icon(icons::TRASH_BIN_MINIMALISTIC)
-                                .size(px(16.0))
-                                .text_color(theme.danger),
-                        )
-                    })
+                    .when(index == 3, |row| row.text_color(theme.danger))
                     .when(index == 1, |row| {
                         row.tooltip(|_, cx| {
                             cx.new(|_| preview::FileEditorTooltip {
@@ -172,6 +171,15 @@ impl FilesSurface {
                             this.dispatch_tree_menu(index, window, cx)
                         }))
                     })
+                    .child(
+                        icons::icon(icon_path)
+                            .size(px(16.0))
+                            .text_color(if index == 3 {
+                                theme.danger
+                            } else {
+                                theme.text_muted
+                            }),
+                    )
                     .child(label),
             );
         }

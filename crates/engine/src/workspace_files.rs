@@ -805,6 +805,7 @@ fn normalize_watch_events(
                     changes.insert(
                         path.clone(),
                         WorkspaceFileChange {
+                            operation_id: None,
                             kind: WorkspaceFileChangeKind::Modified,
                             path,
                             old_path: None,
@@ -815,6 +816,7 @@ fn normalize_watch_events(
                 changes.insert(
                     path.clone(),
                     WorkspaceFileChange {
+                        operation_id: None,
                         kind: WorkspaceFileChangeKind::Renamed,
                         path,
                         old_path: Some(old_path),
@@ -841,6 +843,7 @@ fn normalize_watch_events(
                 continue;
             };
             let incoming = WorkspaceFileChange {
+                operation_id: None,
                 kind,
                 path: path.clone(),
                 old_path: None,
@@ -1013,6 +1016,7 @@ fn list_directory_blocking(
             .as_ref()
             .is_some_and(|visible| !visible.contains(&path));
         entries.push(WorkspaceEntry {
+            mutation_revision: None,
             name: entry.file_name().to_string_lossy().into_owned(),
             path,
             kind,
@@ -1066,6 +1070,8 @@ fn list_directory_blocking(
         })
     });
     Ok(WorkspaceDirectoryPage {
+        checkout_id: None,
+        mutation_capabilities: None,
         directory: directory.wire_path(),
         entries: page_entries,
         next_cursor,

@@ -556,6 +556,7 @@ impl FileTreeModel {
 
 fn root_entry() -> WorkspaceEntry {
     WorkspaceEntry {
+        mutation_revision: None,
         path: String::new(),
         name: String::new(),
         kind: WorkspaceEntryKind::Directory,
@@ -614,6 +615,7 @@ mod tests {
 
     fn entry(path: &str, kind: WorkspaceEntryKind) -> WorkspaceEntry {
         WorkspaceEntry {
+            mutation_revision: None,
             path: path.into(),
             name: path.rsplit('/').next().unwrap_or(path).into(),
             kind,
@@ -630,6 +632,8 @@ mod tests {
         next_cursor: Option<&str>,
     ) -> WorkspaceDirectoryPage {
         WorkspaceDirectoryPage {
+            checkout_id: None,
+            mutation_capabilities: None,
             directory: directory.into(),
             entries,
             next_cursor: next_cursor.map(str::to_string),

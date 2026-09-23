@@ -1154,6 +1154,7 @@ fn forwardable(method: &str) -> bool {
             | methods::SEARCH_WORKSPACE_FILES
             | methods::READ_WORKSPACE_IMAGE
             | methods::READ_WORKSPACE_FILE
+            | methods::MOVE_WORKSPACE_ENTRY
             | methods::WRITE_WORKSPACE_FILE
             | methods::WATCH_WORKSPACE_FILES
             | methods::CREATE_WORKTREE
@@ -2499,6 +2500,15 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::from)?;
                 RpcReply::value(&file)
             }
+            methods::MOVE_WORKSPACE_ENTRY => {
+                let request: zeron_proto::MoveWorkspaceEntryRequest = parse_params(params)?;
+                let outcome = self
+                    .workspace_files
+                    .move_entry(request)
+                    .await
+                    .map_err(RpcError::from)?;
+                RpcReply::value(&outcome)
+            }
             methods::WRITE_WORKSPACE_FILE => {
                 let request: zeron_proto::WriteWorkspaceFileRequest = parse_params(params)?;
                 let outcome = tokio::time::timeout(
@@ -3280,6 +3290,7 @@ mod tests {
         assert!(forwardable(methods::SEARCH_WORKSPACE_FILES));
         assert!(forwardable(methods::READ_WORKSPACE_FILE));
         assert!(forwardable(methods::READ_WORKSPACE_IMAGE));
+        assert!(forwardable(methods::MOVE_WORKSPACE_ENTRY));
         assert!(forwardable(methods::WRITE_WORKSPACE_FILE));
         assert!(forwardable(methods::WATCH_WORKSPACE_FILES));
         assert!(forwardable(methods::WATCH_WORKSPACE_GIT_STATUS));

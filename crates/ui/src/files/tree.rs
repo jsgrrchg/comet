@@ -227,7 +227,12 @@ impl FilesSurface {
                 let focused = self.tree_focus.is_focused(window);
                 let is_directory = node.entry.kind == WorkspaceEntryKind::Directory;
                 let decoration = self.git_decoration(&row.path, is_directory, cx);
-                let drag_payload = WorkspacePathDrag::new(path.clone(), is_directory);
+                let drag_payload = WorkspacePathDrag::new(path.clone(), is_directory).with_origin(
+                    self.interaction_origin(cx),
+                    super::WorkspacePathSource::Tree,
+                    node.entry.mutation_revision.clone(),
+                );
+                let drag_owner = cx.weak_entity();
                 let renaming = self
                     .tree_rename
                     .as_ref()
@@ -295,10 +300,19 @@ impl FilesSurface {
                     .when(
                         crate::click_activation_drag_enabled() && !renaming,
                         |element| {
-                            element.on_drag(drag_payload, |payload, _, _, cx| {
+                            element.on_drag(drag_payload.clone(), move |payload, _, _, cx| {
+                                let _ = drag_owner
+                                    .update(cx, |files, cx| files.close_tree_context_menu(cx));
                                 cx.stop_propagation();
                                 workspace_path_drag_ghost(payload, cx)
                             })
+                        },
+                    )
+                    .when(
+                        !crate::click_activation_drag_enabled() && !renaming,
+                        |element| {
+                            element
+                                .child(super::workspace_drag_handle(drag_payload.clone(), &theme))
                         },
                     )
                     .child(

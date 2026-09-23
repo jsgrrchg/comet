@@ -77,13 +77,73 @@ pub(super) fn toolbar_button(id: &'static str, label: &'static str) -> gpui::Sta
 /// that workspace instead of leaking a path from the UI machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspacePathDrag {
+    pub origin: Option<mutations::WorkspaceInteractionOrigin>,
+    pub source: WorkspacePathSource,
+    pub revision: Option<String>,
     pub path: String,
     pub is_directory: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspacePathSource {
+    Tree,
+    Search,
+    FileTab,
+}
+
+pub(super) fn workspace_drag_handle(
+    payload: WorkspacePathDrag,
+    theme: &crate::theme::Theme,
+) -> gpui::AnyElement {
+    div()
+        .id(gpui::SharedString::from(format!(
+            "workspace-drag-handle:{}",
+            payload.path
+        )))
+        .w(px(18.))
+        .h(px(24.))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_grab()
+        .role(gpui::Role::Button)
+        .aria_label("Drag file to move or add to chat")
+        .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(|_, _, cx| cx.stop_propagation())
+        .on_drag(payload, |payload, _, _, cx| {
+            cx.stop_propagation();
+            workspace_path_drag_ghost(payload, cx)
+        })
+        .child(
+            crate::icons::icon(crate::icons::DRAG_HANDLE)
+                .size(px(12.))
+                .text_color(theme.text_faint),
+        )
+        .into_any_element()
+}
+
 impl WorkspacePathDrag {
     pub(crate) fn new(path: String, is_directory: bool) -> Self {
-        Self { path, is_directory }
+        Self {
+            path,
+            is_directory,
+            origin: None,
+            source: WorkspacePathSource::Search,
+            revision: None,
+        }
+    }
+
+    pub(crate) fn with_origin(
+        mut self,
+        origin: Option<mutations::WorkspaceInteractionOrigin>,
+        source: WorkspacePathSource,
+        revision: Option<String>,
+    ) -> Self {
+        self.origin = origin;
+        self.source = source;
+        self.revision = revision;
+        self
     }
 
     fn title(&self) -> SharedString {

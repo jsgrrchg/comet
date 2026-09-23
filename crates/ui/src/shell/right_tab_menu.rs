@@ -1,6 +1,15 @@
 //! Context actions for the session-owned right surface tabs.
 
 use super::*;
+use std::collections::VecDeque;
+
+pub(super) struct RightTabCloseBatch {
+    panel_key: String,
+    pub(super) target: RightSurface,
+    selection: RightSurface,
+    remaining: VecDeque<RightSurface>,
+    pub(super) waiting: Option<RightSurface>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RightTabCloseMode {
@@ -37,11 +46,358 @@ fn close_targets(
         .collect()
 }
 
+impl Shell {
+    fn right_tab_order(&self, cx: &App) -> Vec<RightSurface> {
+        self.right_surface_rows(cx)
+            .into_iter()
+            .map(|row| row.0)
+            .collect()
+    }
+
+    fn can_start_right_tab_close(&self) -> bool {
+        self.right_tab_close_batch.is_none()
+            && self.pending_file_closes.is_empty()
+            && self.pending_exit.is_none()
+    }
+
+    fn start_right_tab_close(
+        &mut self,
+        panel_key: &str,
+        target: RightSurface,
+        mode: RightTabCloseMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if panel_key != self.panel_key(cx) || !self.can_start_right_tab_close() {
+            return;
+        }
+        let targets = close_targets(&self.right_tab_order(cx), target, mode);
+        if targets.is_empty() {
+            return;
+        }
+        let active = self.resolved_right_active(cx);
+        let selection = if mode == RightTabCloseMode::Others || targets.contains(&active) {
+            target
+        } else {
+            active
+        };
+        self.right_tab_close_batch = Some(RightTabCloseBatch {
+            panel_key: panel_key.to_owned(),
+            target,
+            selection,
+            remaining: targets.into(),
+            waiting: None,
+        });
+        self.advance_right_tab_close(window, cx);
+    }
+
+    fn advance_right_tab_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        loop {
+            let Some(batch) = self.right_tab_close_batch.as_ref() else {
+                return;
+            };
+            let order = self.right_tab_order(cx);
+            if batch.panel_key != self.panel_key(cx) || !order.contains(&batch.target) {
+                self.right_tab_close_batch = None;
+                return;
+            }
+            if batch.waiting.is_some() {
+                return;
+            }
+            let batch = self.right_tab_close_batch.as_mut().unwrap();
+            let Some(surface) = batch.remaining.pop_front() else {
+                let selection = if order.contains(&batch.selection) {
+                    batch.selection
+                } else {
+                    batch.target
+                };
+                self.right_tab_close_batch = None;
+                self.set_right_active(selection, cx);
+                self.focus_right_file_editor(selection, window, cx);
+                return;
+            };
+            if !order.contains(&surface) {
+                continue;
+            }
+            // The individual close owns saving, PTYs, browser teardown and watches.
+            self.close_right_surface(surface, window, cx);
+            if self.pending_file_closes.contains(&surface) {
+                if let Some(batch) = self.right_tab_close_batch.as_mut() {
+                    batch.waiting = Some(surface);
+                }
+                return;
+            }
+        }
+    }
+
+    pub(super) fn resume_right_tab_close(
+        &mut self,
+        surface: RightSurface,
+        panel_key: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(batch) = self.right_tab_close_batch.as_mut()
+            && batch.panel_key == panel_key
+            && batch.waiting == Some(surface)
+        {
+            batch.waiting = None;
+            self.advance_right_tab_close(window, cx);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use RightSurface::{Browser, Diff, File, Picker, Subagent, Terminal};
     use RightTabCloseMode::{Left, Others, Right};
+    use gpui::{AppContext, TestAppContext};
+
+    fn setup(cx: &mut TestAppContext) -> (tempfile::TempDir, gpui::WindowHandle<Shell>) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("owner".into());
+                state
+            });
+            let mut shell = Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            );
+            shell.active_chat = "owner".into();
+            shell
+        });
+        (dir, window)
+    }
+
+    fn add_subagent(shell: &mut Shell, name: &str, cx: &mut Context<Shell>) -> RightSurface {
+        shell.add_subagent_surface("owner".into(), name.into(), name.into(), false, cx);
+        Subagent(shell.subagent_seq)
+    }
+
+    #[gpui::test]
+    fn bulk_close_releases_mixed_surfaces_and_selects_the_inactive_target(cx: &mut TestAppContext) {
+        let (_dir, handle) = setup(cx);
+        let weak = handle
+            .update(cx, |shell, window, cx| {
+                shell.add_file_surface("clean.rs".into(), window, cx);
+                let file = shell.file_surfaces[&shell.file_surface_seq].downgrade();
+                let target = add_subagent(shell, "keep", cx);
+                let removed = add_subagent(shell, "remove", cx);
+                shell.add_diff_surface(cx);
+                shell.add_browser_surface(None, window, cx);
+                // A real tab entity without an engine/PTY process in this fixture.
+                let terminal = shell.right_terminal_panel(cx);
+                let tab = terminal.update(cx, |panel, cx| {
+                    panel.reserve_tab_for_chat("owner".into(), "Terminal", cx)
+                });
+                shell
+                    .right_tabs
+                    .entry("owner".into())
+                    .or_default()
+                    .push(Terminal(tab));
+                assert!(
+                    shell
+                        .right_tab_order(cx)
+                        .iter()
+                        .any(|s| matches!(s, Terminal(_)))
+                );
+                shell.start_right_tab_close("owner", target, Others, window, cx);
+                assert_eq!(shell.right_tab_order(cx), [target]);
+                assert_eq!(shell.resolved_right_active(cx), target);
+                assert!(shell.right_tab_close_batch.is_none());
+                assert!(shell.file_surfaces.is_empty());
+                assert!(shell.file_surface_keys.is_empty());
+                assert!(shell.file_surface_subs.is_empty());
+                assert!(shell.diffs.is_empty());
+                assert!(shell.diff_subs.is_empty());
+                assert!(shell.browsers.is_empty());
+                assert!(shell.browser_subs.is_empty());
+                assert!(!shell.right_tab_order(cx).contains(&removed));
+                assert!(
+                    shell
+                        .right_terminal
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .tab_summaries(cx)
+                        .is_empty()
+                );
+                file
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[gpui::test]
+    fn directional_closes_preserve_surviving_selection_or_select_target(cx: &mut TestAppContext) {
+        let (_dir, handle) = setup(cx);
+        handle
+            .update(cx, |shell, window, cx| {
+                let a = add_subagent(shell, "a", cx);
+                let b = add_subagent(shell, "b", cx);
+                let c = add_subagent(shell, "c", cx);
+                shell.start_right_tab_close("other-session", b, Others, window, cx);
+                assert_eq!(shell.right_tab_order(cx), [a, b, c]);
+                shell.start_right_tab_close("owner", b, Left, window, cx);
+                assert_eq!(shell.right_tab_order(cx), [b, c]);
+                assert_eq!(shell.resolved_right_active(cx), c);
+                shell.start_right_tab_close("owner", b, Right, window, cx);
+                assert_eq!(shell.right_tab_order(cx), [b]);
+                assert_eq!(shell.resolved_right_active(cx), b);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn pending_and_failed_files_pause_batches_until_discard_or_keep_open(cx: &mut TestAppContext) {
+        let (_dir, handle) = setup(cx);
+        for (failed, keep_open) in [(false, false), (true, false), (true, true)] {
+            let (file, target, tail) = handle
+                .update(cx, |shell, window, cx| {
+                    // Clear the previous scenario using the ordinary close path.
+                    for surface in shell.right_tab_order(cx) {
+                        shell.close_right_surface(surface, window, cx);
+                    }
+                    shell.add_file_surface("test.rs".into(), window, cx);
+                    let file = shell.file_surfaces[&shell.file_surface_seq].clone();
+                    file.update(cx, |file, _| file.seed_pending_exit_test_document(failed));
+                    let target = add_subagent(shell, "keep", cx);
+                    let tail = add_subagent(shell, "tail", cx);
+                    shell.start_right_tab_close("owner", target, Others, window, cx);
+                    assert_eq!(shell.right_tab_order(cx).len(), 3);
+                    let waiting = shell.right_tab_close_batch.as_ref().unwrap().waiting;
+                    assert_eq!(waiting, Some(File(shell.file_surface_seq)));
+                    assert_eq!(shell.resolved_right_active(cx), waiting.unwrap());
+                    shell.start_right_tab_close("owner", tail, Left, window, cx);
+                    assert_eq!(shell.right_tab_close_batch.as_ref().unwrap().target, target);
+                    (file, target, tail)
+                })
+                .unwrap();
+            file.update(cx, |file, cx| file.resolve_test_file_close(keep_open, cx));
+            cx.run_until_parked();
+            handle
+                .update(cx, |shell, _, cx| {
+                    assert!(shell.right_tab_close_batch.is_none());
+                    assert!(shell.pending_file_closes.is_empty());
+                    if keep_open {
+                        assert_eq!(shell.right_tab_order(cx).len(), 3);
+                        assert!(shell.right_tab_order(cx).contains(&tail));
+                        assert!(matches!(shell.resolved_right_active(cx), File(_)));
+                    } else {
+                        assert_eq!(shell.right_tab_order(cx), [target]);
+                        assert_eq!(shell.resolved_right_active(cx), target);
+                    }
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn successful_save_resumes_snapshot_and_target_close_cancels_it(cx: &mut TestAppContext) {
+        let (_dir, handle) = setup(cx);
+        for (failed, close_target) in [(false, false), (true, false), (false, true)] {
+            let (file, target, added) = handle
+                .update(cx, |shell, window, cx| {
+                    for surface in shell.right_tab_order(cx) {
+                        shell.close_right_surface(surface, window, cx);
+                    }
+                    shell.add_file_surface("test.rs".into(), window, cx);
+                    let file = shell.file_surfaces[&shell.file_surface_seq].clone();
+                    file.update(cx, |file, _| file.seed_pending_exit_test_document(failed));
+                    let target = add_subagent(shell, "keep", cx);
+                    let tail = add_subagent(shell, "tail", cx);
+                    shell.start_right_tab_close("owner", target, Others, window, cx);
+                    assert!(
+                        shell
+                            .right_tab_close_batch
+                            .as_ref()
+                            .unwrap()
+                            .waiting
+                            .is_some()
+                    );
+                    let added = add_subagent(shell, "opened-after-snapshot", cx);
+                    // A queued candidate can disappear independently while saving.
+                    shell.close_right_surface(tail, window, cx);
+                    if close_target {
+                        shell.close_right_surface(target, window, cx);
+                        assert!(shell.right_tab_close_batch.is_none());
+                    }
+                    (file, target, added)
+                })
+                .unwrap();
+            file.update(cx, |file, cx| file.finish_test_file_save(cx));
+            cx.run_until_parked();
+            handle
+                .update(cx, |shell, _, cx| {
+                    assert!(shell.right_tab_close_batch.is_none());
+                    assert!(shell.pending_file_closes.is_empty());
+                    if close_target {
+                        assert_eq!(shell.right_tab_order(cx), [added]);
+                        assert_eq!(shell.resolved_right_active(cx), added);
+                    } else {
+                        assert_eq!(shell.right_tab_order(cx), [target, added]);
+                        assert_eq!(shell.resolved_right_active(cx), target);
+                    }
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn pending_close_cannot_continue_in_another_session(cx: &mut TestAppContext) {
+        let (_dir, handle) = setup(cx);
+        let (file, target, tail) = handle
+            .update(cx, |shell, window, cx| {
+                shell.add_file_surface("test.rs".into(), window, cx);
+                let file = shell.file_surfaces[&shell.file_surface_seq].clone();
+                file.update(cx, |file, _| file.seed_pending_exit_test_document(false));
+                let target = add_subagent(shell, "keep", cx);
+                let tail = add_subagent(shell, "tail", cx);
+                shell.start_right_tab_close("owner", target, Others, window, cx);
+                shell.state.update(cx, |state, cx| {
+                    state.select_chat(Some("new-session".into()), cx)
+                });
+                (file, target, tail)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let other = handle
+            .update(cx, |shell, _, cx| {
+                assert_eq!(shell.active_chat, "new-session");
+                assert!(shell.right_tab_close_batch.is_none());
+                add_subagent(shell, "other", cx)
+            })
+            .unwrap();
+        file.update(cx, |file, cx| file.resolve_test_file_close(false, cx));
+        cx.run_until_parked();
+        handle
+            .update(cx, |shell, _, cx| {
+                assert_eq!(shell.right_tab_order(cx), [other]);
+                assert_eq!(shell.resolved_right_active(cx), other);
+                assert_eq!(shell.right_tabs["owner"], [target, tail]);
+                assert!(shell.pending_file_closes.is_empty());
+            })
+            .unwrap();
+    }
 
     #[test]
     fn targets_follow_visible_order_for_every_surface_kind() {

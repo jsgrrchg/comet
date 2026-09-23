@@ -1523,6 +1523,7 @@ pub struct Shell {
     file_surface_subs: std::collections::HashMap<u64, Subscription>,
     file_surface_seq: u64,
     pending_file_closes: std::collections::HashSet<RightSurface>,
+    right_tab_close_batch: Option<right_tab_menu::RightTabCloseBatch>,
     pending_exit: Option<PendingExit>,
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
@@ -1937,6 +1938,7 @@ impl Shell {
             file_surface_subs: std::collections::HashMap::new(),
             file_surface_seq: 0,
             pending_file_closes: std::collections::HashSet::new(),
+            right_tab_close_batch: None,
             pending_exit: None,
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
@@ -2383,6 +2385,7 @@ impl Shell {
             self.last_appshot_chat = Some(selected.clone());
         }
         if selected != self.active_chat {
+            self.right_tab_close_batch = None;
             self.suspend_file_images(cx);
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
@@ -3047,9 +3050,12 @@ impl Shell {
                     FilesEvent::ShowAllFilesChanged(show_all_files) => {
                         this.set_files_show_all(*show_all_files, cx)
                     }
-                    FilesEvent::CloseReady => {
-                        this.on_file_close_ready(RightSurface::File(id), &event_panel_key, cx)
-                    }
+                    FilesEvent::CloseReady => this.on_file_close_ready(
+                        RightSurface::File(id),
+                        &event_panel_key,
+                        window,
+                        cx,
+                    ),
                     FilesEvent::CloseCancelled => {
                         this.cancel_file_close(RightSurface::File(id), cx)
                     }
@@ -3325,6 +3331,13 @@ impl Shell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .right_tab_close_batch
+            .as_ref()
+            .is_some_and(|batch| batch.target == surface)
+        {
+            self.right_tab_close_batch = None;
+        }
         let was_active = self.resolved_right_active(cx) == surface;
         let key = self.panel_key(cx);
         let files = match surface {
@@ -3335,6 +3348,7 @@ impl Shell {
             match files.update(cx, |files, cx| files.prepare_close(cx)) {
                 FilesCloseDisposition::Allow => {
                     self.complete_file_close(surface, &key, cx);
+                    self.resume_right_tab_close(surface, &key, window, cx);
                 }
                 FilesCloseDisposition::Pending | FilesCloseDisposition::Blocked => {
                     self.pending_file_closes.insert(surface);
@@ -3389,10 +3403,12 @@ impl Shell {
         &mut self,
         surface: RightSurface,
         panel_key: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.pending_file_closes.contains(&surface) {
             self.complete_file_close(surface, panel_key, cx);
+            self.resume_right_tab_close(surface, panel_key, window, cx);
         } else {
             if self.pending_exit.is_some() {
                 self.reveal_unsaved_file(cx);
@@ -3402,6 +3418,13 @@ impl Shell {
     }
 
     fn cancel_file_close(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
+        if self
+            .right_tab_close_batch
+            .as_ref()
+            .is_some_and(|batch| batch.waiting == Some(surface))
+        {
+            self.right_tab_close_batch = None;
+        }
         self.pending_file_closes.remove(&surface);
         self.pending_exit = None;
         cx.notify();
@@ -3446,6 +3469,7 @@ impl Shell {
     }
 
     fn prepare_exit(&mut self, action: PendingExit, cx: &mut Context<Self>) -> bool {
+        self.right_tab_close_batch = None;
         let surfaces = self.file_surfaces.values().cloned().collect::<Vec<_>>();
         if surfaces
             .iter()

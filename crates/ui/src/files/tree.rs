@@ -484,6 +484,11 @@ impl FilesSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Leave text input and editing shortcuts to the inline field. Stopping
+        // printable keys here would also prevent the platform's text insertion.
+        if self.tree_rename.is_some() {
+            return;
+        }
         if event.keystroke.key == "escape" && cx.has_active_drag() {
             cx.stop_active_drag(window);
             self.clear_tree_drag(window, cx);

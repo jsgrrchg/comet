@@ -160,13 +160,33 @@ impl FilesSurface {
             .tree_rename
             .as_ref()
             .filter(|rename| rename.path == path)?;
+        let theme = Theme::of(cx).clone();
+        // gpui-base's Input is unstyled: explicitly supply the same visible
+        // caret and selection colors as the file editor, including theme changes.
+        rename.input.update(cx, |input, _| {
+            input.set_editor_style(super::editor_adapter::editor_style(&theme));
+        });
         Some(
             div()
                 .id("tree-rename-input")
+                .debug_selector(|| "tree-rename-input".into())
                 .flex_1()
                 .min_w_0()
+                .h(px(23.))
+                .px(px(4.))
+                .flex()
+                .items_center()
+                .rounded(px(4.))
+                .border_1()
+                .border_color(theme.accent)
+                .bg(theme.input_glass_bg())
+                .font_family(theme.font_sans.clone())
+                .text_size(px(11.5))
+                .text_color(theme.text)
+                .cursor_text()
                 .occlude()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(|_, _, cx| cx.stop_propagation())
                 .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                     if event.keystroke.key == "escape" {
                         if this.tree_rename.as_ref().is_some_and(|r| !r.submitted) {
@@ -175,8 +195,8 @@ impl FilesSurface {
                             cx.notify();
                         }
                         window.prevent_default();
+                        cx.stop_propagation();
                     }
-                    cx.stop_propagation();
                 }))
                 .child(Input::new(&rename.input))
                 .into_any_element(),
@@ -330,6 +350,88 @@ impl FilesSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[gpui::test]
+    fn rename_input_keeps_focus_and_supports_caret_editing(cx: &mut gpui::TestAppContext) {
+        let (files, cx) = super::super::test_support::setup(cx);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let _sub = cx.update(|_, cx| {
+            cx.subscribe(&files, move |_, event, _| {
+                recorded.borrow_mut().push(event.clone())
+            })
+        });
+        files.update_in(cx, |files, window, cx| {
+            files.tree.select("a.txt");
+            files.tree_focus.focus(window, cx);
+        });
+        cx.simulate_keystrokes("f2");
+        let input = files.read_with(cx, |files, _| {
+            files.tree_rename.as_ref().unwrap().input.clone()
+        });
+        assert_eq!(input.read_with(cx, |input, _| input.selected_range()), 0..1);
+        cx.simulate_keystrokes("right");
+        assert_eq!(input.read_with(cx, |input, _| input.selected_range()), 1..1);
+        cx.simulate_input("b");
+        assert_eq!(
+            input.read_with(cx, |input, _| input.value().to_string()),
+            "ab.txt"
+        );
+
+        let bounds = cx.debug_bounds("tree-rename-input").unwrap();
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        files.update_in(cx, |files, window, cx| {
+            assert!(
+                files.tree_rename.is_some(),
+                "clicking the field must not activate its tree row"
+            );
+            assert!(input.focus_handle(cx).is_focused(window));
+            assert!(!files.tree_focus.is_focused(window));
+        });
+        for theme in [Theme::dark(), Theme::light()] {
+            cx.update(|window, cx| {
+                cx.set_global(theme);
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            input.read_with(cx, |input, _| {
+                let (caret, _) = input.cursor_layout().expect("rename must lay out a caret");
+                assert!(caret.size.width > px(0.));
+                assert!(caret.size.height > px(0.));
+                assert!(caret.left() >= bounds.left());
+                assert!(caret.right() <= bounds.right());
+                assert!(caret.top() >= bounds.top());
+                assert!(caret.bottom() <= bounds.bottom());
+            });
+        }
+        cx.simulate_keystrokes("escape");
+        files.update_in(cx, |files, window, _| {
+            assert!(files.tree_rename.is_none());
+            assert!(files.tree_focus.is_focused(window));
+        });
+        cx.run_until_parked();
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, FilesEvent::OpenFile(_) | FilesEvent::Mutate(_)))
+        );
+
+        cx.simulate_keystrokes("f2");
+        cx.simulate_input("résumé");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        let events = events.borrow();
+        let intents = events
+            .iter()
+            .filter_map(|event| match event {
+                FilesEvent::Mutate(intent) => Some(intent),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].destination.as_deref(), Some("résumé.txt"));
+    }
+
     #[gpui::test]
     fn refreshed_revision_does_not_authorize_an_already_open_confirmation(
         cx: &mut gpui::TestAppContext,

@@ -114,10 +114,11 @@ impl Shell {
         let RightSurface::File(id) = menu.target else {
             return None;
         };
-        self.file_surface_paths
-            .get(&id)
-            .filter(|path| !path.is_empty())
-            .cloned()
+        let path = self.file_surface_paths.get(&id)?;
+        self.file_surfaces
+            .get(&id)?
+            .read(cx)
+            .absolute_file_path(path)
     }
 
     fn copy_right_tab_path(&mut self, cx: &mut Context<Self>) {
@@ -572,11 +573,64 @@ mod tests {
             .unwrap();
     }
 
+    fn seed_remote_chat(shell: &mut Shell, cx: &mut Context<Shell>) {
+        shell.state.update(cx, |state, _| {
+            state.local_device_id = Some("viewer-host".into());
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "owner", "deviceId": "remote-host", "archived": false,
+                    "cwd": "/only/on/remote", "createdAt": "2026-09-23T00:00:00Z"
+                }))
+                .unwrap(),
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn copy_path_requires_context_and_keeps_the_dirty_editors_original_host(
+        cx: &mut TestAppContext,
+    ) {
+        let (_dir, handle) = setup(cx);
+        handle
+            .update(cx, |shell, window, cx| {
+                shell.add_file_surface("test.rs".into(), window, cx);
+                let target = File(shell.file_surface_seq);
+                let position = gpui::point(px(20.), px(20.));
+                cx.write_to_clipboard(ClipboardItem::new_string("unchanged".into()));
+                shell.open_right_tab_menu(target, position, cx);
+                shell.copy_right_tab_path(cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("unchanged")
+                );
+
+                seed_remote_chat(shell, cx);
+                let file = shell.file_surfaces[&shell.file_surface_seq].clone();
+                file.update(cx, |file, cx| {
+                    file.ensure_loaded(cx);
+                    file.seed_pending_exit_test_document(true);
+                });
+                shell.state.update(cx, |state, _| {
+                    state.chats[0].cwd = Some("/different/checkout".into());
+                    state.chats[0].device_id = "different-host".into();
+                });
+                file.update(cx, |file, cx| file.ensure_loaded(cx));
+                shell.open_right_tab_menu(target, position, cx);
+                shell.copy_right_tab_path(cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("/only/on/remote/test.rs")
+                );
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn copy_path_reads_current_workspace_path_and_rejects_stale_contexts(cx: &mut TestAppContext) {
         let (_dir, handle) = setup(cx);
         handle
             .update(cx, |shell, window, cx| {
+                seed_remote_chat(shell, cx);
                 shell.add_file_surface("src/original.rs".into(), window, cx);
                 let id = shell.file_surface_seq;
                 let target = File(id);
@@ -587,7 +641,7 @@ mod tests {
                 shell.copy_right_tab_path(cx);
                 assert_eq!(
                     cx.read_from_clipboard().unwrap().text().as_deref(),
-                    Some("src/área nueva.rs")
+                    Some("/only/on/remote/src/área nueva.rs")
                 );
                 assert_eq!(shell.resolved_right_active(cx), active);
                 assert!(!shell.right_tab_menu.is_open());

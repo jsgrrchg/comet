@@ -13563,6 +13563,16 @@ mod right_tab_mouse_regressions {
         cx.update(|window, cx| {
             shell.update(cx, |shell, cx| {
                 shell.close_right_tab_menu(cx);
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("viewer-host".into());
+                    state.chats.push(
+                        serde_json::from_value(serde_json::json!({
+                            "id": "parent", "deviceId": "remote-host", "archived": false,
+                            "cwd": "/only/on/remote", "createdAt": "2026-09-23T00:00:00Z"
+                        }))
+                        .unwrap(),
+                    );
+                });
                 shell.add_file_surface("src/old.rs".into(), window, cx);
                 shell.set_right_active(RightSurface::Subagent(2), cx);
             })
@@ -13583,7 +13593,7 @@ mod right_tab_mouse_regressions {
         shell.read_with(cx, |shell, cx| {
             assert_eq!(
                 cx.read_from_clipboard().unwrap().text().as_deref(),
-                Some("src/archivo ñ.rs")
+                Some("/only/on/remote/src/archivo ñ.rs")
             );
             assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(2));
             assert!(!shell.right_tab_menu.is_open());

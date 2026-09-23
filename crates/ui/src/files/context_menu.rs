@@ -1,6 +1,6 @@
 //! Tree menus share the editor's popup surface, positioning and dismissal.
 use super::*;
-use crate::{popover, theme::Theme};
+use crate::{icons, popover, theme::Theme};
 use gpui::{ClipboardItem, KeyDownEvent, MouseButton};
 use mutations::WorkspaceInteractionOrigin;
 
@@ -151,6 +151,13 @@ impl FilesSurface {
                     .id(gpui::SharedString::from(format!("tree-menu-{index}")))
                     .role(gpui::Role::MenuItem)
                     .aria_label(label)
+                    .when(index == 3, |row| {
+                        row.text_color(theme.danger).child(
+                            crate::icons::icon(icons::TRASH_BIN_MINIMALISTIC)
+                                .size(px(16.0))
+                                .text_color(theme.danger),
+                        )
+                    })
                     .when(index == 1, |row| {
                         row.tooltip(|_, cx| {
                             cx.new(|_| preview::FileEditorTooltip {

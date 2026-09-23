@@ -5,27 +5,6 @@ import XCTest
 
 @MainActor
 final class TranscriptLayoutTests: XCTestCase {
-    @MainActor
-    private final class DisplaySampler: NSObject {
-        private var link: CADisplayLink?
-        private let capture: (CADisplayLink) -> Void
-
-        init(capture: @escaping (CADisplayLink) -> Void) {
-            self.capture = capture
-            super.init()
-            let link = CADisplayLink(target: self, selector: #selector(tick(_:)))
-            self.link = link
-            link.add(to: .main, forMode: .common)
-        }
-
-        func stop() {
-            link?.invalidate()
-            link = nil
-        }
-
-        @objc private func tick(_ link: CADisplayLink) { capture(link) }
-    }
-
     private struct MotionSample: Codable {
         let timestamp: CFTimeInterval
         let targetTimestamp: CFTimeInterval
@@ -36,6 +15,42 @@ final class TranscriptLayoutTests: XCTestCase {
         let tailGap: CGFloat?
         let tailVisible: Bool
         let pinned: Bool
+    }
+
+    private struct GeometrySample: Codable {
+        let timestamp: CFTimeInterval
+        let targetTimestamp: CFTimeInterval
+        let callbackTime: CFTimeInterval
+        let position: CGFloat?
+        let modelPosition: CGFloat?
+        let viewport: CGRect?
+        let modelViewport: CGRect?
+        let tail: CGRect?
+
+        var gap: CGFloat? {
+            guard let viewport, let tail else { return nil }
+            return viewport.maxY - tail.maxY
+        }
+    }
+
+    private func geometrySample(_ link: CADisplayLink, position: CGFloat?, modelPosition: CGFloat?,
+                                tailKey: String?) -> GeometrySample {
+        TranscriptLayoutProbe.sample()
+        return GeometrySample(timestamp: link.timestamp, targetTimestamp: link.targetTimestamp,
+            callbackTime: CACurrentMediaTime(), position: position, modelPosition: modelPosition,
+            viewport: TranscriptLayoutProbe.presentedFrame(for: key),
+            modelViewport: TranscriptLayoutProbe.viewports[key],
+            tail: tailKey.flatMap { TranscriptLayoutProbe.presentedFrame(for: $0) })
+    }
+
+    private func attachMotion(_ name: String, samples: [GeometrySample], events: [String] = []) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(samples)
+        let attachment = XCTAttachment(string: "events=\(events)\nsamples=\(String(decoding: data, as: UTF8.self))")
+        attachment.name = name
+        attachment.lifetime = .keepAlways
+        add(attachment)
     }
 
     @Observable final class Harness {
@@ -203,43 +218,52 @@ final class TranscriptLayoutTests: XCTestCase {
         }
     }
 
-    func testToolGroupsRevealAndCollapseThroughIntermediateHeights() async {
+    func testToolGroupsRevealAndCollapseThroughIntermediateHeights() async throws {
         await mount(turns: 3)
         let rows = harness.store.transcriptCache.rows(revision: harness.store.revision,
             entries: harness.store.entries, pendingSends: harness.store.pendingSends)
         let index = rows.lastIndex { if case .toolGroup = $0.kind { return true }; return false }!
         let id = rows[index].id
-        harness.folds.values[id] = false
-        await settle()
         let table = harness.scroll.nativeScrollView as! TranscriptTableView
         let path = IndexPath(row: index, section: 0)
         let tailKey = key + "|" + rows.last!.id
+        // Measure the two endpoints independently of the animated samples.
+        harness.folds.values[id] = true
+        await settle()
+        let openedHeight = table.rectForRow(at: path).height
+        harness.folds.values[id] = false
+        await settle()
+        let closedHeight = table.rectForRow(at: path).height
+        XCTAssertGreaterThan(openedHeight - closedHeight, 100)
         for open in [true, false, true, false] {
-            let start = table.rectForRow(at: path).height
-            withAnimation(Motion.resize) { harness.folds.values[id] = open }
-            var heights: [CGFloat] = []
-            var gaps: [CGFloat] = []
-            for _ in 0..<30 {
-                try? await Task.sleep(for: .milliseconds(16))
-                heights.append(table.rectForRow(at: path).height)
-                if let viewport = TranscriptLayoutProbe.presentedFrame(for: key),
-                   let tail = TranscriptLayoutProbe.presentedFrame(for: tailKey) {
-                    gaps.append(viewport.maxY - tail.maxY)
+            let start = open ? closedHeight : openedHeight
+            let target = open ? openedHeight : closedHeight
+            var samples: [GeometrySample] = []
+            var stableFrames = 0
+            let completed = await DisplaySampler.observe("Tool disclosure reaches its endpoint") { [self] link in
+                let sample = geometrySample(link,
+                    position: table.cellForRow(at: path)?.layer.presentation()?.bounds.height,
+                    modelPosition: table.rectForRow(at: path).height, tailKey: tailKey)
+                samples.append(sample)
+                if samples.count == 1 {
+                    withAnimation(Motion.resize) { harness.folds.values[id] = open }
+                    return false
                 }
+                let atTarget = sample.position.map { abs($0 - target) <= 1 } ?? false
+                stableFrames = atTarget && abs(table.rectForRow(at: path).height - target) <= 1
+                    ? stableFrames + 1 : 0
+                return stableFrames == 3
             }
-            let attachment = XCTAttachment(string: "heights=\(heights)\ngaps=\(gaps)")
-            attachment.name = open ? "tool-opening-motion" : "tool-closing-motion"
-            attachment.lifetime = .keepAlways
-            add(attachment)
-            XCTAssertEqual(gaps.count, 30)
-            // Task.sleep is a minimum delay, not a display-frame clock. A
-            // loaded simulator can sample a 200ms transition fewer than six
-            // times. Require actual interpolation rather than a frame count.
-            let end = heights.last!
+            try attachMotion(open ? "tool-opening-motion" : "tool-closing-motion", samples: samples)
+            let heights = samples.compactMap(\.position)
+            let gaps = samples.compactMap(\.gap)
+            XCTAssertTrue(completed, "Disclosure did not reach its measured endpoint")
+            XCTAssertGreaterThan(samples.count, 1)
+            XCTAssertEqual(heights.count, samples.count, "The tool cell must remain presented")
+            XCTAssertEqual(gaps.count, samples.count, "Viewport and tail must remain presented")
             XCTAssertTrue(heights.contains {
-                $0 > min(start, end) + 1 && $0 < max(start, end) - 1
+                $0 > min(start, target) + 1 && $0 < max(start, target) - 1
             }, "Disclosure must render an intermediate height, not snap between endpoints")
-            XCTAssertGreaterThan(abs(end - start), 100)
             XCTAssertLessThan((gaps.max() ?? .infinity) - (gaps.min() ?? 0), 4)
             assertTailVisible()
         }
@@ -449,32 +473,56 @@ final class TranscriptLayoutTests: XCTestCase {
         }
     }
 
-    func testInterruptedKeyboardMotionKeepsTranscriptAttached() async {
+    func testInterruptedKeyboardMotionKeepsTranscriptAttached() async throws {
         await mount(turns: 600, useEditor: true)
         let editor = findNativeEditor(window)!
         let tailKey = key + "|a599#t1.0"
-        let baseline = TranscriptLayoutProbe.presentedFrame(for: key)!.maxY
-            - TranscriptLayoutProbe.presentedFrame(for: tailKey)!.maxY
-        var errors: [CGFloat] = []
-        var samples: [String] = []
-        for showing in [true, false, true, false, true, false] {
-            if showing { editor.becomeFirstResponder() } else { editor.resignFirstResponder() }
-            for _ in 0..<8 {
-                try? await Task.sleep(for: .milliseconds(16))
-                if let viewport = TranscriptLayoutProbe.presentedFrame(for: key),
-                   let tail = TranscriptLayoutProbe.presentedFrame(for: tailKey) {
-                    errors.append(abs(viewport.maxY - tail.maxY - baseline))
-                    samples.append("show=\(showing) viewport=\(viewport.maxY) tail=\(tail.maxY) gap=\(viewport.maxY - tail.maxY)")
-                }
+        let hiddenPosition = try XCTUnwrap(TranscriptLayoutProbe.presentedFrame(for: key)).maxY
+        let baseline = hiddenPosition - (try XCTUnwrap(TranscriptLayoutProbe.presentedFrame(for: tailKey))).maxY
+        var samples: [GeometrySample] = []
+        var events: [String] = []
+        var toggle = 0
+        var showing = false
+        var legStart = hiddenPosition
+        var stableFrames = 0
+        let completed = await DisplaySampler.observe("Keyboard reverses in flight and finishes hidden") { [self] link in
+            let sample = geometrySample(link,
+                position: TranscriptLayoutProbe.presentedFrame(for: key)?.maxY,
+                modelPosition: nil, tailKey: tailKey)
+            samples.append(sample)
+            guard let position = sample.position, let target = sample.modelViewport?.maxY else { return false }
+            if toggle == 0 {
+                toggle = 1
+                showing = true
+                editor.becomeFirstResponder()
+                events.append("show timestamp=\(link.timestamp) position=\(position)")
+                return false
             }
+            if toggle == 6 {
+                let hidden = abs(position - hiddenPosition) <= 1 && abs(target - hiddenPosition) <= 1
+                stableFrames = hidden && !editor.isFirstResponder ? stableFrames + 1 : 0
+                return stableFrames == 3
+            }
+            // The model viewport supplies the requested endpoint; the presentation
+            // must travel toward it before we reverse. Scheduler wake-ups do not
+            // establish that the keyboard is still moving.
+            guard showing ? target < legStart - 1 : target > legStart + 1 else { return false }
+            let progress = (position - legStart) / (target - legStart)
+            guard progress >= 0.45, progress < 1, abs(position - target) > 1 else { return false }
+            events.append("reverse toggle=\(toggle) timestamp=\(link.timestamp) position=\(position) target=\(target)")
+            legStart = position
+            toggle += 1
+            showing.toggle()
+            if showing { editor.becomeFirstResponder() } else { editor.resignFirstResponder() }
+            return false
         }
-        let attachment = XCTAttachment(string: samples.joined(separator: "\n"))
-        attachment.name = "interrupted-keyboard-motion"
-        attachment.lifetime = .keepAlways
-        add(attachment)
-        XCTAssertGreaterThan(errors.count, 40)
-        XCTAssertLessThan(errors.max() ?? .infinity, 4)
-        await settle()
+        try attachMotion("interrupted-keyboard-motion", samples: samples, events: events)
+        let gaps = samples.compactMap(\.gap)
+        XCTAssertTrue(completed, "Keyboard did not complete five observed in-flight reversals")
+        XCTAssertEqual(toggle, 6)
+        XCTAssertGreaterThan(samples.count, 1)
+        XCTAssertEqual(gaps.count, samples.count, "Viewport and tail must remain presented")
+        XCTAssertLessThan(gaps.map { abs($0 - baseline) }.max() ?? .infinity, 4)
         assertTailVisible()
     }
 
@@ -553,37 +601,42 @@ final class TranscriptLayoutTests: XCTestCase {
         return view.subviews.lazy.compactMap { self.findNativeEditor($0) }.first
     }
 
-    func testAnimatedComposerResizeKeepsTranscriptAttachedThroughoutMotion() async {
+    func testAnimatedComposerResizeKeepsTranscriptAttachedThroughoutMotion() async throws {
         await mount(turns: 600)
         let tailKey = key + "|a599#t1.0"
         let startGap = TranscriptLayoutProbe.presentedFrame(for: key)!.maxY
             - TranscriptLayoutProbe.presentedFrame(for: tailKey)!.maxY
         for height: CGFloat in [390, 64, 240, 64] {
-            let startPosition = TranscriptLayoutProbe.presentedFrame(for: key)!.maxY
-            withAnimation(.easeInOut(duration: 0.35)) { harness.composerHeight = height }
-            var samples: [String] = []
-            var gaps: [CGFloat] = []
-            var positions: [CGFloat] = []
-            for _ in 0..<30 {
-                try? await Task.sleep(for: .milliseconds(16))
-                guard let viewport = TranscriptLayoutProbe.presentedFrame(for: key),
-                      let tail = TranscriptLayoutProbe.presentedFrame(for: tailKey) else { continue }
-                gaps.append(viewport.maxY - tail.maxY)
-                positions.append(viewport.maxY)
-                samples.append("viewport=\(viewport.maxY) tail=\(tail.maxY) gap=\(viewport.maxY-tail.maxY)")
+            let start = try XCTUnwrap(TranscriptLayoutProbe.presentedFrame(for: key)).maxY
+            let target = start - (height - harness.composerHeight)
+            var samples: [GeometrySample] = []
+            var stableFrames = 0
+            let completed = await DisplaySampler.observe("Composer reaches its requested height") { [self] link in
+                let sample = geometrySample(link,
+                    position: TranscriptLayoutProbe.presentedFrame(for: key)?.maxY,
+                    modelPosition: nil, tailKey: tailKey)
+                samples.append(sample)
+                if samples.count == 1 {
+                    withAnimation(.easeInOut(duration: 0.35)) { harness.composerHeight = height }
+                    return false
+                }
+                let atTarget = sample.position.map { abs($0 - target) <= 1 } ?? false
+                let modelAtTarget = sample.modelViewport.map { abs($0.maxY - target) <= 1 } ?? false
+                stableFrames = atTarget && modelAtTarget ? stableFrames + 1 : 0
+                return stableFrames == 3
             }
-            let attachment = XCTAttachment(string: samples.joined(separator: "\n"))
-            attachment.name = "composer-motion-\(Int(height))"
-            attachment.lifetime = .keepAlways
-            add(attachment)
-            XCTAssertEqual(gaps.count, 30, "Resizing must not temporarily unrealize the tail")
-            let endPosition = positions.last!
+            try attachMotion("composer-motion-\(Int(height))", samples: samples)
+            let positions = samples.compactMap(\.position)
+            let gaps = samples.compactMap(\.gap)
+            XCTAssertTrue(completed, "Composer did not reach its requested height")
+            XCTAssertGreaterThan(samples.count, 1)
+            XCTAssertEqual(positions.count, samples.count)
+            XCTAssertEqual(gaps.count, samples.count, "Resizing must not temporarily unrealize the tail")
             XCTAssertTrue(positions.contains {
-                $0 > min(startPosition, endPosition) + 1 && $0 < max(startPosition, endPosition) - 1
+                $0 > min(start, target) + 1 && $0 < max(start, target) - 1
             }, "Composer resize must render an intermediate position")
             XCTAssertLessThan(gaps.map { abs($0 - startGap) }.max() ?? .infinity, 4,
                 "Transcript and composer must move together throughout the resize")
-            await settle()
             assertTailVisible()
         }
     }
@@ -602,50 +655,49 @@ final class TranscriptLayoutTests: XCTestCase {
         assertTailVisible()
     }
 
-    func testPendingSendAnimatesAndRetainsRunwayThroughAdoptionAndReopen() async {
+    func testPendingSendAnimatesAndRetainsRunwayThroughAdoptionAndReopen() async throws {
         await mount(turns: 600, offline: false)
-        func findScroll(_ view: UIView) -> UIScrollView? {
-            if let scroll = view as? UIScrollView { return scroll }
-            return view.subviews.lazy.compactMap { findScroll($0) }.first
-        }
-        let native = findScroll(window)!
-        let startOffset = native.layer.presentation()?.bounds.origin.y ?? native.contentOffset.y
-        harness.store.sendSteer(prompt: "Keep this local turn at the top.")
-        let id = harness.store.lastSubmittedMessageId!
-        var offsets: [CGFloat] = []
-        var intervals: [Double] = []
-        var modelOffsets: [CGFloat] = []
-        var previous = CACurrentMediaTime()
-        for _ in 0..<28 {
-            try? await Task.sleep(for: .milliseconds(16))
-            // A parent layout pass with unchanged fractional geometry must
-            // not reset the offset and cancel the running UIKit animation.
+        let native = try XCTUnwrap(harness.scroll.nativeScrollView)
+        var samples: [GeometrySample] = []
+        var submittedID: String?
+        var stableFrames = 0
+        let completed = await DisplaySampler.observe("Pending send reaches the runway anchor") { [self] link in
+            let sample = geometrySample(link, position: native.layer.presentation()?.bounds.origin.y,
+                modelPosition: native.contentOffset.y, tailKey: submittedID.map { key + "|" + $0 })
+            samples.append(sample)
+            if samples.count == 1 {
+                harness.store.sendSteer(prompt: "Keep this local turn at the top.")
+                submittedID = harness.store.lastSubmittedMessageId
+                return false
+            }
+            // Keep exercising unchanged parent geometry during the native send
+            // animation, after observing the currently presented frame.
             native.superview?.setNeedsLayout()
             native.superview?.layoutIfNeeded()
-            let now = CACurrentMediaTime()
-            intervals.append((now - previous) * 1000)
-            previous = now
-            offsets.append(native.layer.presentation()?.bounds.origin.y ?? native.contentOffset.y)
-            modelOffsets.append(native.contentOffset.y)
+            let anchored = sample.viewport.flatMap { viewport in
+                sample.tail.map { abs($0.minY - viewport.minY) <= 3 }
+            } ?? false
+            stableFrames = anchored ? stableFrames + 1 : 0
+            return stableFrames == 3
         }
-        let diagnostic = XCTAttachment(string: "Presentation offsets: \(offsets)\nModel offsets: \(modelOffsets)\nSample intervals ms: \(intervals)")
-        diagnostic.name = "pending-send-animation-samples"
-        diagnostic.lifetime = .keepAlways
-        add(diagnostic)
-        let endOffset = offsets.last!
+        try attachMotion("pending-send-animation-samples", samples: samples)
+        let offsets = samples.compactMap(\.position)
+        XCTAssertTrue(completed, "The pending prompt did not reach the top of the viewport")
+        XCTAssertGreaterThan(samples.count, 1)
+        XCTAssertEqual(offsets.count, samples.count, "The scroll view must remain presented")
+        let start = try XCTUnwrap(offsets.first)
+        let end = try XCTUnwrap(offsets.last)
         XCTAssertTrue(offsets.contains {
-            $0 > min(startOffset, endOffset) + 1 && $0 < max(startOffset, endOffset) - 1
+            $0 > min(start, end) + 1 && $0 < max(start, end) - 1
         }, "The send must glide through an intermediate offset, not jump after a delay")
-        await settle()
-        func assertPrompt() {
+        let id = try XCTUnwrap(submittedID)
+        func promptAligned() -> Bool {
+            TranscriptLayoutProbe.sample()
             guard let prompt = TranscriptLayoutProbe.tails[key + "|" + id],
-                  let viewport = TranscriptLayoutProbe.viewports[key] else {
-                XCTFail("The retained prompt must be realized after navigation")
-                return
-            }
-            XCTAssertEqual(prompt.minY, viewport.minY, accuracy: 3)
+                  let viewport = TranscriptLayoutProbe.viewports[key] else { return false }
+            return abs(prompt.minY - viewport.minY) <= 3
         }
-        assertPrompt()
+        XCTAssertTrue(promptAligned())
         var entries = harness.store.entries
         entries.append(MessageEntry(id: id, role: .user,
             parts: [.text(id: "t0", text: "Keep this local turn at the top.")], createdAt: nowMs(),
@@ -654,12 +706,19 @@ final class TranscriptLayoutTests: XCTestCase {
             parts: [.text(id: "t0", text: "Done.")], createdAt: nowMs(),
             deviceId: "test", status: .complete, continuationOf: nil))
         harness.store.setEntries(entries)
-        await settle()
-        assertPrompt()
+        let adoptedTail = harness.store.transcriptCache.rows(revision: harness.store.revision,
+            entries: entries, pendingSends: harness.store.pendingSends).last!.id
+        let adopted = await waitForTestCondition {
+            promptAligned() && TranscriptLayoutProbe.tails[key + "|" + adoptedTail] != nil
+        }
+        XCTAssertTrue(adopted, "The adopted reply must render with its prompt anchored")
         harness.identity = UUID()
         harness.scroll = ScrollState()
-        await settle()
-        assertPrompt()
+        let reopened = await waitForTestCondition {
+            guard let reopenedScroll = harness.scroll.nativeScrollView, reopenedScroll !== native else { return false }
+            return promptAligned()
+        }
+        XCTAssertTrue(reopened, "The new transcript view must realize the retained prompt at the top")
     }
 
     func testWarm600TurnOpenRealizesTailWithoutScroll() async {

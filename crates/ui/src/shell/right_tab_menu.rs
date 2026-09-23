@@ -3,6 +3,13 @@
 use super::*;
 use std::collections::VecDeque;
 
+#[derive(Clone)]
+pub(super) struct RightTabMenuState {
+    panel_key: String,
+    target: RightSurface,
+    position: Point<Pixels>,
+}
+
 pub(super) struct RightTabCloseBatch {
     panel_key: String,
     pub(super) target: RightSurface,
@@ -47,6 +54,124 @@ fn close_targets(
 }
 
 impl Shell {
+    fn right_tab_menu_is_valid(&self, menu: &RightTabMenuState, cx: &App) -> bool {
+        matches!(self.route, Route::Chat)
+            && self.right_pane_open(cx)
+            && menu.panel_key == self.panel_key(cx)
+            && self.right_tab_order(cx).contains(&menu.target)
+    }
+
+    pub(super) fn open_right_tab_menu(
+        &mut self,
+        target: RightSurface,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let menu = RightTabMenuState {
+            panel_key: self.panel_key(cx),
+            target,
+            position,
+        };
+        if !self.right_tab_menu_is_valid(&menu, cx) {
+            return;
+        }
+        self.close_right_plus(cx);
+        self.close_chat_menu(cx);
+        self.close_user_menu(cx);
+        self.close_spaces_menu(cx);
+        self.close_space_menu(cx);
+        self.right_tab_menu.open(menu);
+        cx.notify();
+    }
+
+    pub(super) fn close_right_tab_menu(&mut self, cx: &mut Context<Self>) {
+        if self.right_tab_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.right_tab_menu);
+            cx.notify();
+        }
+    }
+
+    fn dispatch_right_tab_close(
+        &mut self,
+        mode: RightTabCloseMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.right_tab_menu.as_open().cloned() else {
+            return;
+        };
+        let valid = self.right_tab_menu_is_valid(&menu, cx);
+        self.close_right_tab_menu(cx);
+        if valid {
+            self.start_right_tab_close(&menu.panel_key, menu.target, mode, window, cx);
+        }
+    }
+
+    pub(super) fn render_right_tab_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.right_tab_menu.get()?.clone();
+        if !self.right_tab_menu_is_valid(&menu, cx) {
+            self.close_right_tab_menu(cx);
+            return None;
+        }
+        let theme = Theme::of(cx).for_popup();
+        let order = self.right_tab_order(cx);
+        let mut card = popover::popover_card(&theme)
+            .id("right-tab-context-menu")
+            .debug_selector(|| "right-tab-context-menu".into())
+            .role(gpui::Role::Menu)
+            .aria_label("Tab actions")
+            .w(px(236.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_right_tab_menu(cx)))
+            .flex()
+            .flex_col();
+        for (mode, id, label) in [
+            (
+                RightTabCloseMode::Left,
+                "right-tab-close-left",
+                "Close Tabs to the Left",
+            ),
+            (
+                RightTabCloseMode::Right,
+                "right-tab-close-right",
+                "Close Tabs to the Right",
+            ),
+            (
+                RightTabCloseMode::Others,
+                "right-tab-close-others",
+                "Close Other Tabs",
+            ),
+        ] {
+            let enabled = self.right_tab_menu.is_open()
+                && self.can_start_right_tab_close()
+                && !close_targets(&order, menu.target, mode).is_empty();
+            card = card.child(
+                popover::menu_row(&theme, false, id)
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .role(gpui::Role::MenuItem)
+                    .aria_label(label)
+                    .when(!enabled, |row| {
+                        row.opacity(0.38)
+                            .cursor_default()
+                            .aria_description("Unavailable")
+                    })
+                    .when(enabled, |row| {
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.dispatch_right_tab_close(mode, window, cx);
+                        }))
+                    })
+                    .child(label),
+            );
+        }
+        Some(popover::menu_at(
+            "right-tab-context-menu-overlay",
+            menu.position,
+            card.into_any_element(),
+            self.right_tab_menu.closing_since(),
+        ))
+    }
+
     fn right_tab_order(&self, cx: &App) -> Vec<RightSurface> {
         self.right_surface_rows(cx)
             .into_iter()

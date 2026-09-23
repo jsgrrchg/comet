@@ -247,6 +247,9 @@ impl Shell {
         if !self.files_panel_open(cx) {
             return;
         }
+        if let Some(files) = self.files.get(&self.panel_key(cx)).cloned() {
+            files.update(cx, |files, cx| files.suspend_tree_interactions(cx));
+        }
         let from = self.files_visible_width(cx);
         self.panels
             .update(&self.panel_key(cx), |p| p.files_open = false);

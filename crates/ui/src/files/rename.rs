@@ -9,6 +9,7 @@ pub(super) struct TreeRename {
     pub origin: mutations::WorkspaceInteractionOrigin,
     pub input: Entity<InputState>,
     pub submitted: bool,
+    revision: Option<String>,
     _events: Subscription,
 }
 pub(super) struct TreeDelete {
@@ -16,6 +17,7 @@ pub(super) struct TreeDelete {
     pub origin: mutations::WorkspaceInteractionOrigin,
     pub focus: FocusHandle,
     pub confirm_focused: bool,
+    revision: Option<String>,
 }
 
 pub(super) fn name_selection(name: &str, directory: bool) -> std::ops::Range<usize> {
@@ -104,6 +106,7 @@ impl FilesSurface {
             origin,
             input,
             submitted: false,
+            revision: entry.mutation_revision,
             _events: events,
         });
         window.focus(&focus, cx);
@@ -119,6 +122,15 @@ impl FilesSurface {
         if !self.accepts_origin(&rename.origin, cx) {
             self.tree_rename = None;
             cx.notify();
+            return;
+        }
+        if self
+            .tree
+            .node(&rename.path)
+            .and_then(|node| node.entry.mutation_revision.as_ref())
+            != rename.revision.as_ref()
+        {
+            self.report_mutation_error("Entry changed; cancel and reopen Rename".into(), cx);
             return;
         }
         let path = rename.path.clone();
@@ -188,11 +200,16 @@ impl FilesSurface {
             origin: origin.clone(),
             path: Some(path.clone()),
         });
+        let revision = self
+            .tree
+            .node(&path)
+            .and_then(|node| node.entry.mutation_revision.clone());
         self.tree_delete = Some(TreeDelete {
             path,
             origin,
             focus,
             confirm_focused: false,
+            revision,
         });
         cx.notify();
     }
@@ -210,7 +227,19 @@ impl FilesSurface {
             path: None,
         });
         if confirm && self.accepts_origin(&dialog.origin, cx) {
-            self.request_mutation(&dialog.path, None, cx);
+            if self
+                .tree
+                .node(&dialog.path)
+                .and_then(|node| node.entry.mutation_revision.as_ref())
+                != dialog.revision.as_ref()
+            {
+                self.report_mutation_error(
+                    "Entry changed; reopen Delete to confirm its current contents".into(),
+                    cx,
+                );
+            } else {
+                self.request_mutation(&dialog.path, None, cx);
+            }
         }
         self.tree_focus.focus(window, cx);
         cx.notify();

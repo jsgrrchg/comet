@@ -10484,6 +10484,18 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_files_key = self.panel_key(cx);
+        let hidden_explorers = self
+            .files
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() != active_files_key || !matches!(self.route, Route::Chat)
+            })
+            .map(|(_, files)| files.clone())
+            .collect::<Vec<_>>();
+        for files in hidden_explorers {
+            files.update(cx, |files, cx| files.suspend_tree_interactions(cx));
+        }
         if let Some(command) = self.pending_workspace_command.take() {
             use crate::composer::WorkspaceCommand;
             match command {

@@ -185,6 +185,7 @@ impl FilesSurface {
             .flat_map(|frame| &frame.changes)
             .find(|change| change.operation_id.as_deref() == Some(&intent.operation_id))
             .cloned();
+        let observed_applied = observed.is_some();
         if let Some(change) = observed {
             self.apply_semantic_mutation(&change, None, true, cx);
         }
@@ -198,11 +199,13 @@ impl FilesSurface {
                 self.apply_semantic_mutation(change, entry.clone(), true, cx);
             }
             Ok(WorkspaceMutationOutcome::Rejected { message, .. }) | Err(message) => {
-                self.mutation_error = Some(message.clone().into())
+                if !observed_applied {
+                    self.mutation_error = Some(message.clone().into());
+                }
             }
             _ => self.mutation_error = Some("Workspace changed before operation completed".into()),
         }
-        if matches!(result, Ok(WorkspaceMutationOutcome::Applied { .. })) {
+        if observed_applied || matches!(result, Ok(WorkspaceMutationOutcome::Applied { .. })) {
             self.tree_rename = None;
         } else if let Some(rename) = &mut self.tree_rename {
             rename.submitted = false;
@@ -214,6 +217,7 @@ impl FilesSurface {
         drop(frames);
         self.loads.clear();
         self.tree.invalidate_loads();
+        self.tree_list_generation = self.tree.generation();
         self.refresh(cx);
         self.reconcile_open_documents(cx);
         let paths = self.preview.documents.keys().cloned().collect::<Vec<_>>();
@@ -301,6 +305,7 @@ impl FilesSurface {
             _ => {}
         }
         self.invalidate_markdown_images(None, cx);
+        self.tree_list_generation = self.tree.generation();
         self.sync_tree_list();
         self.reveal_tree_selection();
         cx.notify();

@@ -11,6 +11,9 @@ pub(super) struct TreeDrag {
     pub destination: Option<String>,
     pub pointer: Point<Pixels>,
     pub bounds: Bounds<Pixels>,
+    hover_since: Option<std::time::Instant>,
+    last_tick: Option<std::time::Instant>,
+    tick_task: Option<Task<()>>,
 }
 
 /// The server is authoritative for existence/permissions/collisions. This
@@ -168,8 +171,25 @@ impl FilesSurface {
                 destination_path(&payload.path, directory, payload.is_directory).is_some()
             });
         if self.tree_drag.destination != destination {
+            self.tree_drag.hover_since = Some(cx.background_executor().now());
             self.tree_drag.destination = destination;
             cx.notify();
+        }
+        if self.tree_drag.tick_task.is_none() {
+            self.tree_drag.last_tick = Some(cx.background_executor().now());
+            self.tree_drag.tick_task = Some(cx.spawn_in(window, async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(16))
+                        .await;
+                    if !this
+                        .update_in(cx, |files, window, cx| files.tree_drag_tick(window, cx))
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                }
+            }));
         }
         cx.set_active_drag_cursor_style(
             if self.tree_drag.destination.is_some() {
@@ -201,12 +221,126 @@ impl FilesSurface {
         }
     }
 
+    pub(super) fn tree_drag_tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(payload) = self.tree_drag.payload.clone() else {
+            return false;
+        };
+        let pointer = window.mouse_position();
+        if !cx.has_active_drag()
+            || !window.is_window_active()
+            || !self.tree_drag_compatible(&payload, cx)
+            || !self.tree_drag.bounds.contains(&pointer)
+        {
+            self.clear_tree_drag(window, cx);
+            return false;
+        }
+        let now = cx.background_executor().now();
+        let elapsed = self
+            .tree_drag
+            .last_tick
+            .replace(now)
+            .map(|last| now.saturating_duration_since(last).as_secs_f32())
+            .unwrap_or(0.)
+            .min(0.05);
+        let viewport = self.tree_list.viewport_bounds();
+        let speed = if viewport.contains(&pointer) {
+            edge_scroll_speed(
+                f32::from(pointer.y),
+                f32::from(viewport.top()),
+                f32::from(viewport.bottom()),
+            )
+        } else {
+            0.
+        };
+        if speed != 0. {
+            let offset = self.tree_list.scroll_px_offset_for_scrollbar();
+            self.tree_list
+                .set_offset_from_scrollbar(gpui::point(offset.x, offset.y - px(speed * elapsed)));
+            cx.notify();
+        }
+        let destination = self.drop_directory_at(pointer).filter(|directory| {
+            destination_path(&payload.path, directory, payload.is_directory).is_some()
+        });
+        if destination != self.tree_drag.destination {
+            self.tree_drag.destination = destination;
+            self.tree_drag.hover_since = Some(now);
+            cx.notify();
+        }
+        if self
+            .tree_drag
+            .hover_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_millis(650))
+        {
+            self.tree_drag.hover_since = None;
+            if let Some(directory) = self.tree_drag.destination.clone().filter(|p| !p.is_empty()) {
+                if self.tree.expand(&directory) {
+                    self.sync_tree_list();
+                    let needs_load = self
+                        .tree
+                        .node(&directory)
+                        .is_some_and(|node| node.stale || !node.has_loaded);
+                    if needs_load {
+                        self.load_directory(directory, None, cx);
+                    }
+                    cx.notify();
+                }
+            }
+        }
+        true
+    }
+
+    pub(crate) fn suspend_tree_interactions(&mut self, cx: &mut Context<Self>) {
+        if self.tree_drag.payload.is_some()
+            || self.tree_context_menu.is_open()
+            || self
+                .tree_rename
+                .as_ref()
+                .is_some_and(|rename| !rename.submitted)
+            || self.tree_delete.is_some()
+        {
+            self.interaction_generation = self.interaction_generation.wrapping_add(1);
+            self.tree_drag = TreeDrag::default();
+            self.close_tree_context_menu(cx);
+            if self
+                .tree_rename
+                .as_ref()
+                .is_some_and(|rename| !rename.submitted)
+            {
+                self.tree_rename = None;
+            }
+            if let Some(dialog) = self.tree_delete.take() {
+                cx.emit(FilesEvent::HoldMutation {
+                    origin: dialog.origin,
+                    path: None,
+                });
+            }
+            cx.notify();
+        }
+    }
+
     pub(super) fn clear_tree_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_drag.tick_task = None;
+        self.tree_drag.hover_since = None;
+        self.tree_drag.last_tick = None;
         if self.tree_drag.payload.take().is_some() || self.tree_drag.destination.take().is_some() {
             self.tree_drag.destination = None;
             cx.set_active_drag_cursor_style(CursorStyle::Arrow, window);
             cx.notify();
         }
+    }
+}
+
+fn edge_scroll_speed(y: f32, top: f32, bottom: f32) -> f32 {
+    if y < top || y > bottom || bottom <= top {
+        return 0.;
+    }
+    let band = 28.0_f32.min((bottom - top) / 2.0);
+    if y < top + band {
+        -540.0 * (1.0 - (y - top) / band)
+    } else if y > bottom - band {
+        540.0 * (1.0 - (bottom - y) / band)
+    } else {
+        0.0
     }
 }
 
@@ -258,6 +392,50 @@ mod tests {
                     .any(|event| matches!(event, FilesEvent::AddToChat { .. }))
             );
         }
+    }
+    #[gpui::test]
+    fn hover_expands_only_after_delay_and_escape_stops_tasks(cx: &mut gpui::TestAppContext) {
+        if !crate::click_activation_drag_enabled() {
+            return;
+        }
+        let (files, cx) = super::super::test_support::setup(cx);
+        let start = cx.debug_bounds("tree-entry:a.txt").unwrap().center();
+        let end = cx.debug_bounds("tree-entry:folder").unwrap().center();
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            start + gpui::point(px(9.), px(0.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            end,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.executor().advance_clock(Duration::from_millis(649));
+        files.update_in(cx, |files, window, cx| {
+            files.tree_drag_tick(window, cx);
+            assert!(!files.tree.is_expanded("folder"));
+        });
+        cx.executor().advance_clock(Duration::from_millis(1));
+        files.update_in(cx, |files, window, cx| {
+            files.tree_drag_tick(window, cx);
+            assert!(files.tree.is_expanded("folder"));
+        });
+        cx.simulate_keystrokes("escape");
+        files.read_with(cx, |files, cx| {
+            assert!(files.tree_drag.tick_task.is_none());
+            assert!(files.tree_drag.destination.is_none());
+            assert!(!cx.has_active_drag());
+        });
+    }
+    #[test]
+    fn autoscroll_is_bounded_and_stops_outside_the_viewport() {
+        assert_eq!(edge_scroll_speed(100., 100., 500.), -540.);
+        assert_eq!(edge_scroll_speed(500., 100., 500.), 540.);
+        assert_eq!(edge_scroll_speed(300., 100., 500.), 0.);
+        assert_eq!(edge_scroll_speed(99., 100., 500.), 0.);
+        assert!(edge_scroll_speed(486., 100., 500.) > 0.);
     }
     #[test]
     fn tree_drop_resolves_parent_root_and_descendants() {

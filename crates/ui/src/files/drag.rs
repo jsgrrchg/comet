@@ -429,6 +429,50 @@ mod tests {
             assert!(!cx.has_active_drag());
         });
     }
+    #[cfg(target_os = "windows")]
+    #[gpui::test]
+    fn windows_row_jitter_preserves_click_and_handle_starts_drag(cx: &mut gpui::TestAppContext) {
+        let (files, cx) = super::super::test_support::setup(cx);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let _sub = cx.update(|_, cx| {
+            cx.subscribe(&files, move |_, event, _| {
+                recorded.borrow_mut().push(event.clone())
+            })
+        });
+        let row = cx.debug_bounds("tree-entry:a.txt").unwrap().center();
+        cx.simulate_mouse_down(row, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            row + gpui::point(px(8.), px(0.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.update(|_, cx| assert!(!cx.has_active_drag()));
+        cx.simulate_mouse_up(
+            row + gpui::point(px(8.), px(0.)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        assert!(
+            events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event,FilesEvent::OpenFile(path) if path=="a.txt"))
+        );
+        let handle = cx
+            .debug_bounds("workspace-drag-handle:a.txt")
+            .unwrap()
+            .center();
+        cx.simulate_mouse_down(handle, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            handle + gpui::point(px(9.), px(0.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.update(|_, cx| assert!(cx.has_active_drag()));
+        cx.simulate_keystrokes("escape");
+    }
     #[test]
     fn autoscroll_is_bounded_and_stops_outside_the_viewport() {
         assert_eq!(edge_scroll_speed(100., 100., 500.), -540.);

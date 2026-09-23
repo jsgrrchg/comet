@@ -369,6 +369,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structural_mutations_preserve_remote_addressing_and_never_retry_transport_errors() {
+        let transport = Arc::new(DeterministicTransport {
+            scripted_responses: Mutex::new([Err(RpcError::Transport("reply lost".into()))].into()),
+            ..Default::default()
+        });
+        let client = WorkspaceFilesClient::with_transport(
+            transport.clone(),
+            FilesRequestContext {
+                target: target(),
+                target_device_id: Some("host".into()),
+                cwd: "/remote".into(),
+                checkout_id: Some("checkout".into()),
+            },
+        );
+        let result = client
+            .move_entry(zeron_proto::MoveWorkspaceEntryRequest {
+                target: target(),
+                operation_id: "op".into(),
+                expected_checkout_id: "checkout".into(),
+                source_path: "a".into(),
+                destination_path: "folder/a".into(),
+                expected_source_revision: "rev".into(),
+                expected_kind: zeron_proto::WorkspaceEntryKind::File,
+            })
+            .await;
+        assert!(result.is_err());
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, methods::MOVE_WORKSPACE_ENTRY);
+        assert_eq!(calls[0].1["targetDeviceId"], "host");
+        assert_eq!(calls[0].1["expectedCheckoutId"], "checkout");
+        assert_eq!(calls[0].1["sourcePath"], "a");
+    }
+    #[tokio::test]
     async fn cached_directory_refresh_collects_pages_but_initial_load_stays_lazy() {
         for refresh in [false, true] {
             let transport = Arc::new(DeterministicTransport {

@@ -189,13 +189,13 @@ impl Shell {
                         is_directory,
                         origin,
                     } => {
-                        if source.read(cx).accepts_origin(origin, cx)
-                            && this.panel_key(cx) == source.read(cx).chat_id()
-                        {
-                            this.composer.update(cx, |composer, cx| {
-                                composer.add_workspace_path(path, *is_directory, window, cx)
-                            });
-                        }
+                        let payload = WorkspacePathDrag::new(path.clone(), *is_directory)
+                            .with_origin(
+                                Some(origin.clone()),
+                                crate::files::WorkspacePathSource::Tree,
+                                None,
+                            );
+                        this.attach_workspace_drag(&payload, window, cx);
                     }
                     FilesEvent::Mutate(intent)
                         if this.accepts_file_navigation(&owner, &source, cx) =>

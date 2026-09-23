@@ -312,7 +312,7 @@ fn move_blocking(
     if cancel.load(Ordering::Acquire) {
         return Err((Reason::Busy, "Move cancelled before execution".into()));
     }
-    move_no_replace(&workspace.root, source.as_path(), destination.as_path()).map_err(io_error)?;
+    move_entry_no_replace(&workspace.root, source.as_path(), destination.as_path())?;
     let target = workspace.root.join(destination.as_path());
     let updated = std::fs::symlink_metadata(&target).unwrap_or(metadata);
     Ok(WorkspaceEntry {
@@ -325,6 +325,76 @@ fn move_blocking(
         read_only: !updated.is_file(),
         mutation_revision: Some(revision(&updated)),
     })
+}
+
+/// Case-insensitive filesystems may reject even a spelling-only rename under
+/// NOREPLACE. Stage that single directory entry, never a second hard link.
+fn move_entry_no_replace(root: &Path, source: &Path, destination: &Path) -> MutationResult<()> {
+    match move_no_replace(root, source, destination) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            #[cfg(unix)]
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+                && is_case_alias(root, source, destination)
+            {
+                let temporary = source
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .join(format!(".zeron-save-{}.tmp", uuid::Uuid::new_v4()));
+                move_no_replace(root, source, &temporary).map_err(io_error)?;
+                if let Err(error) = move_no_replace(root, &temporary, destination) {
+                    if let Err(rollback) = move_no_replace(root, &temporary, source) {
+                        return Err((
+                            Reason::PartialFailure,
+                            format!(
+                                "Rename could not complete ({error}) or restore its original name ({rollback}); recover the entry at {}",
+                                temporary.display()
+                            ),
+                        ));
+                    }
+                    return Err(io_error(error));
+                }
+                return Ok(());
+            }
+            Err(io_error(error))
+        }
+    }
+}
+
+#[cfg(unix)]
+fn is_case_alias(root: &Path, source: &Path, destination: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if source.parent() != destination.parent() {
+        return false;
+    }
+    let (Some(from), Some(to)) = (source.file_name(), destination.file_name()) else {
+        return false;
+    };
+    if from == to || from.to_string_lossy().to_lowercase() != to.to_string_lossy().to_lowercase() {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (
+        std::fs::symlink_metadata(root.join(source)),
+        std::fs::symlink_metadata(root.join(destination)),
+    ) else {
+        return false;
+    };
+    if a.dev() != b.dev() || a.ino() != b.ino() || is_link(&a) || is_link(&b) {
+        return false;
+    }
+    // Distinct hard-link names are a real collision, not an alias in a
+    // case-insensitive directory. A failed enumeration never authorizes a move.
+    let Ok(entries) = std::fs::read_dir(root.join(source.parent().unwrap_or(Path::new("")))) else {
+        return false;
+    };
+    for entry in entries {
+        match entry {
+            Ok(entry) if entry.file_name() == to => return false,
+            Err(_) => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Open every ancestor without following links, and anchor the native rename to those handles.
@@ -457,6 +527,62 @@ mod tests {
                 WorkspaceEntryKind::File
             },
         }
+    }
+    #[test]
+    fn simultaneous_moves_never_replace_the_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("one"), "one").unwrap();
+        std::fs::write(root.join("two"), "two").unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let results = std::thread::scope(|scope| {
+            let a = barrier.clone();
+            let first = scope.spawn(move || {
+                a.wait();
+                move_entry_no_replace(root, Path::new("one"), Path::new("winner"))
+            });
+            let b = barrier.clone();
+            let second = scope.spawn(move || {
+                b.wait();
+                move_entry_no_replace(root, Path::new("two"), Path::new("winner"))
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert_ne!(results.0.is_ok(), results.1.is_ok());
+        let winner = std::fs::read_to_string(root.join("winner")).unwrap();
+        let loser = if winner == "one" { "two" } else { "one" };
+        assert_eq!(std::fs::read_to_string(root.join(loser)).unwrap(), loser);
+    }
+    #[test]
+    fn case_only_rename_preserves_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("File.txt"), "keep").unwrap();
+        move_entry_no_replace(dir.path(), Path::new("File.txt"), Path::new("file.txt")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("file.txt")).unwrap(),
+            "keep"
+        );
+        let names = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![std::ffi::OsString::from("file.txt")]);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn case_similar_hard_links_are_still_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("A"), "keep").unwrap();
+        // Only filesystems supporting distinct case names can create this fixture.
+        if std::fs::hard_link(dir.path().join("A"), dir.path().join("a")).is_err() {
+            return;
+        }
+        assert_eq!(
+            move_entry_no_replace(dir.path(), Path::new("A"), Path::new("a"))
+                .unwrap_err()
+                .0,
+            Reason::DestinationExists
+        );
     }
     #[test]
     fn delete_requires_current_revision_and_explicit_recursion() {

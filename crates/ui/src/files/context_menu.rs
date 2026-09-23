@@ -59,14 +59,25 @@ impl FilesSurface {
             event.keystroke.modifiers.control,
         ) {
             popover::MenuKey::Escape => self.close_tree_context_menu(cx),
-            popover::MenuKey::Up | popover::MenuKey::Down => {
-                if let Some(menu) = self.tree_context_menu.open_mut() {
-                    menu.active = popover::menu_step(
-                        Some(menu.active),
-                        4,
-                        if event.keystroke.key == "up" { -1 } else { 1 },
-                    )
-                    .unwrap_or(0);
+            key @ (popover::MenuKey::Up | popover::MenuKey::Down) => {
+                if let Some(menu) = self.tree_context_menu.as_open() {
+                    let mut next = menu.active;
+                    for _ in 0..4 {
+                        next = popover::menu_step(
+                            Some(next),
+                            4,
+                            if matches!(key, popover::MenuKey::Up) {
+                                -1
+                            } else {
+                                1
+                            },
+                        )
+                        .unwrap_or(0);
+                        if next < 2 || self.can_mutate_tree_entry(&menu.path, next == 3, cx) {
+                            break;
+                        }
+                    }
+                    self.tree_context_menu.open_mut().unwrap().active = next;
                     cx.notify();
                 }
             }
@@ -140,6 +151,14 @@ impl FilesSurface {
                     .id(gpui::SharedString::from(format!("tree-menu-{index}")))
                     .role(gpui::Role::MenuItem)
                     .aria_label(label)
+                    .when(index == 1, |row| {
+                        row.tooltip(|_, cx| {
+                            cx.new(|_| preview::FileEditorTooltip {
+                                text: "Copy workspace-relative path".into(),
+                            })
+                            .into()
+                        })
+                    })
                     .when(!enabled, |el| el.opacity(0.38).cursor_default())
                     .when(enabled, |el| {
                         el.on_click(cx.listener(move |this, _, window, cx| {

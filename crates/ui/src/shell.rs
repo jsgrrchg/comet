@@ -3076,13 +3076,13 @@ impl Shell {
                         is_directory,
                         origin,
                     } => {
-                        if source.read(cx).accepts_origin(origin, cx)
-                            && this.panel_key(cx) == source.read(cx).chat_id()
-                        {
-                            this.composer.update(cx, |composer, cx| {
-                                composer.add_workspace_path(path, *is_directory, window, cx)
-                            });
-                        }
+                        let payload = WorkspacePathDrag::new(path.clone(), *is_directory)
+                            .with_origin(
+                                Some(origin.clone()),
+                                crate::files::WorkspacePathSource::Tree,
+                                None,
+                            );
+                        this.attach_workspace_drag(&payload, window, cx);
                     }
                     FilesEvent::Mutate(intent) => {
                         this.start_file_mutation(source.clone(), intent.clone(), cx)
@@ -8518,6 +8518,7 @@ impl Shell {
         // such as a pane resize.
         div()
             .id("chat-dropzone")
+            .debug_selector(|| "chat-dropzone".into())
             .relative()
             .flex_1()
             .min_w_0()

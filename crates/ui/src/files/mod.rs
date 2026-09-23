@@ -33,7 +33,7 @@ pub mod preview;
 mod rename;
 pub mod search;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 pub mod tree;
 pub mod watch;
 
@@ -96,11 +96,20 @@ pub(super) fn workspace_drag_handle(
     payload: WorkspacePathDrag,
     theme: &crate::theme::Theme,
 ) -> gpui::AnyElement {
+    let label = if payload.source == WorkspacePathSource::Tree {
+        "Drag to move or add to chat"
+    } else {
+        "Drag to add to chat"
+    };
     div()
         .id(gpui::SharedString::from(format!(
             "workspace-drag-handle:{}",
             payload.path
         )))
+        .debug_selector({
+            let path = payload.path.clone();
+            move || format!("workspace-drag-handle:{path}")
+        })
         .w(px(18.))
         .h(px(24.))
         .flex_none()
@@ -109,7 +118,7 @@ pub(super) fn workspace_drag_handle(
         .justify_center()
         .cursor_grab()
         .role(gpui::Role::Button)
-        .aria_label("Drag file to move or add to chat")
+        .aria_label(label)
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .on_click(|_, _, cx| cx.stop_propagation())
         .on_drag(payload, |payload, _, _, cx| {

@@ -129,6 +129,9 @@ impl FilesSurface {
 
     pub(crate) fn report_mutation_error(&mut self, message: String, cx: &mut Context<Self>) {
         self.mutation_error = Some(message.into());
+        if let Some(rename) = self.tree_rename.as_mut() {
+            rename.submitted = false;
+        }
         cx.notify();
     }
 
@@ -318,6 +321,58 @@ mod tests {
     use super::*;
     use gpui::{AppContext, TestAppContext};
 
+    #[gpui::test]
+    fn watch_before_lost_reply_still_remaps_the_dirty_buffer(cx: &mut TestAppContext) {
+        let (files, cx) = super::super::test_support::setup(cx);
+        files.update_in(cx, |files, _, cx| {
+            let origin = files.interaction_origin(cx).unwrap();
+            let intent = MutationIntent {
+                operation_id: "observed".into(),
+                origin,
+                entry: files.tree.node("a.txt").unwrap().entry.clone(),
+                destination: Some("b.txt".into()),
+            };
+            let mut document = FileDocument::loading(DocumentKey {
+                chat_id: "chat".into(),
+                checkout_id: Some("checkout".into()),
+                path: "a.txt".into(),
+            });
+            document.phase = DocumentPhase::Ready;
+            document.revision = 4;
+            document.saved_revision = 1;
+            files.preview.documents.insert("a.txt".into(), document);
+            files.prepare_mutation(intent.clone(), cx);
+            let change = zeron_proto::WorkspaceFileChange {
+                operation_id: Some("observed".into()),
+                kind: zeron_proto::WorkspaceFileChangeKind::Renamed,
+                path: "b.txt".into(),
+                old_path: Some("a.txt".into()),
+            };
+            files.apply_workspace_changes(
+                zeron_proto::WorkspaceFileChanges {
+                    sequence: 2,
+                    resync_required: false,
+                    changes: vec![change],
+                },
+                cx,
+            );
+            assert!(files.preview.documents.contains_key("a.txt"));
+            files.apply_workspace_changes(
+                zeron_proto::WorkspaceFileChanges {
+                    sequence: 3,
+                    resync_required: false,
+                    changes: vec![],
+                },
+                cx,
+            );
+            files.finish_mutation(&intent, &Err("reply lost".into()), cx);
+            assert_eq!(files.watch_sequence, Some(3));
+            assert!(files.preview.documents["b.txt"].is_dirty());
+            assert_eq!(files.preview.documents["b.txt"].phase, DocumentPhase::Ready);
+            assert!(files.mutation_error.is_none());
+            assert!(!files.mutation_busy());
+        });
+    }
     #[test]
     fn path_membership_uses_component_boundaries() {
         assert!(contains_path("a", "a/child"));

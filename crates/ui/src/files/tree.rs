@@ -163,6 +163,7 @@ impl FilesSurface {
     }
 
     pub(super) fn on_tree_scrolled(&mut self, cx: &mut Context<Self>) {
+        self.close_tree_context_menu(cx);
         // The list repaints itself; the floating rail needs a view pass.
         cx.notify();
     }
@@ -221,6 +222,7 @@ impl FilesSurface {
                     return gpui::Empty.into_any_element();
                 };
                 let path = row.path.clone();
+                let menu_path = path.clone();
                 let selected = self.tree.selected() == Some(path.as_str());
                 let focused = self.tree_focus.is_focused(window);
                 let is_directory = node.entry.kind == WorkspaceEntryKind::Directory;
@@ -272,6 +274,19 @@ impl FilesSurface {
                         this.tree_focus.focus(window, cx);
                         this.activate_tree_path(path.clone(), cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            window.prevent_default();
+                            this.open_tree_context_menu(
+                                menu_path.clone(),
+                                event.position,
+                                window,
+                                cx,
+                            );
+                        }),
+                    )
                     .when(crate::click_activation_drag_enabled(), |element| {
                         element.on_drag(drag_payload, |payload, _, _, cx| {
                             cx.stop_propagation();
@@ -421,6 +436,24 @@ impl FilesSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.tree_menu_key(event, window, cx) {
+            return;
+        }
+        if event.keystroke.key == "menu"
+            || (event.keystroke.key == "f10" && event.keystroke.modifiers.shift)
+        {
+            if let Some(path) = self.tree.selected().map(str::to_string) {
+                self.open_tree_context_menu(
+                    path,
+                    self.tree_list.viewport_bounds().origin,
+                    window,
+                    cx,
+                );
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
         let handled = match event.keystroke.key.as_str() {
             "up" => {
                 self.tree.select_previous();

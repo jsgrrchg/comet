@@ -18,6 +18,7 @@ use crate::{
 };
 
 pub mod client;
+mod context_menu;
 pub mod document;
 pub mod editor;
 pub mod editor_adapter;
@@ -29,6 +30,8 @@ pub mod model;
 pub mod mutations;
 pub mod preview;
 pub mod search;
+#[cfg(test)]
+mod test_support;
 pub mod tree;
 pub mod watch;
 
@@ -140,12 +143,20 @@ pub(crate) fn workspace_path_drag_ghost(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesEvent {
+    AddToChat {
+        path: String,
+        is_directory: bool,
+        origin: mutations::WorkspaceInteractionOrigin,
+    },
     Mutate(mutations::MutationIntent),
     OpenFile(String),
     RevealFile(String),
     OpenWebLink(crate::markdown::render::LinkActivation),
     TitleChanged,
-    FileRenamed { old_path: String, new_path: String },
+    FileRenamed {
+        old_path: String,
+        new_path: String,
+    },
     WordWrapChanged(bool),
     ShowAllFilesChanged(bool),
     CloseReady,
@@ -214,6 +225,7 @@ pub struct FilesSurface {
     watch_sequence: Option<u64>,
     watch_error: Option<SharedString>,
     preview: FilePreviewState,
+    tree_context_menu: crate::popover::Popup<context_menu::TreeContextMenu>,
     editor_context_menu: crate::popover::Popup<EditorContextMenu>,
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
@@ -263,6 +275,7 @@ impl Render for FilesSurface {
                     .map(|message| crate::popover::error_row(&theme, message).into_any_element()),
             )
             .children(editor_context_menu)
+            .children(self.render_tree_context_menu(&theme, cx))
     }
 }
 
@@ -552,6 +565,7 @@ impl FilesSurface {
                 word_wrap,
                 editor_font_size,
             ),
+            tree_context_menu: crate::popover::Popup::default(),
             editor_context_menu: crate::popover::Popup::default(),
             loads: HashMap::new(),
             error: None,
@@ -981,6 +995,7 @@ impl FilesSurface {
         self.watch_task = None;
         self.watch_sequence = None;
         self.watch_error = None;
+        self.tree_context_menu = crate::popover::Popup::default();
         self.editor_context_menu = crate::popover::Popup::default();
         self.preview.reset();
         self.tree.reset();

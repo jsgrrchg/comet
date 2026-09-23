@@ -3021,6 +3021,19 @@ impl Shell {
                     return;
                 }
                 match event {
+                    FilesEvent::AddToChat {
+                        path,
+                        is_directory,
+                        origin,
+                    } => {
+                        if source.read(cx).accepts_origin(origin, cx)
+                            && this.panel_key(cx) == source.read(cx).chat_id()
+                        {
+                            this.composer.update(cx, |composer, cx| {
+                                composer.add_workspace_path(path, *is_directory, window, cx)
+                            });
+                        }
+                    }
                     FilesEvent::Mutate(intent) => {
                         this.start_file_mutation(source.clone(), intent.clone(), cx)
                     }

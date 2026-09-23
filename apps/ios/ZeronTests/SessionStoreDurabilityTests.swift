@@ -4,6 +4,37 @@ import XCTest
 
 @MainActor
 final class SessionStoreDurabilityTests: XCTestCase {
+    private enum WaitError: Error { case timedOut }
+
+    private func waitUntil(_ description: String, timeout: Duration = .seconds(5),
+                           file: StaticString = #filePath, line: UInt = #line,
+                           _ condition: () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !condition() {
+            guard clock.now < deadline else {
+                XCTFail("Timed out waiting for \(description)", file: file, line: line)
+                throw WaitError.timedOut
+            }
+            try await clock.sleep(for: .milliseconds(10))
+        }
+    }
+
+    private func waitForPersistence(_ task: Task<Bool, Never>,
+                                    file: StaticString = #filePath, line: UInt = #line) async throws -> Bool {
+        let completed = expectation(description: "Stopped store's persistence attempt finished")
+        var result: Bool?
+        let observer = Task {
+            let saved = await task.value
+            guard !Task.isCancelled else { return }
+            result = saved
+            completed.fulfill()
+        }
+        defer { observer.cancel() }
+        await fulfillment(of: [completed], timeout: 5)
+        return try XCTUnwrap(result, "Persistence did not finish before the timeout", file: file, line: line)
+    }
+
     private func config() -> AppConfig {
         AppConfig(edgeURL: URL(string: "http://localhost:1")!, mode: .dev,
                   userId: "u", orgId: "o", deviceId: "phone",
@@ -430,9 +461,8 @@ final class SessionStoreDurabilityTests: XCTestCase {
         try store.doc.getMap(id: "test").insert(key: "value", v: "async")
         store.doc.commit()
 
-        for _ in 0..<20 {
-            await Task.yield()
-            if store.outbox.count > baseline { break }
+        try await waitUntil("the local update to enter the outbox") {
+            store.outbox.count > baseline
         }
         XCTAssertEqual(store.outbox.count, baseline + 1)
 
@@ -453,12 +483,10 @@ final class SessionStoreDurabilityTests: XCTestCase {
         try store.doc.getMap(id: "test").insert(key: "value", v: "durable")
         store.doc.commit()
 
-        var newBatchIDs: Set<String> = []
-        for _ in 0..<20 {
-            await Task.yield()
-            newBatchIDs = Set(store.outbox.map(\.batchId)).subtracting(baseline)
-            if !newBatchIDs.isEmpty { break }
+        try await waitUntil("the committed batch to enter the outbox") {
+            !Set(store.outbox.map(\.batchId)).subtracting(baseline).isEmpty
         }
+        let newBatchIDs = Set(store.outbox.map(\.batchId)).subtracting(baseline)
         XCTAssertEqual(newBatchIDs.count, 1)
         let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
         XCTAssertTrue(newBatchIDs.isSubset(of: Set(loaded.outbox.map(\.batchId))))
@@ -490,14 +518,15 @@ final class SessionStoreDurabilityTests: XCTestCase {
         try store.doc.getMap(id: "test").insert(key: "value", v: "retry")
         store.doc.commit()
 
-        for _ in 0..<20 { await Task.yield() }
+        try await waitUntil("the failed write's batch to enter the outbox") {
+            store.outbox.count > baselineCount
+        }
         XCTAssertEqual(store.outbox.count, baselineCount + 1)
         XCTAssertTrue(store.admittedBatchIDs.isEmpty)
 
         DocDisk.directoryOverride = restoredDirectory
-        for _ in 0..<35 {
-            if !store.admittedBatchIDs.isEmpty { break }
-            try await Task.sleep(for: .milliseconds(100))
+        try await waitUntil("the retried write to admit its durable batches") {
+            !store.admittedBatchIDs.isEmpty
         }
         XCTAssertEqual(store.admittedBatchIDs, Set(store.outbox.map(\.batchId)))
         let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
@@ -516,8 +545,9 @@ final class SessionStoreDurabilityTests: XCTestCase {
         }
 
         let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
         let started = expectation(description: "blocking export started")
-        let blocker = Task {
+        Task {
             await SnapshotExporter.shared.export {
                 started.fulfill()
                 gate.wait()
@@ -531,15 +561,17 @@ final class SessionStoreDurabilityTests: XCTestCase {
         store.start(holdDial: true)
         try appendEntry(store, id: "first", text: "dirty")
         store.doc.commit()
-        for _ in 0..<20 {
-            await Task.yield()
-            if store.outbox.count == 1 { break }
+        try await waitUntil("the batch to enter the outbox before wiping") {
+            store.outbox.count == 1
         }
-        store.stop()
+        // The local commit saved synchronously. Dirty the snapshot again so
+        // stop actually queues a write behind the blocked exporter.
+        store.retirePush(batchId: try XCTUnwrap(store.outbox.first?.batchId))
+        let persistence = try XCTUnwrap(store.stop())
         DocDisk.wipeAll()
         gate.signal()
-        _ = await blocker.value
-        try await Task.sleep(for: .milliseconds(100))
+        let saved = try await waitForPersistence(persistence)
+        XCTAssertFalse(saved, "A revoked lease must reject the stopped store's write")
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
         XCTAssertFalse(FileManager.default.fileExists(atPath: DocDisk.chat2URL(for: id).path))
@@ -559,8 +591,9 @@ final class SessionStoreDurabilityTests: XCTestCase {
         }
 
         let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
         let started = expectation(description: "blocking export started")
-        let exportBlocker = Task {
+        Task {
             await SnapshotExporter.shared.export {
                 started.fulfill()
                 gate.wait()
@@ -572,25 +605,25 @@ final class SessionStoreDurabilityTests: XCTestCase {
         let id = "lease-deallocated-\(UUID().uuidString)"
         var batchID = ""
         weak var weakStore: SessionStore?
+        let persistence: Task<Bool, Never>
         do {
             let store = SessionStore(chatId: id, config: config())
             weakStore = store
             store.start(holdDial: true)
             try appendEntry(store, id: "deallocated", text: "deallocated")
             store.doc.commit()
-            for _ in 0..<20 {
-                await Task.yield()
-                if store.outbox.count == 1 { break }
+            try await waitUntil("the batch to enter the outbox before deallocation") {
+                store.outbox.count == 1
             }
             batchID = try XCTUnwrap(store.outbox.first?.batchId)
-            store.stop()
+            persistence = try XCTUnwrap(store.stop())
         }
         XCTAssertNil(weakStore)
 
         DocDisk.directoryOverride = root
         gate.signal()
-        _ = await exportBlocker.value
-        try await Task.sleep(for: .milliseconds(100))
+        let saved = try await waitForPersistence(persistence)
+        XCTAssertTrue(saved, "The final snapshot must persist after the store is released")
 
         let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
         XCTAssertEqual(loaded.outbox.map(\.batchId), [batchID])
@@ -610,8 +643,9 @@ final class SessionStoreDurabilityTests: XCTestCase {
         }
 
         let gate = DispatchSemaphore(value: 0)
+        defer { gate.signal() }
         let started = expectation(description: "blocking export started")
-        let exportBlocker = Task {
+        Task {
             await SnapshotExporter.shared.export {
                 started.fulfill()
                 gate.wait()
@@ -625,27 +659,25 @@ final class SessionStoreDurabilityTests: XCTestCase {
         old.start(holdDial: true)
         try appendEntry(old, id: "old", text: "old")
         old.doc.commit()
-        for _ in 0..<20 {
-            await Task.yield()
-            if old.outbox.count == 1 { break }
+        try await waitUntil("the old store's batch to enter the outbox") {
+            old.outbox.count == 1
         }
-        old.stop()
+        let persistence = try XCTUnwrap(old.stop())
 
         DocDisk.directoryOverride = root
         let replacement = SessionStore(chatId: id, config: config())
         replacement.start(holdDial: true)
         try appendEntry(replacement, id: "new", text: "new")
         replacement.doc.commit()
-        for _ in 0..<20 {
-            await Task.yield()
-            if replacement.outbox.count == 1 { break }
+        try await waitUntil("the replacement store's batch to enter the outbox") {
+            replacement.outbox.count == 1
         }
         XCTAssertEqual(replacement.outbox.count, 1)
         replacement.flushToDisk()
 
         gate.signal()
-        _ = await exportBlocker.value
-        try await Task.sleep(for: .milliseconds(100))
+        let saved = try await waitForPersistence(persistence)
+        XCTAssertFalse(saved, "The old store must not overwrite its replacement")
         let loaded = try XCTUnwrap(DocDisk.loadChat2(into: LoroDoc(), id: id))
         XCTAssertEqual(loaded.outbox.map(\.batchId), replacement.outbox.map(\.batchId))
         replacement.stop()
@@ -657,13 +689,15 @@ final class SessionStoreDurabilityTests: XCTestCase {
         try appendEntry(store, id: "first", text: "first")
         store.doc.commit()
         store.start(holdDial: true)
-        for _ in 0..<50 where !store.entries.contains(where: { $0.id == "first" }) {
-            await Task.yield()
+        try await waitUntil("the initial projection") {
+            store.entries.contains { $0.id == "first" }
         }
         try appendEntry(store, id: "second", text: "second")
         store.doc.commit()
         store.project()
-        try await Task.sleep(for: .milliseconds(1_300))
+        try await waitUntil("the trailing projection") {
+            store.entries.contains { $0.id == "second" }
+        }
         XCTAssertTrue(store.entries.contains { entry in
             entry.id == "second"
         })

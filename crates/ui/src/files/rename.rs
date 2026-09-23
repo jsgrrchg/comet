@@ -268,6 +268,7 @@ impl FilesSurface {
         );
         let card = popover::dialog_card(&theme)
             .w(px(380.))
+            .gap(px(12.))
             .track_focus(&dialog.focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 match event.keystroke.key.as_str() {
@@ -307,10 +308,10 @@ impl FilesSurface {
                             })),
                     )
                     .child(
-                        popover::btn_danger(&theme, "Delete permanently")
+                        popover::btn_danger(&theme, "Delete")
                             .id("tree-delete-confirm")
                             .role(gpui::Role::Button)
-                            .aria_label("Delete permanently")
+                            .aria_label("Delete")
                             .when(dialog.confirm_focused, |el| {
                                 el.border_1().border_color(theme.text)
                             })

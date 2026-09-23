@@ -29,6 +29,7 @@ mod markdown_preview;
 pub mod model;
 pub mod mutations;
 pub mod preview;
+mod rename;
 pub mod search;
 #[cfg(test)]
 mod test_support;
@@ -148,6 +149,10 @@ pub enum FilesEvent {
         is_directory: bool,
         origin: mutations::WorkspaceInteractionOrigin,
     },
+    HoldMutation {
+        origin: mutations::WorkspaceInteractionOrigin,
+        path: Option<String>,
+    },
     Mutate(mutations::MutationIntent),
     OpenFile(String),
     RevealFile(String),
@@ -199,6 +204,9 @@ pub struct FilesSurface {
     deferred_file_changes: Vec<zeron_proto::WorkspaceFileChanges>,
     applied_mutations: std::collections::VecDeque<String>,
     mutation_error: Option<SharedString>,
+    mutation_hold: Option<String>,
+    tree_rename: Option<rename::TreeRename>,
+    tree_delete: Option<rename::TreeDelete>,
     state: Entity<AppState>,
     chat_id: String,
     review_comment_flush_source: u64,
@@ -276,6 +284,7 @@ impl Render for FilesSurface {
             )
             .children(editor_context_menu)
             .children(self.render_tree_context_menu(&theme, cx))
+            .children(self.render_tree_delete(&theme, window, cx))
     }
 }
 
@@ -534,6 +543,9 @@ impl FilesSurface {
             deferred_file_changes: Vec::new(),
             applied_mutations: std::collections::VecDeque::new(),
             mutation_error: None,
+            mutation_hold: None,
+            tree_rename: None,
+            tree_delete: None,
             state,
             chat_id,
             review_comment_flush_source: NEXT_REVIEW_COMMENT_FLUSH_SOURCE
@@ -981,6 +993,14 @@ impl FilesSurface {
     }
 
     fn apply_target(&mut self, next: Option<FilesRequestContext>, cx: &mut Context<Self>) {
+        if let Some(dialog) = self.tree_delete.take() {
+            cx.emit(FilesEvent::HoldMutation {
+                origin: dialog.origin,
+                path: None,
+            });
+        }
+        self.tree_rename = None;
+        self.mutation_hold = None;
         self.interaction_generation = self.interaction_generation.wrapping_add(1);
         self.effective_checkout_id = None;
         self.mutation_capabilities = None;

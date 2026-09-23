@@ -103,7 +103,25 @@ impl FilesSurface {
         })
     }
 
+    pub(crate) fn hold_mutation(&mut self, path: Option<String>, cx: &mut Context<Self>) {
+        self.mutation_hold = path;
+        let paths = self.preview.documents.keys().cloned().collect::<Vec<_>>();
+        for path in paths {
+            if self.mutation_blocks_path(&path) {
+                self.preview.documents.get_mut(&path).unwrap().autosave_task = None;
+            } else {
+                self.schedule_autosave(path, cx);
+            }
+        }
+    }
     pub(super) fn mutation_blocks_path(&self, path: &str) -> bool {
+        if self
+            .mutation_hold
+            .as_deref()
+            .is_some_and(|hold| contains_path(hold, path))
+        {
+            return true;
+        }
         self.pending_mutation
             .as_ref()
             .is_some_and(|intent| intent.affects(path))
@@ -183,6 +201,11 @@ impl FilesSurface {
                 self.mutation_error = Some(message.clone().into())
             }
             _ => self.mutation_error = Some("Workspace changed before operation completed".into()),
+        }
+        if matches!(result, Ok(WorkspaceMutationOutcome::Applied { .. })) {
+            self.tree_rename = None;
+        } else if let Some(rename) = &mut self.tree_rename {
+            rename.submitted = false;
         }
         self.pending_mutation = None;
         let frames = std::mem::take(&mut self.deferred_file_changes);

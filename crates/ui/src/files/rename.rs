@@ -1,0 +1,353 @@
+//! Inline single-line rename and permanent-delete confirmation.
+use super::*;
+use crate::{popover, theme::Theme};
+use gpui::{AnyElement, Focusable, KeyDownEvent, MouseButton};
+use gpui_base::input::{Input, InputEvent, InputState};
+
+pub(super) struct TreeRename {
+    pub path: String,
+    pub origin: mutations::WorkspaceInteractionOrigin,
+    pub input: Entity<InputState>,
+    pub submitted: bool,
+    _events: Subscription,
+}
+pub(super) struct TreeDelete {
+    pub path: String,
+    pub origin: mutations::WorkspaceInteractionOrigin,
+    pub focus: FocusHandle,
+    pub confirm_focused: bool,
+}
+
+pub(super) fn name_selection(name: &str, directory: bool) -> std::ops::Range<usize> {
+    let end = if directory {
+        name.len()
+    } else {
+        name.rfind('.').filter(|i| *i > 0).unwrap_or(name.len())
+    };
+    0..end
+}
+pub(super) fn renamed_path(path: &str, name: &str) -> Result<String, &'static str> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.eq_ignore_ascii_case(".git")
+        || name.contains(['/', '\\', '\0', ':'])
+    {
+        return Err("Enter a single file name without path separators");
+    }
+    let parent = model::parent_path(path).unwrap_or_default();
+    Ok(if parent.is_empty() {
+        name.into()
+    } else {
+        format!("{parent}/{name}")
+    })
+}
+impl FilesSurface {
+    pub(super) fn can_mutate_tree_entry(&self, path: &str, deleting: bool, cx: &gpui::App) -> bool {
+        !self.mutation_busy()
+            && self.is_current_target(cx)
+            && self.effective_checkout_id.is_some()
+            && self.mutation_capabilities.is_some_and(|c| {
+                if deleting {
+                    c.delete_entry
+                } else {
+                    c.move_entry
+                }
+            })
+            && self.tree.node(path).is_some_and(|n| {
+                n.entry.mutation_revision.is_some()
+                    && n.entry.kind != zeron_proto::WorkspaceEntryKind::Symlink
+            })
+    }
+    pub(super) fn begin_tree_rename(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_mutate_tree_entry(&path, false, cx) {
+            return;
+        }
+        let Some(origin) = self.interaction_origin(cx) else {
+            return;
+        };
+        let entry = self.tree.node(&path).unwrap().entry.clone();
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(entry.name.clone()));
+        input.update(cx, |state, cx| {
+            state.set_selected_range(
+                name_selection(
+                    &entry.name,
+                    entry.kind == zeron_proto::WorkspaceEntryKind::Directory,
+                ),
+                cx,
+            )
+        });
+        let events = cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
+            InputEvent::PressEnter { .. } => this.submit_tree_rename(window, cx),
+            InputEvent::Blur
+                if this
+                    .tree_rename
+                    .as_ref()
+                    .is_some_and(|rename| !rename.submitted) =>
+            {
+                this.tree_rename = None;
+                cx.notify();
+            }
+            _ => {}
+        });
+        let focus = input.focus_handle(cx);
+        self.tree.select(path.clone());
+        self.reveal_tree_selection();
+        self.mutation_error = None;
+        self.tree_rename = Some(TreeRename {
+            path,
+            origin,
+            input,
+            submitted: false,
+            _events: events,
+        });
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+    fn submit_tree_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(rename) = &self.tree_rename else {
+            return;
+        };
+        if rename.submitted {
+            return;
+        }
+        if !self.accepts_origin(&rename.origin, cx) {
+            self.tree_rename = None;
+            cx.notify();
+            return;
+        }
+        let path = rename.path.clone();
+        let name = rename.input.read(cx).value().to_string();
+        let destination = match renamed_path(&path, &name) {
+            Ok(path) => path,
+            Err(message) => {
+                self.report_mutation_error(message.into(), cx);
+                return;
+            }
+        };
+        if path == destination {
+            self.tree_rename = None;
+            self.tree_focus.focus(window, cx);
+            cx.notify();
+            return;
+        }
+        self.tree_rename.as_mut().unwrap().submitted = true;
+        self.request_mutation(&path, Some(destination), cx);
+    }
+    pub(super) fn render_tree_rename(
+        &self,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let rename = self
+            .tree_rename
+            .as_ref()
+            .filter(|rename| rename.path == path)?;
+        Some(
+            div()
+                .id("tree-rename-input")
+                .flex_1()
+                .min_w_0()
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                    if event.keystroke.key == "escape" {
+                        if this.tree_rename.as_ref().is_some_and(|r| !r.submitted) {
+                            this.tree_rename = None;
+                            this.tree_focus.focus(window, cx);
+                            cx.notify();
+                        }
+                        window.prevent_default();
+                    }
+                    cx.stop_propagation();
+                }))
+                .child(Input::new(&rename.input))
+                .into_any_element(),
+        )
+    }
+    pub(super) fn begin_tree_delete(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.can_mutate_tree_entry(&path, true, cx) {
+            return;
+        }
+        let Some(origin) = self.interaction_origin(cx) else {
+            return;
+        };
+        let focus = cx.focus_handle();
+        focus.focus(window, cx);
+        cx.emit(FilesEvent::HoldMutation {
+            origin: origin.clone(),
+            path: Some(path.clone()),
+        });
+        self.tree_delete = Some(TreeDelete {
+            path,
+            origin,
+            focus,
+            confirm_focused: false,
+        });
+        cx.notify();
+    }
+    pub(super) fn dismiss_tree_delete(
+        &mut self,
+        confirm: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(dialog) = self.tree_delete.take() else {
+            return;
+        };
+        cx.emit(FilesEvent::HoldMutation {
+            origin: dialog.origin.clone(),
+            path: None,
+        });
+        if confirm && self.accepts_origin(&dialog.origin, cx) {
+            self.request_mutation(&dialog.path, None, cx);
+        }
+        self.tree_focus.focus(window, cx);
+        cx.notify();
+    }
+    pub(super) fn render_tree_delete(
+        &self,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let dialog = self.tree_delete.as_ref()?;
+        let theme = theme.for_popup();
+        let directory = self
+            .tree
+            .node(&dialog.path)
+            .is_some_and(|n| n.entry.kind == zeron_proto::WorkspaceEntryKind::Directory);
+        let copy = format!(
+            "Permanently delete {}? {}Open editor buffers will be kept for recovery.",
+            dialog.path,
+            if directory {
+                "All current folder contents will be deleted. "
+            } else {
+                "This cannot be undone. "
+            }
+        );
+        let card = popover::dialog_card(&theme)
+            .w(px(380.))
+            .track_focus(&dialog.focus)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                match event.keystroke.key.as_str() {
+                    "escape" => this.dismiss_tree_delete(false, window, cx),
+                    "tab" | "left" | "right" => {
+                        if let Some(dialog) = this.tree_delete.as_mut() {
+                            dialog.confirm_focused = !dialog.confirm_focused;
+                            cx.notify();
+                        }
+                    }
+                    "enter" => {
+                        let confirm = this.tree_delete.as_ref().is_some_and(|d| d.confirm_focused);
+                        this.dismiss_tree_delete(confirm, window, cx);
+                    }
+                    _ => {}
+                }
+                window.prevent_default();
+                cx.stop_propagation();
+            }))
+            .child(popover::dialog_title(&theme, "Delete permanently?"))
+            .child(popover::dialog_body(&theme, copy))
+            .child(
+                div()
+                    .flex()
+                    .justify_end()
+                    .gap(px(8.))
+                    .child(
+                        popover::btn_ghost(&theme, "Cancel", "tree-delete-cancel")
+                            .id("tree-delete-cancel")
+                            .role(gpui::Role::Button)
+                            .aria_label("Cancel")
+                            .when(!dialog.confirm_focused, |el| {
+                                el.bg(crate::theme::wash(0.12))
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dismiss_tree_delete(false, window, cx)
+                            })),
+                    )
+                    .child(
+                        popover::btn_danger(&theme, "Delete permanently")
+                            .id("tree-delete-confirm")
+                            .role(gpui::Role::Button)
+                            .aria_label("Delete permanently")
+                            .when(dialog.confirm_focused, |el| {
+                                el.border_1().border_color(theme.text)
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.dismiss_tree_delete(true, window, cx)
+                            })),
+                    ),
+            );
+        Some(popover::modal(
+            "tree-delete-dialog",
+            window.viewport_size(),
+            card.into_any_element(),
+        ))
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[gpui::test]
+    fn inline_rename_submits_once_and_cancel_delete_never_mutates(cx: &mut gpui::TestAppContext) {
+        let (files, cx) = super::super::test_support::setup(cx);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let _sub = cx.update(|_, cx| {
+            cx.subscribe(&files, move |_, event, _| {
+                recorded.borrow_mut().push(event.clone())
+            })
+        });
+        files.update_in(cx, |files, window, cx| {
+            files.begin_tree_rename("a.txt".into(), window, cx);
+            let input = files.tree_rename.as_ref().unwrap().input.clone();
+            input.update(cx, |input, cx| input.set_value("new.txt", window, cx));
+            files.submit_tree_rename(window, cx);
+            files.submit_tree_rename(window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            events
+                .borrow()
+                .iter()
+                .filter(|event| matches!(event, FilesEvent::Mutate(_)))
+                .count(),
+            1
+        );
+        events.borrow_mut().clear();
+        files.update_in(cx, |files, window, cx| {
+            files.tree_rename = None;
+            files.begin_tree_delete("folder".into(), window, cx);
+            assert!(!files.tree_delete.as_ref().unwrap().confirm_focused);
+            files.dismiss_tree_delete(false, window, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, FilesEvent::Mutate(_)))
+        );
+    }
+    #[test]
+    fn rename_preserves_parent_and_selects_only_basename() {
+        assert_eq!(renamed_path("src/a.txt", "é.txt").unwrap(), "src/é.txt");
+        for invalid in ["", ".", "..", "../a", "a/b", ".git", "a\\b"] {
+            assert!(renamed_path("src/a", invalid).is_err());
+        }
+        assert_eq!(name_selection("foo.test.ts", false), 0..8);
+        assert_eq!(name_selection(".gitignore", false), 0..10);
+        assert_eq!(name_selection("foo.ts", true), 0..6);
+    }
+}

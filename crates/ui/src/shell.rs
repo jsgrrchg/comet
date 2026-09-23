@@ -3021,6 +3021,18 @@ impl Shell {
                     return;
                 }
                 match event {
+                    FilesEvent::HoldMutation { origin, path } => {
+                        let surfaces = this
+                            .files
+                            .values()
+                            .chain(this.file_surfaces.values())
+                            .filter(|s| s.read(cx).shares_workspace(origin))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for surface in surfaces {
+                            surface.update(cx, |files, cx| files.hold_mutation(path.clone(), cx));
+                        }
+                    }
                     FilesEvent::AddToChat {
                         path,
                         is_directory,

@@ -63,7 +63,7 @@ impl FilesSurface {
                 if let Some(menu) = self.tree_context_menu.open_mut() {
                     menu.active = popover::menu_step(
                         Some(menu.active),
-                        2,
+                        4,
                         if event.keystroke.key == "up" { -1 } else { 1 },
                     )
                     .unwrap_or(0);
@@ -108,6 +108,8 @@ impl FilesSurface {
                 cx.write_to_clipboard(ClipboardItem::new_string(path));
                 self.tree_focus.focus(window, cx);
             }
+            2 => self.begin_tree_rename(path, window, cx),
+            3 => self.begin_tree_delete(path, window, cx),
             _ => {}
         }
     }
@@ -125,15 +127,25 @@ impl FilesSurface {
             .flex_col()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_tree_context_menu(cx)))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        for (index, label) in ["Add to chat", "Copy path"].into_iter().enumerate() {
+        for (index, label) in ["Add to chat", "Copy path", "Rename…", "Delete…"]
+            .into_iter()
+            .enumerate()
+        {
+            if index == 2 {
+                card = card.child(popover::menu_separator());
+            }
+            let enabled = index < 2 || self.can_mutate_tree_entry(&menu.path, index == 3, cx);
             card = card.child(
                 popover::menu_row(&theme, menu.active == index, format!("tree-menu-{index}"))
                     .id(gpui::SharedString::from(format!("tree-menu-{index}")))
                     .role(gpui::Role::MenuItem)
                     .aria_label(label)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.dispatch_tree_menu(index, window, cx)
-                    }))
+                    .when(!enabled, |el| el.opacity(0.38).cursor_default())
+                    .when(enabled, |el| {
+                        el.on_click(cx.listener(move |this, _, window, cx| {
+                            this.dispatch_tree_menu(index, window, cx)
+                        }))
+                    })
                     .child(label),
             );
         }

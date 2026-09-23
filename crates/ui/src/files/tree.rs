@@ -228,6 +228,11 @@ impl FilesSurface {
                 let is_directory = node.entry.kind == WorkspaceEntryKind::Directory;
                 let decoration = self.git_decoration(&row.path, is_directory, cx);
                 let drag_payload = WorkspacePathDrag::new(path.clone(), is_directory);
+                let renaming = self
+                    .tree_rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.path == path);
+                let rename_element = self.render_tree_rename(&path, cx);
                 let expanded = is_directory && self.tree.is_expanded(&path);
                 let text_color = if let Some(decoration) = decoration {
                     decoration.color(&theme)
@@ -287,12 +292,15 @@ impl FilesSurface {
                             );
                         }),
                     )
-                    .when(crate::click_activation_drag_enabled(), |element| {
-                        element.on_drag(drag_payload, |payload, _, _, cx| {
-                            cx.stop_propagation();
-                            workspace_path_drag_ghost(payload, cx)
-                        })
-                    })
+                    .when(
+                        crate::click_activation_drag_enabled() && !renaming,
+                        |element| {
+                            element.on_drag(drag_payload, |payload, _, _, cx| {
+                                cx.stop_propagation();
+                                workspace_path_drag_ghost(payload, cx)
+                            })
+                        },
+                    )
                     .child(
                         div()
                             .size(px(14.0))
@@ -317,15 +325,16 @@ impl FilesSurface {
                             .size(px(14.0))
                             .flex_none(),
                     )
-                    .child(
+                    .child(rename_element.unwrap_or_else(|| {
                         div()
                             .min_w_0()
                             .truncate()
                             .font_family(theme.font_sans.clone())
                             .text_size(px(11.5))
                             .text_color(text_color)
-                            .child(node.entry.name),
-                    )
+                            .child(node.entry.name)
+                            .into_any_element()
+                    }))
                     .into_any_element()
             }
             VisibleRowKind::Loading { .. } => status_row(
@@ -449,6 +458,18 @@ impl FilesSurface {
                     window,
                     cx,
                 );
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if matches!(event.keystroke.key.as_str(), "f2" | "delete") {
+            if let Some(path) = self.tree.selected().map(str::to_string) {
+                if event.keystroke.key == "f2" {
+                    self.begin_tree_rename(path, window, cx);
+                } else {
+                    self.begin_tree_delete(path, window, cx);
+                }
             }
             window.prevent_default();
             cx.stop_propagation();

@@ -5,8 +5,8 @@ The same menu opens with the Menu key or Shift+F10 on the selected row.
 
 - **Add to chat** inserts a workspace reference into the current draft and focuses
   the composer. It keeps existing text and does not send a message.
-- **Copy path** copies the workspace-relative path with `/` separators, including
-  when the workspace belongs to another device.
+- **Copy path** copies the full path using the owning workspace's root and path
+  format, including when the workspace belongs to another device.
 - **Rename…** edits the name in the row. Enter submits; Escape or losing focus
   before submission cancels. F2 also opens the inline editor. A rename never
   overwrites another entry.

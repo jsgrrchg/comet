@@ -11,6 +11,26 @@ pub(super) struct TreeContextMenu {
     pub active: usize,
 }
 
+fn absolute_workspace_path(root: &str, relative: &str) -> String {
+    // Interpret the owning host's path, not the desktop's OS. PathBuf::join
+    // would mix separators when viewing a Windows workspace from Linux/macOS.
+    let bytes = root.as_bytes();
+    let windows = root.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'));
+    if windows {
+        format!(
+            "{}\\{}",
+            root.trim_end_matches(['/', '\\']).replace('/', "\\"),
+            relative.replace('/', "\\")
+        )
+    } else {
+        format!("{}/{}", root.trim_end_matches('/'), relative)
+    }
+}
+
 impl FilesSurface {
     pub(super) fn open_tree_context_menu(
         &mut self,
@@ -116,7 +136,10 @@ impl FilesSurface {
                 origin,
             }),
             1 => {
-                cx.write_to_clipboard(ClipboardItem::new_string(path));
+                cx.write_to_clipboard(ClipboardItem::new_string(absolute_workspace_path(
+                    &origin.context.cwd,
+                    &path,
+                )));
                 self.tree_focus.focus(window, cx);
             }
             2 => self.begin_tree_rename(path, window, cx),
@@ -160,7 +183,7 @@ impl FilesSurface {
                     .when(index == 1, |row| {
                         row.tooltip(|_, cx| {
                             cx.new(|_| preview::FileEditorTooltip {
-                                text: "Copy workspace-relative path".into(),
+                                text: "Copy full path".into(),
                             })
                             .into()
                         })
@@ -195,9 +218,72 @@ impl FilesSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::TestAppContext;
+    use gpui::{AppContext, TestAppContext};
+
+    #[test]
+    fn full_paths_follow_the_owning_hosts_path_format() {
+        for (root, expected) in [
+            ("/workspace", "/workspace/src/a.txt"),
+            ("/workspace/", "/workspace/src/a.txt"),
+            ("/", "/src/a.txt"),
+            (r"C:\work", r"C:\work\src\a.txt"),
+            (r"C:\", r"C:\src\a.txt"),
+            ("C:/work/", r"C:\work\src\a.txt"),
+            (r"\\server\share\work\", r"\\server\share\work\src\a.txt"),
+            (r"\\?\C:\work", r"\\?\C:\work\src\a.txt"),
+        ] {
+            assert_eq!(absolute_workspace_path(root, "src/a.txt"), expected);
+        }
+    }
+
     #[gpui::test]
-    fn menu_selects_without_opening_and_copy_is_relative(cx: &mut TestAppContext) {
+    fn copy_uses_the_remote_workspace_root(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        for (root, expected) in [
+            ("/remote/project", "/remote/project/a.txt"),
+            (r"D:\remote\project", r"D:\remote\project\a.txt"),
+        ] {
+            let window = cx.add_window(|_, cx| {
+                let state = cx.new(|_| {
+                    let mut state = super::super::test_support::state();
+                    state.chats[0].device_id = "remote-host".into();
+                    state.chats[0].cwd = Some(root.into());
+                    state
+                });
+                super::super::test_support::explorer(state, cx)
+            });
+            window
+                .update(cx, |files, window, cx| {
+                    assert_eq!(
+                        files
+                            .request_context
+                            .as_ref()
+                            .unwrap()
+                            .target_device_id
+                            .as_deref(),
+                        Some("remote-host")
+                    );
+                    files.open_tree_context_menu(
+                        "a.txt".into(),
+                        gpui::point(px(50.), px(50.)),
+                        window,
+                        cx,
+                    );
+                    files.dispatch_tree_menu(1, window, cx);
+                    assert_eq!(
+                        cx.read_from_clipboard().unwrap().text().as_deref(),
+                        Some(expected)
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn menu_selects_without_opening_and_copies_full_path(cx: &mut TestAppContext) {
         let (files, cx) = super::super::test_support::setup(cx);
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let recorded = events.clone();
@@ -213,7 +299,7 @@ mod tests {
             files.dispatch_tree_menu(1, window, cx);
             assert_eq!(
                 cx.read_from_clipboard().unwrap().text().as_deref(),
-                Some("a.txt")
+                Some("/workspace/a.txt")
             );
             files.open_tree_context_menu(
                 "folder".into(),

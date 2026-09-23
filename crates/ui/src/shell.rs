@@ -63,6 +63,7 @@ mod actions_ui;
 mod command_palette;
 mod files_panel;
 mod project_icon;
+mod right_tab_menu;
 mod sidebar_pins;
 mod sidebar_sections;
 mod spaces;

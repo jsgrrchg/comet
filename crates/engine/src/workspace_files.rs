@@ -1851,6 +1851,8 @@ fn checked_directory(
     root: &Path,
     directory: &WorkspaceRelativePath,
 ) -> Result<PathBuf, WorkspaceFilesError> {
+    let canonical_root =
+        std::fs::canonicalize(root).map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
     let mut current = root.to_path_buf();
     for component in directory.as_path().components() {
         let Component::Normal(component) = component else {
@@ -1872,7 +1874,7 @@ fn checked_directory(
     }
     let canonical = std::fs::canonicalize(&current)
         .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
-    if !canonical.starts_with(root) {
+    if !canonical.starts_with(&canonical_root) {
         return Err(WorkspaceFilesError::Authorization(
             "directory escaped workspace".into(),
         ));
@@ -2008,6 +2010,26 @@ mod tests {
 
     fn no_cancel() -> AtomicBool {
         AtomicBool::new(false)
+    }
+
+    #[test]
+    fn checked_directory_accepts_the_workspace_root_and_its_child_after_canonicalization() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("child")).unwrap();
+        let canonical_root = std::fs::canonicalize(root.path()).unwrap();
+
+        assert_eq!(
+            checked_directory(root.path(), &WorkspaceRelativePath::directory("").unwrap()).unwrap(),
+            canonical_root
+        );
+        assert_eq!(
+            checked_directory(
+                root.path(),
+                &WorkspaceRelativePath::directory("child").unwrap()
+            )
+            .unwrap(),
+            canonical_root.join("child")
+        );
     }
 
     #[test]

@@ -107,6 +107,30 @@ impl Shell {
         }
     }
 
+    fn right_tab_copy_path(&self, menu: &RightTabMenuState, cx: &App) -> Option<String> {
+        if !self.right_tab_menu_is_valid(menu, cx) {
+            return None;
+        }
+        let RightSurface::File(id) = menu.target else {
+            return None;
+        };
+        self.file_surface_paths
+            .get(&id)
+            .filter(|path| !path.is_empty())
+            .cloned()
+    }
+
+    fn copy_right_tab_path(&mut self, cx: &mut Context<Self>) {
+        let path = self
+            .right_tab_menu
+            .as_open()
+            .and_then(|menu| self.right_tab_copy_path(menu, cx));
+        self.close_right_tab_menu(cx);
+        if let Some(path) = path {
+            cx.write_to_clipboard(ClipboardItem::new_string(path));
+        }
+    }
+
     pub(super) fn render_right_tab_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let menu = self.right_tab_menu.get()?.clone();
         if !self.right_tab_menu_is_valid(&menu, cx) {
@@ -162,6 +186,30 @@ impl Shell {
                         }))
                     })
                     .child(label),
+            );
+        }
+        if matches!(menu.target, RightSurface::File(_)) {
+            let enabled =
+                self.right_tab_menu.is_open() && self.right_tab_copy_path(&menu, cx).is_some();
+            let id = "right-tab-copy-path";
+            card = card.child(popover::menu_separator()).child(
+                popover::menu_row(&theme, false, id)
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .role(gpui::Role::MenuItem)
+                    .aria_label("Copy Path")
+                    .when(!enabled, |row| {
+                        row.opacity(0.38)
+                            .cursor_default()
+                            .aria_description("Unavailable")
+                    })
+                    .when(enabled, |row| {
+                        row.on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.copy_right_tab_path(cx);
+                        }))
+                    })
+                    .child("Copy Path"),
             );
         }
         Some(popover::menu_at(
@@ -520,6 +568,68 @@ mod tests {
                 assert_eq!(shell.resolved_right_active(cx), other);
                 assert_eq!(shell.right_tabs["owner"], [target, tail]);
                 assert!(shell.pending_file_closes.is_empty());
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn copy_path_reads_current_workspace_path_and_rejects_stale_contexts(cx: &mut TestAppContext) {
+        let (_dir, handle) = setup(cx);
+        handle
+            .update(cx, |shell, window, cx| {
+                shell.add_file_surface("src/original.rs".into(), window, cx);
+                let id = shell.file_surface_seq;
+                let target = File(id);
+                let active = add_subagent(shell, "active", cx);
+                let position = gpui::point(px(20.), px(20.));
+                shell.open_right_tab_menu(target, position, cx);
+                shell.rename_file_surface(id, "owner", "src/original.rs", "src/área nueva.rs", cx);
+                shell.copy_right_tab_path(cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("src/área nueva.rs")
+                );
+                assert_eq!(shell.resolved_right_active(cx), active);
+                assert!(!shell.right_tab_menu.is_open());
+
+                cx.write_to_clipboard(ClipboardItem::new_string("unchanged".into()));
+                shell.open_right_tab_menu(target, position, cx);
+                shell.file_surface_paths.remove(&id);
+                assert!(
+                    shell
+                        .right_tab_copy_path(shell.right_tab_menu.as_open().unwrap(), cx)
+                        .is_none()
+                );
+                shell.copy_right_tab_path(cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("unchanged")
+                );
+
+                shell.file_surface_paths.insert(id, "src/remote.rs".into());
+                shell.open_right_tab_menu(target, position, cx);
+                shell.active_chat = "different-session".into();
+                shell.copy_right_tab_path(cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("unchanged")
+                );
+                shell.active_chat = "owner".into();
+                shell.open_right_tab_menu(target, position, cx);
+                shell.close_right_surface(target, window, cx);
+                shell.copy_right_tab_path(cx);
+                assert_eq!(
+                    cx.read_from_clipboard().unwrap().text().as_deref(),
+                    Some("unchanged")
+                );
+                for target in [Picker, Diff(1), Terminal(1), Browser(1), active] {
+                    let menu = RightTabMenuState {
+                        panel_key: "owner".into(),
+                        target,
+                        position,
+                    };
+                    assert!(shell.right_tab_copy_path(&menu, cx).is_none());
+                }
             })
             .unwrap();
     }

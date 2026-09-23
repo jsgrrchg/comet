@@ -13556,6 +13556,41 @@ mod right_tab_mouse_regressions {
     }
 
     #[gpui::test]
+    fn file_context_menu_copies_renamed_path_without_selecting_the_file(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        open_menu(&shell, cx, 0);
+        assert!(cx.debug_bounds("right-tab-copy-path").is_none());
+        cx.update(|window, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.close_right_tab_menu(cx);
+                shell.add_file_surface("src/old.rs".into(), window, cx);
+                shell.set_right_active(RightSurface::Subagent(2), cx);
+            })
+        });
+        open_menu(&shell, cx, 2);
+        shell.update(cx, |shell, cx| {
+            shell.rename_file_surface(
+                shell.file_surface_seq,
+                "parent",
+                "src/old.rs",
+                "src/archivo ñ.rs",
+                cx,
+            );
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let position = cx.debug_bounds("right-tab-copy-path").unwrap().center();
+        cx.simulate_click(position, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, cx| {
+            assert_eq!(
+                cx.read_from_clipboard().unwrap().text().as_deref(),
+                Some("src/archivo ñ.rs")
+            );
+            assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(2));
+            assert!(!shell.right_tab_menu.is_open());
+        });
+    }
+
+    #[gpui::test]
     fn subagent_close_press_does_not_start_parent_drag(cx: &mut TestAppContext) {
         let (shell, cx) = setup(cx);
         let start = cx.debug_bounds("right-surface-close-0").unwrap().center();

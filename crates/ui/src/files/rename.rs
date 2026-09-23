@@ -256,9 +256,10 @@ impl FilesSurface {
             .tree
             .node(&dialog.path)
             .is_some_and(|n| n.entry.kind == zeron_proto::WorkspaceEntryKind::Directory);
+        let name = dialog.path.rsplit('/').next().unwrap_or(&dialog.path);
         let copy = format!(
             "Permanently delete {}? {}Open editor buffers will be kept for recovery.",
-            dialog.path,
+            name,
             if directory {
                 "All current folder contents will be deleted. "
             } else {

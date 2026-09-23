@@ -347,7 +347,7 @@ impl WorkspaceFiles {
             page.checkout_id = Some(workspace.checkout_id);
             page.mutation_capabilities = Some(zeron_proto::WorkspaceMutationCapabilities {
                 move_entry: cfg!(any(target_os = "linux", target_os = "macos", windows)),
-                delete_entry: false,
+                delete_entry: true,
             });
             page
         })

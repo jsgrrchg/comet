@@ -7,6 +7,68 @@ use zeron_proto::{
 type MutationResult<T> = Result<T, (Reason, String)>;
 
 impl WorkspaceFiles {
+    pub async fn delete_entry(
+        &self,
+        request: zeron_proto::DeleteWorkspaceEntryRequest,
+    ) -> Result<WorkspaceMutationOutcome, WorkspaceFilesError> {
+        let workspace = self.resolve_target(&request.target).await?;
+        let gate = self
+            .mutation_gate(&workspace.checkout_id)
+            .write_owned()
+            .await;
+        if request.expected_checkout_id.is_empty()
+            || self.resolve_target(&request.target).await? != workspace
+            || request.expected_checkout_id != workspace.checkout_id
+        {
+            return Ok(rejected(
+                request.operation_id,
+                Reason::WorkspaceChanged,
+                "Workspace changed; refresh before deleting",
+            ));
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_on_drop = CancelOnDrop::new(cancel.clone());
+        let owner = self.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _gate = gate;
+            let result = match delete_blocking(&workspace, &request, &cancel) {
+                Ok(()) => WorkspaceMutationOutcome::Applied {
+                    operation_id: request.operation_id.clone(),
+                    checkout_id: workspace.checkout_id.clone(),
+                    change: WorkspaceFileChange {
+                        operation_id: Some(request.operation_id),
+                        kind: WorkspaceFileChangeKind::Removed,
+                        path: request.path,
+                        old_path: None,
+                    },
+                    entry: None,
+                },
+                Err((reason, message)) => rejected(request.operation_id, reason, &message),
+            };
+            owner.publish_mutation(&workspace.checkout_id, &result);
+            result
+        })
+        .await
+        .map_err(|e| WorkspaceFilesError::Io(format!("delete worker failed: {e}")))?;
+        cancel_on_drop.disarm();
+        Ok(result)
+    }
+
+    fn publish_mutation(&self, checkout: &str, result: &WorkspaceMutationOutcome) {
+        if let Some(watch) = lock(&self.inner.watches).get(checkout).cloned() {
+            match result {
+                WorkspaceMutationOutcome::Applied { change, .. } => {
+                    watch.publish(false, vec![change.clone()])
+                }
+                WorkspaceMutationOutcome::Rejected {
+                    reason: Reason::PartialFailure,
+                    ..
+                } => watch.publish(true, vec![]),
+                _ => {}
+            }
+        }
+    }
+
     pub(super) fn mutation_gate(&self, checkout: &str) -> Arc<tokio::sync::RwLock<()>> {
         let mut gates = lock(&self.inner.mutation_gates);
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -40,12 +102,13 @@ impl WorkspaceFiles {
         }
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_on_drop = CancelOnDrop::new(cancel.clone());
+        let owner = self.clone();
         let result = tokio::task::spawn_blocking(move || {
             let _gate = gate;
-            match move_blocking(&workspace, &request, &cancel) {
+            let result = match move_blocking(&workspace, &request, &cancel) {
                 Ok(entry) => WorkspaceMutationOutcome::Applied {
                     operation_id: request.operation_id.clone(),
-                    checkout_id: workspace.checkout_id,
+                    checkout_id: workspace.checkout_id.clone(),
                     change: WorkspaceFileChange {
                         operation_id: Some(request.operation_id),
                         kind: WorkspaceFileChangeKind::Renamed,
@@ -55,12 +118,52 @@ impl WorkspaceFiles {
                     entry: Some(entry),
                 },
                 Err((reason, message)) => rejected(request.operation_id, reason, &message),
-            }
+            };
+            owner.publish_mutation(&workspace.checkout_id, &result);
+            result
         })
         .await
         .map_err(|e| WorkspaceFilesError::Io(format!("move worker failed: {e}")))?;
         cancel_on_drop.disarm();
         Ok(result)
+    }
+}
+
+fn delete_blocking(
+    workspace: &ResolvedWorkspace,
+    request: &zeron_proto::DeleteWorkspaceEntryRequest,
+    cancel: &AtomicBool,
+) -> MutationResult<()> {
+    if request.operation_id.is_empty() || request.operation_id.len() > 128 {
+        return Err((Reason::InvalidPath, "Invalid operation identity".into()));
+    }
+    let (relative, metadata) = source(
+        &workspace.root,
+        &request.path,
+        &request.expected_source_revision,
+        request.expected_kind,
+    )?;
+    if metadata.is_dir() && !request.recursive {
+        return Err((
+            Reason::InvalidDestination,
+            "Deleting a folder requires recursive confirmation".into(),
+        ));
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err((Reason::Busy, "Delete cancelled before execution".into()));
+    }
+    let target = workspace.root.join(relative.as_path());
+    if metadata.is_dir() {
+        // std::fs::remove_dir_all does not follow symbolic links and uses platform
+        // handle-relative traversal. A failed recursive delete may have removed children.
+        std::fs::remove_dir_all(target).map_err(|e| {
+            (
+                Reason::PartialFailure,
+                format!("Folder deletion did not complete; refresh to see remaining files: {e}"),
+            )
+        })
+    } else {
+        std::fs::remove_file(target).map_err(io_error)
     }
 }
 
@@ -355,6 +458,67 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn delete_requires_current_revision_and_explicit_recursion() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir(root.join("folder")).unwrap();
+        std::fs::write(root.join("folder/file"), "keep").unwrap();
+        let ws = ResolvedWorkspace {
+            checkout_id: "checkout".into(),
+            root: root.into(),
+        };
+        let mut req = zeron_proto::DeleteWorkspaceEntryRequest {
+            target: request(root, "folder", "unused").target,
+            operation_id: "delete".into(),
+            expected_checkout_id: "checkout".into(),
+            path: "folder".into(),
+            expected_source_revision: revision(&std::fs::metadata(root.join("folder")).unwrap()),
+            expected_kind: WorkspaceEntryKind::Directory,
+            recursive: false,
+        };
+        assert!(delete_blocking(&ws, &req, &AtomicBool::new(false)).is_err());
+        assert!(root.join("folder/file").exists());
+        req.recursive = true;
+        delete_blocking(&ws, &req, &AtomicBool::new(false)).unwrap();
+        assert!(!root.join("folder").exists());
+        assert_eq!(
+            delete_blocking(&ws, &req, &AtomicBool::new(false))
+                .unwrap_err()
+                .0,
+            Reason::SourceMissing
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn deleting_directory_does_not_follow_links_to_external_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("folder")).unwrap();
+        std::fs::write(outside.path().join("keep"), "keep").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("folder/link")).unwrap();
+        let ws = ResolvedWorkspace {
+            checkout_id: "checkout".into(),
+            root: dir.path().into(),
+        };
+        let req = zeron_proto::DeleteWorkspaceEntryRequest {
+            target: request(dir.path(), "folder", "unused").target,
+            operation_id: "delete".into(),
+            expected_checkout_id: "checkout".into(),
+            path: "folder".into(),
+            expected_source_revision: revision(
+                &std::fs::metadata(dir.path().join("folder")).unwrap(),
+            ),
+            expected_kind: WorkspaceEntryKind::Directory,
+            recursive: true,
+        };
+        delete_blocking(&ws, &req, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("keep")).unwrap(),
+            "keep"
+        );
+    }
+
     #[test]
     fn moves_subtrees_without_replacement_or_prefix_confusion() {
         let dir = tempfile::tempdir().unwrap();

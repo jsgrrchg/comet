@@ -331,6 +331,64 @@ impl FilesSurface {
 mod tests {
     use super::*;
     #[gpui::test]
+    fn refreshed_revision_does_not_authorize_an_already_open_confirmation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (files, cx) = super::super::test_support::setup(cx);
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let _sub = cx.update(|_, cx| {
+            cx.subscribe(&files, move |_, event, _| {
+                recorded.borrow_mut().push(event.clone())
+            })
+        });
+        files.update_in(cx, |files, window, cx| {
+            files.begin_tree_delete("a.txt".into(), window, cx);
+            files.begin_tree_rename("a.txt".into(), window, cx);
+            let input = files.tree_rename.as_ref().unwrap().input.clone();
+            input.update(cx, |input, cx| input.set_value("renamed.txt", window, cx));
+            let mut entry =
+                super::super::test_support::entry("a.txt", zeron_proto::WorkspaceEntryKind::File);
+            entry.mutation_revision = Some("external-edit".into());
+            files.tree.apply_page(
+                zeron_proto::WorkspaceDirectoryPage {
+                    directory: "".into(),
+                    checkout_id: Some("checkout".into()),
+                    mutation_capabilities: files.mutation_capabilities,
+                    entries: vec![entry],
+                    next_cursor: None,
+                    truncated: false,
+                },
+                files.tree.generation(),
+            );
+            files.submit_tree_rename(window, cx);
+            assert!(!files.tree_rename.as_ref().unwrap().submitted);
+            assert!(
+                files
+                    .mutation_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("Entry changed")
+            );
+            files.dismiss_tree_delete(true, window, cx);
+            assert!(
+                files
+                    .mutation_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("Entry changed")
+            );
+        });
+        cx.run_until_parked();
+        assert!(
+            !events
+                .borrow()
+                .iter()
+                .any(|event| matches!(event, FilesEvent::Mutate(_)))
+        );
+    }
+
+    #[gpui::test]
     fn inline_rename_submits_once_and_cancel_delete_never_mutates(cx: &mut gpui::TestAppContext) {
         let (files, cx) = super::super::test_support::setup(cx);
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));

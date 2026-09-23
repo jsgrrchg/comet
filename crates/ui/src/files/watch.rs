@@ -141,6 +141,11 @@ impl FilesSurface {
                     }
                 }
                 WorkspaceFileChangeKind::Modified => {
+                    // Saves (including atomic replacement) change the metadata
+                    // revision used by move/delete, even when the name is unchanged.
+                    if let Some(parent) = parent_path(&change.path) {
+                        parents.insert(parent);
+                    }
                     self.reconcile_document(change.path, cx);
                 }
                 WorkspaceFileChangeKind::Removed => {
@@ -198,6 +203,116 @@ pub(super) fn sequence_needs_resync(previous: Option<u64>, next: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::AppContext;
+
+    #[gpui::test]
+    fn completed_save_refreshes_revision_before_the_next_mutation(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, mut requests) = tokio::sync::mpsc::channel(16);
+        let (replies, inbound) = tokio::sync::mpsc::channel(16);
+        let engine =
+            crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound));
+        let state = cx.new(|_| {
+            let mut state = super::super::test_support::state();
+            state.set_test_engine(engine);
+            state
+        });
+        let files = cx.new(|cx| super::super::test_support::explorer(state, cx));
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&files, move |_, event, _| {
+                recorded.borrow_mut().push(event.clone())
+            })
+        });
+        files.update(cx, |files, cx| {
+            files.apply_workspace_changes(
+                WorkspaceFileChanges {
+                    sequence: 1,
+                    resync_required: false,
+                    changes: vec![zeron_proto::WorkspaceFileChange {
+                        operation_id: None,
+                        kind: WorkspaceFileChangeKind::Modified,
+                        path: "a.txt".into(),
+                        old_path: None,
+                    }],
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        let request: serde_json::Value = serde_json::from_str(
+            &requests
+                .try_recv()
+                .expect("Modified must reload the containing directory"),
+        )
+        .unwrap();
+        assert_eq!(
+            request["method"],
+            zeron_rpc::methods::LIST_WORKSPACE_DIRECTORY
+        );
+        assert_eq!(request["params"]["directory"], "");
+        let mut entry =
+            super::super::test_support::entry("a.txt", zeron_proto::WorkspaceEntryKind::File);
+        entry.mutation_revision = Some("after-save".into());
+        runtime.block_on(async {
+            replies
+                .send(
+                    serde_json::json!({
+                        "id": request["id"], "ok": {
+                            "directory": "", "checkoutId": "checkout",
+                            "mutationCapabilities": {"moveEntry": true, "deleteEntry": true},
+                            "entries": [entry], "nextCursor": null, "truncated": false
+                        }
+                    })
+                    .to_string(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while replies.capacity() < replies.max_capacity() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        cx.run_until_parked();
+        files.update(cx, |files, cx| {
+            assert_eq!(
+                files
+                    .tree
+                    .node("a.txt")
+                    .unwrap()
+                    .entry
+                    .mutation_revision
+                    .as_deref(),
+                Some("after-save")
+            );
+            files.request_mutation("a.txt", Some("renamed.txt".into()), cx);
+            files.request_mutation("a.txt", Some("folder/a.txt".into()), cx);
+            files.request_mutation("a.txt", None, cx);
+        });
+        cx.run_until_parked();
+        let events = events.borrow();
+        let intents = events
+            .iter()
+            .filter_map(|event| match event {
+                FilesEvent::Mutate(intent) => Some(intent),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(intents.len(), 3);
+        assert!(
+            intents
+                .iter()
+                .all(|intent| intent.entry.mutation_revision.as_deref() == Some("after-save"))
+        );
+    }
 
     #[test]
     fn sequence_gaps_require_resync() {

@@ -254,6 +254,7 @@ pub(crate) struct DockState {
     phase: Glide,
     last_frame: Option<Instant>,
     pub frame: DockFrame,
+    /// Horizontal center and top edge of the painted composer.
     position: Option<(Glide, Glide)>,
     last_geometry: Option<Instant>,
     last_docked: bool,
@@ -474,7 +475,9 @@ impl Element for DockedComposer {
     ) {
         let mut state = self.state.borrow_mut();
         let docked = state.frame.docked;
-        let x = f32::from(bounds.left());
+        // Width already animates in layout. Anchor its center so the moving
+        // left edge does not feed a second spring and cause lateral drift.
+        let x = f32::from(bounds.center().x);
         // Anchor by the top of the input surface, not its shrinking bottom.
         let y = if docked {
             f32::from(bounds.top())
@@ -794,7 +797,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn measured_dock_retargets_without_a_first_frame_jump(cx: &mut gpui::TestAppContext) {
+    fn measured_dock_stays_centered_through_resize_and_reversal(cx: &mut gpui::TestAppContext) {
         struct Fixture {
             state: SharedDock,
             now: Instant,
@@ -831,64 +834,84 @@ mod tests {
                     ))
             }
         }
-        let measured = Rc::new(std::cell::Cell::new(None));
-        let now = Instant::now();
-        let handle = cx.open_window(gpui::size(px(1600.0), px(900.0)), |_, _| Fixture {
-            state: Default::default(),
-            now,
-            docked: false,
-            width: 768.0,
-            measured: measured.clone(),
-        });
-        let draw = |cx: &mut gpui::TestAppContext| {
-            cx.update_window(handle.into(), |_, window, cx| {
-                window.draw(cx).clear();
-            })
-            .unwrap();
-            measured.get().unwrap()
-        };
-        let origin = draw(cx);
-        handle
-            .update(cx, |fixture, _, cx| {
-                fixture.now = now + std::time::Duration::from_secs(30);
-                fixture.docked = true;
-                fixture.width = 1232.0;
-                cx.notify();
-            })
-            .unwrap();
-        assert_eq!(draw(cx), origin);
-        handle
-            .update(cx, |fixture, _, cx| {
-                fixture.now += std::time::Duration::from_millis(100);
-                cx.notify();
-            })
-            .unwrap();
-        let moving = draw(cx);
-        assert!(moving.top() > origin.top());
-        handle
-            .update(cx, |fixture, _, cx| {
-                fixture.docked = false;
-                fixture.width = 768.0;
-                cx.notify();
-            })
-            .unwrap();
-        assert_eq!(
-            draw(cx),
-            moving,
-            "reversal and resize must start at the painted bounds"
-        );
-        for _ in 0..90 {
-            handle
-                .update(cx, |fixture, _, cx| {
-                    fixture.now += std::time::Duration::from_millis(16);
-                    cx.notify();
-                })
-                .unwrap();
-            draw(cx);
+        let mut default_tops = None;
+        for thread_width in [768.0, 592.0, 1232.0] {
+            let measured = Rc::new(std::cell::Cell::new(None));
+            let now = Instant::now();
+            let handle = cx.open_window(gpui::size(px(1600.0), px(900.0)), |_, _| Fixture {
+                state: Default::default(),
+                now,
+                docked: false,
+                width: 768.0,
+                measured: measured.clone(),
+            });
+            let draw = |cx: &mut gpui::TestAppContext| {
+                let pixel = cx
+                    .update_window(handle.into(), |_, window, cx| {
+                        window.draw(cx).clear();
+                        1.0 / window.scale_factor()
+                    })
+                    .unwrap();
+                let bounds = measured.get().unwrap();
+                // GPUI snaps painted bounds to device pixels; allow that
+                // rounding without accepting an animated lateral excursion.
+                assert!(
+                    (f32::from(bounds.center().x) - 800.0).abs() <= pixel,
+                    "composer drifted horizontally at thread width {thread_width}: {bounds:?}"
+                );
+                bounds
+            };
+            let origin = draw(cx);
+            let mut tops = Vec::new();
+            // Reverse during travel in both directions, then complete a full
+            // round trip. Every painted frame must keep the same center.
+            for (docked, frames) in [(true, 6), (false, 6), (true, 90), (false, 90)] {
+                let before = draw(cx);
+                handle
+                    .update(cx, |fixture, _, cx| {
+                        if fixture.now == now {
+                            fixture.now += std::time::Duration::from_secs(30);
+                        }
+                        fixture.docked = docked;
+                        fixture.width = if docked { thread_width } else { 768.0 };
+                        cx.notify();
+                    })
+                    .unwrap();
+                assert_eq!(
+                    draw(cx),
+                    before,
+                    "route changes must start at the painted bounds"
+                );
+                for _ in 0..frames {
+                    handle
+                        .update(cx, |fixture, _, cx| {
+                            fixture.now += std::time::Duration::from_millis(16);
+                            cx.notify();
+                        })
+                        .unwrap();
+                    tops.push(draw(cx).top());
+                }
+                let bounds = draw(cx);
+                if docked {
+                    assert!(bounds.top() > origin.top());
+                }
+                if frames == 90 {
+                    let expected_width = if docked { thread_width } else { 768.0 };
+                    let expected_top = if docked {
+                        900.0 - 124.0
+                    } else {
+                        f32::from(origin.top())
+                    };
+                    assert!((f32::from(bounds.size.width) - expected_width).abs() < 0.1);
+                    assert!((f32::from(bounds.top()) - expected_top).abs() < 0.1);
+                }
+            }
+            if let Some(default_tops) = &default_tops {
+                assert_eq!(&tops, default_tops, "width must not alter vertical travel");
+            } else {
+                default_tops = Some(tops);
+            }
         }
-        let settled = draw(cx);
-        assert!((f32::from(settled.top() - origin.top())).abs() < 0.1);
-        assert!((f32::from(settled.size.width) - 768.0).abs() < 0.1);
     }
 
     #[gpui::test]

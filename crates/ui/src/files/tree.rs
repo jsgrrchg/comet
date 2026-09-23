@@ -177,8 +177,13 @@ impl FilesSurface {
     pub(super) fn render_tree(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let scrollbar = popover::rail(self, "files-tree-scrollbar", &theme, cx);
+        self.reset_tree_drop_rows();
+        let root_target = self.render_tree_root_target(cx);
         div()
             .id("files-tree")
+            .debug_selector(|| "files-tree".into())
+            .on_drag_move::<WorkspacePathDrag>(cx.listener(Self::on_tree_drag_move))
+            .on_drop::<WorkspacePathDrag>(cx.listener(Self::on_tree_drop))
             .role(gpui::Role::Tree)
             .aria_label("Workspace file tree")
             .relative()
@@ -195,6 +200,7 @@ impl FilesSurface {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_tree_key_down(event, window, cx)
             }))
+            .child(root_target)
             .child(
                 list(self.tree_list.clone(), cx.processor(Self::render_tree_row))
                     .flex_1()
@@ -216,6 +222,12 @@ impl FilesSurface {
         };
         let theme = Theme::of(cx).clone();
         let padding = 8.0 + row.depth as f32 * TREE_INDENT;
+        let drop_key = row.path.clone();
+        let drop_target = match &row.kind {
+            VisibleRowKind::Entry => Some(row.path.clone()),
+            VisibleRowKind::Empty { directory } => Some(directory.clone()),
+            _ => None,
+        };
         let content = match row.kind {
             VisibleRowKind::Entry => {
                 let Some(node) = self.tree.node(&row.path).cloned() else {
@@ -260,6 +272,14 @@ impl FilesSurface {
                     )))
                     .role(gpui::Role::TreeItem)
                     .aria_label(node.entry.name.clone())
+                    .debug_selector({
+                        let path = row.path.clone();
+                        move || format!("tree-entry:{path}")
+                    })
+                    .when(
+                        is_directory && self.tree_drag.destination.as_deref() == Some(&path),
+                        |el| el.bg(crate::theme::wash(0.18)),
+                    )
                     .aria_selected(selected)
                     .when(is_directory, |element| element.aria_expanded(expanded))
                     .h(px(TREE_ROW_HEIGHT))
@@ -418,7 +438,12 @@ impl FilesSurface {
                 )
                 .into_any_element(),
         };
-        with_indent_guides(content, row.depth, TREE_ROW_HEIGHT, &theme)
+        self.track_tree_drop_row(
+            drop_key,
+            drop_target,
+            TREE_ROW_HEIGHT,
+            with_indent_guides(content, row.depth, TREE_ROW_HEIGHT, &theme),
+        )
     }
 
     pub(super) fn activate_tree_path(&mut self, path: String, cx: &mut Context<Self>) {
@@ -459,6 +484,12 @@ impl FilesSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.key == "escape" && cx.has_active_drag() {
+            cx.stop_active_drag(window);
+            self.clear_tree_drag(window, cx);
+            cx.stop_propagation();
+            return;
+        }
         if self.tree_menu_key(event, window, cx) {
             return;
         }

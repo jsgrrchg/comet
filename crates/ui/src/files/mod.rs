@@ -20,6 +20,7 @@ use crate::{
 pub mod client;
 mod context_menu;
 pub mod document;
+mod drag;
 pub mod editor;
 pub mod editor_adapter;
 mod git_status;
@@ -265,6 +266,7 @@ pub struct FilesSurface {
     applied_mutations: std::collections::VecDeque<String>,
     mutation_error: Option<SharedString>,
     mutation_hold: Option<String>,
+    tree_drag: drag::TreeDrag,
     tree_rename: Option<rename::TreeRename>,
     tree_delete: Option<rename::TreeDelete>,
     state: Entity<AppState>,
@@ -304,6 +306,9 @@ pub struct FilesSurface {
 
 impl Render for FilesSurface {
     fn render(&mut self, window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !cx.has_active_drag() || !self.is_current_target(cx) {
+            self.clear_tree_drag(window, cx);
+        }
         if std::mem::take(&mut self.search_restore_tree_focus) {
             self.tree_focus.focus(window, cx);
         }
@@ -604,6 +609,7 @@ impl FilesSurface {
             applied_mutations: std::collections::VecDeque::new(),
             mutation_error: None,
             mutation_hold: None,
+            tree_drag: drag::TreeDrag::default(),
             tree_rename: None,
             tree_delete: None,
             state,
@@ -1060,6 +1066,7 @@ impl FilesSurface {
             });
         }
         self.tree_rename = None;
+        self.tree_drag = drag::TreeDrag::default();
         self.mutation_hold = None;
         self.interaction_generation = self.interaction_generation.wrapping_add(1);
         self.effective_checkout_id = None;

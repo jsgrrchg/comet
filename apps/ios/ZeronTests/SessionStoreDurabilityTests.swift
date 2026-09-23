@@ -441,6 +441,121 @@ final class SessionStoreDurabilityTests: XCTestCase {
         XCTAssertFalse(saver.isDirty)
     }
 
+    func testDeadlineOverlapsDebounceExportAndPersistsNewestChange() async throws {
+        let scheduler = ManualDocSaverScheduler()
+        let firstExportStarted = expectation(description: "debounce export is blocked")
+        let secondCallbackStarted = expectation(description: "deadline callback overlaps debounce")
+        let secondExportStarted = expectation(description: "deadline export is blocked")
+        let firstGate = DispatchSemaphore(value: 0)
+        let secondGate = DispatchSemaphore(value: 0)
+        defer {
+            firstGate.signal()
+            secondGate.signal()
+        }
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("overlapping-save-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var snapshot = Data([1])
+        var writes: [Data] = []
+        var results: [Bool] = []
+        var callbacks = 0
+        var attempts = 0
+        var inFlight = 0
+        let saver = DocSaver(save: {
+            XCTFail("Timer saves must use the background hook")
+            return false
+        }, quietDebounceNs: 300_000_000, maxDeferralNs: 400_000_000,
+        staleRetryNs: 300_000_000, scheduler: scheduler)
+        saver.onSaved = { callbacks += 1 }
+        saver.background = { [weak saver] in
+            guard let saver else { return false }
+            attempts += 1
+            inFlight += 1
+            defer { inFlight -= 1 }
+            let attempt = attempts
+            let exportedSnapshot = snapshot
+            if attempt == 2 {
+                XCTAssertEqual(inFlight, 2, "The deadline must enter before the debounce returns")
+                secondCallbackStarted.fulfill()
+            }
+            let result = await saver.commitAsync(
+                export: {
+                    if attempt == 1 {
+                        firstExportStarted.fulfill()
+                        firstGate.wait()
+                    } else if attempt == 2 {
+                        secondExportStarted.fulfill()
+                        secondGate.wait()
+                    }
+                    return exportedSnapshot
+                },
+                write: { data in
+                    do {
+                        try data.write(to: url, options: .atomic)
+                        writes.append(data)
+                        return true
+                    } catch {
+                        XCTFail("Snapshot write failed: \(error)")
+                        return false
+                    }
+                }
+            )
+            results.append(result)
+            return result
+        }
+
+        func waitForTimer(_ task: Task<Void, Never>) async {
+            let finished = expectation(description: "timer callback completed")
+            let observer = Task {
+                await task.value
+                guard !Task.isCancelled else { return }
+                finished.fulfill()
+            }
+            defer { observer.cancel() }
+            await fulfillment(of: [finished], timeout: 5)
+        }
+
+        saver.poke()
+        let debounce = try XCTUnwrap(scheduler.startNext()) // 300 ms
+        await fulfillment(of: [firstExportStarted], timeout: 5)
+        XCTAssertEqual(attempts, 1)
+        snapshot = Data([2])
+        saver.poke()
+
+        await scheduler.advance(by: 99_999_999)
+        XCTAssertEqual(attempts, 1, "The maximum deadline must not fire early")
+        let deadline = try XCTUnwrap(scheduler.startNext()) // 400 ms, while debounce is suspended
+        await fulfillment(of: [secondCallbackStarted], timeout: 5)
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertTrue(saver.isDirty)
+        XCTAssertEqual(callbacks, 0)
+
+        firstGate.signal()
+        await fulfillment(of: [secondExportStarted], timeout: 5)
+        await waitForTimer(debounce)
+        XCTAssertEqual(writes, [Data([1])])
+        XCTAssertEqual(try Data(contentsOf: url), Data([1]))
+        XCTAssertEqual(results, [false], "An older snapshot cannot complete the newer save")
+        XCTAssertTrue(saver.isDirty, "The latest change is still waiting for its export")
+        XCTAssertEqual(callbacks, 0, "An obsolete export must not announce a completed save")
+
+        secondGate.signal()
+        await waitForTimer(deadline)
+        XCTAssertEqual(writes, [Data([1]), Data([2])])
+        XCTAssertEqual(try Data(contentsOf: url), Data([2]))
+        XCTAssertEqual(results, [false, true])
+        XCTAssertFalse(saver.isDirty)
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertEqual(inFlight, 0)
+
+        // The newer poke and the stale export both armed timers. Neither may
+        // write or notify again after the overlapping deadline saved the change.
+        await scheduler.advance(by: 10_000_000_000)
+        XCTAssertEqual(attempts, 2)
+        XCTAssertEqual(writes.count, 2)
+        XCTAssertEqual(callbacks, 1)
+        XCTAssertEqual(try Data(contentsOf: url), Data([2]))
+    }
+
     func testFailedSaveRetriesAfterTwoSeconds() async {
         let scheduler = ManualDocSaverScheduler()
         var saves = 0

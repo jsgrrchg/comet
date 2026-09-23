@@ -17,6 +17,17 @@ final class ManualDocSaverScheduler: DocSaverScheduling {
         jobs.append(Job(deadline: now + nanoseconds, action: action))
     }
 
+    /// Moves to the next deadline and starts its callback without waiting for it
+    /// to finish. Wait for an explicit signal from the callback before advancing
+    /// again, and await the returned task to observe its completed effects.
+    func startNext() -> Task<Void, Never>? {
+        precondition(!advancing, "Cannot start a callback during a serial advance")
+        guard let index = jobs.indices.min(by: { jobs[$0].deadline < jobs[$1].deadline }) else { return nil }
+        let job = jobs.remove(at: index)
+        now = job.deadline
+        return Task { await job.action() }
+    }
+
     /// Completes every due action, including work scheduled by those actions,
     /// before returning. Await this before asserting persistence effects.
     func advance(by nanoseconds: UInt64) async {

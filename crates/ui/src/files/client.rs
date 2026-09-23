@@ -127,7 +127,7 @@ impl WorkspaceFilesClient {
     /// Refresh through the cached children before publishing the new listing.
     /// Usually this reads only the pages already visited. If a cached child is
     /// missing, reach the end before treating it as deleted.
-    pub(super) async fn list_directory_snapshot(
+    pub(crate) async fn list_directory_snapshot(
         &self,
         mut request: ListWorkspaceDirectoryRequest,
         cached_paths: &[String],
@@ -151,6 +151,11 @@ impl WorkspaceFilesClient {
                 }
                 request.cursor = Some(cursor);
                 let next = self.list_directory(request.clone()).await?;
+                if next.checkout_id != page.checkout_id {
+                    return Err(FilesClientError::Decode(
+                        "Workspace changed between directory pages".into(),
+                    ));
+                }
                 for entry in &next.entries {
                     remaining.remove(entry.path.as_str());
                 }
@@ -247,6 +252,20 @@ impl WorkspaceFilesClient {
         request: WriteWorkspaceFileRequest,
     ) -> Result<WriteWorkspaceFileOutcome, FilesClientError> {
         self.call(methods::WRITE_WORKSPACE_FILE, &request).await
+    }
+
+    pub async fn move_entry(
+        &self,
+        request: zeron_proto::MoveWorkspaceEntryRequest,
+    ) -> Result<zeron_proto::WorkspaceMutationOutcome, FilesClientError> {
+        self.call(methods::MOVE_WORKSPACE_ENTRY, &request).await
+    }
+
+    pub async fn delete_entry(
+        &self,
+        request: zeron_proto::DeleteWorkspaceEntryRequest,
+    ) -> Result<zeron_proto::WorkspaceMutationOutcome, FilesClientError> {
+        self.call(methods::DELETE_WORKSPACE_ENTRY, &request).await
     }
 
     pub async fn watch(&self) -> Result<mpsc::Receiver<serde_json::Value>, FilesClientError> {

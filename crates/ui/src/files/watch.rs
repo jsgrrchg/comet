@@ -71,8 +71,36 @@ impl FilesSurface {
         }));
     }
 
-    fn apply_workspace_changes(&mut self, frame: WorkspaceFileChanges, cx: &mut Context<Self>) {
-        let gap = sequence_needs_resync(self.watch_sequence, frame.sequence);
+    pub(super) fn apply_workspace_changes(
+        &mut self,
+        mut frame: WorkspaceFileChanges,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_mutation.is_some() {
+            // Defer affected events; unrelated changes still flow through. Keep
+            // sequence accounting on the live stream, not the deferred fragments.
+            let intent = self.pending_mutation.as_ref().unwrap();
+            let (affected, independent): (Vec<_>, Vec<_>) =
+                frame.changes.into_iter().partition(|change| {
+                    intent.affects(&change.path)
+                        || change
+                            .old_path
+                            .as_deref()
+                            .is_some_and(|old| intent.affects(old))
+                });
+            if !affected.is_empty() || frame.resync_required {
+                self.deferred_file_changes.push(WorkspaceFileChanges {
+                    sequence: frame.sequence,
+                    resync_required: frame.resync_required,
+                    changes: affected,
+                });
+            }
+            frame.changes = independent;
+            frame.resync_required = false;
+        }
+
+        let gap = self.pending_mutation.is_none()
+            && sequence_needs_resync(self.watch_sequence, frame.sequence);
         tracing::trace!(
             sequence = frame.sequence,
             previous_sequence = ?self.watch_sequence,
@@ -91,6 +119,16 @@ impl FilesSurface {
 
         let mut parents = HashSet::new();
         for change in frame.changes {
+            if change.operation_id.is_some() {
+                self.apply_semantic_mutation(&change, None, false, cx);
+                if let Some(parent) = parent_path(&change.path) {
+                    parents.insert(parent);
+                }
+                if let Some(old) = change.old_path.as_deref().and_then(parent_path) {
+                    parents.insert(old);
+                }
+                continue;
+            }
             self.invalidate_markdown_images(Some(&change.path), cx);
             if let Some(old_path) = &change.old_path {
                 self.invalidate_markdown_images(Some(old_path), cx);
@@ -114,7 +152,7 @@ impl FilesSurface {
                 }
                 WorkspaceFileChangeKind::Renamed => {
                     if let Some(old_path) = change.old_path {
-                        self.tree.remove(&old_path);
+                        self.tree.relocate_subtree(&old_path, &change.path, None);
                         for (old_path, new_path) in
                             self.rename_documents(&old_path, change.path.clone(), cx)
                         {

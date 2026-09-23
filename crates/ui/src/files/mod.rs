@@ -26,6 +26,7 @@ mod image_preview;
 pub(crate) mod markdown_media;
 mod markdown_preview;
 pub mod model;
+pub mod mutations;
 pub mod preview;
 pub mod search;
 pub mod tree;
@@ -139,6 +140,7 @@ pub(crate) fn workspace_path_drag_ghost(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FilesEvent {
+    Mutate(mutations::MutationIntent),
     OpenFile(String),
     RevealFile(String),
     OpenWebLink(crate::markdown::render::LinkActivation),
@@ -178,6 +180,14 @@ struct EditorContextMenu {
 }
 
 pub struct FilesSurface {
+    surface_id: gpui::EntityId,
+    interaction_generation: u64,
+    effective_checkout_id: Option<String>,
+    mutation_capabilities: Option<zeron_proto::WorkspaceMutationCapabilities>,
+    pending_mutation: Option<mutations::MutationIntent>,
+    deferred_file_changes: Vec<zeron_proto::WorkspaceFileChanges>,
+    applied_mutations: std::collections::VecDeque<String>,
+    mutation_error: Option<SharedString>,
     state: Entity<AppState>,
     chat_id: String,
     review_comment_flush_source: u64,
@@ -247,6 +257,11 @@ impl Render for FilesSurface {
             .flex_col()
             .children(header)
             .child(div().flex_1().min_h_0().w_full().child(body))
+            .children(
+                self.mutation_error
+                    .as_ref()
+                    .map(|message| crate::popover::error_row(&theme, message).into_any_element()),
+            )
             .children(editor_context_menu)
     }
 }
@@ -498,6 +513,14 @@ impl FilesSurface {
                 .ok();
         });
         let mut surface = Self {
+            surface_id: cx.entity_id(),
+            interaction_generation: 0,
+            effective_checkout_id: None,
+            mutation_capabilities: None,
+            pending_mutation: None,
+            deferred_file_changes: Vec::new(),
+            applied_mutations: std::collections::VecDeque::new(),
+            mutation_error: None,
             state,
             chat_id,
             review_comment_flush_source: NEXT_REVIEW_COMMENT_FLUSH_SOURCE
@@ -875,6 +898,8 @@ impl FilesSurface {
                 let reload = surface.tree.node(&directory).is_some_and(|node| node.stale);
                 match result {
                     Ok(page) => {
+                        surface.effective_checkout_id = page.checkout_id.clone();
+                        surface.mutation_capabilities = page.mutation_capabilities;
                         surface.error = None;
                         surface.tree.apply_page(page, generation);
                     }
@@ -942,6 +967,13 @@ impl FilesSurface {
     }
 
     fn apply_target(&mut self, next: Option<FilesRequestContext>, cx: &mut Context<Self>) {
+        self.interaction_generation = self.interaction_generation.wrapping_add(1);
+        self.effective_checkout_id = None;
+        self.mutation_capabilities = None;
+        self.pending_mutation = None;
+        self.deferred_file_changes.clear();
+        self.applied_mutations.clear();
+        self.mutation_error = None;
         self.release_git_status();
         self.suspend_images(cx);
         self.cancel_review_comment_flush(cx);
@@ -1030,13 +1062,10 @@ impl FilesSurface {
                     .cursor_text()
                     .hover(|style| style.bg(crate::theme::ink(0.055)))
                     // Clicking the field's padding focuses the input too.
-                    .on_mouse_down(
-                        gpui::MouseButton::Left,
-                        move |_, window, cx| {
-                            window.focus(&search_focus, cx);
-                            cx.stop_propagation();
-                        },
-                    )
+                    .on_mouse_down(gpui::MouseButton::Left, move |_, window, cx| {
+                        window.focus(&search_focus, cx);
+                        cx.stop_propagation();
+                    })
                     .child(
                         crate::icons::icon(crate::icons::MAGNIFER)
                             .size(px(12.0))
@@ -1117,10 +1146,7 @@ mod explorer_tests {
         cx.update(|window, cx| window.draw(cx).clear());
         // The explorer header is the same band as the editor header.
         let header = cx.debug_bounds("files-explorer-header").unwrap();
-        assert_eq!(
-            header.size.height,
-            px(crate::surface_chrome::HEADER_HEIGHT)
-        );
+        assert_eq!(header.size.height, px(crate::surface_chrome::HEADER_HEIGHT));
         let bounds = cx.debug_bounds("files-search").unwrap();
         assert!(bounds.top() >= header.top() && bounds.bottom() <= header.bottom());
         // Click the field padding, not just the input's text hitbox.

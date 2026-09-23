@@ -61,6 +61,7 @@ use crate::workspace_links::resolve_workspace_file_link;
 
 mod actions_ui;
 mod command_palette;
+mod file_mutations;
 mod files_panel;
 mod project_icon;
 mod sidebar_pins;
@@ -3020,6 +3021,9 @@ impl Shell {
                     return;
                 }
                 match event {
+                    FilesEvent::Mutate(intent) => {
+                        this.start_file_mutation(source.clone(), intent.clone(), cx)
+                    }
                     FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
                     FilesEvent::RevealFile(path) => {
                         this.add_files_surface(window, cx);

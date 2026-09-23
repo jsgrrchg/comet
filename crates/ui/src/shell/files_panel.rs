@@ -172,6 +172,11 @@ impl Shell {
                 &files,
                 window,
                 move |this: &mut Self, source, event, window, cx| match event {
+                    FilesEvent::Mutate(intent)
+                        if this.accepts_file_navigation(&owner, &source, cx) =>
+                    {
+                        this.start_file_mutation(source.clone(), intent.clone(), cx);
+                    }
                     FilesEvent::OpenFile(path)
                         if this.accepts_file_navigation(&owner, &source, cx) =>
                     {
@@ -493,9 +498,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pane_toggle_drives_surfaces_only_and_last_tab_close_collapses_them(
-        cx: &mut TestAppContext,
-    ) {
+    fn pane_toggle_drives_surfaces_only_and_last_tab_close_collapses_them(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
             gpui_base::init(cx);

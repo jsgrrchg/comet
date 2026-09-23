@@ -97,7 +97,7 @@ enum ReloadDecision {
 
 pub(super) struct FilePreviewState {
     images_visible: bool,
-    documents: HashMap<String, FileDocument>,
+    pub(super) documents: HashMap<String, FileDocument>,
     document_recency: VecDeque<String>,
     active: Option<String>,
     highlights: HashMap<String, HighlightedFile>,
@@ -1319,7 +1319,10 @@ impl FilesSurface {
     }
 
     pub(super) fn schedule_autosave(&mut self, path: String, cx: &mut Context<Self>) {
-        if !self.preview.autosave_enabled || self.preview.autosave_paused_for_reload(&path) {
+        if self.mutation_blocks_path(&path)
+            || !self.preview.autosave_enabled
+            || self.preview.autosave_paused_for_reload(&path)
+        {
             return;
         }
         let delay = Duration::from_millis(self.preview.autosave_delay_ms);
@@ -1358,7 +1361,7 @@ impl FilesSurface {
     }
 
     pub(super) fn save_document(&mut self, path: String, cx: &mut Context<Self>) {
-        if self.target_change_pending {
+        if self.mutation_blocks_path(&path) || self.target_change_pending {
             return;
         }
         let Some(context) = self.request_context.clone() else {

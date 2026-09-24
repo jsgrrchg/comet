@@ -64,6 +64,7 @@ mod command_palette;
 mod files_panel;
 mod project_icon;
 mod sidebar_pins;
+mod sidebar_drafts;
 mod sidebar_sections;
 mod spaces;
 mod tabs;
@@ -1641,6 +1642,8 @@ pub struct Shell {
     new_thread_artwork_ready: crate::new_thread_background_effects::Readiness,
     /// Session-transient disclosure state, matching the Archived shelf.
     pub(super) pinned_open: bool,
+    pub(super) drafts_open: bool,
+    draft_changes: Option<sidebar_drafts::PendingDraftChanges>,
     pub(super) sessions_open: bool,
     /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
     /// (user request), session-transient. `archived_shown` pages the
@@ -2092,6 +2095,8 @@ impl Shell {
             new_thread_artwork_ready: Default::default(),
             archived_open: true,
             pinned_open: true,
+            drafts_open: true,
+            draft_changes: None,
             sessions_open: true,
             archived_shown: 0,
             sidebar_collapsed_groups: std::collections::HashSet::new(),
@@ -7188,6 +7193,7 @@ impl Shell {
 
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
+        let drafts_section = self.render_drafts_section(theme, cx);
 
 
         // The space filter lives ABOVE the scroll region (fixed) so its
@@ -7348,6 +7354,7 @@ impl Shell {
                     // No "Sessions" header (user request) — the list
                     // is the whole column; a little air stands in.
                     .pt(px(SIDEBAR_LIST_PAD_TOP))
+                    .children(drafts_section)
                     .child(active_list)
                     .children(archived_section)
                     .children(moving_row),

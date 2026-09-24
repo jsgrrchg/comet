@@ -19,7 +19,14 @@ It gives a background selection one in every four admissions, with oldest-servic
 ordering within each class. The disk backlog is paged by chat ID, rather than
 materialized as thousands of documents or semaphore-waiting tasks. A served quiet
 background client releases its slot; a warm interactive client has a 10 s reuse
-grace. Under contention a caught-up client yields after 30 s. A client still
+grace after catch-up completes. Incomplete catch-up cannot be retired by that
+idle grace. Closing clients retain their slots until teardown completes, while
+the dispatcher continues admitting other work and handling durable jobs. The
+bounded set of close tasks is tracked and joined before the host's final
+snapshot; actor ownership is retained throughout shutdown so a cancelled close
+cannot detach the actor.
+All session waits, including handshake, backfill and backpressured sends, are
+interruptible by shutdown. Under contention a caught-up client yields after 30 s. A client still
 catching up has up to five minutes before rotation so slow checkpoint downloads
 are not continually cancelled. These are initial policy constants, not measured
 optimal values for all devices.
@@ -104,4 +111,7 @@ work to drain, and checks socket release on shutdown. It measures a two-worker
 headless test process, not the complete desktop application's platform baseline.
 The workerd tests use real DO SQLite and sockets for old ACKs, retry, overflow and
 more-than-256-wake delivery. Other coverage checks restart publication, lost ACKs,
-checkpoint rejection, constructor cancellation and the view-attachment race.
+checkpoint rejection, constructor/shutdown cancellation and the view-attachment
+race. Loopback lifecycle tests hold twelve valid checkpoints beyond the idle
+grace, verify durable snapshots after release, and admit an unrelated chat while
+a renewed wake closes a peer stalled before ROWS_DONE.

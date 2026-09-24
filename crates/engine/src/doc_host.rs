@@ -1523,10 +1523,26 @@ impl DocHost {
     fn spawn_sync_scheduler(&self) {
         let weak = Arc::downgrade(&self.inner);
         self.spawn_worker(async move {
+            use futures::{StreamExt, stream::FuturesUnordered};
             let mut turn = 0u64;
             let mut disk_cursor = String::new();
+            // Closing clients keep their admission slots until teardown ends,
+            // but no individual close can suspend unrelated admissions/work.
+            // Track teardown independently of this cancellable dispatcher:
+            // host shutdown must join these actors before its final snapshot.
+            let mut stopping = FuturesUnordered::<tokio::task::JoinHandle<String>>::new();
+            let mut stopping_ids = HashSet::new();
             loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    Some(result) = stopping.next(), if !stopping.is_empty() => {
+                        match result {
+                            Ok(id) => { stopping_ids.remove(&id); }
+                            Err(error) => tracing::error!(%error, "chat sync teardown failed"),
+                        }
+                        continue;
+                    }
+                }
                 let Some(inner) = weak.upgrade() else { return };
                 let host = Self { inner };
                 host.evict_over_budget();
@@ -1590,7 +1606,9 @@ impl DocHost {
                             && !h.sync_started.load(Ordering::Acquire)
                     });
                 for handle in &handles {
-                    if !handle.sync_started.load(Ordering::Acquire) {
+                    if !handle.sync_started.load(Ordering::Acquire)
+                        || stopping_ids.contains(&handle.chat_id)
+                    {
                         continue;
                     }
                     let captured = handle.sync_wake_version.load(Ordering::Acquire);
@@ -1601,7 +1619,8 @@ impl DocHost {
                         .ok()
                         .flatten();
                     if pending_wake.is_some_and(|v| v != captured) {
-                        host.stop_sync(handle).await;
+                        stopping_ids.insert(handle.chat_id.clone());
+                        stopping.push(host.inner.tasks.spawn(host.stop_sync_owned(handle.clone())));
                         handle.sync_requested.store(true, Ordering::Release);
                         continue;
                     }
@@ -1615,7 +1634,11 @@ impl DocHost {
                                 .complete_sync_job(&handle.chat_id, "wake", captured);
                     }
                     let caught_up = lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up());
-                    let idle = handle.messages_tx.receiver_count() == 0
+                    // A quiet document can still be receiving its checkpoint
+                    // or commands. Incomplete catch-up only yields via rotate's
+                    // explicit service deadline, never the short reuse grace.
+                    let idle = caught_up
+                        && handle.messages_tx.receiver_count() == 0
                         && handle.queue_tx.receiver_count() == 0
                         && handle.writers.load(Ordering::Acquire) == 0
                         && (now_ms() - handle.last_access.load(Ordering::Relaxed) >= SYNC_IDLE_MS
@@ -1632,7 +1655,8 @@ impl DocHost {
                         if idle {
                             handle.sync_requested.store(false, Ordering::Release);
                         }
-                        host.stop_sync(handle).await;
+                        stopping_ids.insert(handle.chat_id.clone());
+                        stopping.push(host.inner.tasks.spawn(host.stop_sync_owned(handle.clone())));
                     }
                 }
                 let running = handles
@@ -1722,6 +1746,17 @@ impl DocHost {
                 host.evict_over_budget();
             }
         });
+    }
+
+    fn stop_sync_owned(
+        &self,
+        handle: Arc<ChatDocHandle>,
+    ) -> impl std::future::Future<Output = String> + Send + 'static {
+        let host = self.clone();
+        async move {
+            host.stop_sync(&handle).await;
+            handle.chat_id.clone()
+        }
     }
 
     async fn stop_sync(&self, handle: &ChatDocHandle) {
@@ -5710,50 +5745,6 @@ mod publication_eviction_tests {
         reopened.shutdown_workers().await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn idle_connection_closes_while_caller_keeps_document() {
-        let dir = tempfile::tempdir().unwrap();
-        let host = DocHost::new(
-            Arc::new(DocsStore::open(dir.path()).unwrap()),
-            DocHostConfig {
-                device_id: "host".into(),
-                default_harness: HarnessId::Mock,
-                edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
-            },
-        );
-        let handle = host.open("idle").unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while lock(&handle.chat2).is_none() {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        for (id, _) in host.inner.store.pending_chat_updates("idle").unwrap() {
-            host.inner
-                .store
-                .acknowledge_chat_update("idle", &id)
-                .unwrap();
-        }
-        handle
-            .last_access
-            .store(now_ms() - SYNC_IDLE_MS - 1, Ordering::Release);
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while handle.sync_started.load(Ordering::Acquire) {
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(lock(&handle.chat2).is_none());
-        assert!(lock(&host.inner.handles).contains_key("idle"));
-        let writer = handle.writer();
-        assert_eq!(handle.writers.load(Ordering::Acquire), 1);
-        drop(writer);
-        assert_eq!(handle.writers.load(Ordering::Acquire), 0);
-        host.shutdown_workers().await;
-    }
-
     #[tokio::test]
     async fn caller_and_watch_protect_the_open_to_attach_handoff() {
         let dir = tempfile::tempdir().unwrap();
@@ -5920,3 +5911,7 @@ mod publication_eviction_tests {
         host.shutdown_workers().await;
     }
 }
+
+#[cfg(test)]
+#[path = "doc_host_sync_tests.rs"]
+mod sync_lifecycle_tests;

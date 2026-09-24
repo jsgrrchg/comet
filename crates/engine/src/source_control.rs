@@ -1187,9 +1187,14 @@ printf '%s\n' '[{"number":90,"title":"Host-resolved pull request","url":"https:/
         );
         let refs = repos.refs(&checkout).await.unwrap();
         for path in [&worktree.path, &default_worktree.path] {
+            // Git reports slash-separated paths on Windows, while settings
+            // retain canonical Win32 prefixes. Compare the actual directory.
             assert!(
-                refs.iter()
-                    .any(|entry| entry.worktree_path.as_ref() == Some(path))
+                refs.iter().any(|entry| entry
+                    .worktree_path
+                    .as_ref()
+                    .is_some_and(|listed| same_file::is_same_file(listed, path).unwrap_or(false))),
+                "Git refs must include worktree {path}; got {refs:?}"
             );
         }
     }

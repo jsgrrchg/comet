@@ -147,8 +147,12 @@ fn validate_directory(value: &str) -> Result<PathBuf, EngineError> {
             "Choose a folder outside Git's .git directory".into(),
         ));
     }
+    #[cfg(windows)]
+    crate::repos::validate_windows_worktree_path(&path.to_string_lossy())?;
     std::fs::create_dir_all(&path)?;
     let path = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    crate::repos::validate_windows_worktree_path(&path.to_string_lossy())?;
     if path.components().any(|part| {
         part.as_os_str()
             .as_encoded_bytes()

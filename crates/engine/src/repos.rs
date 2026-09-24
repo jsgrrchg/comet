@@ -231,17 +231,6 @@ impl Repos {
             cmd.args(["-c", "core.longpaths=true"]);
         }
         if let Some(cwd) = cwd {
-            #[cfg(windows)]
-            {
-                // CreateProcess rejects a long lpCurrentDirectory, including
-                // verbatim paths. Start at the volume/share root and let Git
-                // change directories after startup, using its long-path support.
-                let cwd = std::path::absolute(cwd)?;
-                cmd.current_dir(cwd.ancestors().last().unwrap());
-                cmd.arg("-C")
-                    .arg(windows_git_worktree_path(&cwd.to_string_lossy()));
-            }
-            #[cfg(not(windows))]
             cmd.current_dir(cwd);
         }
         cmd.args(args);
@@ -1116,7 +1105,6 @@ impl Repos {
         // Snapshot the destination once per creation. Changes never relocate
         // existing worktrees or alter the cwd already stored on a chat.
         let base = self.inner.worktrees.root().join(&repo_name);
-        std::fs::create_dir_all(&base)?;
         // Auto-generate a name colliding with neither an existing dir nor branch.
         let existing: HashSet<String> = self
             .branches(repo_path)
@@ -1145,6 +1133,9 @@ impl Repos {
         let name =
             name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
         let path = base.join(&name);
+        #[cfg(windows)]
+        validate_windows_worktree_path(&path.to_string_lossy())?;
+        std::fs::create_dir_all(&base)?;
         let branch_name = format!("zeron/{name}");
         #[cfg(windows)]
         self.add_worktree_in_two_steps(repo_path, &path, &branch_name, branch)
@@ -1173,7 +1164,7 @@ impl Repos {
     }
 
     /// Git's built-in checkout passes `<destination>/.git` in GIT_DIR, whose
-    /// separate PATH_MAX check still rejects long Windows destinations even
+    /// separate PATH_MAX - 40 check rejects some launchable Windows paths even
     /// with core.longpaths enabled. Register first, then reset from the new
     /// checkout using a short, relative GIT_DIR. Keep native add's hook and
     /// failure semantics: incomplete checkouts are removed, hook failures
@@ -2300,6 +2291,20 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Win32 process working directories remain limited to MAX_PATH even when
+/// file I/O supports extended paths. A usable worktree must be able to launch
+/// Git, hooks, and agents, not merely be created on disk. Count UTF-16 units,
+/// excluding the verbatim prefix and reserving the terminating NUL.
+#[cfg(any(windows, test))]
+pub(crate) fn validate_windows_worktree_path(path: &str) -> Result<(), EngineError> {
+    if windows_git_worktree_path(path).encode_utf16().count() >= 260 {
+        return Err(EngineError::Other(
+            "This worktree path is too long to start tools on Windows. Choose a shorter location, such as C:\\worktrees.".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Git's worktree command normalizes backslashes to slashes, which breaks
 /// Win32 verbatim prefixes (`\\?\` becomes `//?/`). Keep native paths for
 /// filesystem access, but pass drive/UNC paths without that prefix to Git.
@@ -2343,6 +2348,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn windows_worktree_limit_counts_utf16_without_verbatim_prefix() {
+        for prefix in ["C:/", "//?/C:/", "//server/share/", "//?/UNC/server/share/"] {
+            let prefix_len = windows_git_worktree_path(prefix).encode_utf16().count();
+            let path = format!("{prefix}{}", "a".repeat(259 - prefix_len));
+            assert!(validate_windows_worktree_path(&path).is_ok());
+            assert!(validate_windows_worktree_path(&format!("{path}a")).is_err());
+        }
+        assert!(validate_windows_worktree_path(&format!("C:/{}", "日本語".repeat(80))).is_ok());
+        assert!(validate_windows_worktree_path(&format!("C:/{}", "😀".repeat(129))).is_err());
+    }
 
     async fn two_step_fixture(hook_exit: u8) -> (tempfile::TempDir, Repos, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();

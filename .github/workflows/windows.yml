@@ -64,7 +64,7 @@ jobs:
         run: |
           cargo test --release --locked -p zeron-proto --lib device_paths
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --release --locked -p zeron-engine --test worktree_on_run worktree_location_supports_
+          cargo test --release --locked -p zeron-engine --test worktree_on_run worktree_location_
       - name: Native harness security and integration tests
         run: cargo test --release --locked -p zeron-harness --features native-fixture --lib --test codex_availability --test windows_native
       - name: UI tests

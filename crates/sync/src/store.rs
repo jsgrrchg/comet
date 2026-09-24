@@ -129,6 +129,17 @@ impl DocsStore {
         store_blocking(|| self.pending_chat_updates_blocking(doc_id))
     }
 
+    /// Admission/lifetime checks must not copy the pending payloads.
+    pub fn has_pending_chat_updates(&self, doc_id: &str) -> Result<bool, StoreError> {
+        store_blocking(|| {
+            Ok(self.conn().query_row(
+                "SELECT EXISTS(SELECT 1 FROM chat_outbox WHERE doc_id=?1)",
+                params![doc_id],
+                |row| row.get(0),
+            )?)
+        })
+    }
+
     fn pending_chat_updates_blocking(
         &self,
         doc_id: &str,

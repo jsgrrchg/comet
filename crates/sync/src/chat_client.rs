@@ -272,6 +272,7 @@ struct PendingPush {
 #[derive(Default)]
 struct Shared {
     cursor: u64,
+    caught_up: bool,
     pending: VecDeque<PendingPush>,
     /// Last hello/probe view of the server log (checkpoint-policy inputs).
     server: Option<wire::StateHeader>,
@@ -714,6 +715,11 @@ impl ChatClient {
             server.row_count = 0;
             server.row_bytes = 0;
         }
+    }
+
+    pub fn caught_up(&self) -> bool {
+        let shared = lock(&self.shared);
+        shared.caught_up && !shared.needs_checkpoint && !shared.gap_repair
     }
 
     pub fn stats(&self) -> ChatStatsSnapshot {
@@ -1197,6 +1203,7 @@ impl Actor {
             let _ = ready.send(Ok(()));
         }
         if !lock(&self.shared).needs_checkpoint {
+            lock(&self.shared).caught_up = true;
             let _ = self.events.send(ChatEvent::CaughtUp { head_seq });
         }
 
@@ -1503,6 +1510,7 @@ impl Actor {
                                 && !sh.needs_checkpoint
                             {
                                 sh.http_live_epoch = Some(replay_epoch);
+                                sh.caught_up = true;
                             }
                         }
                     }

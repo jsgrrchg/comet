@@ -452,7 +452,7 @@ pub fn apply_keymap(
 }
 
 /// The settings sections (feature-inventory §1.5 routes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SettingsSection {
     Devices,
     /// Which harnesses the composer offers (enable/disable toggles) —
@@ -465,6 +465,7 @@ pub enum SettingsSection {
     Notifications,
     Shortcuts,
     /// Composer and conversation behavior plus thread naming.
+    #[default]
     General,
     Appshots,
     Archived,
@@ -498,6 +499,51 @@ impl SettingsSection {
         self != Self::Agents && (self != Self::Appshots || crate::appshots::is_desktop())
     }
 
+    /// Where a generic "open Settings" lands for a remembered section: legacy
+    /// aliases resolve to their page, and a section this build does not show
+    /// (Appshots off-desktop) falls back to General.
+    pub(crate) fn reopenable(self) -> Self {
+        let section = self.canonical();
+        if section.visible_in_nav() {
+            section
+        } else {
+            Self::General
+        }
+    }
+
+    /// Stable name shared by `ui-settings.json` and `ZERON_OPEN_ROUTE`.
+    fn slug(self) -> &'static str {
+        match self {
+            SettingsSection::Devices => "devices",
+            SettingsSection::Harnesses => "providers",
+            SettingsSection::Agents => "agents",
+            SettingsSection::Appearance => "appearance",
+            SettingsSection::Files => "files",
+            SettingsSection::Notifications => "notifications",
+            SettingsSection::Shortcuts => "shortcuts",
+            SettingsSection::General => "general",
+            SettingsSection::Appshots => "appshots",
+            SettingsSection::Archived => "archived",
+        }
+    }
+
+    /// Inverse of [`Self::slug`], plus the pages' former names.
+    fn from_slug(slug: &str) -> Option<Self> {
+        Some(match slug {
+            "devices" => SettingsSection::Devices,
+            "providers" | "harnesses" => SettingsSection::Harnesses,
+            "agents" => SettingsSection::Agents,
+            "appearance" => SettingsSection::Appearance,
+            "files" => SettingsSection::Files,
+            "notifications" => SettingsSection::Notifications,
+            "shortcuts" => SettingsSection::Shortcuts,
+            "general" | "conversations" => SettingsSection::General,
+            "appshots" => SettingsSection::Appshots,
+            "archived" => SettingsSection::Archived,
+            _ => return None,
+        })
+    }
+
     /// Nav groups are separated by spacing alone: preferences, providers and
     /// devices, then workspace data.
     fn starts_nav_group(self) -> bool {
@@ -520,6 +566,35 @@ impl SettingsSection {
             SettingsSection::Archived => "Archived sessions",
         }
     }
+}
+
+/// Persisted as [`crate::settings::UiSettings::settings_section`].
+impl serde::Serialize for SettingsSection {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.slug())
+    }
+}
+
+/// Lenient: an unknown or malformed value reads as General instead of
+/// failing — and so defaulting — the whole settings file.
+impl<'de> serde::Deserialize<'de> for SettingsSection {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(value.as_str().and_then(Self::from_slug).unwrap_or_default())
+    }
+}
+
+/// The section a `ZERON_OPEN_ROUTE` value opens: bare `settings` reopens the
+/// remembered section, `settings/<slug>` names one (and so becomes the
+/// remembered one). `None` for anything else, including unknown slugs.
+fn settings_open_route(route: &str, remembered: SettingsSection) -> Option<SettingsSection> {
+    if route == "settings" {
+        return Some(remembered.reopenable());
+    }
+    route
+        .strip_prefix("settings/")
+        .and_then(SettingsSection::from_slug)
+        .map(SettingsSection::canonical)
 }
 
 /// What the main outlet shows.
@@ -1951,7 +2026,7 @@ impl Shell {
         });
         let data_dir = boot.data_dir.clone();
         let window_key = state.read(cx).window_key.clone();
-        let settings = settings::windows::current(window_key.as_deref(), cx);
+        let mut settings = settings::windows::current(window_key.as_deref(), cx);
         if let Some(saved) = window_key
             .as_deref()
             .and_then(|key| settings.windows.get(key))
@@ -1971,23 +2046,25 @@ impl Shell {
         }
         // Dev/testing knob: `ZERON_OPEN_ROUTE=settings[/<section>]` boots
         // straight into a settings section — these pages have no deep link and
-        // synthetic input can't reach them on headless compositors.
-        let route = match std::env::var("ZERON_OPEN_ROUTE").ok().as_deref() {
-            Some("settings") | Some("settings/devices") => {
-                Route::Settings(SettingsSection::Devices)
+        // synthetic input can't reach them on headless compositors. Bare
+        // `settings` reopens the remembered section; a named one is
+        // remembered like any other link to a section.
+        let open_route = std::env::var("ZERON_OPEN_ROUTE").ok();
+        let route = match open_route.as_deref() {
+            Some(route) if route == "settings" || route.starts_with("settings/") => {
+                match settings_open_route(route, settings.settings_section) {
+                    Some(section) => {
+                        if settings.settings_section != section {
+                            settings.settings_section = section;
+                            settings::update(settings::SavePolicy::Debounced, cx, |s| {
+                                s.settings_section = section;
+                            });
+                        }
+                        Route::Settings(section)
+                    }
+                    None => Route::Chat,
+                }
             }
-            // `agents` and `harnesses` are the page's former names.
-            Some("settings/providers") | Some("settings/agents") | Some("settings/harnesses") => {
-                Route::Settings(SettingsSection::Harnesses)
-            }
-            Some("settings/general") | Some("settings/conversations") => {
-                Route::Settings(SettingsSection::General)
-            }
-            Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
-            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
-            Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
-            Some("settings/appshots") => Route::Settings(SettingsSection::Appshots),
-            Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -2472,7 +2549,9 @@ impl Shell {
             self.cancel_pinned_session_drag(cx);
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
-        // snap, no tween — the panels belong to the destination chat).
+        // snap, no tween — the panels belong to the destination chat). The
+        // new-chat canvas is the exception: it always lands with the terminal
+        // hidden.
         let selected = state.read(cx).selected_chat.clone().unwrap_or_default();
         if !selected.is_empty() {
             self.last_appshot_chat = Some(selected.clone());
@@ -2501,7 +2580,19 @@ impl Shell {
             self.right_takeover_content_tween = None;
             self.main_takeover_tween = None;
             self.terminal_tween = None;
-            let panels = self.panels.get(&self.panel_key(cx));
+            let key = self.panel_key(cx);
+            // Entering the new-chat canvas always lands with the terminal
+            // hidden (user request) — a previously opened canvas drawer must
+            // not pop open on a fresh canvas. The source chat's flag stays in
+            // the map, so returning restores it.
+            let panels = if self.active_chat.is_empty() {
+                self.panels.update(&key, |panels| {
+                    panels.terminal_open = false;
+                });
+                self.panels.get(&key)
+            } else {
+                self.panels.get(&key)
+            };
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
             }
@@ -2558,13 +2649,7 @@ impl Shell {
     /// (user report).
     fn panel_key(&self, cx: &App) -> String {
         if self.active_chat.is_empty() {
-            let space = self
-                .state
-                .read(cx)
-                .selected_space
-                .clone()
-                .unwrap_or_default();
-            format!("space-canvas:{space}")
+            crate::state::canvas_panel_key(self.state.read(cx).selected_space.as_deref())
         } else {
             self.active_chat.clone()
         }
@@ -4022,9 +4107,64 @@ impl Shell {
             self.settings_focus_pending = true;
         }
         self.route = Route::Settings(section);
+        self.remember_settings_section(section, cx);
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
         cx.notify();
+    }
+
+    /// Generic entry points (⌘, / Ctrl+,, the footer gear, the palette,
+    /// `/settings`) reopen the section last viewed. Links that name a
+    /// section go through [`Self::open_settings`] instead.
+    fn open_last_settings(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(self.settings.settings_section.reopenable(), cx);
+    }
+
+    /// Every section shown is the one to reopen. Written through the shell's
+    /// own settings copy: [`Self::schedule_save`] replaces the whole file
+    /// from it, so a write that bypassed it would be undone by the next save.
+    fn remember_settings_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        let section = section.canonical();
+        if self.settings.settings_section != section {
+            self.settings.settings_section = section;
+            self.schedule_save(cx);
+        }
+    }
+
+    /// Escape bubbling out of the settings page. Focused controls — open
+    /// dropdowns, the shortcut recorder, a dialog's own input — consume it
+    /// before it gets here. What remains open without holding focus closes
+    /// first: the account menu, a sync prompt, then the routed page's dialog
+    /// or login flow. Returns whether one did; only then does Settings stay.
+    fn dismiss_settings_escape_surface(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.sync_flow.has_visible_overlay() {
+            return true;
+        }
+        if self.user_menu.is_open() {
+            self.close_user_menu(cx);
+            return true;
+        }
+        if self.user_menu.get().is_some() {
+            return true;
+        }
+        let Route::Settings(section) = self.route else {
+            return false;
+        };
+        match section.canonical() {
+            SettingsSection::Devices => self
+                .devices_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            SettingsSection::Harnesses => self
+                .harnesses_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            SettingsSection::Appearance => self
+                .appearance_page
+                .as_ref()
+                .is_some_and(|page| page.update(cx, |page, cx| page.dismiss_on_escape(cx))),
+            _ => false,
+        }
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
@@ -4038,7 +4178,7 @@ impl Shell {
         if matches!(self.route, Route::Settings(_)) {
             self.close_settings(cx);
         } else {
-            self.open_settings(SettingsSection::General, cx);
+            self.open_last_settings(cx);
         }
     }
 
@@ -4072,6 +4212,7 @@ impl Shell {
             }
             NavEntry::Settings(section) => {
                 self.route = Route::Settings(section.canonical());
+                self.remember_settings_section(section, cx);
             }
         }
         self.close_user_menu(cx);
@@ -4231,9 +4372,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Shortcuts
-            | SettingsSection::General
-            | SettingsSection::Appshots => {
+            SettingsSection::Shortcuts | SettingsSection::General | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
                     let keymap = self.settings.keymap.clone();
@@ -6060,7 +6199,9 @@ impl Shell {
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 let key = &event.keystroke.key;
                 if key == "escape" {
-                    this.close_settings(cx);
+                    if !this.dismiss_settings_escape_surface(cx) {
+                        this.close_settings(cx);
+                    }
                     cx.stop_propagation();
                 } else if key == "tab" {
                     move_settings_focus(
@@ -7196,7 +7337,6 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
@@ -7413,10 +7553,12 @@ impl Shell {
     }
 
     /// Update strip: shown above the user menu whenever the engine's
-    /// UpdateStatus stream reports a newer release. On a macOS bundle install
-    /// it drives the whole flow — click to download, then click to restart into
-    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
-    /// (`zeron update`); click dismisses it for that version.
+    /// UpdateStatus stream reports a newer release. On desktop-update installs
+    /// (macOS bundles, Windows portable packages) it drives the whole flow —
+    /// click to download, then click to restart into the staged replacement.
+    /// Managed installs are advisory (`zeron update`); unmanaged installs link
+    /// to the GitHub releases page. Clicking an advisory dismisses it for that
+    /// version.
     fn render_update_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let status = self.state.read(cx).update.clone()?;
         if !status.update_available {
@@ -7426,21 +7568,8 @@ impl Shell {
         if self.update_dismissed.as_deref() == Some(latest.as_str()) {
             return None;
         }
-        let desktop_update = self.install.supports_desktop_update();
-
-        let (label, clickable): (SharedString, bool) = if desktop_update {
-            match &self.update_flow {
-                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
-                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
-                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
-                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
-            }
-        } else {
-            (
-                format!("Update available — v{latest} · run `zeron update`").into(),
-                true,
-            )
-        };
+        let (label, clickable) =
+            Self::update_strip_label(&self.install, &self.update_flow, &latest);
         let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
         let tone = if failed { theme.danger } else { theme.accent };
         // Follow the selected spectrum with a low-emphasis glass tint rather
@@ -7476,10 +7605,44 @@ impl Shell {
         Some(strip.into_any_element())
     }
 
+    /// The update strip's label and click affordance per install kind. Desktop
+    /// update installs (macOS bundles, Windows portable packages) drive their
+    /// flow from the strip; managed installs get the `zeron update` hint;
+    /// unmanaged installs (source builds, hand-copied binaries) are pointed at
+    /// the GitHub releases page.
+    fn update_strip_label(
+        install: &zeron_update::InstallKind,
+        flow: &UpdateFlow,
+        latest: &str,
+    ) -> (SharedString, bool) {
+        if install.supports_desktop_update() {
+            match flow {
+                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
+                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
+                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
+                UpdateFlow::Failed(message) => (format!("Update failed: {message}").into(), true),
+            }
+        } else if matches!(install, zeron_update::InstallKind::Managed { .. }) {
+            (
+                format!("Update available — v{latest} · run `zeron update`").into(),
+                true,
+            )
+        } else {
+            (
+                format!("Update available — v{latest} · download from GitHub").into(),
+                true,
+            )
+        }
+    }
+
     /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
-    /// installs → dismiss for this version.
+    /// installs (managed: `zeron update`, unmanaged: the GitHub releases page)
+    /// → open the destination if there is one, then dismiss for this version.
     fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
         if !self.install.supports_desktop_update() {
+            if matches!(self.install, zeron_update::InstallKind::Unmanaged) {
+                cx.open_url(zeron_update::RELEASES_PAGE);
+            }
             self.update_dismissed = self
                 .state
                 .read(cx)
@@ -9894,21 +10057,41 @@ impl Shell {
                         this.close_right_surface(surface, window, cx);
                     }),
                 )
-                .when(crate::click_activation_drag_enabled(), |el| {
-                    el.on_drag(
-                        RightTabDrag {
-                            panel_key: self.panel_key(cx),
-                            from: ix,
-                            title: ghost_title,
-                            workspace_path,
-                        },
-                        |payload, _point, _, cx| {
-                            let title = payload.title.clone();
-                            cx.stop_propagation();
-                            cx.new(|_| SurfaceTabGhost { title })
-                        },
-                    )
-                })
+                .on_drag(
+                    RightTabDrag {
+                        panel_key: self.panel_key(cx),
+                        from: ix,
+                        title: ghost_title,
+                        workspace_path,
+                    },
+                    |payload, _point, _, cx| {
+                        let title = payload.title.clone();
+                        cx.stop_propagation();
+                        cx.new(|_| SurfaceTabGhost { title })
+                    },
+                )
+                // The chip's BlockMouse hitbox (the titlebar/scroll carve-out
+                // below) cuts the strip out of the hover stack, so the
+                // strip's own on_drop can never fire while the pointer is
+                // over a chip — tabs tile the strip. Receiving the drop on
+                // the chip itself keeps drag-reorder working without giving
+                // up the carve-out. The bubble dispatch reaches the chip
+                // before the strip, and the handler consumes the drag, so
+                // the two never double-apply.
+                .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
+                    if payload.panel_key != this.panel_key(cx) {
+                        this.right_tab_drag = None;
+                        cx.notify();
+                        return;
+                    }
+                    let to = this
+                        .right_tab_drag
+                        .as_ref()
+                        .map(|d| d.over)
+                        .unwrap_or(payload.from);
+                    this.right_tab_drag = None;
+                    this.reorder_right_tabs(payload.from, to, cx);
+                }))
                 .child(
                     // Leading slot: icon normally, ✕ on tab hover — two
                     // stacked layers opacity-swapped by the group hover.
@@ -10960,7 +11143,7 @@ impl Render for Shell {
                     .update(cx, |c, cx| c.open_model_menu(window, cx)),
                 WorkspaceCommand::New => self.open_new_session(cx),
                 WorkspaceCommand::Resume => self.toggle_command_palette(window, cx),
-                WorkspaceCommand::Settings => self.open_settings(SettingsSection::Devices, cx),
+                WorkspaceCommand::Settings => self.open_last_settings(cx),
                 WorkspaceCommand::Diff if !self.active_chat.is_empty() => self.add_diff_surface(cx),
                 WorkspaceCommand::Files if !self.active_chat.is_empty() => {
                     self.add_files_surface(window, cx)
@@ -11684,6 +11867,57 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_strip_labels_cover_every_install_kind() {
+        // Managed (curl|sh daemon layout): the CLI hint.
+        let managed = zeron_update::InstallKind::Managed {
+            app_root: PathBuf::from("/home/u/.zeron/app"),
+        };
+        assert_eq!(
+            Shell::update_strip_label(&managed, &UpdateFlow::Idle, "0.2.86").0,
+            SharedString::from("Update available — v0.2.86 · run `zeron update`")
+        );
+        // Unmanaged (source builds, hand-copied binaries — bare Windows
+        // release exes): the GitHub releases page, clickable to open it.
+        let unmanaged = Shell::update_strip_label(
+            &zeron_update::InstallKind::Unmanaged,
+            &UpdateFlow::Idle,
+            "0.2.86",
+        );
+        assert_eq!(
+            unmanaged.0,
+            SharedString::from("Update available — v0.2.86 · download from GitHub")
+        );
+        assert!(unmanaged.1);
+        // Downloading is not clickable (desktop flow) and the flow labels stay
+        // untouched for the installs that own them.
+        let mac_app = zeron_update::InstallKind::MacApp {
+            bundle: PathBuf::from("/Applications/Zeron.app"),
+        };
+        assert_eq!(
+            Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86").0,
+            SharedString::from("Downloading v0.2.86…")
+        );
+        assert!(!Shell::update_strip_label(&mac_app, &UpdateFlow::Downloading, "0.2.86").1);
+        assert_eq!(
+            Shell::update_strip_label(&mac_app, &UpdateFlow::Idle, "0.2.86").0,
+            SharedString::from("Update available — v0.2.86")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_portable_strip_drives_the_desktop_flow() {
+        let portable = zeron_update::InstallKind::WindowsPortable {
+            directory: PathBuf::from(r"C:\Users\u\AppData\Local\Programs\Zeron"),
+        };
+        assert_eq!(
+            Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86").0,
+            SharedString::from("Update available — v0.2.86")
+        );
+        assert!(Shell::update_strip_label(&portable, &UpdateFlow::Idle, "0.2.86").1);
+    }
 
     #[test]
     fn sidebar_drag_nudges_each_edge_once_until_rearmed() {
@@ -14341,13 +14575,7 @@ mod right_tab_mouse_regressions {
             Some(MouseButton::Left),
             gpui::Modifiers::default(),
         );
-        cx.update(|_, cx| {
-            assert_eq!(
-                cx.has_active_drag(),
-                crate::click_activation_drag_enabled(),
-                "tab drag policy does not match the current platform"
-            )
-        });
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "tab drag did not start"));
         cx.simulate_mouse_up(start, MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_down(start, MouseButton::Middle, gpui::Modifiers::default());
         cx.simulate_mouse_up(start, MouseButton::Middle, gpui::Modifiers::default());
@@ -14362,7 +14590,10 @@ mod right_tab_mouse_regressions {
     fn subagent_tab_click_jitter_selects_without_starting_a_drag(cx: &mut TestAppContext) {
         let (shell, cx) = setup(cx);
         let start = cx.debug_bounds("right-surface-tab-0").unwrap().center();
-        let end = start + gpui::point(px(8.), px(0.));
+        // Sub-threshold pointer jitter (the Windows drag rectangle is 4px,
+        // matching the system SM_CXDRAG default): a jittery click must stay
+        // a click — no drag ghost, tab still activates on release.
+        let end = start + gpui::point(px(3.), px(0.));
 
         cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
@@ -14376,6 +14607,40 @@ mod right_tab_mouse_regressions {
 
         shell.read_with(cx, |shell, cx| {
             assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(1));
+        });
+    }
+
+    /// The user-visible contract: dragging a surface tab onto another slot
+    /// reorders the strip. On Windows the chip's `on_drag` used to be gated
+    /// off entirely (`click_activation_drag_enabled`), so the drag could
+    /// never start; on every platform the drop could not land on a chip
+    /// (BlockMouse carve-out). This test is the regression lock for both.
+    #[gpui::test]
+    fn surface_tab_drag_reorders_the_strip(cx: &mut TestAppContext) {
+        let (shell, cx) = setup(cx);
+        let from = cx.debug_bounds("right-surface-tab-0").unwrap().center();
+        let to = cx.debug_bounds("right-surface-tab-1").unwrap().center();
+
+        cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+        // First move crosses the threshold and promotes the press into a
+        // drag (bubble phase). The DragMoveEvent dispatch that computes the
+        // drop slot only fires on the NEXT move (capture phase, after the
+        // drag is already active) — a real pointer always produces both.
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.update(|_, cx| {
+            assert!(cx.has_active_drag(), "surface tab drag never started");
+        });
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, gpui::Modifiers::default());
+
+        shell.read_with(cx, |shell, cx| {
+            let key = shell.panel_key(cx);
+            let tabs = shell.right_tabs.get(&key).expect("panel has surface tabs");
+            assert_eq!(
+                tabs,
+                &vec![RightSurface::Subagent(2), RightSurface::Subagent(1)],
+                "tab drag did not reorder the strip"
+            );
         });
     }
 }
@@ -14681,7 +14946,7 @@ mod settings_modal_regressions {
                     assert_eq!(shell.route, Route::Chat);
                     assert!(!shell.settings_focus_pending);
                     shell.toggle_settings(cx);
-                    assert_eq!(shell.route, Route::Settings(SettingsSection::General));
+                    assert_eq!(shell.route, Route::Settings(section.reopenable()));
                 }
                 shell.open_settings(SettingsSection::Agents, cx);
                 assert_eq!(shell.route, Route::Settings(SettingsSection::Harnesses));
@@ -14691,5 +14956,234 @@ mod settings_modal_regressions {
                 assert!(shell.settings_restore_pending);
             })
             .unwrap();
+    }
+
+    fn init_settings_test(
+        saved: settings::UiSettings,
+        dir: &std::path::Path,
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            settings::init(saved, dir, cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+    }
+
+    fn test_shell(dir: &std::path::Path, cx: &mut Context<Shell>) -> Shell {
+        let state = cx.new(|_| AppState::new());
+        Shell::new(
+            state,
+            EngineBootConfig {
+                data_dir: dir.into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock,
+            },
+            cx,
+        )
+    }
+
+    #[test]
+    fn remembered_sections_reopen_only_where_the_nav_can_show_them() {
+        assert_eq!(
+            SettingsSection::Shortcuts.reopenable(),
+            SettingsSection::Shortcuts
+        );
+        // The legacy Accounts alias lands on the page that absorbed it.
+        assert_eq!(
+            SettingsSection::Agents.reopenable(),
+            SettingsSection::Harnesses
+        );
+        // Appshots is hidden off-desktop, so it cannot be reopened there.
+        assert_eq!(
+            SettingsSection::Appshots.reopenable(),
+            if crate::appshots::is_desktop() {
+                SettingsSection::Appshots
+            } else {
+                SettingsSection::General
+            }
+        );
+        for section in SettingsSection::ALL {
+            assert!(section.reopenable().visible_in_nav(), "{section:?}");
+            assert_eq!(SettingsSection::from_slug(section.slug()), Some(section));
+        }
+    }
+
+    #[test]
+    fn open_route_names_a_section_or_reopens_the_remembered_one() {
+        let remembered = SettingsSection::Notifications;
+        assert_eq!(
+            settings_open_route("settings", remembered),
+            Some(SettingsSection::Notifications)
+        );
+        assert_eq!(
+            settings_open_route("settings", SettingsSection::Agents),
+            Some(SettingsSection::Harnesses)
+        );
+        for (route, section) in [
+            ("settings/devices", SettingsSection::Devices),
+            ("settings/providers", SettingsSection::Harnesses),
+            ("settings/agents", SettingsSection::Harnesses),
+            ("settings/harnesses", SettingsSection::Harnesses),
+            ("settings/general", SettingsSection::General),
+            ("settings/conversations", SettingsSection::General),
+            ("settings/files", SettingsSection::Files),
+            ("settings/appshots", SettingsSection::Appshots),
+            ("settings/archived", SettingsSection::Archived),
+        ] {
+            assert_eq!(
+                settings_open_route(route, remembered),
+                Some(section),
+                "{route}"
+            );
+        }
+        assert_eq!(settings_open_route("settings/billing", remembered), None);
+        assert_eq!(settings_open_route("new", remembered), None);
+    }
+
+    #[gpui::test]
+    fn settings_reopen_where_they_were_left(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let window = cx.add_window(|_, cx| test_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                // Nothing remembered yet: General.
+                shell.toggle_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::General));
+                // Switching sections inside Settings is remembered.
+                shell.open_settings(SettingsSection::Shortcuts, cx);
+                assert_eq!(shell.settings.settings_section, SettingsSection::Shortcuts);
+                assert_eq!(
+                    settings::current(cx).settings_section,
+                    SettingsSection::Shortcuts
+                );
+                shell.toggle_settings(cx);
+                assert_eq!(shell.route, Route::Chat);
+                // ⌘, / the footer gear reopen it…
+                shell.toggle_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Shortcuts));
+                shell.close_settings(cx);
+                // …as do the palette and `/settings`.
+                shell.open_last_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Shortcuts));
+                shell.close_settings(cx);
+
+                // A link naming a section wins, and becomes the one remembered.
+                shell.open_settings(SettingsSection::Appearance, cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Appearance));
+                shell.close_settings(cx);
+                shell.toggle_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Appearance));
+                shell.close_settings(cx);
+
+                // Legacy aliases are remembered as the page they resolve to.
+                shell.open_settings(SettingsSection::Agents, cx);
+                assert_eq!(shell.settings.settings_section, SettingsSection::Harnesses);
+                shell.close_settings(cx);
+                shell.toggle_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::Harnesses));
+                settings::flush(cx);
+            })
+            .unwrap();
+        // It survives a restart.
+        assert_eq!(
+            settings::UiSettings::load(dir.path()).settings_section,
+            SettingsSection::Harnesses
+        );
+    }
+
+    #[gpui::test]
+    fn unknown_or_hidden_remembered_sections_reopen_general(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            settings::UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "settingsSection": "billing"}"#,
+        )
+        .unwrap();
+        let saved = settings::UiSettings::load(dir.path());
+        assert_eq!(saved.sidebar_width, 300.0);
+        init_settings_test(saved, dir.path(), cx);
+        let window = cx.add_window(|_, cx| test_shell(dir.path(), cx));
+        window
+            .update(cx, |shell, _, cx| {
+                shell.toggle_settings(cx);
+                assert_eq!(shell.route, Route::Settings(SettingsSection::General));
+                shell.close_settings(cx);
+                // A remembered section this build hides falls back as well.
+                shell.settings.settings_section = SettingsSection::Appshots;
+                shell.toggle_settings(cx);
+                assert_eq!(
+                    shell.route,
+                    Route::Settings(SettingsSection::Appshots.reopenable())
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn escape_closes_what_is_open_inside_settings_before_settings(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
+        shell.update(cx, |shell, cx| {
+            // No engine in tests: render the workspace, not the boot gate.
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.open_settings(SettingsSection::Devices, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        // A dialog that does not hold focus (the rename input was never
+        // clicked) still closes before Settings does.
+        let devices = shell.read_with(cx, |shell, _| shell.devices_page.clone().unwrap());
+        devices.update(cx, |page, cx| {
+            page.open_rename("device-1".into(), "Studio".into(), cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_keystrokes("escape");
+        assert!(!devices.update(cx, |page, cx| page.dismiss_on_escape(cx)));
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.route, Route::Settings(SettingsSection::Devices));
+        });
+
+        // So does the account menu opened from the settings footer.
+        shell.update(cx, |shell, cx| {
+            shell.user_menu.open(());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_keystrokes("escape");
+        shell.read_with(cx, |shell, _| {
+            assert!(!shell.user_menu.is_open());
+            assert_eq!(shell.route, Route::Settings(SettingsSection::Devices));
+        });
+        // The exit animation's reap runs on wall-clock time; stand in for it.
+        shell.update(cx, |shell, cx| {
+            shell.user_menu = popover::Popup::default();
+            cx.notify();
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        // With nothing left open, Escape leaves Settings.
+        cx.simulate_keystrokes("escape");
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.route, Route::Chat);
+            assert_eq!(shell.settings.settings_section, SettingsSection::Devices);
+        });
     }
 }

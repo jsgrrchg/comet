@@ -230,3 +230,207 @@ async fn idle_connection_closes_while_caller_keeps_document() {
     assert_eq!(handle.writers.load(Ordering::Acquire), 0);
     host.shutdown_workers().await;
 }
+
+fn workspace(store: Arc<DocsStore>) -> WorkspaceHost {
+    WorkspaceHost::open(
+        store,
+        crate::workspace_host::WorkspaceHostConfig {
+            device_id: "host".into(),
+            device_name: "Test host".into(),
+            platform: "linux".into(),
+            org_id: "test-org".into(),
+            user_id: "test-user".into(),
+            edge: None,
+        },
+    )
+    .unwrap()
+}
+
+fn legacy_chat(workspace: &WorkspaceHost, id: &str, device: &str, generation: Option<u32>) {
+    workspace
+        .create_chat(id, None, Some(device), None, None)
+        .unwrap();
+    let mut row = workspace.chat(id).unwrap().unwrap();
+    row.room_gen = generation;
+    workspace.import_chat_row(&row).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn twelve_foreign_legacy_wakes_do_not_block_interactive_sync() {
+    let relay = relay(Hold::Checkpoint).await;
+    relay.release.send_replace(true);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let workspace = workspace(store.clone());
+    for i in 0..ACTIVE_SYNC_CAP {
+        let id = format!("legacy-{i:02}");
+        legacy_chat(
+            &workspace,
+            &id,
+            "another-host",
+            if i % 2 == 0 { None } else { Some(1) },
+        );
+        store.schedule_sync_job(&id, "wake").unwrap();
+    }
+    let host = host(store.clone(), &relay);
+    host.set_workspace(workspace);
+    // Reach the old failure state (12 phantom clients) or successful retirement.
+    until(|| {
+        store.sync_work_counts().unwrap().1 == 0
+            || lock(&host.inner.handles)
+                .values()
+                .filter(|h| h.sync_started.load(Ordering::Acquire))
+                .count()
+                == ACTIVE_SYNC_CAP
+    })
+    .await;
+    let interactive = host.open("interactive").unwrap();
+    let _view = interactive.watch_messages();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !lock(&interactive.chat2)
+            .as_ref()
+            .is_some_and(|c| c.caught_up())
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("foreign legacy wakes occupied every admission slot");
+    until(|| store.sync_work_counts().unwrap().1 == 0).await;
+    assert!(
+        lock(&host.inner.handles)
+            .values()
+            .filter(|h| h.chat_id.starts_with("legacy-"))
+            .all(|h| !h.sync_started.load(Ordering::Acquire)
+                && !h.sync_requested.load(Ordering::Acquire))
+    );
+    assert!(lock(&host.inner.seed_waiting).is_empty());
+    for i in 0..ACTIVE_SYNC_CAP {
+        host.enqueue_wakeup(&format!("legacy-{i:02}")).unwrap();
+    }
+    until(|| store.sync_work_counts().unwrap().1 == 0).await;
+    assert_eq!(
+        relay.joins.load(Ordering::SeqCst),
+        1,
+        "rejected wakes started network work"
+    );
+    host.shutdown_workers().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn admissible_wakes_preserve_missing_rows_modern_readers_and_local_epoch() {
+    let relay = relay(Hold::Checkpoint).await;
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let workspace = workspace(store.clone());
+    workspace
+        .create_chat("modern-foreign", None, Some("another-host"), None, None)
+        .unwrap();
+    legacy_chat(&workspace, "epoch-override", "another-host", Some(1));
+    let thin = SessionDoc::init("epoch-override").unwrap();
+    store
+        .save_snapshot_with_cursor(
+            "epoch-override",
+            &thin.export_snapshot().unwrap(),
+            0,
+            crate::chat2_host::CHAT2_DOC_EPOCH,
+        )
+        .unwrap();
+    let ids = ["missing-row", "modern-foreign", "epoch-override"];
+    for id in ids {
+        store.initialize_chat_outbox(id, &[]).unwrap();
+        store.schedule_sync_job(id, "wake").unwrap();
+    }
+    let host = host(store.clone(), &relay);
+    host.set_workspace(workspace.clone());
+    until(|| relay.rows_requests.load(Ordering::SeqCst) == ids.len()).await;
+    for id in ids {
+        let handle = lock(&host.inner.handles).get(id).cloned().unwrap();
+        assert_eq!(handle.room_gen, 2);
+        assert!(handle.sync_started.load(Ordering::Acquire));
+        assert!(
+            store.sync_job_version(id, "wake").unwrap().is_some(),
+            "retired before catch-up"
+        );
+    }
+    assert!(workspace.chat("missing-row").unwrap().is_none());
+    // Creation arrives after its notification has already started joining.
+    workspace
+        .create_chat("missing-row", None, Some("another-host"), None, None)
+        .unwrap();
+    relay.release.send_replace(true);
+    until(|| store.sync_work_counts().unwrap().1 == 0).await;
+    for id in ids {
+        let snapshot = store.load_snapshot(id).unwrap().unwrap();
+        let doc = loro::LoroDoc::new();
+        doc.import(&snapshot).unwrap();
+        assert_eq!(doc.get_text("slow-checkpoint").to_string(), "received");
+    }
+    host.shutdown_workers().await;
+}
+
+#[tokio::test]
+async fn legacy_admission_rechecks_owner_and_retires_only_the_captured_wake() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let workspace = workspace(store.clone());
+    legacy_chat(&workspace, "reassigned", "host", None);
+    let host = DocHost::new(
+        store.clone(),
+        DocHostConfig {
+            device_id: "host".into(),
+            default_harness: HarnessId::Mock,
+            edge: None,
+        },
+    );
+    host.set_workspace(workspace.clone());
+    let handle = host.open_local("reassigned").unwrap();
+    assert_eq!(
+        host.prepare_sync_admission(&handle, None).unwrap(),
+        Some(SyncAdmission::Seed)
+    );
+    handle.sync_requested.store(true, Ordering::Release);
+    handle
+        .doc
+        .doc()
+        .get_text("local-edit")
+        .insert(0, "keep this edit")
+        .unwrap();
+    handle.doc.doc().commit();
+    let updates = crate::chat2_host::publication_updates(handle.doc.doc()).unwrap();
+    store
+        .enqueue_chat_update("reassigned", "local-batch", &updates[0])
+        .unwrap();
+    let outbox = store.pending_chat_updates("reassigned").unwrap();
+    host.enqueue_wakeup("reassigned").unwrap();
+    let old = store.sync_job_version("reassigned", "wake").unwrap();
+    // Ownership changes while this handle is waiting for admission.
+    workspace
+        .set_chat_host("reassigned", "another-host")
+        .unwrap();
+    host.enqueue_wakeup("reassigned").unwrap();
+    let newer = store.sync_job_version("reassigned", "wake").unwrap();
+    assert_ne!(old, newer);
+    assert_eq!(host.prepare_sync_admission(&handle, old).unwrap(), None);
+    assert_eq!(store.sync_job_version("reassigned", "wake").unwrap(), newer);
+    assert!(!handle.sync_requested.load(Ordering::Acquire));
+    assert!(!handle.sync_started.load(Ordering::Acquire));
+    assert_eq!(host.prepare_sync_admission(&handle, newer).unwrap(), None);
+    assert_eq!(store.sync_job_version("reassigned", "wake").unwrap(), None);
+    assert_eq!(store.pending_chat_updates("reassigned").unwrap(), outbox);
+    assert_eq!(
+        handle.doc.doc().get_text("local-edit").to_string(),
+        "keep this edit"
+    );
+    // A cutover on another host can overtake this old cached handle: defer,
+    // rather than retire the notification for the now-modern room.
+    workspace.set_chat_room_gen("reassigned", 2).unwrap();
+    host.enqueue_wakeup("reassigned").unwrap();
+    let cutover = store.sync_job_version("reassigned", "wake").unwrap();
+    assert_eq!(host.prepare_sync_admission(&handle, cutover).unwrap(), None);
+    assert_eq!(
+        store.sync_job_version("reassigned", "wake").unwrap(),
+        cutover
+    );
+    host.shutdown_workers().await;
+}

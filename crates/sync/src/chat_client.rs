@@ -769,9 +769,12 @@ impl ChatClient {
     /// Leave cleanly and stop the actor.
     pub async fn shutdown(mut self) {
         let _ = self.shutdown.send(true);
-        if let Some(task) = self.task.take() {
+        // Retain abort ownership while awaiting: cancelling this future must
+        // still run Drop with the actor handle, rather than detach the actor.
+        if let Some(task) = self.task.as_mut() {
             let _ = task.await;
         }
+        self.task.take();
         // A fallback pull may still be importing after the socket actor exits.
         // Join its cancellation before the host takes its final snapshot.
         let offline = lock(&self.offline_task).take();
@@ -908,7 +911,16 @@ impl Actor {
             };
 
             let session_started = tokio::time::Instant::now();
-            match self.run_session(pipe, &mut ready).await {
+            // Cover the whole session, including backpressured sends, HELLO
+            // and row backfill. A peer need not close or reach a deadline for
+            // shutdown to complete. The clone avoids borrowing self twice.
+            let mut shutdown = self.shutdown.clone();
+            let end = tokio::select! {
+                biased;
+                _ = shutdown.wait_for(|stop| *stop) => SessionEnd::Stop,
+                end = self.run_session(pipe, &mut ready) => end,
+            };
+            match end {
                 SessionEnd::Stop => return,
                 SessionEnd::Reconnect => {
                     use std::sync::atomic::Ordering::Relaxed;

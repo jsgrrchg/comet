@@ -1975,3 +1975,22 @@ async fn shutdown_cancels_dial_and_joins_http_fallback() {
         "fallback must be dropped before final snapshot"
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_construction_closes_the_actor_pipe() {
+    let (pipe, mut server) = pipe_pair();
+    let connecting = tokio::spawn(ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        Arc::new(RecordingSink::default()),
+        Arc::new(PendingFetcher),
+        "cancelled",
+        0,
+        ChatTuning::default(),
+    ));
+    expect_kind(&mut server, frame_type::HELLO).await;
+    connecting.abort();
+    let _ = connecting.await;
+    tokio::time::timeout(Duration::from_secs(1), server.tx.closed())
+        .await
+        .expect("cancelled constructor left a detached actor alive");
+}

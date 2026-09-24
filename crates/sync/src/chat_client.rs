@@ -237,9 +237,10 @@ impl BinConnector for WsBinConnector {
             let socket_permit = crate::budget::shared().socket().await?;
             let dial_permit = crate::budget::shared().dial().await?;
             let url = provider.url().await?;
-            let ws = crate::dial::connect_ws(&url)
-                .await
-                .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+            let ws = crate::dial::connect_ws(&url).await.map_err(|e| {
+                crate::budget::shared().observe_error(&e);
+                SyncError::WebSocket(e.to_string())
+            })?;
             drop(dial_permit);
             let (out_tx, out_rx) = mpsc::channel(64);
             let (in_tx, in_rx) = mpsc::channel(64);
@@ -428,6 +429,11 @@ pub struct ChatStatsSnapshot {
     pub server_resets: u64,
 }
 
+fn retry_jitter(max: Duration) -> Duration {
+    let random = u64::from_le_bytes(uuid::Uuid::new_v4().as_bytes()[..8].try_into().unwrap());
+    Duration::from_millis(random % (max.as_millis() as u64 + 1))
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -605,28 +611,25 @@ impl ChatClient {
         };
         let task = tokio::spawn(actor.run(ready_tx));
 
+        // Own both actor tasks BEFORE the await. Cancelling a timed-out
+        // construction must not detach its JoinHandle and leak a live socket.
+        let client = Self {
+            sink,
+            shared,
+            events,
+            shutdown: shutdown_tx,
+            nudge: nudge_tx,
+            probe: probe_tx,
+            redial: redial_tx,
+            presence_out: presence_tx,
+            flags,
+            task: Some(task),
+            offline_task,
+        };
         match ready_rx.await {
-            Ok(Ok(())) => Ok(Self {
-                sink,
-                shared,
-                events,
-                shutdown: shutdown_tx,
-                nudge: nudge_tx,
-                probe: probe_tx,
-                redial: redial_tx,
-                presence_out: presence_tx,
-                flags,
-                task: Some(task),
-                offline_task,
-            }),
-            Ok(Err(err)) => {
-                task.abort();
-                Err(err)
-            }
-            Err(_) => {
-                task.abort();
-                Err(SyncError::Closed)
-            }
+            Ok(Ok(())) => Ok(client),
+            Ok(Err(err)) => Err(err),
+            Err(_) => Err(SyncError::Closed),
         }
     }
 
@@ -944,9 +947,9 @@ impl Actor {
             wait
         };
         tokio::select! {
-            _ = tokio::time::sleep(wait) => Waited::Elapsed,
-            _ = wake.recv() => Waited::Woke,
-            _ = online.recv() => Waited::Woke,
+            _ = tokio::time::sleep(wait + retry_jitter(wait / 4)) => Waited::Elapsed,
+            _ = wake.recv() => { tokio::time::sleep(retry_jitter(BACKOFF_BASE)).await; Waited::Woke },
+            _ = online.recv() => { tokio::time::sleep(retry_jitter(BACKOFF_BASE)).await; Waited::Woke },
             _ = self.shutdown.changed() => {
                 if *self.shutdown.borrow() {
                     Waited::Shutdown

@@ -2,8 +2,10 @@
 //! deliberately remain outside this small budget. Permits cover the resource's
 //! entire lifetime, including response bodies and socket teardown.
 use crate::SyncError;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::Instant;
 
 #[derive(Clone, Copy)]
 pub enum Priority {
@@ -18,6 +20,8 @@ pub struct Budget {
     background_http: Arc<Semaphore>,
     waiters: Arc<Semaphore>,
     limits: [usize; 3],
+    paused_until: Mutex<Option<Instant>>,
+    next_dial: Mutex<Option<Instant>>,
 }
 
 pub struct Permit {
@@ -47,6 +51,8 @@ impl Budget {
             background_http: Arc::new(Semaphore::new(http.saturating_sub(2).max(1))),
             waiters: Arc::new(Semaphore::new(128)),
             limits: [sockets, dials, http],
+            paused_until: Mutex::new(None),
+            next_dial: Mutex::new(None),
         })
     }
 
@@ -55,6 +61,7 @@ impl Budget {
         resource: &Arc<Semaphore>,
         background: bool,
     ) -> Result<Permit, SyncError> {
+        self.wait_for_resources().await;
         // Never allow callers to build an unbounded semaphore wait queue.
         let _waiting =
             self.waiters.clone().try_acquire_owned().map_err(|_| {
@@ -76,6 +83,7 @@ impl Budget {
             .acquire_owned()
             .await
             .map_err(|_| SyncError::Closed)?;
+        self.wait_for_resources().await;
         Ok(Permit {
             _resource: resource,
             _background: background,
@@ -86,12 +94,53 @@ impl Budget {
         self.acquire(&self.sockets, false).await
     }
     pub async fn dial(&self) -> Result<Permit, SyncError> {
-        self.acquire(&self.dials, false).await
+        let permit = self.acquire(&self.dials, false).await?;
+        let at = {
+            let mut next = self.next_dial.lock().unwrap_or_else(|e| e.into_inner());
+            let at = next.unwrap_or_else(Instant::now).max(Instant::now());
+            *next = Some(at + Duration::from_millis(50));
+            at
+        };
+        tokio::time::sleep_until(at).await;
+        self.wait_for_resources().await;
+        Ok(permit)
     }
     pub async fn http(&self, priority: Priority) -> Result<Permit, SyncError> {
         self.acquire(&self.http, matches!(priority, Priority::Background))
             .await
     }
+    /// Preserve OS error identity before transport layers stringify it.
+    pub fn observe_error(&self, error: &(dyn std::error::Error + 'static)) {
+        let mut current = Some(error);
+        while let Some(error) = current {
+            if let Some(io) = error.downcast_ref::<std::io::Error>() {
+                #[cfg(unix)]
+                let exhausted = matches!(io.raw_os_error(), Some(23 | 24));
+                #[cfg(windows)]
+                let exhausted = matches!(io.raw_os_error(), Some(4 | 10024));
+                #[cfg(not(any(unix, windows)))]
+                let exhausted = false;
+                if exhausted {
+                    *self.paused_until.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(Instant::now() + Duration::from_secs(2));
+                    tracing::warn!("sync admission paused: process file descriptors exhausted");
+                    return;
+                }
+            }
+            current = error.source();
+        }
+    }
+
+    async fn wait_for_resources(&self) {
+        loop {
+            let until = *self.paused_until.lock().unwrap_or_else(|e| e.into_inner());
+            match until {
+                Some(at) if at > Instant::now() => tokio::time::sleep_until(at).await,
+                _ => return,
+            }
+        }
+    }
+
     pub fn stats(&self) -> BudgetStats {
         BudgetStats {
             sockets: self.limits[0] - self.sockets.available_permits(),
@@ -113,6 +162,21 @@ pub fn shared() -> &'static Arc<Budget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn resource_exhaustion_pauses_all_data_admission() {
+        let budget = Budget::new(2, 2, 2);
+        budget.observe_error(&std::io::Error::from_raw_os_error(24));
+        let pending = tokio::spawn({
+            let budget = budget.clone();
+            async move { budget.socket().await }
+        });
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!pending.is_finished());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        drop(pending.await.unwrap().unwrap());
+        assert_eq!(budget.stats().sockets, 0);
+    }
     #[tokio::test]
     async fn cancellation_releases_capacity_and_background_leaves_interactive_room() {
         let budget = Budget::new(1, 1, 3);

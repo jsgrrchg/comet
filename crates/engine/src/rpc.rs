@@ -1735,7 +1735,7 @@ impl RpcService for EngineRpc {
                 self.workspace
                     .change_draft(&change)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&serde_json::json!({ "ok": true }))
+                RpcReply::value(&self.workspace.watch_drafts().borrow().clone())
             }
             methods::CLAIM_DRAFT => {
                 #[derive(Deserialize)]

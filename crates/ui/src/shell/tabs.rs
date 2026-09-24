@@ -134,6 +134,7 @@ impl Shell {
     /// re-homes the canvas onto that project; under "All" the current pick
     /// (the last selected project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.composer.update(cx, |composer, cx| composer.start_prompt_draft(cx));
         self.command_palette = None;
         self.route = Route::Chat;
         self.focus_composer(cx);

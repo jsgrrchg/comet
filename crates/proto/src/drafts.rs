@@ -97,6 +97,8 @@ pub struct PromptDraft {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DraftsState {
+    #[serde(default)]
+    pub revision: u64,
     pub drafts: Vec<PromptDraft>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

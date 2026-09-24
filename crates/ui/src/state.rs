@@ -680,6 +680,7 @@ pub struct AppState {
     /// Synced user/org sidebar pin state. Local workspaces deliberately ignore
     /// this and continue reading their device-local settings entry.
     pub sidebar_preferences: SidebarPreferencesState,
+    pub prompt_drafts: zeron_proto::DraftsState,
     session_presentation: Option<Vec<Session>>,
     /// The project the new-session canvas mints into. Healed by
     /// [`Self::apply_spaces`] when the row vanishes; selecting a chat implies
@@ -801,6 +802,7 @@ impl AppState {
             chats: Vec::new(),
             sessions: Vec::new(),
             sidebar_preferences: SidebarPreferencesState::default(),
+            prompt_drafts: Default::default(),
             session_presentation: None,
             selected_space: None,
             no_project: false,
@@ -1795,6 +1797,7 @@ impl AppState {
         self.chats.clear();
         self.sessions.clear();
         self.sidebar_preferences = SidebarPreferencesState::default();
+        self.prompt_drafts = Default::default();
         self.session_presentation = None;
         self.selected_space = None;
         self.no_project = false;
@@ -1869,6 +1872,11 @@ impl AppState {
         let mut watch_tasks = Vec::with_capacity(10);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
             watch_tasks.push(task);
+        }
+        if handle.engine_info().supports(zeron_proto::DRAFTS_CAPABILITY) {
+            watch_tasks.push(spawn_watch(cx, handle.clone(), methods::WATCH_DRAFTS, |state, value: zeron_proto::DraftsState| {
+                if value.revision < state.prompt_drafts.revision || state.prompt_drafts == value { false } else { state.prompt_drafts = value; true }
+            }));
         }
         watch_tasks.extend([
             spawn_watch(

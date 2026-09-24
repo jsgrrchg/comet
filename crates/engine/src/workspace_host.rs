@@ -1448,7 +1448,10 @@ impl WorkspaceHostInner {
         for row in &mut drafts {
             row.pending = pending.iter().any(|p| p.revision == row.revision);
         }
-        publish_if_changed(&self.drafts_tx, zeron_proto::DraftsState { drafts });
+        self.drafts_tx.send_if_modified(|state| {
+            if state.drafts == drafts { return false; }
+            state.revision += 1; state.drafts = drafts; true
+        });
     }
 
     fn save_snapshot(&self) {

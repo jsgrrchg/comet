@@ -18,6 +18,7 @@ pub mod net_path;
 pub mod registry;
 pub mod socket;
 mod store;
+mod sync_jobs;
 mod types;
 pub mod wake;
 

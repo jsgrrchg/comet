@@ -546,6 +546,7 @@ pub struct ChatDocHandle {
     sync_started: AtomicBool,
     sync_requested: AtomicBool,
     sync_last_started: AtomicI64,
+    sync_wake_version: AtomicI64,
     sync_cancel: Mutex<CancellationToken>,
     writers: Arc<AtomicUsize>,
     pub(crate) persistence: Option<Arc<crate::chat_persistence::ChatPersistence>>,
@@ -1412,6 +1413,7 @@ impl DocHost {
             sync_started: AtomicBool::new(false),
             sync_requested: AtomicBool::new(false),
             sync_last_started: AtomicI64::new(0),
+            sync_wake_version: AtomicI64::new(0),
             sync_cancel: Mutex::new(CancellationToken::new()),
             writers: Arc::new(AtomicUsize::new(0)),
             persistence,
@@ -1460,20 +1462,14 @@ impl DocHost {
                             // check and the push let the join's store+drain
                             // slip between, orphaning the update forever).
                             let batch_id = uuid::Uuid::new_v4().to_string();
+                            let client_guard = lock(&handle.chat2);
                             if let Err(err) = publication_store.enqueue_chat_update(&publication_chat, &batch_id, bytes) {
                                 handle.publication_failed.store(true, Ordering::Release);
+                                lock(&handle.chat2_pending_local).push((batch_id.clone(), bytes.clone()));
                                 tracing::error!(chat = %publication_chat, %err, "chat2: durable outbox write failed");
                             }
-                            let client_guard = lock(&handle.chat2);
-                            match &*client_guard {
-                                Some(client) => client.enqueue_batch(batch_id, bytes.clone()),
-                                None => {
-                                    // Durable rows are loaded by the next client. Keep
-                                    // only failed writes in memory for retry.
-                                    if handle.publication_failed.load(Ordering::Acquire) {
-                                        lock(&handle.chat2_pending_local).push((batch_id, bytes.clone()));
-                                    }
-                                },
+                            if let Some(client) = &*client_guard {
+                                client.enqueue_batch(batch_id, bytes.clone());
                             }
                         }
                         true
@@ -1515,6 +1511,7 @@ impl DocHost {
         let weak = Arc::downgrade(&self.inner);
         self.spawn_worker(async move {
             let mut turn = 0u64;
+            let mut disk_cursor = String::new();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let Some(inner) = weak.upgrade() else { return };
@@ -1527,13 +1524,58 @@ impl DocHost {
                     continue;
                 };
                 let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
-                let waiting_exists = handles.iter().any(|h| {
-                    h.sync_requested.load(Ordering::Acquire)
-                        && !h.sync_started.load(Ordering::Acquire)
-                });
+                for handle in &handles {
+                    if !handle.publication_failed.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let _client = lock(&handle.chat2);
+                    let mut failed = lock(&handle.chat2_pending_local);
+                    failed.retain(|(id, bytes)| {
+                        host.inner
+                            .store
+                            .enqueue_chat_update(&handle.chat_id, id, bytes)
+                            .is_err()
+                    });
+                    if failed.is_empty() {
+                        handle.publication_failed.store(false, Ordering::Release);
+                    }
+                }
+
+                let durable = host
+                    .inner
+                    .store
+                    .pending_sync_docs(&disk_cursor, 4)
+                    .unwrap_or_default();
+                if durable.is_empty() {
+                    disk_cursor.clear();
+                }
+                let waiting_exists = !durable.is_empty()
+                    || handles.iter().any(|h| {
+                        h.sync_requested.load(Ordering::Acquire)
+                            && !h.sync_started.load(Ordering::Acquire)
+                    });
                 for handle in &handles {
                     if !handle.sync_started.load(Ordering::Acquire) {
                         continue;
+                    }
+                    let captured = handle.sync_wake_version.load(Ordering::Acquire);
+                    let pending_wake = host
+                        .inner
+                        .store
+                        .sync_job_version(&handle.chat_id, "wake")
+                        .ok()
+                        .flatten();
+                    if pending_wake.is_some_and(|v| v != captured) {
+                        host.stop_sync(handle).await;
+                        handle.sync_requested.store(true, Ordering::Release);
+                        continue;
+                    }
+                    if captured != 0 && lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up())
+                    {
+                        let _ =
+                            host.inner
+                                .store
+                                .complete_sync_job(&handle.chat_id, "wake", captured);
                     }
                     let idle = handle.messages_tx.receiver_count() == 0
                         && handle.queue_tx.receiver_count() == 0
@@ -1569,6 +1611,29 @@ impl DocHost {
                             && !h.sync_started.load(Ordering::Acquire)
                     })
                     .collect();
+                // Disk is the unbounded backlog; only materialize work that
+                // can compete for an available slot this turn.
+                let disk_healthy = !lock(&host.inner.handles)
+                    .values()
+                    .any(|h| h.publication_failed.load(Ordering::Acquire));
+                if disk_healthy {
+                    for id in durable.into_iter().take(available.min(4)) {
+                        disk_cursor = id.clone();
+                        if waiting.iter().any(|h| h.chat_id == id) {
+                            continue;
+                        }
+                        match host.open_local(&id) {
+                            Ok(handle) if !handle.sync_started.load(Ordering::Acquire) => {
+                                handle.sync_requested.store(true, Ordering::Release);
+                                waiting.push(handle);
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(chat = %id, %err, "durable sync work deferred")
+                            }
+                        }
+                    }
+                }
                 for _ in 0..available.min(4) {
                     turn += 1;
                     waiting.sort_by_key(|h| {
@@ -1591,6 +1656,15 @@ impl DocHost {
                         continue;
                     }
                     handle.sync_last_started.store(now_ms(), Ordering::Release);
+                    handle.sync_wake_version.store(
+                        host.inner
+                            .store
+                            .sync_job_version(&handle.chat_id, "wake")
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0),
+                        Ordering::Release,
+                    );
                     if handle.room_gen >= 2 {
                         let cursor = handle.persistence.as_ref().map_or(0, |p| p.cursor());
                         host.spawn_chat2_join(edge.clone(), &handle, cursor);
@@ -1713,7 +1787,7 @@ impl DocHost {
                                 client.enqueue_batch(id, bytes);
                             }
                             let pending: Vec<(String, Vec<u8>)> =
-                                std::mem::take(&mut *lock(&handle.chat2_pending_local));
+                                lock(&handle.chat2_pending_local).clone();
                             for (batch_id, update) in pending {
                                 client.enqueue_batch(batch_id, update);
                             }
@@ -2106,7 +2180,36 @@ impl DocHost {
                     continue; // never ran here — an empty doc is just new
                 }
                 if let Err(err) = host.salvage_chat_transcript(&chat.id).await {
+                    let _ = host.inner.store.schedule_sync_job(&chat.id, "recovery");
                     tracing::warn!(chat = %chat.id, error = %err, "transcript salvage failed");
+                }
+            }
+            let mut after = String::new();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let jobs = host
+                    .inner
+                    .store
+                    .pending_sync_jobs("recovery", &after, 1)
+                    .unwrap_or_default();
+                let Some(chat) = jobs.into_iter().next() else {
+                    after.clear();
+                    continue;
+                };
+                after = chat.clone();
+                let version = host
+                    .inner
+                    .store
+                    .sync_job_version(&chat, "recovery")
+                    .ok()
+                    .flatten();
+                if host.salvage_chat_transcript(&chat).await.is_ok() {
+                    if let Some(version) = version {
+                        let _ = host
+                            .inner
+                            .store
+                            .complete_sync_job(&chat, "recovery", version);
+                    }
                 }
             }
         });
@@ -2469,7 +2572,7 @@ impl DocHost {
         if handle.publication_failed.load(Ordering::Acquire) {
             return true;
         }
-        if handle.messages_tx.receiver_count() > 0 {
+        if handle.messages_tx.receiver_count() > 0 || handle.queue_tx.receiver_count() > 0 {
             return true;
         }
         // The handle itself holds one doc ref; more means a live writer.
@@ -5554,6 +5657,7 @@ mod publication_eviction_tests {
             host.open(&format!("other-{i}")).unwrap();
         }
 
+        host.stop_sync(&handle).await;
         assert!(
             !host.pinned(&handle),
             "durably queued ops need not retain the whole doc in memory"

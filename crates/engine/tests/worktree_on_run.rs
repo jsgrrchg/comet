@@ -440,3 +440,62 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool, test_setup: b
 
     core.shutdown().await;
 }
+
+/// Run on Windows CI with an actual destination beyond MAX_PATH, regardless
+/// of the runner's global Git configuration.
+#[cfg(windows)]
+#[tokio::test]
+async fn worktree_location_supports_long_windows_destinations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "t@example.com"]);
+    git(&repo, &["config", "user.name", "Test"]);
+    git(&repo, &["config", "core.longpaths", "false"]);
+    std::fs::write(repo.join("README.md"), "hello").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-m", "init"]);
+    let mut destination = root.join("other disk");
+    while destination.to_string_lossy().encode_utf16().count() < 300 {
+        destination.push("long-folder-with-spaces 日本語");
+    }
+    let repos = zeron_engine::Repos::with_worktrees_root(
+        &root.join("settings"),
+        "test-device",
+        root.join("default"),
+    );
+    repos
+        .set_worktree_settings(zeron_proto::WorktreeSettings {
+            use_custom_directory: true,
+            custom_directory: Some(destination.to_string_lossy().into_owned()),
+        })
+        .await
+        .unwrap();
+    let worktree = repos.create_worktree(&repo, "main").await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(PathBuf::from(&worktree.path).join("README.md")).unwrap(),
+        "hello"
+    );
+    assert_eq!(
+        repos
+            .current_branch(std::path::Path::new(&worktree.path))
+            .await
+            .unwrap(),
+        worktree.branch
+    );
+    assert!(repos.refs(&repo).await.unwrap().iter().any(|entry| {
+        entry
+            .worktree_path
+            .as_ref()
+            .is_some_and(|path| same_file::is_same_file(path, &worktree.path).unwrap_or(false))
+    }));
+    let config = Command::new("git")
+        .args(["config", "--local", "core.longpaths"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(config.status.success());
+    assert_eq!(String::from_utf8_lossy(&config.stdout).trim(), "false");
+}

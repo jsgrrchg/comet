@@ -227,6 +227,8 @@ impl Repos {
         {
             use std::os::windows::process::CommandExt;
             cmd.as_std_mut().creation_flags(0x08000000);
+            // Let Git handle long native paths without persisting user config.
+            cmd.args(["-c", "core.longpaths=true"]);
         }
         cmd.args(args);
         if let Some(cwd) = cwd {
@@ -1134,15 +1136,12 @@ impl Repos {
             name.ok_or_else(|| EngineError::Other("Could not allocate a worktree name".into()))?;
         let path = base.join(&name);
         let branch_name = format!("zeron/{name}");
+        #[cfg(windows)]
+        let git_path = windows_git_worktree_path(&path.to_string_lossy());
+        #[cfg(not(windows))]
+        let git_path = path.to_string_lossy();
         self.git(
-            &[
-                "worktree",
-                "add",
-                "-b",
-                &branch_name,
-                &path.to_string_lossy(),
-                branch,
-            ],
+            &["worktree", "add", "-b", &branch_name, &git_path, branch],
             Some(repo_path),
         )
         .await?;
@@ -2189,8 +2188,48 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Git's worktree command normalizes backslashes to slashes, which breaks
+/// Win32 verbatim prefixes (`\\?\` becomes `//?/`). Keep native paths for
+/// filesystem access, but pass drive/UNC paths without that prefix to Git.
+#[cfg(any(windows, test))]
+fn windows_git_worktree_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    if let Some(unc) = path.strip_prefix("//?/UNC/") {
+        return format!("//{unc}");
+    }
+    if let Some(drive) = path.strip_prefix("//?/") {
+        let bytes = drive.as_bytes();
+        if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1..3] == *b":/" {
+            return drive.to_owned();
+        }
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn git_worktree_paths_strip_only_drive_and_unc_verbatim_prefixes() {
+        for (native, expected) in [
+            (
+                r"\\?\C:\other disk\日本語\repo",
+                "C:/other disk/日本語/repo",
+            ),
+            (r"\\?\UNC\server\share\repo", "//server/share/repo"),
+            (r"C:\worktrees\repo", "C:/worktrees/repo"),
+            (r"\\server\share\repo", "//server/share/repo"),
+            ("//?/C:/worktrees/repo", "C:/worktrees/repo"),
+            ("//?/UNC/server/share/repo", "//server/share/repo"),
+        ] {
+            assert_eq!(super::windows_git_worktree_path(native), expected);
+        }
+        let suffix = "folder/".repeat(50);
+        assert_eq!(
+            super::windows_git_worktree_path(&format!("//?/C:/{suffix}")),
+            format!("C:/{suffix}")
+        );
+    }
+
     use super::*;
 
     fn history_commit(sha: String, parent_sha: Option<String>) -> GitHistoryCommit {

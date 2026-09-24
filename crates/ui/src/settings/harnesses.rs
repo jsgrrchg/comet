@@ -235,7 +235,8 @@ impl HarnessesPage {
     /// `ListHarnesses` against the target device (installed probe + enabled
     /// set both come from where the CLIs actually live).
     fn load(&mut self, cx: &mut Context<Self>) {
-        self.worktrees.update(cx, |card, cx| card.load(self.target_device.clone(), cx));
+        self.worktrees
+            .update(cx, |card, cx| card.load(self.target_device.clone(), cx));
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };

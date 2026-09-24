@@ -230,15 +230,25 @@ impl Repos {
             // Let Git handle long native paths without persisting user config.
             cmd.args(["-c", "core.longpaths=true"]);
         }
-        cmd.args(args);
         if let Some(cwd) = cwd {
+            #[cfg(windows)]
+            {
+                // CreateProcess rejects a long lpCurrentDirectory, including
+                // verbatim paths. Start at the volume/share root and let Git
+                // change directories after startup, using its long-path support.
+                let cwd = std::path::absolute(cwd)?;
+                cmd.current_dir(cwd.ancestors().last().unwrap());
+                cmd.arg("-C")
+                    .arg(windows_git_worktree_path(&cwd.to_string_lossy()));
+            }
+            #[cfg(not(windows))]
             cmd.current_dir(cwd);
         }
+        cmd.args(args);
         cmd.stdin(std::process::Stdio::null());
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+        let output = cmd.output().await.map_err(|e| {
+            EngineError::Other(format!("git {args:?} in {cwd:?} failed to start: {e}"))
+        })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let message = stderr.trim();

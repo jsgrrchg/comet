@@ -1,4 +1,4 @@
-//! The Agents page's device-addressed worktree destination settings.
+//! The Providers page's device-addressed worktree destination settings.
 
 use gpui::{AnyElement, Context, Entity, Render, Subscription, Task, Window, div, prelude::*, px};
 use zeron_proto::{FolderListing, WorktreeSettings, WorktreeSettingsStatus};
@@ -248,7 +248,7 @@ impl WorktreeSettingsCard {
             .mt(px(12.0))
             .overflow_hidden()
             .border_1()
-            .border_color(theme.border)
+            .border_color(widgets::row_divider(theme))
             .rounded(px(10.0))
             .child(
                 div()
@@ -257,11 +257,10 @@ impl WorktreeSettingsCard {
                     .gap(px(2.0))
                     .p(px(4.0))
                     .border_b_1()
-                    .border_color(theme.border)
+                    .border_color(widgets::row_divider(theme))
                     .child(
                         widgets::ghost_action(theme)
                             .id("worktrees-home")
-                            .hover(|style| widgets::ghost_hover(theme, style))
                             .child(
                                 icons::icon(icons::HOME)
                                     .size(px(14.0))
@@ -280,10 +279,9 @@ impl WorktreeSettingsCard {
                             )
                             .child("Up")
                             .when(has_parent, |el| {
-                                el.hover(|style| widgets::ghost_hover(theme, style))
-                                    .on_click(cx.listener(move |card, _, _, cx| {
-                                        card.browse(parent.clone(), cx)
-                                    }))
+                                el.on_click(cx.listener(move |card, _, _, cx| {
+                                    card.browse(parent.clone(), cx)
+                                }))
                             })
                             .when(!has_parent, |el| el.opacity(0.5)),
                     )
@@ -291,7 +289,6 @@ impl WorktreeSettingsCard {
                         widgets::ghost_action(theme)
                             .id("worktrees-open-path")
                             .ml_auto()
-                            .hover(|style| widgets::ghost_hover(theme, style))
                             .child("Open path")
                             .on_click(cx.listener(|card, _, _, cx| card.browse_input(cx))),
                     ),
@@ -315,7 +312,6 @@ impl WorktreeSettingsCard {
                             .id(("worktree-folder", index))
                             .w_full()
                             .gap(px(8.0))
-                            .hover(|style| widgets::ghost_hover(theme, style))
                             .child(
                                 icons::icon(icons::FOLDER)
                                     .size(px(16.0))
@@ -369,11 +365,10 @@ impl WorktreeSettingsCard {
                         .justify_end()
                         .p(px(4.0))
                         .border_t_1()
-                        .border_color(theme.border)
+                        .border_color(widgets::row_divider(theme))
                         .child(
                             widgets::ghost_action(theme)
                                 .id("worktrees-use-folder")
-                                .hover(|style| widgets::ghost_hover(theme, style))
                                 .child("Use this folder")
                                 .on_click(cx.listener(|card, _, _, cx| {
                                     if let Loadable::Ready(listing) = &card.folders {
@@ -409,41 +404,36 @@ impl WorktreeSettingsCard {
 
 impl Render for WorktreeSettingsCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx).clone();
-        let mut card = widgets::section_card(&theme).mt(px(20.0));
+        let theme = Theme::of(cx).for_settings_surface();
+        let mut card = widgets::section_card(&theme).mt(px(0.0));
         let Loadable::Ready(status) = &self.settings else {
             let header = widgets::card_row(&theme, true)
-                .child(widgets::row_tile(&theme, icons::FOLDER))
                 .child(widgets::row_title(&theme, "Custom worktree location"));
             card = card.child(header);
-            return match &self.settings {
-                Loadable::Error(error) => card
-                    .child(
+            let card =
+                match &self.settings {
+                    Loadable::Error(error) => card.child(
                         div()
-                            .px(px(20.0))
+                            .px(px(16.0))
                             .pb(px(14.0))
                             .child(widgets::error_strip(&theme, error.clone()))
                             .child(
                                 widgets::ghost_action(&theme)
                                     .id("worktrees-retry")
-                                    .hover(|style| widgets::ghost_hover(&theme, style))
                                     .child("Retry")
                                     .on_click(cx.listener(|card, _, _, cx| {
                                         card.load(card.target.clone(), cx)
                                     })),
                             ),
-                    )
-                    .into_any_element(),
-                _ => card
-                    .child(
+                    ),
+                    _ => card.child(
                         div()
-                            .pl(px(70.0))
-                            .pr(px(20.0))
+                            .px(px(16.0))
                             .pb(px(14.0))
                             .child(description(&theme, "Loading worktree settings…")),
-                    )
-                    .into_any_element(),
-            };
+                    ),
+                };
+            return widgets::section(&theme, "Worktrees", card).into_any_element();
         };
         let overridden = status.environment_override.is_some();
         let interactive = !self.saving && !overridden;
@@ -458,7 +448,6 @@ impl Render for WorktreeSettingsCard {
         };
         card = card.child(
             widgets::card_row(&theme, true)
-                .child(widgets::row_tile(&theme, icons::FOLDER))
                 .child(
                     div()
                         .flex_1()
@@ -478,32 +467,44 @@ impl Render for WorktreeSettingsCard {
                         }),
                 )
                 .child(
-                    widgets::toggle_switch(&theme, enabled)
+                    widgets::toggle_switch(&theme, enabled, "worktrees-custom")
                         .id("worktrees-custom-toggle")
                         .flex_none()
+                        .role(gpui::Role::Switch)
+                        .aria_label("Custom worktree location")
+                        .aria_toggled(if enabled {
+                            gpui::Toggled::True
+                        } else {
+                            gpui::Toggled::False
+                        })
                         .when(interactive, |el| {
-                            el.cursor_pointer().on_click(cx.listener(|card, _, _, cx| {
-                                card.enabled = !card.enabled;
-                                card.browsing = false;
-                                card.folder_task = None;
-                                card.error = None;
-                                cx.notify();
-                            }))
+                            el.cursor_pointer()
+                                .tab_index(0)
+                                .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                .on_click(cx.listener(|card, _, _, cx| {
+                                    card.enabled = !card.enabled;
+                                    card.browsing = false;
+                                    card.folder_task = None;
+                                    card.error = None;
+                                    cx.notify();
+                                }))
                         })
                         .when(!interactive, |el| el.opacity(0.5)),
                 ),
         );
 
-        // Align the expanded controls with the label, after the shared 36px
-        // icon tile and 14px gap used by the other Agents rows.
-        let mut detail = div().pl(px(70.0)).pr(px(20.0)).pb(px(14.0));
+        // Match the text inset of the shared settings block rows.
+        let mut detail = div().px(px(16.0)).pb(px(16.0));
         if overridden {
-            return card
-                .child(detail.child(description(
+            return widgets::section(
+                &theme,
+                "Worktrees",
+                card.child(detail.child(description(
                     &theme,
                     "Location set by ZERON_WORKTREES_DIR on this device.",
-                )))
-                .into_any_element();
+                ))),
+            )
+            .into_any_element();
         }
         if show_editor {
             detail = detail.child(
@@ -525,10 +526,9 @@ impl Render for WorktreeSettingsCard {
                             }),
                     )
                     .child(
-                        widgets::ghost_action(&theme)
+                        widgets::action_button(&theme, widgets::ActionTone::Filled)
                             .id("worktrees-browse")
                             .flex_none()
-                            .hover(|style| widgets::ghost_hover(&theme, style))
                             .child("Browse…")
                             .when(interactive, |el| {
                                 el.on_click(cx.listener(|card, _, _, cx| card.browse_input(cx)))
@@ -560,27 +560,28 @@ impl Render for WorktreeSettingsCard {
                             .id("worktrees-cancel")
                             .child("Cancel")
                             .when(interactive, |el| {
-                                el.hover(|style| widgets::ghost_hover(&theme, style))
-                                    .on_click(cx.listener(|card, _, _, cx| card.reset_draft(cx)))
+                                el.on_click(cx.listener(|card, _, _, cx| card.reset_draft(cx)))
                             })
                             .when(!interactive, |el| el.opacity(0.5)),
                     )
                     .child(
-                        widgets::ghost_action(&theme)
+                        widgets::action_button(&theme, widgets::ActionTone::Solid)
                             .id("worktrees-save")
                             .child(if self.saving { "Saving…" } else { "Save" })
                             .when(can_save, |el| {
-                                el.text_color(theme.accent)
-                                    .hover(|style| style.bg(theme.accent.opacity(0.08)))
-                                    .on_click(cx.listener(|card, _, _, cx| card.save(cx)))
+                                el.on_click(cx.listener(|card, _, _, cx| card.save(cx)))
                             })
                             .when(!can_save, |el| el.opacity(0.5)),
                     ),
             );
         }
-        card.when(
-            show_editor || self.browsing || self.error.is_some() || show_actions,
-            |card| card.child(detail),
+        widgets::section(
+            &theme,
+            "Worktrees",
+            card.when(
+                show_editor || self.browsing || self.error.is_some() || show_actions,
+                |card| card.child(detail),
+            ),
         )
         .into_any_element()
     }
@@ -589,6 +590,7 @@ impl Render for WorktreeSettingsCard {
 fn description(theme: &Theme, text: &str) -> gpui::Div {
     div()
         .text_size(crate::typography::ui_rems(widgets::ROW_DESCRIPTION_SIZE))
-        .text_color(theme.text_muted.opacity(0.65))
+        .line_height(crate::typography::ui_rems(16.0))
+        .text_color(theme.text_muted)
         .child(text.to_owned())
 }

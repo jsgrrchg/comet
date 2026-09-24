@@ -96,6 +96,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
 }
 
 pub struct HarnessesPage {
+    worktrees: Entity<super::worktrees::WorktreeSettingsCard>,
     state: Entity<AppState>,
     scroll: widgets::PageScroll,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
@@ -118,6 +119,7 @@ pub struct HarnessesPage {
 impl HarnessesPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let mut page = Self {
+            worktrees: cx.new(|cx| super::worktrees::WorktreeSettingsCard::new(state.clone(), cx)),
             state,
             scroll: widgets::PageScroll::default(),
             harnesses: Loadable::Idle,
@@ -233,6 +235,7 @@ impl HarnessesPage {
     /// `ListHarnesses` against the target device (installed probe + enabled
     /// set both come from where the CLIs actually live).
     fn load(&mut self, cx: &mut Context<Self>) {
+        self.worktrees.update(cx, |card, cx| card.load(self.target_device.clone(), cx));
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -747,7 +750,8 @@ impl Render for HarnessesPage {
                                         .child(switcher),
                                 )
                                 .children(error)
-                                .child(body),
+                                .child(body)
+                                .child(self.worktrees.clone()),
                         ),
                 )
                 .fade_overflow_y(&self.scroll.scroll),

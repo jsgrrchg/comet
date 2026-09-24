@@ -6,7 +6,8 @@
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
 //! created under `~/.zeron/worktrees/<repoName>/<worktreeName>` (NOT the data
 //! dir — worktrees are user-facing working checkouts), with an auto-generated name +
-//! matching `zeron/<name>` branch. `ZERON_WORKTREES_DIR` overrides the root.
+//! matching `zeron/<name>` branch. Device preferences can choose another root;
+//! `ZERON_WORKTREES_DIR` takes precedence over those preferences.
 //!
 //! All git access is via subprocess (`tokio::process`) — never libgit2.
 
@@ -92,20 +93,10 @@ pub(crate) fn expand_home(cwd: &str) -> String {
     }
 }
 
-/// Where new worktrees live. Deliberately NOT under the backend data dir —
-/// worktrees are user-facing working checkouts. `ZERON_WORKTREES_DIR` overrides
-/// (test isolation); empty reads as unset.
-fn default_worktrees_root() -> PathBuf {
-    std::env::var_os("ZERON_WORKTREES_DIR")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".zeron").join("worktrees"))
-}
-
 struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
-    worktrees_root: PathBuf,
+    worktrees: crate::worktree_settings::WorktreePreferences,
     file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     http: reqwest::Client,
     github_avatars: std::sync::Mutex<HashMap<String, String>>,
@@ -136,19 +127,40 @@ impl Repos {
         &self.inner.data_dir
     }
 
-    /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
-    /// comes from `$ZERON_WORKTREES_DIR` or `~/.zeron/worktrees`.
+    /// Device preferences live in `data_dir`. New worktrees use the custom
+    /// location or `~/.zeron/worktrees`; a nonempty `$ZERON_WORKTREES_DIR`
+    /// overrides both (including test isolation).
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
-        Self::with_worktrees_root(data_dir, device_id, default_worktrees_root())
+        Self::with_worktree_preferences(
+            data_dir,
+            device_id,
+            home_dir().join(".zeron").join("worktrees"),
+            std::env::var_os("ZERON_WORKTREES_DIR")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+        )
     }
 
-    /// Explicit worktree root (tests).
+    /// Explicit default worktree root, without the environment override (tests).
     pub fn with_worktrees_root(data_dir: &Path, device_id: &str, worktrees_root: PathBuf) -> Self {
+        Self::with_worktree_preferences(data_dir, device_id, worktrees_root, None)
+    }
+
+    fn with_worktree_preferences(
+        data_dir: &Path,
+        device_id: &str,
+        worktrees_root: PathBuf,
+        environment_override: Option<PathBuf>,
+    ) -> Self {
         Self {
             inner: std::sync::Arc::new(ReposInner {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
-                worktrees_root,
+                worktrees: crate::worktree_settings::WorktreePreferences::open(
+                    data_dir,
+                    worktrees_root,
+                    environment_override,
+                ),
                 file_searches: std::sync::Mutex::new(HashMap::new()),
                 http: reqwest::Client::builder()
                     .timeout(GITHUB_AVATAR_TIMEOUT)
@@ -160,6 +172,17 @@ impl Repos {
                 file_index: std::sync::Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    pub fn worktree_settings(&self) -> zeron_proto::WorktreeSettingsStatus {
+        self.inner.worktrees.status()
+    }
+
+    pub async fn set_worktree_settings(
+        &self,
+        settings: zeron_proto::WorktreeSettings,
+    ) -> Result<zeron_proto::WorktreeSettingsStatus, EngineError> {
+        self.inner.worktrees.set(settings).await
     }
 
     // ── registry (repos.json) ───────────────────────────────────────────────
@@ -1074,7 +1097,9 @@ impl Repos {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "repo".to_string());
-        let base = self.inner.worktrees_root.join(&repo_name);
+        // Snapshot the destination once per creation. Changes never relocate
+        // existing worktrees or alter the cwd already stored on a chat.
+        let base = self.inner.worktrees.root().join(&repo_name);
         std::fs::create_dir_all(&base)?;
         // Auto-generate a name colliding with neither an existing dir nor branch.
         let existing: HashSet<String> = self

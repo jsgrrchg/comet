@@ -155,7 +155,6 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     // macOS tempdirs live behind the /var → /private/var symlink.
     let tmp_path = tmp.path().canonicalize().unwrap();
     let worktrees_root = tmp_path.join("worktrees");
-    unsafe { std::env::set_var("ZERON_WORKTREES_DIR", &worktrees_root) };
 
     let repo_dir = tmp_path.join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -165,6 +164,7 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     std::fs::write(repo_dir.join("README.md"), "hello\n").unwrap();
     git(&repo_dir, &["add", "."]);
     git(&repo_dir, &["commit", "-m", "init"]);
+    std::fs::write(repo_dir.join("local-only.txt"), "keep my original checkout").unwrap();
     let repo_path = repo_dir.to_string_lossy().to_string();
     #[cfg(unix)]
     let project_dir = if use_project_symlink {
@@ -204,6 +204,16 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     // Save through the same RPC as the editor: the Space may use an alias
     // while the queued WorktreeSpec carries the canonical repository path.
     let client = zeron_rpc::memory_client(core.rpc_service());
+    client
+        .call(
+            zeron_rpc::methods::SET_WORKTREE_SETTINGS,
+            serde_json::json!({
+                "useCustomDirectory": true,
+                "customDirectory": worktrees_root,
+            }),
+        )
+        .await
+        .expect("choose initial worktree directory");
     client
         .call(
             zeron_rpc::methods::UPSERT_PROJECT_ACTION,
@@ -297,7 +307,19 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
         "stamped branch is the worktree's own: {branch}"
     );
 
-    // A duplicate spec-carrying Run (client retry) REUSES the checkout.
+    // Changing the destination only affects future worktrees. A duplicate
+    // spec-carrying Run (client retry) still REUSES the chat's old checkout.
+    let next_root = tmp_path.join("new-worktree-location");
+    client
+        .call(
+            zeron_rpc::methods::SET_WORKTREE_SETTINGS,
+            serde_json::json!({
+                "useCustomDirectory": true,
+                "customDirectory": next_root,
+            }),
+        )
+        .await
+        .expect("change destination while the old chat exists");
     let second_command = core
         .doc_host
         .queue_command(
@@ -322,6 +344,59 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     assert!(reused.setup_action.is_none(), "setup must not run on reuse");
     assert!(reused.setup_error.is_none());
     assert!(!first.join("setup-marker").exists());
+
+    let next_chat = "chat-after-location-change";
+    client
+        .call(
+            zeron_rpc::methods::MUTATE,
+            serde_json::json!({
+                "op": "createChat", "chatId": next_chat, "deviceId": core.device_id,
+            }),
+        )
+        .await
+        .unwrap();
+    core.workspace
+        .rename_chat(next_chat, "Another pre-titled chat")
+        .unwrap();
+    core.doc_host
+        .queue_command(
+            next_chat,
+            run_payload("new-location-message", &repo_path, None),
+        )
+        .unwrap();
+    wait_for(
+        || cwds.lock().unwrap().len() == 3,
+        "new chat in the new directory",
+    )
+    .await;
+    let next_cwd = cwds.lock().unwrap()[2].clone();
+    assert!(PathBuf::from(&next_cwd).starts_with(&next_root));
+    assert_eq!(
+        core.workspace.chat(CHAT).unwrap().unwrap().cwd.as_deref(),
+        Some(first_cwd.as_str())
+    );
+    assert_eq!(
+        core.workspace
+            .chat(next_chat)
+            .unwrap()
+            .unwrap()
+            .cwd
+            .as_deref(),
+        Some(next_cwd.as_str())
+    );
+    let refs = core.repos.refs(&repo_dir).await.unwrap();
+    for cwd in [&first_cwd, &next_cwd] {
+        assert!(
+            refs.iter()
+                .any(|entry| entry.worktree_path.as_ref() == Some(cwd)),
+            "Git selector retains {cwd}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("local-only.txt")).unwrap(),
+        "keep my original checkout"
+    );
+    assert_eq!(core.repos.current_branch(&repo_dir).await.unwrap(), "main");
 
     core.shutdown().await;
 }

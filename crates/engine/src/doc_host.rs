@@ -18,7 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use base64::Engine as _;
@@ -556,6 +556,7 @@ pub struct ChatDocHandle {
     sync_background: AtomicBool,
     sync_last_started: AtomicI64,
     sync_wake_version: AtomicI64,
+    sync_wake_ticket: AtomicU64,
     sync_cancel: Mutex<CancellationToken>,
     writers: Arc<AtomicUsize>,
     pub(crate) persistence: Option<Arc<crate::chat_persistence::ChatPersistence>>,
@@ -602,6 +603,13 @@ impl Drop for ChatDocHandle {
 }
 
 impl ChatDocHandle {
+    /// Live views and agents retain their transport until their lease ends.
+    fn sync_protected(&self) -> bool {
+        self.messages_tx.receiver_count() > 0
+            || self.queue_tx.receiver_count() > 0
+            || self.writers.load(Ordering::Acquire) > 0
+    }
+
     pub fn chat_id(&self) -> &str {
         &self.chat_id
     }
@@ -1424,6 +1432,7 @@ impl DocHost {
             sync_background: AtomicBool::new(false),
             sync_last_started: AtomicI64::new(0),
             sync_wake_version: AtomicI64::new(0),
+            sync_wake_ticket: AtomicU64::new(0),
             sync_cancel: Mutex::new(CancellationToken::new()),
             writers: Arc::new(AtomicUsize::new(0)),
             persistence,
@@ -1643,32 +1652,77 @@ impl DocHost {
                 if durable.is_empty() {
                     disk_cursor.clear();
                 }
-                let waiting_exists = !durable.is_empty()
-                    || handles.iter().any(|h| {
-                        h.sync_requested.load(Ordering::Acquire)
-                            && !h.sync_started.load(Ordering::Acquire)
-                    });
+                // Discover actual contenders before deciding whether to retire
+                // a client. A connected chat's outbox is not slot contention.
+                let disk_healthy = !handles.iter()
+                    .any(|h| h.publication_failed.load(Ordering::Acquire));
+                let mut candidates: Vec<_> = handles.iter()
+                    .filter(|h| h.sync_requested.load(Ordering::Acquire)
+                        && !h.sync_started.load(Ordering::Acquire)
+                        && !stopping_ids.contains(&h.chat_id))
+                    .cloned().collect();
+                if disk_healthy {
+                    for id in durable {
+                        // Advance even at capacity: active outboxes must not
+                        // hide waiting work later in the disk index.
+                        disk_cursor = id.clone();
+                        if candidates.iter().any(|h| h.chat_id == id)
+                            || stopping_ids.contains(&id)
+                            || handles.iter().any(|h| h.chat_id == id && h.sync_started.load(Ordering::Acquire))
+                        {
+                            continue;
+                        }
+                        match host.open_local(&id) {
+                            Ok(handle) => {
+                                handle.sync_background.store(true, Ordering::Release);
+                                handle.sync_requested.store(true, Ordering::Release);
+                                candidates.push(handle);
+                            }
+                            Err(err) => tracing::warn!(chat = %id, %err, "durable sync work deferred"),
+                        }
+                    }
+                }
+                let mut waiting = Vec::new();
+                for handle in candidates {
+                    let wake_version = match host.inner.store.sync_job_version(&handle.chat_id, "wake") {
+                        Ok(version) => version,
+                        Err(error) => {
+                            tracing::warn!(chat = %handle.chat_id, %error, "sync admission deferred: wake read failed");
+                            continue;
+                        }
+                    };
+                    match host.prepare_sync_admission(&handle, wake_version) {
+                        Ok(Some(action)) => waiting.push((handle, action, wake_version)),
+                        Ok(None) => {},
+                        Err(error) => tracing::warn!(chat = %handle.chat_id, %error, "sync admission eligibility deferred"),
+                    }
+                }
                 for handle in &handles {
                     if !handle.sync_started.load(Ordering::Acquire)
                         || stopping_ids.contains(&handle.chat_id)
                     {
                         continue;
                     }
-                    let captured = handle.sync_wake_version.load(Ordering::Acquire);
+                    let mut captured = handle.sync_wake_version.load(Ordering::Acquire);
                     let pending_wake = host
                         .inner
                         .store
                         .sync_job_version(&handle.chat_id, "wake")
                         .ok()
                         .flatten();
-                    if pending_wake.is_some_and(|v| v != captured) {
-                        stopping_ids.insert(handle.chat_id.clone());
-                        stopping.push(host.inner.tasks.spawn(host.stop_sync_owned(handle.clone())));
-                        handle.sync_requested.store(true, Ordering::Release);
-                        continue;
+                    if let Some(version) = pending_wake.filter(|v| *v != captured) {
+                        // Keep the healthy transport. Retirement of this wake
+                        // requires a read started after its version was seen.
+                        if let Some(client) = lock(&handle.chat2).as_ref() {
+                            let ticket = client.request_catch_up();
+                            handle.sync_wake_ticket.store(ticket, Ordering::Release);
+                            handle.sync_wake_version.store(version, Ordering::Release);
+                            captured = version;
+                        }
                     }
                     if captured != 0
-                        && lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up())
+                        && lock(&handle.chat2).as_ref().is_some_and(|c|
+                            c.catch_up_completed(handle.sync_wake_ticket.load(Ordering::Acquire)))
                         && host.wakeup_is_durable(handle)
                     {
                         let _ =
@@ -1681,9 +1735,7 @@ impl DocHost {
                     // or commands. Incomplete catch-up only yields via rotate's
                     // explicit service deadline, never the short reuse grace.
                     let idle = caught_up
-                        && handle.messages_tx.receiver_count() == 0
-                        && handle.queue_tx.receiver_count() == 0
-                        && handle.writers.load(Ordering::Acquire) == 0
+                        && !handle.sync_protected()
                         && (now_ms() - handle.last_access.load(Ordering::Relaxed) >= SYNC_IDLE_MS
                             || (handle.sync_background.load(Ordering::Acquire) && caught_up))
                         && !host
@@ -1691,57 +1743,52 @@ impl DocHost {
                             .store
                             .has_pending_chat_updates(&handle.chat_id)
                             .unwrap_or(true);
-                    let age = now_ms() - handle.sync_last_started.load(Ordering::Relaxed);
-                    let rotate =
-                        waiting_exists && age >= SYNC_QUANTUM_MS && (caught_up || age >= 300_000);
-                    if idle || rotate {
-                        if idle {
-                            handle.sync_requested.store(false, Ordering::Release);
-                        }
+                    if idle {
+                        handle.sync_requested.store(false, Ordering::Release);
                         stopping_ids.insert(handle.chat_id.clone());
                         stopping.push(host.inner.tasks.spawn(host.stop_sync_owned(handle.clone())));
                     }
                 }
-                let running = handles
-                    .iter()
-                    .filter(|h| h.sync_started.load(Ordering::Acquire))
-                    .count();
-                // Leave half the socket budget available during overlap/teardown
-                // and for another live profile while one is being retired.
+                // Closing clients still own capacity until teardown is joined.
+                let running = handles.iter().filter(|h|
+                    h.sync_started.load(Ordering::Acquire) || stopping_ids.contains(&h.chat_id)
+                ).count();
                 let available = ACTIVE_SYNC_CAP.saturating_sub(running);
-                let mut waiting: Vec<_> = handles
-                    .into_iter()
-                    .filter(|h| {
-                        h.sync_requested.load(Ordering::Acquire)
-                            && !h.sync_started.load(Ordering::Acquire)
-                    })
-                    .collect();
-                // Disk is the unbounded backlog; only materialize work that
-                // can compete for an available slot this turn.
-                let disk_healthy = !lock(&host.inner.handles)
-                    .values()
-                    .any(|h| h.publication_failed.load(Ordering::Acquire));
-                if disk_healthy {
-                    for id in durable
-                        .into_iter()
-                        .take(available.min(SYNC_ADMISSION_BATCH))
-                    {
-                        disk_cursor = id.clone();
-                        if waiting.iter().any(|h| h.chat_id == id) {
-                            continue;
-                        }
-                        match host.open_local(&id) {
-                            Ok(handle) if !handle.sync_started.load(Ordering::Acquire) => {
-                                handle.sync_background.store(true, Ordering::Release);
-                                handle.sync_requested.store(true, Ordering::Release);
-                                waiting.push(handle);
-                            }
-                            Ok(_) => {}
-                            Err(err) => {
-                                tracing::warn!(chat = %id, %err, "durable sync work deferred")
-                            }
-                        }
+                // Only release the deficit for the next admission batch, and
+                // account for closures already in progress. Never rotate a
+                // viewed chat or an agent writer to serve background work.
+                let deficit = if disk_healthy && available == 0 {
+                    waiting.len().min(SYNC_ADMISSION_BATCH)
+                        .saturating_sub(stopping_ids.len())
+                } else { 0 };
+                let mut victims: Vec<_> = handles.iter().filter(|h| {
+                    if !h.sync_started.load(Ordering::Acquire)
+                        || stopping_ids.contains(&h.chat_id) || h.sync_protected() {
+                        return false;
                     }
+                    let age = now_ms() - h.sync_last_started.load(Ordering::Relaxed);
+                    let caught_up = lock(&h.chat2).as_ref().is_some_and(|c| c.caught_up());
+                    // Reuse grace never makes a newly selected chat wait on a
+                    // quiet, fully served client when every slot is occupied.
+                    (caught_up && (age >= SYNC_QUANTUM_MS
+                        || !host.inner.store.has_pending_chat_updates(&h.chat_id).unwrap_or(true)))
+                        || age >= 300_000
+                }).collect();
+                victims.sort_by_key(|h| (
+                    host.inner.store.has_pending_chat_updates(&h.chat_id).unwrap_or(true),
+                    h.sync_last_started.load(Ordering::Relaxed),
+                    h.chat_id.clone(),
+                ));
+                for handle in victims.into_iter().take(deficit) {
+                    // A served quiet client has no reason to compete again.
+                    // Preserve only unfinished catch-up or durable obligations.
+                    let unfinished = !lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up())
+                        || host.inner.store.has_pending_chat_updates(&handle.chat_id).unwrap_or(true)
+                        || host.inner.store.sync_job_version(&handle.chat_id, "wake")
+                            .map_or(true, |v| v.is_some());
+                    handle.sync_requested.store(unfinished, Ordering::Release);
+                    stopping_ids.insert(handle.chat_id.clone());
+                    stopping.push(host.inner.tasks.spawn(host.stop_sync_owned(handle.clone())));
                 }
                 let admission_limit = if disk_healthy {
                     available.min(SYNC_ADMISSION_BATCH)
@@ -1751,8 +1798,8 @@ impl DocHost {
                 let mut admitted = 0;
                 while admitted < admission_limit && !waiting.is_empty() {
                     turn += 1;
-                    waiting.sort_by_key(|h| {
-                        let background = h.messages_tx.receiver_count() == 0;
+                    waiting.sort_by_key(|(h, _, _)| {
+                        let background = !h.sync_protected();
                         (
                             if turn % 4 == 0 {
                                 !background
@@ -1763,29 +1810,14 @@ impl DocHost {
                             h.chat_id.clone(),
                         )
                     });
-                    let handle = waiting.remove(0);
-                    // Capture before deciding eligibility, including retirement.
-                    let wake_version = match host.inner.store.sync_job_version(&handle.chat_id, "wake") {
-                        Ok(version) => version,
-                        Err(error) => {
-                            tracing::warn!(chat = %handle.chat_id, %error, "sync admission deferred: wake read failed");
-                            continue;
-                        }
-                    };
-                    let action = match host.prepare_sync_admission(&handle, wake_version) {
-                        Ok(Some(action)) => action,
-                        Ok(None) => continue,
-                        Err(error) => {
-                            tracing::warn!(chat = %handle.chat_id, %error, "sync admission eligibility deferred");
-                            continue;
-                        }
-                    };
+                    let (handle, action, wake_version) = waiting.remove(0);
                     if handle.sync_started.swap(true, Ordering::AcqRel) {
                         continue;
                     }
                     admitted += 1;
                     handle.sync_last_started.store(now_ms(), Ordering::Release);
                     handle.sync_wake_version.store(wake_version.unwrap_or(0), Ordering::Release);
+                    handle.sync_wake_ticket.store(0, Ordering::Release);
                     match action {
                         SyncAdmission::Join => {
                             let cursor = handle.persistence.as_ref().map_or(0, |p| p.cursor());

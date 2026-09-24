@@ -35,10 +35,21 @@ bounded set of close tasks is tracked and joined before the host's final
 snapshot; actor ownership is retained throughout shutdown so a cancelled close
 cannot detach the actor.
 All session waits, including handshake, backfill and backpressured sends, are
-interruptible by shutdown. Under contention a caught-up client yields after 30 s. A client still
+interruptible by shutdown. Rotation requires all 12 slots to be occupied and an
+eligible chat without a client to be waiting. Pending batches on an existing
+client do not count as contention. Only the next admission batch's missing slots
+are retired, accounting for teardown already in progress. Transcript/queue views
+and agent writer leases protect their clients; if all slots are protected, other
+chats wait until a lease ends. Unprotected, caught-up clients without outgoing
+updates yield immediately under contention, without waiting out the reuse grace.
+Those with pending updates can yield after 30 s. An unprotected client still
 catching up has up to five minutes before rotation so slow checkpoint downloads
 are not continually cancelled. These are initial policy constants, not measured
 optimal values for all devices.
+
+Desktop transcript, queue and subagent watches own an explicit RPC cancellation
+handle, so deselecting/closing a quiet view releases its lease without waiting
+for another document event.
 
 Process-wide chat data budgets allow 24 socket lifetimes, four simultaneous dials
 and eight HTTP requests. At most six background HTTP requests hold slots, leaving
@@ -72,6 +83,14 @@ acceptance and successful snapshot persistence, closing the crash-before-debounc
 window. The dispatcher discovers unacknowledged/rejected outbox
 batches after restart without a UI open. Checkpoint obligations use the existing
 idempotent publication path. Snapshot and cursor persistence remain atomic.
+
+A renewed wake on an existing client requests a fresh row read on that transport
+instead of closing the socket. Monotonic catch-up tickets fence each receipt:
+neither an older in-flight backfill nor an older HTTP pull can acknowledge a newer
+wake. Wake reads and gap repairs are serialized on the socket; HTTP fallback can
+also satisfy a ticket with a complete subsequent pull. Receipt retirement still
+requires command acceptance and snapshot persistence. Failed reads retain the
+durable job and use the existing transport recovery deadlines.
 
 New hosts advertise `nudgeAck=1`. The edge persists a wake before sending it and
 keeps it until the host confirms local durable admission. An opaque token fences
@@ -123,7 +142,14 @@ more-than-256-wake delivery. Other coverage checks restart publication, lost ACK
 checkpoint rejection, constructor/shutdown cancellation and the view-attachment
 race. Loopback lifecycle tests hold twelve valid checkpoints beyond the idle
 grace, verify durable snapshots after release, and admit an unrelated chat while
-a renewed wake closes a peer stalled before ROWS_DONE.
+a renewed wake waits on a peer stalled before ROWS_DONE without replacing it.
+The 48-chat regression runs three waves of wake receipts and local edits with
+eight protected view/writer clients, checking zero reconnects for those clients,
+the 12-client cap, and complete durable backlog drainage. Additional tests cover
+spare capacity, active outboxes at capacity, retiring only one client for one
+waiter, and stale socket/HTTP replies arriving after a newer wake.
+Another 48-chat case holds all 12 slots with views, verifies that the 36 waiting
+jobs remain durable, then closes one view and drains them through the freed slot.
 
 Admission regressions also queue twelve foreign legacy wakes (including missing
 room-generation metadata), assert prompt interactive admission and receipt

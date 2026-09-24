@@ -907,6 +907,18 @@ mod tests {
                 composer.state.update(cx, |state, _| {
                     state.set_test_engine(engine);
                     state.local_device_id = Some("local".into());
+                    state.spaces = vec![zeron_proto::Space {
+                        id: "project".into(),
+                        device_id: "remote".into(),
+                        path: "/workspace/my-project".into(),
+                        name: None,
+                        git_detected: true,
+                        git_checked_at: None,
+                        checkout_id: None,
+                        created_at: chrono::Utc::now(),
+                    }];
+                    state.selected_space = Some("project".into());
+                    state.no_project = false;
                 });
                 composer
                     .input
@@ -914,6 +926,12 @@ mod tests {
                 composer.capture_prompt_draft(cx);
                 let first = composer.flush_prompt_draft(cx).unwrap();
                 assert_eq!(first.content.prompt, "First prompt");
+                assert_eq!(first.content.target.space_id.as_deref(), Some("project"));
+                assert_eq!(
+                    first.content.target.project_name.as_deref(),
+                    Some("my-project")
+                );
+                assert_eq!(first.content.target.device_id, "remote");
                 assert!(first.deferred);
                 composer
                     .input

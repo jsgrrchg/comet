@@ -598,10 +598,14 @@ impl Pickers {
     pub(crate) fn prompt_draft_target(&self, cx: &App) -> zeron_proto::DraftTarget {
         let state = self.state.read(cx);
         let space = state.selected_space_row();
-        zeron_proto::DraftTarget { device_id: state.effective_device_id().unwrap_or_default(),
-            space_id: space.map(|s| s.id.clone()), project_name: space.and_then(|s| s.name.clone()),
-            config: self.resolved(cx).chat_config(), branch: self.config.branch.clone(),
-            new_worktree: self.config.checkout == CheckoutKind::NewWorktree }
+        zeron_proto::DraftTarget {
+            device_id: state.effective_device_id().unwrap_or_default(),
+            space_id: space.map(|s| s.id.clone()),
+            project_name: space.map(|s| s.display_name().to_string()),
+            config: self.resolved(cx).chat_config(),
+            branch: self.config.branch.clone(),
+            new_worktree: self.config.checkout == CheckoutKind::NewWorktree,
+        }
     }
     pub(crate) fn restore_prompt_draft_target(&mut self, target: &zeron_proto::DraftTarget, cx: &mut Context<Self>) {
         self.draft_owner = None;

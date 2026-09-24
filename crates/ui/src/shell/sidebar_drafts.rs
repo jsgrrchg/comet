@@ -279,11 +279,35 @@ impl Shell {
         } else {
             row.preview.clone()
         };
-        let label = row
-            .target
-            .project_name
-            .clone()
+        let state = self.state.read(cx);
+        let space = state
+            .spaces
+            .iter()
+            .find(|space| {
+                Some(&space.id) == row.target.space_id.as_ref()
+                    && space.device_id == row.target.device_id
+            })
+            .cloned();
+        let label = space
+            .as_ref()
+            .map(|space| space.display_name().to_string())
+            .or_else(|| row.target.project_name.clone())
             .unwrap_or_else(|| "No project".into());
+        let leading_icon = if self.settings.sidebar_show_project_icon {
+            self.render_space_project_icon(
+                &format!("draft-{}", row.id),
+                space.as_ref(),
+                Some(&row.target.device_id),
+                SIDEBAR_ACTIVE_HARNESS_ICON_SIZE,
+                false,
+                cx,
+            )
+        } else {
+            icon(icons::PEN)
+                .size(px(12.0))
+                .text_color(theme.accent)
+                .into_any_element()
+        };
         let host = self
             .state
             .read(cx)
@@ -314,6 +338,7 @@ impl Shell {
             cx.has_active_drag() && self.draft_drop_target.as_ref() == Some(&(id.clone(), true));
         div()
             .id(SharedString::from(format!("draft-row-{id}")))
+            .group("sidebar-session-row")
             .h(px(self.prompt_draft_row_height()))
             .w_full()
             .rounded(px(6.0))
@@ -362,7 +387,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(icon(icons::PEN).size(px(12.0)).text_color(theme.accent))
+                    .child(leading_icon)
                     .child(
                         div()
                             .flex_1()

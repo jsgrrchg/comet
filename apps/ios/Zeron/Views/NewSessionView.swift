@@ -11,6 +11,7 @@ import SwiftUI
 
 struct NewSessionView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
     let destination: NewSessionDestination
     @Binding var path: [Route]
     var restoringDraft: PromptDraftRow? = nil
@@ -231,7 +232,7 @@ struct NewSessionView: View {
             // list across harnesses, so it needs every catalog up front).
             liveHarnesses = nil
             catalogs = [:]
-            optionSelections = [:]
+            if restoringDraft == nil { optionSelections = [:] }
             guard let deviceId else { return }
             let list = await model.listHarnesses(deviceId: deviceId)
             guard !Task.isCancelled else { return }
@@ -305,6 +306,12 @@ struct NewSessionView: View {
             saveDraftTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 300_000_000)
                 guard !Task.isCancelled else { return }
+                _ = persistPromptDraft()
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active && !loadingDraft && !submittedDraft {
+                saveDraftTask?.cancel()
                 _ = persistPromptDraft()
             }
         }
@@ -610,16 +617,22 @@ struct NewSessionView: View {
                                                      name: transfer.name),
                         name: att.name, data: att.data)
                 }
-                store.sendWithTransfers(prompt: prompt, chat: chat, live: false,
+                let imagePaths = Dictionary(uniqueKeysWithValues: zip(staged, transfers).map {
+                    ($0.0.id, UploadStash.pendingRef(uploadId: $0.1.uploadId, name: $0.1.name))
+                })
+                let body = AppshotContext.withDraftMetadata(prompt, metadata: restoredAttachmentMetadata, imagePaths: imagePaths)
+                store.sendWithTransfers(prompt: body, chat: chat, live: false,
                                         transfers: transfers, worktree: worktree, draftId: promptSave?.id)
             } else {
-                store.sendRun(prompt: legacyPaths.isEmpty ? prompt
-                                  : withAttachments(text: prompt, paths: legacyPaths),
+                let imagePaths = Dictionary(uniqueKeysWithValues: zip(staged, legacyPaths).map { ($0.0.id, $0.1) })
+                let body = AppshotContext.withDraftMetadata(prompt, metadata: restoredAttachmentMetadata, imagePaths: imagePaths)
+                store.sendRun(prompt: legacyPaths.isEmpty ? body
+                                  : withAttachments(text: body, paths: legacyPaths),
                               chat: chat, attachments: legacyPaths, worktree: worktree, draftId: promptSave?.id)
             }
             if let save = promptSave {
-                guard await store.flushToDiskAsync() else { attachError = "Couldn't persist the send. Your draft is preserved."; busy = false; return }
-                model.workspace?.discardPromptDraft(save.id)
+                guard store.hasDraftCommand(save.id), await store.flushToDiskAsync() else { attachError = "Couldn't persist the send. Your draft is preserved."; busy = false; return }
+                model.workspace?.consumePromptDraft(save.id, revision: save.revision)
             }
             submittedDraft = true
             UIImpactFeedbackGenerator(style: .light).impactOccurred()

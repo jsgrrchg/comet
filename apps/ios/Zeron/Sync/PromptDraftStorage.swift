@@ -26,7 +26,10 @@ final class PromptDraftStorage {
             guard data.count <= 32 * 1024 * 1024, SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == id else { throw CocoaError(.fileReadCorruptFile) }
             try data.write(to: url(id), options: .atomic)
         }
-        try content.write(to: url(save.revision), options: .atomic)
+        let file = try url(save.revision)
+        if let old = try? Data(contentsOf: file) {
+            guard try JSONDecoder().decode(PromptDraftContent.self, from: old) == save.content else { throw CocoaError(.fileWriteFileExists) }
+        } else { try content.write(to: file, options: .atomic) }
         if !pending.contains(where: { $0.revision == save.revision }) { pending.append(save) }
         try persist()
     }
@@ -49,12 +52,16 @@ final class PromptDraftStorage {
         try data.write(to: file, options: .atomic)
         return data
     }
-    func load(_ revision: String) async throws -> PromptDraftContent { try await JSONDecoder().decode(PromptDraftContent.self, from: object(revision)) }
+    func load(_ revision: String) async throws -> PromptDraftContent {
+        let bytes = try await object(revision)
+        return try JSONDecoder().decode(PromptDraftContent.self, from: bytes)
+    }
     func upload(_ save: PromptDraftSave) async throws {
         for id in save.content.attachments.map(\.blob) + [save.revision] {
             let marker = directory.appendingPathComponent("uploaded-\(id)")
             if FileManager.default.fileExists(atPath: marker.path) { continue }
-            _ = try await request("draft-content/\(config.orgId)/\(id)", method: "PUT", body: object(id))
+            let bytes = try await object(id)
+            _ = try await request("draft-content/\(config.orgId)/\(id)", method: "PUT", body: bytes)
             try Data().write(to: marker, options: .atomic)
         }
     }

@@ -1,3 +1,4 @@
+import { draftContentRoute } from "./draft-content";
 /**
  * Zeron-native edge Worker (design §2, ARCHITECTURE §6): JWT auth at the
  * edge, then forwarding into per-session, per-workspace, and per-device
@@ -380,29 +381,8 @@ export default {
       }
     }
 
-    // Immutable draft content/assets; scoped to both account and workspace.
-    if (parts[0] === "draft-content" && parts.length === 3 && ID_RE.test(parts[1]) && /^[a-zA-Z0-9-]{1,128}$/.test(parts[2])) {
-      if (auth.orgId !== parts[1]) return json({ error: "forbidden" }, 403);
-      const key = `drafts/${auth.userId}/${parts[1]}/${parts[2]}`;
-      if (request.method === "PUT") {
-        const limit = 32 * 1024 * 1024;
-        if (Number(request.headers.get("content-length") ?? 0) > limit) return json({ error: "too_large" }, 413);
-        const body = await request.arrayBuffer();
-        if (body.byteLength > limit) return json({ error: "too_large" }, 413);
-        const stored = await env.BLOBS.put(key, body, { onlyIf: { etagDoesNotMatch: "*" } });
-        if (!stored) {
-          const existing = await env.BLOBS.get(key);
-          const old = existing ? new Uint8Array(await existing.arrayBuffer()) : undefined;
-          const next = new Uint8Array(body);
-          if (!old || old.length !== next.length || old.some((b, i) => b !== next[i])) return json({ error: "immutable_revision" }, 409);
-        }
-        return json({ ok: true });
-      }
-      if (request.method === "GET") {
-        const object = await env.BLOBS.get(key);
-        return object ? new Response(object.body, { headers: { "content-type": "application/octet-stream", "cache-control": "private, max-age=31536000, immutable" } }) : json({ error: "not_found" }, 404);
-      }
-    }
+    const draftContent = draftContentRoute(request, env, auth);
+    if (draftContent) return draftContent;
 
     // ── R2 tool-output sidecar (docs/chat2-sync.md A2): full tool outputs
     //    and diffs live here, keyed `{chatId}/{partId}[.diff]`; the doc keeps

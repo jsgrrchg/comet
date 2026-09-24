@@ -45,9 +45,11 @@ extension RegistryDoc {
     func promptDraftClosed(_ id: String) -> Bool { overlayRow(kind: "promptDrafts", id: id)?.fields["closed"]?.boolValue == true }
     func publishPromptDraft(_ save: PromptDraftSave) {
         guard !promptDraftClosed(save.id), !rowExists(kind: "draftRevisions", id: save.revision) else { return }
+        observePromptDraftClock(kind: "promptDrafts", id: save.id)
+        if let base = save.baseRevision { observePromptDraftClock(kind: "draftRevisions", id: base) }
         let stamp = nextHlc()
         var index: [String: JSONValue] = ["revision": .string(save.revision)]
-        if !rowExists(kind: "promptDrafts", id: save.id) {
+        if overlayRow(kind: "promptDrafts", id: save.id)?.fields["orderKey"]?.stringValue.map(PinOrder.valid) != true {
             guard let key = PinOrder.between(nil, promptDraftRows.first?.orderKey, nonce: stamp) else { return }
             index["orderKey"] = .string(key)
         }
@@ -64,7 +66,9 @@ extension RegistryDoc {
                   let data = try? JSONEncoder().encode(version.fields["target"]),
                   let target = try? JSONDecoder().decode(PromptDraftTarget.self, from: data) else { return nil }
             let index = overlayRow(kind: "promptDrafts", id: root)
-            let conflict = index?.fields["revision"]?.stringValue != version.id
+            let sent = index?.fields["sentRevision"]?.stringValue
+            if sent == version.id { return nil }
+            let conflict = sent != nil || index?.fields["revision"]?.stringValue != version.id
             let id = conflict ? version.id : root
             guard !promptDraftClosed(id), let key = (overlayRow(kind: "promptDrafts", id: id) ?? index)?.fields["orderKey"]?.stringValue, PinOrder.valid(key) else { return nil }
             return PromptDraftRow(id: id, revision: version.id, baseRevision: version.fields["baseRevision"]?.stringValue, createdAt: version.fields["createdAt"]?.int64Value ?? 0,
@@ -79,6 +83,7 @@ extension RegistryDoc {
     }
     func movePromptDraft(_ id: String, before: String?, after: String?) {
         guard !promptDraftClosed(id) else { return }
+        observePromptDraftClock(kind: "promptDrafts", id: id)
         let rows = promptDraftRows.filter { $0.id != id }
         let index = before.flatMap { b in rows.firstIndex { $0.id == b } }
             ?? after.flatMap { a in rows.firstIndex { $0.id == a }.map { $0 + 1 } } ?? rows.count

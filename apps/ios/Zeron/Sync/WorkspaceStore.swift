@@ -298,7 +298,13 @@ final class WorkspaceStore {
             }
         }
     }
+    func consumePromptDraft(_ id: String, revision: String) {
+        doc.observePromptDraftClock(kind: "promptDrafts", id: id)
+        doc.write(kind: "promptDrafts", id: id, op: .upsert, set: ["sentRevision": .string(revision)])
+        afterLocalWrite(); flushToDisk()
+    }
     func discardPromptDraft(_ id: String) {
+        doc.observePromptDraftClock(kind: "promptDrafts", id: id)
         doc.write(kind: "promptDrafts", id: id, op: .upsert, set: ["closed": .bool(true)])
         afterLocalWrite()
         flushToDisk()

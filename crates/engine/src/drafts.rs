@@ -35,6 +35,16 @@ impl DraftStore {
     fn key(id: &str) -> String {
         format!("draft-blob:{id}")
     }
+    pub fn save_asset(&self, asset: &DraftAsset) -> Result<(), EngineError> {
+        let bytes = STANDARD.decode(&asset.data).map_err(error)?;
+        if bytes.len() > MAX_DRAFT_ASSET_BYTES
+            || format!("{:x}", Sha256::digest(&bytes)) != asset.blob
+        {
+            return Err(error("Invalid draft attachment"));
+        }
+        self.store.save_snapshot(&Self::key(&asset.blob), &bytes)?;
+        Ok(())
+    }
     pub fn stage(&self, mut draft: SaveDraft) -> Result<SaveDraft, EngineError> {
         if !valid_draft_id(&draft.id)
             || !valid_draft_id(&draft.revision)
@@ -48,18 +58,12 @@ impl DraftStore {
         if draft.content.attachments.len() > 32 {
             return Err(error("Too many draft attachments"));
         }
-        let bytes = serde_json::to_vec(&draft.content).map_err(error)?;
+        let mut bytes = serde_json::to_vec(&draft.content).map_err(error)?;
         if bytes.len() > MAX_DRAFT_CONTENT_BYTES {
             return Err(error("Draft content is too large"));
         }
         for asset in &draft.assets {
-            let bytes = STANDARD.decode(&asset.data).map_err(error)?;
-            if bytes.len() > MAX_DRAFT_ASSET_BYTES
-                || format!("{:x}", Sha256::digest(&bytes)) != asset.blob
-            {
-                return Err(error("Invalid draft attachment"));
-            }
-            self.store.save_snapshot(&Self::key(&asset.blob), &bytes)?;
+            self.save_asset(asset)?;
         }
         for asset in &draft.content.attachments {
             if !valid_blob(&asset.blob) || !self.store.has_snapshot(&Self::key(&asset.blob))? {
@@ -68,9 +72,12 @@ impl DraftStore {
         }
         // Never silently overwrite an immutable revision on a retried request.
         if let Some(old) = self.store.load_snapshot(&Self::key(&draft.revision))? {
-            if old != bytes {
+            let previous: serde_json::Value = serde_json::from_slice(&old).map_err(error)?;
+            let current: serde_json::Value = serde_json::from_slice(&bytes).map_err(error)?;
+            if previous != current {
                 return Err(error("Draft revision already contains different content"));
             }
+            bytes = old;
         }
         self.store
             .save_snapshot(&Self::key(&draft.revision), &bytes)?;
@@ -253,5 +260,61 @@ mod tests {
         assert!(drafts.stage(changed).is_err());
         drafts.acknowledge("revision").unwrap();
         assert!(drafts.pending().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn attachments_and_revision_claims_are_durable_and_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let drafts = DraftStore::new(store.clone(), None, "local".into());
+        let bytes = b"image bytes";
+        let blob = format!("{:x}", Sha256::digest(bytes));
+        let draft = SaveDraft {
+            id: "draft".into(),
+            revision: "revision".into(),
+            base_revision: None,
+            created_at: 1,
+            content: DraftContent {
+                prompt: "".into(),
+                attachments: vec![DraftAttachment {
+                    id: "img".into(),
+                    name: "img.png".into(),
+                    blob: blob.clone(),
+                    appshot: None,
+                }],
+                ..Default::default()
+            },
+            assets: vec![DraftAsset {
+                blob,
+                data: STANDARD.encode(bytes),
+            }],
+        };
+        drafts.stage(draft.clone()).unwrap();
+        drafts.claim("draft", "revision").await.unwrap();
+        drafts.claim("draft", "revision").await.unwrap();
+        assert!(drafts.claim("draft", "different").await.is_err());
+        drop(drafts);
+        let drafts = DraftStore::new(store, None, "local".into());
+        assert_eq!(
+            STANDARD
+                .decode(&drafts.load("revision").await.unwrap().assets[0].data)
+                .unwrap(),
+            bytes
+        );
+        // Swift JSON has a different property order; semantic equality must
+        // preserve the original immutable object bytes when it is retried.
+        let raw = serde_json::to_vec_pretty(&draft.content).unwrap();
+        drafts
+            .store
+            .save_snapshot(&DraftStore::key("revision"), &raw)
+            .unwrap();
+        drafts.stage(draft).unwrap();
+        assert_eq!(
+            drafts
+                .store
+                .load_snapshot(&DraftStore::key("revision"))
+                .unwrap()
+                .unwrap(),
+            raw
+        );
     }
 }

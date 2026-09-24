@@ -1709,6 +1709,13 @@ impl RpcService for EngineRpc {
             methods::WATCH_DRAFTS => Ok(RpcReply::Stream(watch_stream(
                 self.workspace.watch_drafts(),
             ))),
+            methods::SAVE_DRAFT_ASSET => {
+                let asset: zeron_proto::DraftAsset = parse_params(params)?;
+                self.workspace
+                    .save_draft_asset(&asset)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::SAVE_DRAFT => {
                 let draft: zeron_proto::SaveDraft = parse_params(params)?;
                 self.workspace
@@ -1778,7 +1785,7 @@ impl RpcService for EngineRpc {
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                     // An acknowledged durable command owns the content from here.
                     self.workspace
-                        .change_draft(&zeron_proto::DraftChange::Discard { id })
+                        .change_draft(&zeron_proto::DraftChange::Consume { id, revision })
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                     command_id
                 } else {

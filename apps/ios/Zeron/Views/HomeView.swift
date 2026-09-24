@@ -275,6 +275,14 @@ struct HomeView: View {
                         }
                     }
                     .listRowBackground(Theme.accent.opacity(0.06))
+                    .contextMenu {
+                        Button("Move to top", systemImage: "arrow.up.to.line") {
+                            workspace.movePromptDraft(row.id, before: workspace.promptDrafts.first(where: { $0.id != row.id })?.id, after: nil)
+                        }
+                        Button("Move to bottom", systemImage: "arrow.down.to.line") {
+                            workspace.movePromptDraft(row.id, before: nil, after: workspace.promptDrafts.last(where: { $0.id != row.id })?.id)
+                        }
+                    }
                     .swipeActions { Button("Discard", role: .destructive) { workspace.discardPromptDraft(row.id) } }
                 }
                 .onMove { source, destination in

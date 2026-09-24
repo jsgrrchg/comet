@@ -96,6 +96,7 @@ mod tests {
                 "workspaceScope": "local",
                 "cursorSdkVersion": "1.0.31",
                 "capabilities": [
+                    "prompt-drafts-v1",
                     "composer-references-v1",
                     "message-queue-v1",
                     "message-queue-actions-v1",

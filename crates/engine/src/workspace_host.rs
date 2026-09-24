@@ -352,14 +352,15 @@ impl WorkspaceHost {
         self.inner.draft_store.load(revision).await?;
         self.inner.draft_store.claim(id, revision).await
     }
+    pub fn save_draft_asset(&self, asset: &zeron_proto::DraftAsset) -> Result<(), EngineError> {
+        self.inner.draft_store.save_asset(asset)
+    }
     pub fn watch_drafts(&self) -> watch::Receiver<zeron_proto::DraftsState> {
         self.inner.drafts_tx.subscribe()
     }
     pub fn save_draft(&self, draft: zeron_proto::SaveDraft) -> Result<(), EngineError> {
-        if lock(&self.inner.reg).draft_closed(&draft.id) {
-            return Err(EngineError::Other(
-                "Draft was already discarded or sent".into(),
-            ));
+        if lock(&self.inner.reg).draft_discarded(&draft.id) {
+            return Err(EngineError::Other("Draft was already discarded".into()));
         }
         self.inner.draft_store.stage(draft)?;
         self.inner.publish_drafts();
@@ -1449,8 +1450,12 @@ impl WorkspaceHostInner {
             row.pending = pending.iter().any(|p| p.revision == row.revision);
         }
         self.drafts_tx.send_if_modified(|state| {
-            if state.drafts == drafts { return false; }
-            state.revision += 1; state.drafts = drafts; true
+            if state.drafts == drafts {
+                return false;
+            }
+            state.revision += 1;
+            state.drafts = drafts;
+            true
         });
     }
 
@@ -1794,6 +1799,62 @@ mod tests {
     use super::{device_name_on_boot, linked_worktree_root};
 
     #[tokio::test]
+    async fn drafts_watch_preserves_late_edits_and_durable_discard() {
+        use super::*;
+        use zeron_proto::{DraftChange, DraftContent, SaveDraft};
+        let dir = tempfile::tempdir().unwrap();
+        let config = WorkspaceHostConfig {
+            device_id: "device".into(),
+            device_name: "Test".into(),
+            platform: "linux".into(),
+            org_id: "org".into(),
+            user_id: "user".into(),
+            edge: None,
+        };
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = WorkspaceHost::open(store.clone(), config.clone()).unwrap();
+        let mut draft = SaveDraft {
+            id: "draft".into(),
+            revision: "revision-1".into(),
+            base_revision: None,
+            created_at: 1,
+            content: DraftContent {
+                prompt: "Original".into(),
+                ..Default::default()
+            },
+            assets: vec![],
+        };
+        host.save_draft(draft.clone()).unwrap();
+        let initial = host.watch_drafts().borrow().clone();
+        assert_eq!(initial.drafts.len(), 1);
+        host.change_draft(&DraftChange::Consume {
+            id: "draft".into(),
+            revision: "revision-1".into(),
+        })
+        .unwrap();
+        assert!(host.watch_drafts().borrow().drafts.is_empty());
+        draft.base_revision = Some(draft.revision.clone());
+        draft.revision = "revision-2".into();
+        draft.content.prompt = "Concurrent content".into();
+        host.save_draft(draft).unwrap();
+        let recovered = host.watch_drafts().borrow().clone();
+        assert!(recovered.revision > initial.revision);
+        assert_eq!(recovered.drafts[0].id, "revision-2");
+        assert_eq!(
+            host.load_draft("revision-2").await.unwrap().content.prompt,
+            "Concurrent content"
+        );
+        host.change_draft(&DraftChange::Discard {
+            id: "revision-2".into(),
+        })
+        .unwrap();
+        assert!(host.watch_drafts().borrow().drafts.is_empty());
+        drop(host);
+        let reopened = WorkspaceHost::open(store, config).unwrap();
+        assert!(reopened.watch_drafts().borrow().drafts.is_empty());
+    }
+
+    #[tokio::test]
     async fn registry_http_sync_retains_dns_cause() {
         use super::*;
         use crate::http_error::test_support::FailingDns;
@@ -2010,7 +2071,7 @@ async fn draft_publication_task(weak: Weak<WorkspaceHostInner>) {
         let wake = inner.draft_wake.clone();
         if let Ok(pending) = inner.draft_store.pending() {
             for draft in pending {
-                if !lock(&inner.reg).draft_closed(&draft.id) {
+                if !lock(&inner.reg).draft_discarded(&draft.id) {
                     if let Err(error) = inner.draft_store.upload(&draft).await {
                         tracing::debug!(%error, "draft publication deferred");
                         break;

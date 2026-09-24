@@ -22,21 +22,37 @@ impl RegistryDoc {
         Ok(())
     }
 
-    pub fn draft_closed(&self, id: &str) -> bool {
+    pub fn draft_discarded(&self, id: &str) -> bool {
         self.overlay_row(DRAFTS, id)
             .is_some_and(|r| r.fields.get("closed").and_then(Value::as_bool) == Some(true))
+    }
+    pub fn draft_closed(&self, id: &str) -> bool {
+        self.draft_discarded(id)
+            || self
+                .overlay_row(DRAFTS, id)
+                .is_some_and(|r| r.fields.contains_key("sentRevision"))
     }
     pub fn publish_draft(&mut self, draft: &SaveDraft) -> Result<(), DocError> {
         if !valid_draft_id(&draft.id) || !valid_draft_id(&draft.revision) {
             return Err(DocError::Schema("Invalid draft ID".into()));
         }
-        if self.draft_closed(&draft.id) || self.overlay_row(REVISIONS, &draft.revision).is_some() {
+        if self.draft_discarded(&draft.id) || self.overlay_row(REVISIONS, &draft.revision).is_some()
+        {
             return Ok(());
+        }
+        self.observe_sidebar_row(DRAFTS, &draft.id);
+        if let Some(base) = &draft.base_revision {
+            self.observe_sidebar_row(REVISIONS, base);
         }
         let first = self.read_drafts().first().map(|d| d.order_key.clone());
         let stamp = self.next_hlc();
         let mut index = fields([("revision", json!(draft.revision))]);
-        if self.overlay_row(DRAFTS, &draft.id).is_none() {
+        if !self.overlay_row(DRAFTS, &draft.id).is_some_and(|r| {
+            r.fields
+                .get("orderKey")
+                .and_then(Value::as_str)
+                .is_some_and(valid_order_key)
+        }) {
             let order = order_key_between(None, first.as_deref(), &stamp)
                 .map_err(|s| DocError::Schema(s.into()))?;
             index.insert("orderKey".into(), json!(order));
@@ -82,15 +98,22 @@ impl RegistryDoc {
             let Some(root) = row.fields.get("draftId").and_then(Value::as_str) else {
                 continue;
             };
-            if self.draft_closed(root) {
+            if self.draft_discarded(root) {
                 continue;
             }
             let index = self.overlay_row(DRAFTS, root);
+            let sent = index
+                .as_ref()
+                .and_then(|r| r.fields.get("sentRevision"))
+                .and_then(Value::as_str);
+            if sent == Some(row.id.as_str()) {
+                continue;
+            }
             let current = index
                 .as_ref()
                 .and_then(|r| r.fields.get("revision"))
                 .and_then(Value::as_str);
-            let conflict = current != Some(row.id.as_str());
+            let conflict = sent.is_some() || current != Some(row.id.as_str());
             let id = if conflict { row.id.as_str() } else { root };
             if self.draft_closed(id) {
                 continue;
@@ -154,12 +177,24 @@ impl RegistryDoc {
     }
     pub fn change_draft(&mut self, change: &DraftChange) -> Result<(), DocError> {
         let id = match change {
-            DraftChange::Move { id, .. } | DraftChange::Discard { id } => id,
+            DraftChange::Move { id, .. }
+            | DraftChange::Discard { id }
+            | DraftChange::Consume { id, .. } => id,
         };
         if !valid_draft_id(id) {
             return Err(DocError::Schema("Invalid draft ID".into()));
         }
         self.observe_sidebar_row(DRAFTS, id);
+        if let DraftChange::Consume { revision, .. } = change {
+            self.write(
+                DRAFTS,
+                id,
+                OpKind::Upsert,
+                fields([("sentRevision", json!(revision))]),
+            );
+            return Ok(());
+        }
+
         if let DraftChange::Discard { .. } = change {
             self.write(
                 DRAFTS,
@@ -257,5 +292,73 @@ mod tests {
         })
         .unwrap();
         assert!(doc.read_drafts().is_empty());
+    }
+    #[test]
+    fn sending_one_head_keeps_a_concurrent_edit_recoverable() {
+        let mut doc = RegistryDoc::new("a");
+        doc.publish_draft(&draft("a", "base", None)).unwrap();
+        doc.publish_draft(&draft("a", "left", Some("base")))
+            .unwrap();
+        doc.change_draft(&DraftChange::Consume {
+            id: "a".into(),
+            revision: "left".into(),
+        })
+        .unwrap();
+        // A previously offline writer arrives after the send.
+        doc.publish_draft(&draft("a", "right", Some("base")))
+            .unwrap();
+        let rows = doc.read_drafts();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "right");
+        assert!(rows[0].conflict);
+    }
+
+    #[test]
+    fn offline_moves_converge_without_losing_concurrent_content() {
+        let mut a = RegistryDoc::new("a");
+        for (id, rev) in [("a", "one"), ("b", "two"), ("c", "three")] {
+            a.publish_draft(&draft(id, rev, None)).unwrap();
+        }
+        let mut b = RegistryDoc::new("b");
+        let mut server: HashMap<(String, String), RegistryRow> = HashMap::new();
+        fn exchange(doc: &mut RegistryDoc, server: &mut HashMap<(String, String), RegistryRow>) {
+            for batch in doc.take_pushable() {
+                for op in &batch.ops {
+                    let key = (op.kind.clone(), op.id.clone());
+                    if let Some(row) = apply_op(server.get(&key), op).0 {
+                        server.insert(key, row);
+                    }
+                }
+                doc.ack_batch(&batch.batch, 1);
+            }
+            doc.apply_rows(1, server.values().cloned().collect());
+        }
+        exchange(&mut a, &mut server);
+        exchange(&mut b, &mut server);
+        a.change_draft(&DraftChange::Move {
+            id: "a".into(),
+            before: Some("c".into()),
+            after: None,
+        })
+        .unwrap();
+        b.publish_draft(&draft("b", "edited", Some("two"))).unwrap();
+        b.change_draft(&DraftChange::Move {
+            id: "b".into(),
+            before: Some("c".into()),
+            after: None,
+        })
+        .unwrap();
+        exchange(&mut a, &mut server);
+        exchange(&mut b, &mut server);
+        exchange(&mut a, &mut server);
+        assert_eq!(a.read_drafts(), b.read_drafts());
+        assert_eq!(
+            a.read_drafts()
+                .iter()
+                .find(|d| d.id == "b")
+                .unwrap()
+                .revision,
+            "edited"
+        );
     }
 }

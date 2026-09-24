@@ -18,6 +18,7 @@ export default defineConfig({
       main: "./test/workerd/fixture.ts",
       miniflare: {
         compatibilityDate: "2026-07-01",
+        r2Buckets: ["BLOBS"],
         durableObjects: {
           TEST_LOG: { className: "TestLogRoom", useSQLite: true },
           CHAT_ROOMS: { className: "ChatRoom", useSQLite: true },

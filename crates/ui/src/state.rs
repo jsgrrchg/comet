@@ -499,6 +499,12 @@ impl EngineHandle {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_test_capability(mut self, capability: &str) -> Self {
+        self.engine_info.capabilities.push(capability.into());
+        self
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_test_client(client: RpcClient) -> Self {
         Self {
             inner: Arc::new(RemoteEngine {
@@ -1873,10 +1879,24 @@ impl AppState {
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
             watch_tasks.push(task);
         }
-        if handle.engine_info().supports(zeron_proto::DRAFTS_CAPABILITY) {
-            watch_tasks.push(spawn_watch(cx, handle.clone(), methods::WATCH_DRAFTS, |state, value: zeron_proto::DraftsState| {
-                if value.revision < state.prompt_drafts.revision || state.prompt_drafts == value { false } else { state.prompt_drafts = value; true }
-            }));
+        if handle
+            .engine_info()
+            .supports(zeron_proto::DRAFTS_CAPABILITY)
+        {
+            watch_tasks.push(spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_DRAFTS,
+                |state, value: zeron_proto::DraftsState| {
+                    if value.revision < state.prompt_drafts.revision || state.prompt_drafts == value
+                    {
+                        false
+                    } else {
+                        state.prompt_drafts = value;
+                        true
+                    }
+                },
+            ));
         }
         watch_tasks.extend([
             spawn_watch(

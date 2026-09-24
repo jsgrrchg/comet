@@ -109,7 +109,9 @@ impl Shell {
             {
                 for change in &pending.queue {
                     match change {
-                        DraftChange::Discard { id } => rows.retain(|r| &r.id != id),
+                        DraftChange::Discard { id } | DraftChange::Consume { id, .. } => {
+                            rows.retain(|r| &r.id != id)
+                        }
                         DraftChange::Move { id, before, after } => {
                             if let Some(i) = rows.iter().position(|r| &r.id == id) {
                                 let row = rows.remove(i);
@@ -379,8 +381,9 @@ impl Shell {
                                 if this.composer.read(cx).active_prompt_draft()
                                     == Some(discard.as_str())
                                 {
-                                    this.composer
-                                        .update(cx, |composer, cx| composer.start_prompt_draft(cx));
+                                    this.composer.update(cx, |composer, cx| {
+                                        composer.abandon_prompt_draft(cx)
+                                    });
                                 }
                             }))
                             .child(

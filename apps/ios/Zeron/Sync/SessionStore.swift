@@ -839,6 +839,9 @@ final class SessionStore {
     }
 
     /// schema.rs queue_command, field for field.
+    func hasDraftCommand(_ id: String) -> Bool {
+        (doc.getDeepValue().mapValue?["commands"]?.listValue ?? []).contains { $0.mapValue?["id"]?.stringValue == "draft-command-\(id)" }
+    }
     private func queueCommand(kind: String, payload: [String: Any], commandId: String? = nil) {
         if let commandId, (doc.getDeepValue().mapValue?["commands"]?.listValue ?? []).contains(where: { $0.mapValue?["id"]?.stringValue == commandId }) { return }
         let commands = doc.getList(id: "commands")

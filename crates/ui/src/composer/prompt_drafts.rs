@@ -9,10 +9,71 @@ use zeron_proto::{DraftAsset, DraftAttachment, DraftBundle, DraftContent, Prompt
 pub(super) struct EditingDraft {
     pub id: String,
     pub revision: Option<String>,
+    pub base_revision: Option<String>,
     pub created_at: i64,
     pub saved: Option<DraftContent>,
     pub snapshot: DraftBundle,
 }
+#[derive(Default)]
+pub(crate) struct DraftQuitSavers(pub Vec<gpui::WeakEntity<Composer>>);
+impl gpui::Global for DraftQuitSavers {}
+
+pub(crate) fn quit_saves(
+    cx: &mut App,
+) -> Vec<(
+    EngineHandle,
+    SaveDraft,
+    Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
+)> {
+    let editors = cx.default_global::<DraftQuitSavers>().0.clone();
+    editors
+        .into_iter()
+        .filter_map(|editor| {
+            editor
+                .update(cx, |composer, cx| {
+                    if composer.current_key.is_empty() {
+                        composer.capture_prompt_draft(cx);
+                    }
+                    let request = composer.flush_prompt_draft(cx)?;
+                    Some((
+                        composer.prompt_draft_engine.clone()?,
+                        request,
+                        composer.prompt_draft_gate.clone(),
+                    ))
+                })
+                .ok()
+                .flatten()
+        })
+        .collect()
+}
+
+pub(crate) async fn save_request(
+    engine: &EngineHandle,
+    mut request: SaveDraft,
+    known: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    for asset in std::mem::take(&mut request.assets) {
+        if known.contains(&asset.blob) {
+            continue;
+        }
+        engine
+            .client()
+            .call(
+                methods::SAVE_DRAFT_ASSET,
+                serde_json::to_value(&asset).unwrap(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        known.insert(asset.blob);
+    }
+    engine
+        .client()
+        .call(methods::SAVE_DRAFT, serde_json::to_value(&request).unwrap())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 impl Composer {
     pub(crate) fn active_prompt_draft(&self) -> Option<&str> {
         self.prompt_draft.as_ref().map(|d| d.id.as_str())
@@ -59,6 +120,7 @@ impl Composer {
         let editor = self.prompt_draft.get_or_insert_with(|| EditingDraft {
             id: uuid::Uuid::new_v4().to_string(),
             revision: None,
+            base_revision: None,
             created_at: chrono::Utc::now().timestamp_millis(),
             saved: None,
             snapshot: DraftBundle::default(),
@@ -104,15 +166,16 @@ impl Composer {
             return None;
         }
         let changed = editor.saved.as_ref() != Some(&editor.snapshot.content);
-        let base_revision = editor.revision.clone();
+
         if changed || editor.revision.is_none() {
+            editor.base_revision = editor.revision.clone();
             editor.revision = Some(uuid::Uuid::new_v4().to_string());
             editor.saved = Some(editor.snapshot.content.clone());
         }
         let request = SaveDraft {
             id: editor.id.clone(),
             revision: editor.revision.clone()?,
-            base_revision,
+            base_revision: editor.base_revision.clone(),
             created_at: editor.created_at,
             content: editor.snapshot.content.clone(),
             assets: editor
@@ -127,11 +190,8 @@ impl Composer {
             let request = request.clone();
             let gate = self.prompt_draft_gate.clone();
             cx.spawn(async move |this, cx| {
-                let _guard = gate.lock().await;
-                let result = engine
-                    .client()
-                    .call(methods::SAVE_DRAFT, serde_json::to_value(&request).unwrap())
-                    .await;
+                let mut known = gate.lock().await;
+                let result = save_request(&engine, request.clone(), &mut known).await;
                 this.update(cx, |composer, cx| {
                     if let Err(error) = result {
                         if composer.prompt_draft.as_ref().is_some_and(|d| {
@@ -154,10 +214,22 @@ impl Composer {
     }
 
     pub(crate) fn start_prompt_draft(&mut self, cx: &mut Context<Self>) {
+        if !self
+            .state
+            .read(cx)
+            .engine()
+            .is_some_and(|e| e.engine_info().supports(zeron_proto::DRAFTS_CAPABILITY))
+        {
+            return;
+        }
         if self.current_key.is_empty() {
             self.capture_prompt_draft(cx);
             self.flush_prompt_draft(cx);
         }
+        self.abandon_prompt_draft(cx);
+    }
+
+    pub(crate) fn abandon_prompt_draft(&mut self, cx: &mut Context<Self>) {
         self.prompt_draft_debounce = None;
         self.prompt_draft_loading = false;
         self.prompt_draft_load_generation += 1;
@@ -172,6 +244,12 @@ impl Composer {
     }
 
     pub(crate) fn open_prompt_draft(&mut self, row: PromptDraft, cx: &mut Context<Self>) {
+        if self.current_key.is_empty() && self.active_prompt_draft() == Some(&row.id) {
+            self.focus_pending = true;
+            cx.notify();
+            return;
+        }
+        let origin_chat = self.state.read(cx).selected_chat.clone();
         if self.current_key.is_empty() {
             self.capture_prompt_draft(cx);
             self.flush_prompt_draft(cx);
@@ -194,7 +272,8 @@ impl Composer {
                 .map_err(|e| e.to_string())
                 .and_then(|v| serde_json::from_value::<DraftBundle>(v).map_err(|e| e.to_string()));
             this.update(cx, |composer, cx| {
-                if composer.prompt_draft_load_generation != generation
+                if composer.state.read(cx).selected_chat != origin_chat
+                    || composer.prompt_draft_load_generation != generation
                     || !composer
                         .state
                         .read(cx)
@@ -210,6 +289,7 @@ impl Composer {
                         composer.failure_key = None;
                     }
                     Ok(bundle) => {
+                        composer.prompt_draft = None;
                         composer.state.update(cx, |state, cx| {
                             state.select_chat(None, cx);
                             state.select_space(bundle.content.target.space_id.clone(), cx);
@@ -285,6 +365,7 @@ impl Composer {
                         composer.prompt_draft = Some(EditingDraft {
                             id: row.id,
                             revision: Some(row.revision),
+                            base_revision: row.base_revision,
                             created_at: row.created_at,
                             saved: Some(bundle.content.clone()),
                             snapshot: bundle.clone(),
@@ -323,4 +404,58 @@ fn append_asset(
         blob: asset.blob.clone(),
         appshot,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[gpui::test]
+    fn draft_revision_chain_and_new_canvas_preserve_independent_work(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (out, _requests) = tokio::sync::mpsc::channel(32);
+        let (_replies, inbound) = tokio::sync::mpsc::channel(32);
+        let engine = EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound))
+            .with_test_capability(zeron_proto::DRAFTS_CAPABILITY);
+        let (_dir, window) = crate::composer::tests::composer_focus_window(cx);
+        window
+            .update(cx, |composer, _, cx| {
+                composer.state.update(cx, |state, _| {
+                    state.set_test_engine(engine);
+                    state.local_device_id = Some("local".into());
+                });
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("First prompt", cx));
+                composer.capture_prompt_draft(cx);
+                let first = composer.flush_prompt_draft(cx).unwrap();
+                assert_eq!(first.content.prompt, "First prompt");
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Edited prompt", cx));
+                composer.capture_prompt_draft(cx);
+                let second = composer.flush_prompt_draft(cx).unwrap();
+                assert_eq!(second.id, first.id);
+                assert_eq!(second.base_revision, Some(first.revision));
+                assert_eq!(
+                    composer.flush_prompt_draft(cx).unwrap().base_revision,
+                    second.base_revision
+                );
+                composer.start_prompt_draft(cx);
+                assert!(composer.input.read(cx).text().is_empty());
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Independent prompt", cx));
+                composer.capture_prompt_draft(cx);
+                let third = composer.flush_prompt_draft(cx).unwrap();
+                assert_ne!(third.id, second.id);
+                assert!(third.base_revision.is_none());
+            })
+            .unwrap();
+    }
 }

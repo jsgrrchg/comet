@@ -2491,6 +2491,9 @@ impl DocHost {
             .iter()
             .any(|entry| entry.id == id)
         {
+            if id.starts_with("draft-command-") {
+                self.persist_draft_command(&handle)?;
+            }
             return Ok(id);
         }
         let now = now_ms();
@@ -2513,6 +2516,9 @@ impl DocHost {
             resolution: None,
         };
         handle.doc.queue_command(&entry)?;
+        if id.starts_with("draft-command-") {
+            self.persist_draft_command(&handle)?;
+        }
         // Sending a message revives an archived chat: the user is acting in it
         // again, so the LWW row flips back to active on every device. Best-
         // effort — the command itself is durable regardless.
@@ -2526,6 +2532,18 @@ impl DocHost {
         self.nudge_remote_host(chat_id);
         self.spawn_command_delivery(chat_id, entry, transfers);
         Ok(id)
+    }
+
+    fn persist_draft_command(&self, handle: &ChatDocHandle) -> Result<(), EngineError> {
+        if let Some(persistence) = &handle.persistence {
+            persistence.dirty(true);
+            persistence.flush_sync_result().map_err(EngineError::Other)
+        } else {
+            self.inner
+                .store
+                .save_snapshot(&handle.chat_id, &handle.doc.export_snapshot()?)?;
+            Ok(())
+        }
     }
 
     /// A send revives an archived chat on every device (best-effort).

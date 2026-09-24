@@ -1497,6 +1497,14 @@ impl DocHost {
 
     /// Connection lifetime is independent of the document and its outbox.
     /// Concurrent callers activate at most one supervisor for this handle.
+    /// Called on the device control link. Acceptance never cold-opens a chat.
+    pub fn enqueue_wakeup(&self, chat_id: &str) -> Result<(), EngineError> {
+        self.inner
+            .store
+            .schedule_sync_job(chat_id, if chat_id == "*" { "reconcile" } else { "wake" })?;
+        Ok(())
+    }
+
     pub fn activate_sync(&self, handle: &Arc<ChatDocHandle>) {
         if self.inner.config.edge.is_some() && !self.inner.edge_disconnected.load(Ordering::Acquire)
         {
@@ -1523,6 +1531,28 @@ impl DocHost {
                 let Some(edge) = host.inner.config.edge.clone() else {
                     continue;
                 };
+                // Overflow reconciliation is metadata-only and resumable. Wait
+                // for registry truth before deciding the hosted set is complete.
+                if let Some(ws) = host.workspace() {
+                    if ws.sync_status().is_some_and(|s| s.synced) {
+                        if let Ok(Some((version, cursor))) =
+                            host.inner.store.reconciliation_progress()
+                        {
+                            let mut ids: Vec<_> = ws
+                                .watch_chats()
+                                .borrow()
+                                .iter()
+                                .filter(|c| {
+                                    c.device_id == host.inner.config.device_id && c.id > cursor
+                                })
+                                .map(|c| c.id.clone())
+                                .collect();
+                            ids.sort();
+                            ids.truncate(32);
+                            let _ = host.inner.store.reconcile_page(version, &ids);
+                        }
+                    }
+                }
                 let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
                 for handle in &handles {
                     if !handle.publication_failed.load(Ordering::Acquire) {

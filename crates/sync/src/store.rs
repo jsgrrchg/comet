@@ -73,6 +73,7 @@ const MIGRATIONS: &[&str] = &[
     ) STRICT;
     CREATE TABLE sync_job_clock (id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL) STRICT;
     INSERT INTO sync_job_clock VALUES (1,0);",
+    "ALTER TABLE chat_sync_jobs ADD COLUMN cursor TEXT NOT NULL DEFAULT '';",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).

@@ -12,9 +12,53 @@ impl DocsStore {
             tx.execute("UPDATE sync_job_clock SET value=value+1 WHERE id=1", [])?;
             tx.execute(
                 "INSERT INTO chat_sync_jobs(doc_id,kind,version) SELECT ?1,?2,value FROM sync_job_clock WHERE id=1
-                 ON CONFLICT(doc_id,kind) DO UPDATE SET version=excluded.version",
+                 ON CONFLICT(doc_id,kind) DO UPDATE SET version=excluded.version,cursor=''",
                 params![doc, kind],
             )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn reconciliation_progress(&self) -> Result<Option<(i64, String)>, StoreError> {
+        store_blocking(|| {
+            Ok(self.conn().query_row(
+            "SELECT version,cursor FROM chat_sync_jobs WHERE doc_id='*' AND kind='reconcile'", [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?)
+        })
+    }
+
+    /// Atomically accept one bounded page and advance the durable scan cursor.
+    pub fn reconcile_page(&self, version: i64, ids: &[String]) -> Result<(), StoreError> {
+        store_blocking(|| {
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            let current: Option<i64> = tx
+                .query_row(
+                    "SELECT version FROM chat_sync_jobs WHERE doc_id='*' AND kind='reconcile'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if current != Some(version) {
+                return Ok(());
+            }
+            if let Some(last) = ids.last() {
+                tx.execute("UPDATE sync_job_clock SET value=value+1 WHERE id=1", [])?;
+                for id in ids {
+                    tx.execute("INSERT INTO chat_sync_jobs(doc_id,kind,version) SELECT ?1,'wake',value FROM sync_job_clock WHERE id=1 ON CONFLICT(doc_id,kind) DO UPDATE SET version=excluded.version", params![id])?;
+                }
+                tx.execute(
+                    "UPDATE chat_sync_jobs SET cursor=?1 WHERE doc_id='*' AND kind='reconcile'",
+                    params![last],
+                )?;
+            } else {
+                tx.execute(
+                    "DELETE FROM chat_sync_jobs WHERE doc_id='*' AND kind='reconcile'",
+                    [],
+                )?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -79,6 +123,30 @@ impl DocsStore {
 mod tests {
     use super::*;
     #[test]
+    fn reconciliation_resumes_and_new_requests_fence_old_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+        store.schedule_sync_job("*", "reconcile").unwrap();
+        let (version, _) = store.reconciliation_progress().unwrap().unwrap();
+        store
+            .reconcile_page(version, &["a".into(), "b".into()])
+            .unwrap();
+        drop(store);
+        let store = DocsStore::open(dir.path()).unwrap();
+        assert_eq!(
+            store.reconciliation_progress().unwrap(),
+            Some((version, "b".into()))
+        );
+        assert_eq!(store.pending_sync_docs("", 10).unwrap(), vec!["a", "b"]);
+        store.schedule_sync_job("*", "reconcile").unwrap();
+        store.reconcile_page(version, &[]).unwrap();
+        let (newer, cursor) = store.reconciliation_progress().unwrap().unwrap();
+        assert!(newer > version);
+        assert!(cursor.is_empty());
+        store.reconcile_page(newer, &[]).unwrap();
+        assert!(store.reconciliation_progress().unwrap().is_none());
+    }
+    #[test]
     fn work_survives_restart_pages_without_payloads_and_preserves_new_wakes() {
         let dir = tempfile::tempdir().unwrap();
         {
@@ -119,6 +187,9 @@ mod tests {
         assert_eq!(store.sync_job_version("chat-0000", "wake").unwrap(), None);
         store.schedule_sync_job("chat-0000", "wake").unwrap();
         store.complete_sync_job("chat-0000", "wake", 301).unwrap();
-        assert_eq!(store.sync_job_version("chat-0000", "wake").unwrap(), Some(302));
+        assert_eq!(
+            store.sync_job_version("chat-0000", "wake").unwrap(),
+            Some(302)
+        );
     }
 }

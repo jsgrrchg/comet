@@ -11,6 +11,7 @@ pub(super) struct EditingDraft {
     pub revision: Option<String>,
     pub base_revision: Option<String>,
     pub created_at: i64,
+    pub reserved: bool,
     pub saved: Option<DraftContent>,
     pub snapshot: DraftBundle,
 }
@@ -56,14 +57,26 @@ pub(crate) async fn save_request(
         if known.contains(&asset.blob) {
             continue;
         }
-        engine
-            .client()
-            .call(
-                methods::SAVE_DRAFT_ASSET,
-                serde_json::to_value(&asset).unwrap(),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+        let bytes = STANDARD.decode(&asset.data).map_err(|e| e.to_string())?;
+        for index in 0..bytes.len().div_ceil(zeron_proto::DRAFT_CHUNK_BYTES).max(1) {
+            let offset = index * zeron_proto::DRAFT_CHUNK_BYTES;
+            let chunk = zeron_proto::DraftAssetChunk {
+                blob: asset.blob.clone(),
+                index,
+                total_bytes: bytes.len(),
+                data: STANDARD.encode(
+                    &bytes[offset..(offset + zeron_proto::DRAFT_CHUNK_BYTES).min(bytes.len())],
+                ),
+            };
+            engine
+                .client()
+                .call(
+                    methods::SAVE_DRAFT_ASSET,
+                    serde_json::to_value(chunk).unwrap(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         known.insert(asset.blob);
     }
     engine
@@ -74,7 +87,287 @@ pub(crate) async fn save_request(
     Ok(())
 }
 
+async fn load_bundle(engine: &EngineHandle, revision: &str) -> Result<DraftBundle, String> {
+    let value = engine
+        .client()
+        .call(
+            methods::LOAD_DRAFT,
+            serde_json::json!({"revision": revision}),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let content: DraftContent = serde_json::from_value(value).map_err(|e| e.to_string())?;
+    let mut assets = Vec::<DraftAsset>::new();
+    for asset in &content.attachments {
+        if assets.iter().any(|a| a.blob == asset.blob) {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        for index in 0..=zeron_proto::MAX_DRAFT_ASSET_BYTES / zeron_proto::DRAFT_CHUNK_BYTES {
+            let value = engine
+                .client()
+                .call(
+                    methods::LOAD_DRAFT_ASSET,
+                    serde_json::json!({"blob": asset.blob, "index": index}),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let chunk: zeron_proto::DraftAssetChunk =
+                serde_json::from_value(value).map_err(|e| e.to_string())?;
+            if chunk.total_bytes > zeron_proto::MAX_DRAFT_ASSET_BYTES
+                || chunk.index != index
+                || chunk.blob != asset.blob
+            {
+                return Err("Invalid draft attachment response".into());
+            }
+            bytes.extend(STANDARD.decode(&chunk.data).map_err(|e| e.to_string())?);
+            if bytes.len() >= chunk.total_bytes {
+                break;
+            }
+        }
+        if format!("{:x}", Sha256::digest(&bytes)) != asset.blob {
+            return Err("Draft attachment checksum mismatch".into());
+        }
+        assets.push(DraftAsset {
+            blob: asset.blob.clone(),
+            data: STANDARD.encode(bytes),
+        });
+    }
+    Ok(DraftBundle { content, assets })
+}
+
+fn restore_images(bundle: &DraftBundle) -> Result<Vec<attachments::StagedAttachment>, String> {
+    bundle
+        .content
+        .attachments
+        .iter()
+        .map(|asset| {
+            let bytes = bundle
+                .assets
+                .iter()
+                .find(|b| b.blob == asset.blob)
+                .ok_or_else(|| format!("Missing draft attachment: {}", asset.name))?;
+            let bytes = STANDARD.decode(&bytes.data).map_err(|e| e.to_string())?;
+            let format = attachments::format_by_extension(std::path::Path::new(&asset.name))
+                .ok_or_else(|| format!("Unsupported draft image: {}", asset.name))?;
+            if let Some(meta) = &asset.appshot {
+                serde_json::from_value::<appshots::AccessibilitySnapshot>(
+                    meta["accessibility"].clone(),
+                )
+                .map_err(|e| format!("Invalid Appshot context: {e}"))?;
+            }
+            Ok(attachments::StagedAttachment {
+                id: asset.id.clone(),
+                name: asset.name.clone(),
+                image: Arc::new(gpui::Image::from_bytes(format, bytes)),
+            })
+        })
+        .collect()
+}
+
+fn recovery_directory(state: &AppState) -> Option<std::path::PathBuf> {
+    let engine = state.engine()?;
+    let profile = crate::settings::sidebar_pin_profile_key(
+        Some(engine.engine_info().workspace_scope),
+        state.auth.as_ref(),
+        None,
+    )?;
+    let identity = format!("{}:{profile}", engine.engine_info().device_id);
+    Some(
+        state
+            .data_dir
+            .as_ref()?
+            .join("draft-recovery")
+            .join(format!("{:x}", Sha256::digest(identity.as_bytes()))),
+    )
+}
+fn write_recovery_file(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = std::fs::File::create(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        Ok::<_, std::io::Error>(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|e| e.to_string())
+}
+type RecoveryMemory =
+    std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<String, SaveDraft>>;
+fn recovery_memory() -> &'static std::sync::Mutex<RecoveryMemory> {
+    static MEMORY: std::sync::OnceLock<std::sync::Mutex<RecoveryMemory>> =
+        std::sync::OnceLock::new();
+    MEMORY.get_or_init(Default::default)
+}
+fn stage_recovery(directory: &std::path::Path, request: &SaveDraft) -> Result<(), String> {
+    let result = stage_recovery_on_disk(directory, request);
+    if result.is_err() {
+        recovery_memory()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(directory.to_owned())
+            .or_default()
+            .insert(request.revision.clone(), request.clone());
+    }
+    result
+}
+fn stage_recovery_on_disk(directory: &std::path::Path, request: &SaveDraft) -> Result<(), String> {
+    std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+    for asset in &request.assets {
+        let path = directory.join(format!("{}.asset", asset.blob));
+        if !path.exists() {
+            write_recovery_file(&path, asset.data.as_bytes())?;
+        }
+    }
+    let mut manifest = request.clone();
+    manifest.assets.clear();
+    write_recovery_file(
+        &directory.join(format!("{}.json", request.revision)),
+        &serde_json::to_vec(&manifest).map_err(|e| e.to_string())?,
+    )
+}
+fn pending_recovery(directory: &std::path::Path) -> Vec<SaveDraft> {
+    let mut requests = std::collections::HashMap::<String, SaveDraft>::new();
+    if let Ok(entries) = std::fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let request = (|| {
+                let bytes = std::fs::read(entry.path()).ok()?;
+                let mut request: SaveDraft = serde_json::from_slice(&bytes).ok()?;
+                for asset in &request.content.attachments {
+                    request.assets.push(DraftAsset {
+                        blob: asset.blob.clone(),
+                        data: std::fs::read_to_string(
+                            directory.join(format!("{}.asset", asset.blob)),
+                        )
+                        .ok()?,
+                    });
+                }
+                Some(request)
+            })();
+            if let Some(request) = request {
+                requests.insert(request.revision.clone(), request);
+            }
+        }
+    }
+    if let Some(memory) = recovery_memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(directory)
+    {
+        requests.extend(memory.clone());
+    }
+    let mut ordered = Vec::with_capacity(requests.len());
+    while !requests.is_empty() {
+        let next = requests
+            .values()
+            .find(|request| {
+                !request
+                    .base_revision
+                    .as_ref()
+                    .is_some_and(|base| requests.contains_key(base))
+            })
+            .map(|request| request.revision.clone());
+        let Some(next) = next else { break }; // corrupt ancestry must not invent a publication order
+        ordered.push(requests.remove(&next).unwrap());
+    }
+    ordered
+}
+fn acknowledge_recovery(directory: &std::path::Path, revision: &str) {
+    let _ = std::fs::remove_file(directory.join(format!("{revision}.json")));
+    if let Some(memory) = recovery_memory()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(directory)
+    {
+        memory.remove(revision);
+    }
+}
+
 impl Composer {
+    pub(super) fn resume_prompt_draft_saves(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.read(cx);
+        let Some(directory) = recovery_directory(state) else {
+            return;
+        };
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        if !engine
+            .engine_info()
+            .supports(zeron_proto::DRAFTS_CAPABILITY)
+        {
+            return;
+        }
+        if self.prompt_draft_recovery.as_ref() == Some(&directory)
+            && self.prompt_draft_recovery_task.is_some()
+        {
+            return;
+        }
+        self.prompt_draft_recovery = Some(directory.clone());
+        let gate = self.prompt_draft_gate.clone();
+        self.prompt_draft_recovery_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let active = this
+                    .update(cx, |composer, cx| {
+                        let state = composer.state.read(cx);
+                        (recovery_directory(state).as_ref() == Some(&directory))
+                            .then(|| state.engine().cloned())
+                            .flatten()
+                    })
+                    .ok()
+                    .flatten();
+                let Some(engine) = active else {
+                    cx.background_executor().timer(Duration::from_secs(3)).await;
+                    continue;
+                };
+                let pending = pending_recovery(&directory);
+                for request in pending {
+                    let mut known = gate.lock().await;
+                    match save_request(&engine, request.clone(), &mut known).await {
+                        Ok(()) => acknowledge_recovery(&directory, &request.revision),
+                        Err(error) if error.contains("already discarded") => {
+                            acknowledge_recovery(&directory, &request.revision)
+                        }
+                        Err(_) => break,
+                    }
+                }
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+            }
+        }));
+    }
+    pub(super) fn reserve_prompt_draft_attempt(
+        &mut self,
+        request: &SaveDraft,
+    ) -> Result<(), String> {
+        if let Some(directory) = &self.prompt_draft_recovery {
+            std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
+            write_recovery_file(
+                &directory.join(format!("{}.reservation", request.id)),
+                request.revision.as_bytes(),
+            )?;
+        }
+        if let Some(draft) = &mut self.prompt_draft {
+            if draft.id == request.id {
+                draft.reserved = true;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn cancel_prompt_draft_load(&mut self) {
+        if self.prompt_draft_loading {
+            self.prompt_draft_loading = false;
+            self.prompt_draft_load_generation += 1;
+        }
+    }
+
     pub(crate) fn active_prompt_draft(&self) -> Option<&str> {
         self.prompt_draft.as_ref().map(|d| d.id.as_str())
     }
@@ -92,6 +385,7 @@ impl Composer {
             return;
         }
         self.prompt_draft_engine = state.engine().cloned();
+        self.resume_prompt_draft_saves(cx);
         let target = self.pickers.read(cx).prompt_draft_target(cx);
         let mut content = DraftContent {
             prompt: self.input.read(cx).text().to_string(),
@@ -122,12 +416,23 @@ impl Composer {
             revision: None,
             base_revision: None,
             created_at: chrono::Utc::now().timestamp_millis(),
+            reserved: false,
             saved: None,
             snapshot: DraftBundle::default(),
         });
         if editor.snapshot.content == content {
             return;
         }
+        if editor.reserved {
+            // Editing is a new intent; keep the exact uncertain send retryable.
+            editor.id = uuid::Uuid::new_v4().to_string();
+            editor.revision = None;
+            editor.base_revision = None;
+            editor.created_at = chrono::Utc::now().timestamp_millis();
+            editor.saved = None;
+            editor.reserved = false;
+        }
+
         editor.snapshot = DraftBundle { content, assets };
         self.prompt_draft_debounce = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -187,11 +492,27 @@ impl Composer {
                 .collect(),
         };
         if changed {
+            let recovery = self.prompt_draft_recovery.clone();
+            if let Some(directory) = &recovery {
+                if let Err(error) = stage_recovery(directory, &request) {
+                    self.failure = Some(
+                        format!("Draft retained in memory; recovery storage failed: {error}")
+                            .into(),
+                    );
+                    self.failure_key = Some(String::new());
+                    cx.notify();
+                }
+            }
             let request = request.clone();
             let gate = self.prompt_draft_gate.clone();
             cx.spawn(async move |this, cx| {
                 let mut known = gate.lock().await;
                 let result = save_request(&engine, request.clone(), &mut known).await;
+                if result.is_ok() {
+                    if let Some(directory) = &recovery {
+                        acknowledge_recovery(directory, &request.revision);
+                    }
+                }
                 this.update(cx, |composer, cx| {
                     if let Err(error) = result {
                         if composer.prompt_draft.as_ref().is_some_and(|d| {
@@ -262,15 +583,9 @@ impl Composer {
         let generation = self.prompt_draft_load_generation;
         self.prompt_draft_loading = true;
         cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::LOAD_DRAFT,
-                    serde_json::json!({"revision": row.revision}),
-                )
+            let result = load_bundle(&engine, &row.revision)
                 .await
-                .map_err(|e| e.to_string())
-                .and_then(|v| serde_json::from_value::<DraftBundle>(v).map_err(|e| e.to_string()));
+                .and_then(|bundle| restore_images(&bundle).map(|images| (bundle, images)));
             this.update(cx, |composer, cx| {
                 if composer.state.read(cx).selected_chat != origin_chat
                     || composer.prompt_draft_load_generation != generation
@@ -288,7 +603,7 @@ impl Composer {
                         composer.failure = Some(format!("Couldn't open draft: {error}").into());
                         composer.failure_key = None;
                     }
-                    Ok(bundle) => {
+                    Ok((bundle, images)) => {
                         composer.prompt_draft = None;
                         composer.state.update(cx, |state, cx| {
                             state.select_chat(None, cx);
@@ -302,23 +617,13 @@ impl Composer {
                         });
                         composer.attachments.remove("");
                         composer.appshots.remove("");
-                        for asset in &bundle.content.attachments {
-                            let Some(bytes) = bundle
-                                .assets
-                                .iter()
-                                .find(|b| b.blob == asset.blob)
-                                .and_then(|b| STANDARD.decode(&b.data).ok())
-                            else {
-                                continue;
-                            };
+                        for (asset, image) in bundle.content.attachments.iter().zip(images) {
                             if let Some(data) = bundle.assets.iter().find(|b| b.blob == asset.blob)
                             {
                                 composer
                                     .prompt_draft_assets
                                     .insert(asset.id.clone(), data.clone());
                             }
-                            let mut image = attachments::stage_png_bytes(asset.name.clone(), bytes);
-                            image.id = asset.id.clone();
                             if let Some(meta) = &asset.appshot {
                                 if let Ok(accessibility) =
                                     serde_json::from_value(meta["accessibility"].clone())
@@ -363,6 +668,9 @@ impl Composer {
                                 .push(image);
                         }
                         composer.prompt_draft = Some(EditingDraft {
+                            reserved: composer.prompt_draft_recovery.as_ref().is_some_and(|d| {
+                                d.join(format!("{}.reservation", row.id)).exists()
+                            }),
                             id: row.id,
                             revision: Some(row.revision),
                             base_revision: row.base_revision,
@@ -409,6 +717,92 @@ fn append_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unacknowledged_saves_survive_navigation_and_reopening_the_recovery_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = SaveDraft {
+            id: "a".into(),
+            revision: "a1".into(),
+            base_revision: None,
+            created_at: 1,
+            content: DraftContent {
+                prompt: "Must survive failed RPC".into(),
+                ..Default::default()
+            },
+            assets: vec![],
+        };
+        stage_recovery(directory.path(), &request).unwrap();
+        drop(request);
+        let restored = pending_recovery(directory.path());
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].content.prompt, "Must survive failed RPC");
+        acknowledge_recovery(directory.path(), "a1");
+        assert!(pending_recovery(directory.path()).is_empty());
+    }
+
+    #[test]
+    fn failed_recovery_storage_keeps_requests_and_replays_ancestors_first() {
+        let directory = tempfile::tempdir().unwrap();
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let parent = SaveDraft {
+            id: "a".into(),
+            revision: "z-parent".into(),
+            base_revision: None,
+            created_at: 1,
+            content: DraftContent {
+                prompt: "Parent".into(),
+                ..Default::default()
+            },
+            assets: vec![],
+        };
+        let mut child = parent.clone();
+        child.revision = "a-child".into();
+        child.base_revision = Some(parent.revision.clone());
+        assert!(stage_recovery(&blocked, &child).is_err());
+        assert!(stage_recovery(&blocked, &parent).is_err());
+        let restored = pending_recovery(&blocked);
+        assert_eq!(
+            restored
+                .iter()
+                .map(|r| r.revision.as_str())
+                .collect::<Vec<_>>(),
+            ["z-parent", "a-child"]
+        );
+        assert!(pending_recovery(&directory.path().join("another-profile")).is_empty());
+        acknowledge_recovery(&blocked, "z-parent");
+        acknowledge_recovery(&blocked, "a-child");
+        assert!(pending_recovery(&blocked).is_empty());
+        // The disk path uses the same causal ordering regardless of filenames/read_dir.
+        stage_recovery(directory.path(), &child).unwrap();
+        stage_recovery(directory.path(), &parent).unwrap();
+        assert_eq!(pending_recovery(directory.path())[0].revision, "z-parent");
+    }
+
+    #[test]
+    fn restored_images_keep_their_format_and_missing_content_is_an_error() {
+        let mut bundle = DraftBundle {
+            content: DraftContent {
+                attachments: vec![DraftAttachment {
+                    id: "jpeg".into(),
+                    name: "photo.jpg".into(),
+                    blob: "blob".into(),
+                    appshot: None,
+                }],
+                ..Default::default()
+            },
+            assets: vec![DraftAsset {
+                blob: "blob".into(),
+                data: STANDARD.encode(b"jpeg bytes"),
+            }],
+        };
+        let images = restore_images(&bundle).unwrap();
+        assert_eq!(images[0].image.format, gpui::ImageFormat::Jpeg);
+        assert_eq!(images[0].id, "jpeg");
+        bundle.assets.clear();
+        assert!(restore_images(&bundle).is_err());
+    }
+
     #[gpui::test]
     fn draft_revision_chain_and_new_canvas_preserve_independent_work(
         cx: &mut gpui::TestAppContext,
@@ -446,6 +840,14 @@ mod tests {
                     composer.flush_prompt_draft(cx).unwrap().base_revision,
                     second.base_revision
                 );
+                composer.reserve_prompt_draft_attempt(&second).unwrap();
+                composer.input.update(cx, |input, cx| {
+                    input.set_text("Changed after interrupted send", cx)
+                });
+                composer.capture_prompt_draft(cx);
+                let fork = composer.flush_prompt_draft(cx).unwrap();
+                assert_ne!(fork.id, second.id);
+                assert!(fork.base_revision.is_none());
                 composer.start_prompt_draft(cx);
                 assert!(composer.input.read(cx).text().is_empty());
                 composer
@@ -455,6 +857,17 @@ mod tests {
                 let third = composer.flush_prompt_draft(cx).unwrap();
                 assert_ne!(third.id, second.id);
                 assert!(third.base_revision.is_none());
+                composer.prompt_draft_loading = true;
+                let generation = composer.prompt_draft_load_generation;
+                composer.on_input_edited(cx);
+                assert!(!composer.prompt_draft_loading);
+                assert!(composer.prompt_draft_load_generation > generation);
+                composer.prompt_draft_loading = true;
+                composer.state.update(cx, |state, _| {
+                    state.selected_chat = Some("other-chat".into());
+                });
+                composer.on_state_changed(cx);
+                assert!(!composer.prompt_draft_loading);
             })
             .unwrap();
     }

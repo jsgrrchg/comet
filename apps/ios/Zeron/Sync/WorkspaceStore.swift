@@ -315,7 +315,7 @@ final class WorkspaceStore {
         for save in draftStorage.pending { overlay.publishPromptDraft(save) }
         overlay.movePromptDraft(id, before: before, after: after)
         if let row = overlay.promptDraftRows.first(where: { $0.id == id }) {
-            doc.write(kind: "promptDrafts", id: id, op: .upsert, set: ["orderKey": .string(row.orderKey)])
+            doc.setPromptDraftOrder(id, key: row.orderKey)
             afterLocalWrite()
         }
     }

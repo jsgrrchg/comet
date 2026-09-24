@@ -35,6 +35,7 @@ pub use server::{serve_connection, serve_ws_listener};
 pub mod methods {
     pub const WATCH_DRAFTS: &str = "WatchDrafts";
     pub const SAVE_DRAFT_ASSET: &str = "SaveDraftAsset";
+    pub const LOAD_DRAFT_ASSET: &str = "LoadDraftAsset";
     pub const SAVE_DRAFT: &str = "SaveDraft";
     pub const LOAD_DRAFT: &str = "LoadDraft";
     pub const CHANGE_DRAFT: &str = "ChangeDraft";

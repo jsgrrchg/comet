@@ -5251,6 +5251,8 @@ pub struct Composer {
     prompt_draft: Option<prompt_drafts::EditingDraft>,
     prompt_draft_assets: HashMap<String, zeron_proto::DraftAsset>,
     prompt_draft_engine: Option<EngineHandle>,
+    prompt_draft_recovery: Option<std::path::PathBuf>,
+    prompt_draft_recovery_task: Option<Task<()>>,
     prompt_draft_debounce: Option<Task<()>>,
     prompt_draft_loading: bool,
     prompt_draft_load_generation: u64,
@@ -5537,6 +5539,8 @@ impl Composer {
             drafts: HashMap::new(),
             prompt_draft_assets: HashMap::new(),
             prompt_draft_engine: None,
+            prompt_draft_recovery: None,
+            prompt_draft_recovery_task: None,
             prompt_draft: None,
             prompt_draft_debounce: None,
             prompt_draft_loading: false,
@@ -6509,6 +6513,7 @@ impl Composer {
     }
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
+        self.cancel_prompt_draft_load();
         self.capture_prompt_draft(cx);
         if self.wizard.is_some() {
             if self.mention.token.is_some() || self.mention_task.is_some() {
@@ -7239,6 +7244,8 @@ impl Composer {
             self.prompt_draft_loading = false;
             self.prompt_draft = None;
             self.prompt_draft_engine = None;
+            self.prompt_draft_recovery_task = None;
+            self.prompt_draft_recovery = None;
             self.prompt_draft_assets.clear();
             self.prompt_draft_gate = Arc::new(tokio::sync::Mutex::new(Default::default()));
             self.drafts.remove("");
@@ -7249,6 +7256,7 @@ impl Composer {
             }
         }
 
+        self.resume_prompt_draft_saves(cx);
         {
             let state = self.state.read(cx);
             let now = chrono::Utc::now();
@@ -7309,6 +7317,7 @@ impl Composer {
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
+            self.cancel_prompt_draft_load();
             if self.current_key.is_empty() && !self.sending {
                 self.flush_prompt_draft(cx);
             }
@@ -7588,6 +7597,9 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, queue: bool, cx: &mut Context<Self>) {
+        if self.prompt_draft_loading {
+            return;
+        }
         if !self.check_reference_delivery(&text, cx) {
             return;
         }
@@ -7614,6 +7626,13 @@ impl Composer {
             {
                 self.failure = Some("Update the selected device's Zeron to send this draft. Your draft is preserved.".into());
                 self.failure_key = Some(String::new());
+                cx.notify();
+                return;
+            }
+        }
+        if let Some(draft) = &sending_draft {
+            if let Err(error) = self.reserve_prompt_draft_attempt(draft) {
+                self.failure = Some(format!("Couldn't preserve draft send: {error}").into());
                 cx.notify();
                 return;
             }

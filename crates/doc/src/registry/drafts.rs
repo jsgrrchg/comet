@@ -47,6 +47,13 @@ impl RegistryDoc {
         let first = self.read_drafts().first().map(|d| d.order_key.clone());
         let stamp = self.next_hlc();
         let mut index = fields([("revision", json!(draft.revision))]);
+        // A delayed recovery may publish an ancestor after its child.
+        if self.overlay_rows(REVISIONS).iter().any(|r| {
+            r.fields.get("baseRevision").and_then(Value::as_str) == Some(draft.revision.as_str())
+        }) {
+            index.remove("revision");
+        }
+
         if !self.overlay_row(DRAFTS, &draft.id).is_some_and(|r| {
             r.fields
                 .get("orderKey")
@@ -90,6 +97,19 @@ impl RegistryDoc {
             .iter()
             .filter_map(|r| r.fields.get("baseRevision").and_then(Value::as_str))
             .collect();
+        // The LWW index can name an ancestor after out-of-order publication.
+        // Select an actual head deterministically while preserving siblings.
+        let mut heads = std::collections::HashMap::<&str, &str>::new();
+        for row in &revisions {
+            if !parents.contains(row.id.as_str()) {
+                if let Some(root) = row.fields.get("draftId").and_then(Value::as_str) {
+                    heads
+                        .entry(root)
+                        .and_modify(|id| *id = (*id).max(row.id.as_str()))
+                        .or_insert(row.id.as_str());
+                }
+            }
+        }
         let mut result = Vec::new();
         for row in &revisions {
             if parents.contains(row.id.as_str()) {
@@ -112,7 +132,9 @@ impl RegistryDoc {
             let current = index
                 .as_ref()
                 .and_then(|r| r.fields.get("revision"))
-                .and_then(Value::as_str);
+                .and_then(Value::as_str)
+                .filter(|id| !parents.contains(id))
+                .or_else(|| heads.get(root).copied());
             let conflict = sent.is_some() || current != Some(row.id.as_str());
             let id = if conflict { row.id.as_str() } else { root };
             if self.draft_closed(id) {
@@ -278,6 +300,19 @@ mod tests {
         doc.publish_draft(&draft("v3", "v5", Some("v3"))).unwrap();
         assert_eq!(doc.read_drafts().len(), 3);
     }
+    #[test]
+    fn recovery_published_out_of_order_keeps_the_head_under_its_draft_identity() {
+        let mut doc = RegistryDoc::new("device");
+        doc.publish_draft(&draft("a", "r3", Some("r2"))).unwrap();
+        doc.publish_draft(&draft("a", "r1", None)).unwrap();
+        doc.publish_draft(&draft("a", "r2", Some("r1"))).unwrap();
+        let rows = doc.read_drafts();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "a");
+        assert_eq!(rows[0].revision, "r3");
+        assert!(!rows[0].conflict);
+    }
+
     #[test]
     fn delayed_move_or_save_cannot_revive_discarded_draft() {
         let mut doc = RegistryDoc::new("test");

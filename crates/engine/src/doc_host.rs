@@ -3979,6 +3979,10 @@ impl DocHost {
         // Entries this pass decided to leave alone (processed dedupe hits).
         let mut skipped: HashSet<String> = HashSet::new();
         loop {
+            if let Err(error) = handle.doc.reconcile_command_outcomes() {
+                tracing::warn!(%error, "command outcome reconciliation failed");
+                return;
+            }
             let commands = match handle.doc.read_commands() {
                 Ok(commands) => commands,
                 Err(err) => {

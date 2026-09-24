@@ -8,7 +8,7 @@ continue using their existing per-chat draft behavior.
 
 ## Persistence and synchronization
 
-- `promptDrafts` registry rows contain the selected revision, fractional
+- `promptDrafts` registry rows contain the preferred revision, fractional
   `orderKey`, and discard/send markers. Moving a draft only changes its order.
 - `draftRevisions` rows contain immutable ancestry, a short preview, target and
   creation time. Every surviving revision head is recoverable. Concurrent edits
@@ -21,6 +21,12 @@ continue using their existing per-chat draft behavior.
   uploads are cached. Offline edits are visible locally while publication retries.
 - Content and registry rooms use the authenticated user's organization/profile.
   A host going offline does not remove drafts already uploaded to Edge.
+- Desktop keeps a profile-scoped recovery outbox until the engine acknowledges a
+  save. Failed RPCs survive navigation and restart, and replay follows revision
+  ancestry. If local recovery storage fails, an in-memory copy remains retryable
+  while the application is running. Profiles cannot replay each other's requests.
+- Attachment RPCs transfer 1 MiB chunks. Loading a draft fetches its content first
+  and then its assets, avoiding oversized WebSocket frames even for large images.
 - Desktop saves after 300 ms of inactivity and flushes on navigation and normal
   application quit. iOS also flushes when entering the background.
 
@@ -36,9 +42,11 @@ Chat, command and first-message IDs are derived from the draft ID. The command i
 persisted before the draft is consumed, and replaying it does not append another
 command. Failed sends keep their draft content available.
 
-An uncertain send must be retried with the reserved revision. Reservations are
-not silently reassigned to different content. Discard is permanent and cannot be
-undone by delayed movement or publication. Immutable content and ancestry are
+An uncertain send can be retried with the reserved revision. Editing after a send
+attempt creates a new draft identity and retains the original attempt. Reservations
+are not silently reassigned to different content. Merged command copies receive
+the same terminal outcome, including copies arriving after execution. Discard is
+permanent and cannot be undone by delayed movement or publication. Immutable content and ancestry are
 retained; this version does not garbage-collect draft history or shared assets.
 
 ## Rollout and validation
@@ -51,5 +59,7 @@ This change does not deploy Edge automatically.
 Regression coverage includes dense ordering, offline move convergence, concurrent
 heads after send, durable discard, content/asset restart recovery, immutable
 retries, cross-user/org isolation in real R2, serialized claims in real SQLite,
-and preserving independent composer canvases. Native Swift tests cover registry
+preserving independent composer canvases, failure recovery across navigation,
+large attachments over real WebSocket RPC, late command duplicates, and
+out-of-order revision publication. Native Swift tests cover registry
 projection and restored Appshot context; they require Xcode to run.

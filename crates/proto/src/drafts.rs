@@ -121,3 +121,14 @@ pub enum DraftChange {
 pub fn valid_draft_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
+
+/// Every draft asset RPC stays well below the IPC WebSocket frame limit.
+pub const DRAFT_CHUNK_BYTES: usize = 1024 * 1024;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftAssetChunk {
+    pub blob: String,
+    pub data: String,
+    pub index: usize,
+    pub total_bytes: usize,
+}

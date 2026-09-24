@@ -352,8 +352,24 @@ impl WorkspaceHost {
         self.inner.draft_store.load(revision).await?;
         self.inner.draft_store.claim(id, revision).await
     }
-    pub fn save_draft_asset(&self, asset: &zeron_proto::DraftAsset) -> Result<(), EngineError> {
-        self.inner.draft_store.save_asset(asset)
+    pub fn save_draft_asset(
+        &self,
+        asset: &zeron_proto::DraftAssetChunk,
+    ) -> Result<(), EngineError> {
+        self.inner.draft_store.save_asset_chunk(asset)
+    }
+    pub async fn load_draft_asset(
+        &self,
+        blob: &str,
+        index: usize,
+    ) -> Result<zeron_proto::DraftAssetChunk, EngineError> {
+        self.inner.draft_store.load_asset_chunk(blob, index).await
+    }
+    pub async fn load_draft_content(
+        &self,
+        revision: &str,
+    ) -> Result<zeron_proto::DraftContent, EngineError> {
+        self.inner.draft_store.load_content(revision).await
     }
     pub fn watch_drafts(&self) -> watch::Receiver<zeron_proto::DraftsState> {
         self.inner.drafts_tx.subscribe()

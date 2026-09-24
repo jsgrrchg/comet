@@ -43,12 +43,16 @@ struct PromptDraftRow: Identifiable, Hashable {
 
 extension RegistryDoc {
     func promptDraftClosed(_ id: String) -> Bool { overlayRow(kind: "promptDrafts", id: id)?.fields["closed"]?.boolValue == true }
+    func promptDraftConsumed(_ id: String) -> Bool { overlayRow(kind: "promptDrafts", id: id)?.fields["sentRevision"]?.stringValue != nil }
     func publishPromptDraft(_ save: PromptDraftSave) {
         guard !promptDraftClosed(save.id), !rowExists(kind: "draftRevisions", id: save.revision) else { return }
         observePromptDraftClock(kind: "promptDrafts", id: save.id)
         if let base = save.baseRevision { observePromptDraftClock(kind: "draftRevisions", id: base) }
         let stamp = nextHlc()
         var index: [String: JSONValue] = ["revision": .string(save.revision)]
+        if overlayRows(kind: "draftRevisions").contains(where: { $0.fields["baseRevision"]?.stringValue == save.revision }) {
+            index.removeValue(forKey: "revision")
+        }
         if overlayRow(kind: "promptDrafts", id: save.id)?.fields["orderKey"]?.stringValue.map(PinOrder.valid) != true {
             guard let key = PinOrder.between(nil, promptDraftRows.first?.orderKey, nonce: stamp) else { return }
             index["orderKey"] = .string(key)
@@ -61,6 +65,10 @@ extension RegistryDoc {
     var promptDraftRows: [PromptDraftRow] {
         let versions = overlayRows(kind: "draftRevisions")
         let parents = Set(versions.compactMap { $0.fields["baseRevision"]?.stringValue })
+        var heads: [String: String] = [:]
+        for version in versions where !parents.contains(version.id) {
+            if let root = version.fields["draftId"]?.stringValue { heads[root] = max(heads[root] ?? version.id, version.id) }
+        }
         var rows = versions.compactMap { version -> PromptDraftRow? in
             guard !parents.contains(version.id), let root = version.fields["draftId"]?.stringValue, !promptDraftClosed(root),
                   let data = try? JSONEncoder().encode(version.fields["target"]),
@@ -68,9 +76,11 @@ extension RegistryDoc {
             let index = overlayRow(kind: "promptDrafts", id: root)
             let sent = index?.fields["sentRevision"]?.stringValue
             if sent == version.id { return nil }
-            let conflict = sent != nil || index?.fields["revision"]?.stringValue != version.id
+            let selected = index?.fields["revision"]?.stringValue
+            let current = selected.flatMap { parents.contains($0) ? nil : $0 } ?? heads[root]
+            let conflict = sent != nil || current != version.id
             let id = conflict ? version.id : root
-            guard !promptDraftClosed(id), let key = (overlayRow(kind: "promptDrafts", id: id) ?? index)?.fields["orderKey"]?.stringValue, PinOrder.valid(key) else { return nil }
+            guard !promptDraftClosed(id), !promptDraftConsumed(id), let key = (overlayRow(kind: "promptDrafts", id: id) ?? index)?.fields["orderKey"]?.stringValue, PinOrder.valid(key) else { return nil }
             return PromptDraftRow(id: id, revision: version.id, baseRevision: version.fields["baseRevision"]?.stringValue, createdAt: version.fields["createdAt"]?.int64Value ?? 0,
                 preview: version.fields["preview"]?.stringValue ?? "", target: target, orderKey: key, conflict: conflict)
         }
@@ -80,6 +90,11 @@ extension RegistryDoc {
             if let key = PinOrder.between(rows[i].orderKey, upper, nonce: rows[i].revision) { rows[i].orderKey = key }
         }
         return rows.sorted { $0.orderKey == $1.orderKey ? $0.id < $1.id : $0.orderKey < $1.orderKey }
+    }
+    func setPromptDraftOrder(_ id: String, key: String) {
+        guard PinOrder.valid(key) else { return }
+        observePromptDraftClock(kind: "promptDrafts", id: id)
+        write(kind: "promptDrafts", id: id, op: .upsert, set: ["orderKey": .string(key)])
     }
     func movePromptDraft(_ id: String, before: String?, after: String?) {
         guard !promptDraftClosed(id) else { return }

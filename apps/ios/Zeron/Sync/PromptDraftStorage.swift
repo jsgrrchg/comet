@@ -65,7 +65,12 @@ final class PromptDraftStorage {
             try Data().write(to: marker, options: .atomic)
         }
     }
+    func hasReservation(_ id: String) -> Bool {
+        guard let file = try? url(id) else { return false }
+        return FileManager.default.fileExists(atPath: file.appendingPathExtension("claim").path)
+    }
     func claim(id: String, revision: String) async throws {
+        try Data(revision.utf8).write(to: url(id).appendingPathExtension("claim"), options: .atomic)
         _ = try await request("registry/\(config.orgId)/draft-claim", method: "POST", body: JSONSerialization.data(withJSONObject: ["id": id, "revision": revision]))
     }
 }

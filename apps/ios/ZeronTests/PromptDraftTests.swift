@@ -40,4 +40,24 @@ final class PromptDraftTests: XCTestCase {
         XCTAssertEqual(AppshotContext.presentations(text)["pending://upload/image.png"]?.appName, "Notes & Tasks")
     }
 
+    @MainActor func testConsumingUneditedConflictHidesOnlyThatRecoveredHead() {
+        let doc = RegistryDoc(deviceId: "phone")
+        let content = PromptDraftContent(prompt: "Keep this", target: PromptDraftTarget(deviceId: "host"))
+        doc.publishPromptDraft(PromptDraftSave(id: "a", revision: "v1", createdAt: 1, content: content))
+        doc.publishPromptDraft(PromptDraftSave(id: "a", revision: "v2", baseRevision: "v1", createdAt: 1, content: content))
+        doc.publishPromptDraft(PromptDraftSave(id: "a", revision: "v3", baseRevision: "v1", createdAt: 1, content: content))
+        XCTAssertTrue(doc.promptDraftRows.contains { $0.id == "v2" })
+        doc.write(kind: "promptDrafts", id: "v2", op: .upsert, set: ["sentRevision": .string("v2")])
+        XCTAssertEqual(doc.promptDraftRows.map(\.id), ["a"])
+    }
+
+    @MainActor func testCopiedOrderObservesRemoteFutureClock() {
+        let doc = RegistryDoc(deviceId: "phone")
+        let future = "9999999999999-000001-remote"
+        _ = doc.applyRows(seq: 1, rows: [RegistryRow(kind: "promptDrafts", id: "draft", seq: 1, deleted: false,
+            fields: ["orderKey": .string("8")], clocks: ["orderKey": future])])
+        doc.setPromptDraftOrder("draft", key: "c")
+        XCTAssertEqual(doc.overlayRow(kind: "promptDrafts", id: "draft")?.fields["orderKey"]?.stringValue, "c")
+    }
+
 }

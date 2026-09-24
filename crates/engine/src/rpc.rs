@@ -1710,7 +1710,7 @@ impl RpcService for EngineRpc {
                 self.workspace.watch_drafts(),
             ))),
             methods::SAVE_DRAFT_ASSET => {
-                let asset: zeron_proto::DraftAsset = parse_params(params)?;
+                let asset: zeron_proto::DraftAssetChunk = parse_params(params)?;
                 self.workspace
                     .save_draft_asset(&asset)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
@@ -1723,6 +1723,21 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::LOAD_DRAFT_ASSET => {
+                #[derive(Deserialize)]
+                struct LoadAsset {
+                    blob: String,
+                    index: usize,
+                }
+                let p: LoadAsset = parse_params(params)?;
+                RpcReply::value(
+                    &self
+                        .workspace
+                        .load_draft_asset(&p.blob, p.index)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
             methods::LOAD_DRAFT => {
                 #[derive(Deserialize)]
                 struct Load {
@@ -1732,7 +1747,7 @@ impl RpcService for EngineRpc {
                 RpcReply::value(
                     &self
                         .workspace
-                        .load_draft(&p.revision)
+                        .load_draft_content(&p.revision)
                         .await
                         .map_err(|e| RpcError::Failed(e.to_string()))?,
                 )

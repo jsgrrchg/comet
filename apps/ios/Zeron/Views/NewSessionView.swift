@@ -18,6 +18,7 @@ struct NewSessionView: View {
     @State private var promptDraftId = UUID().uuidString.lowercased()
     @State private var promptBaseRevision: String?
     @State private var promptRevision: String?
+    @State private var promptReserved = false
     @State private var promptCreatedAt = nowMs()
     @State private var savedPromptContent: PromptDraftContent?
     @State private var saveDraftTask: Task<Void, Never>?
@@ -171,6 +172,7 @@ struct NewSessionView: View {
             }
 
             composer
+                .disabled(loadingDraft)
                 .padding(.bottom, 8)
         }
         .background(Theme.bg.ignoresSafeArea())
@@ -290,7 +292,9 @@ struct NewSessionView: View {
                     images.append(StagedAttachment(id: asset.id, name: asset.name, data: bytes, image: image))
                     if let appshot = asset.appshot { restoredAttachmentMetadata[asset.id] = appshot }
                 }
+                guard !Task.isCancelled else { return }
                 promptDraftId = row.id; promptRevision = row.revision; promptBaseRevision = row.baseRevision; promptCreatedAt = row.createdAt
+                promptReserved = workspace.draftStorage.hasReservation(row.id)
                 savedPromptContent = content; draft = content.prompt; attachments = images
                 selectedHostId = content.target.deviceId; selectedRef = content.target.branch
                 checkoutKind = content.target.newWorktree ? .newWorktree : .local
@@ -353,6 +357,11 @@ struct NewSessionView: View {
             return nil
         }
         let changed = savedPromptContent != content
+        if changed && promptReserved {
+            promptDraftId = UUID().uuidString.lowercased()
+            promptRevision = nil; promptBaseRevision = nil; promptCreatedAt = nowMs()
+            promptReserved = false
+        }
         let revision = changed ? UUID().uuidString.lowercased() : (promptRevision ?? UUID().uuidString.lowercased())
         let save = PromptDraftSave(id: promptDraftId, revision: revision, baseRevision: changed ? promptRevision : promptBaseRevision, createdAt: promptCreatedAt, content: content)
         do {
@@ -530,7 +539,7 @@ struct NewSessionView: View {
     /// CreateWorktree-before-send was the one new-chat path that could hang
     /// forever on a zombie link (the 2026-08-18 "Sending…" incident).
     private func send() {
-        guard let deviceId, canSend else { return }
+        guard let deviceId, canSend, !loadingDraft else { return }
         let space = space
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         saveDraftTask?.cancel()
@@ -542,6 +551,7 @@ struct NewSessionView: View {
                                 sandbox: "workspace-write")
         Task { @MainActor in
             if let save = promptSave, let workspace = model.workspace {
+                promptReserved = true
                 do { try await workspace.claimPromptDraft(save) }
                 catch { attachError = "Couldn't reserve draft for sending: \(error.localizedDescription)"; busy = false; return }
             }
@@ -641,7 +651,7 @@ struct NewSessionView: View {
             busy = false
             // Replace the canvas with the live session (in-place swap, no
             // back-through-canvas).
-            if path.last == .newSession(destination) || path.last == .draft(promptDraftId) {
+            if path.last == .newSession(destination) || path.last == .draft(restoringDraft?.id ?? promptDraftId) {
                 path.removeLast()
             }
             path.append(.chat(chatId))

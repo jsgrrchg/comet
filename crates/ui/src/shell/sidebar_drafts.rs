@@ -27,6 +27,14 @@ pub(super) struct PendingDraftChanges {
     queue: std::collections::VecDeque<DraftChange>,
 }
 impl Shell {
+    fn prompt_draft_row_height(&self) -> f32 {
+        if self.settings.sidebar_compact {
+            sidebar_row_height(true, false, false, false)
+        } else {
+            64.0
+        }
+    }
+
     fn finish_draft_drop(&mut self, payload: &DraftDrag, cx: &mut Context<Self>) {
         if self.active_sidebar_pin_profile_key(cx).as_ref() != Some(&payload.profile) {
             return;
@@ -224,7 +232,8 @@ impl Shell {
         } else {
             format!("Drafts ({})", rows.len()).into()
         };
-        let height = rows.len() as f32 * 64.0 + spaces::SIDEBAR_DISCLOSURE_BODY_INSET;
+        let height = rows.len() as f32 * self.prompt_draft_row_height()
+            + spaces::SIDEBAR_DISCLOSURE_BODY_INSET;
         let chevron = self.sidebar_disclosure_chevron("drafts", open, theme);
         let header = spaces::sidebar_disclosure_header(theme, label, chevron)
             .id("drafts-toggle")
@@ -264,6 +273,12 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let compact = self.settings.sidebar_compact;
+        let preview = if row.conflict {
+            format!("Recovered edit · {}", row.preview)
+        } else {
+            row.preview.clone()
+        };
         let active = self.state.read(cx).selected_chat.is_none()
             && self.composer.read(cx).active_prompt_draft() == Some(row.id.as_str());
         let label = row
@@ -301,13 +316,14 @@ impl Shell {
             cx.has_active_drag() && self.draft_drop_target.as_ref() == Some(&(id.clone(), true));
         div()
             .id(SharedString::from(format!("draft-row-{id}")))
-            .h(px(64.0))
+            .h(px(self.prompt_draft_row_height()))
             .w_full()
             .rounded(px(6.0))
             .px(px(10.0))
-            .py(px(8.0))
+            .py(px(if compact { 0.0 } else { 8.0 }))
             .flex()
             .flex_col()
+            .when(compact, |el| el.justify_center())
             .gap(px(4.0))
             .cursor_pointer()
             .bg(if active {
@@ -359,9 +375,13 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .text_color(theme.accent)
-                            .child(target),
+                            .text_size(crate::typography::ui_rems(if compact {
+                                12.0
+                            } else {
+                                11.0
+                            }))
+                            .text_color(if compact { theme.text } else { theme.accent })
+                            .child(if compact { preview.clone() } else { target }),
                     )
                     .child(
                         div()
@@ -393,17 +413,15 @@ impl Shell {
                             ),
                     ),
             )
-            .child(
-                div()
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(12.0))
-                    .text_color(theme.text)
-                    .child(if row.conflict {
-                        format!("Recovered edit · {}", row.preview)
-                    } else {
-                        row.preview
-                    }),
-            )
+            .when(!compact, |el| {
+                el.child(
+                    div()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text)
+                        .child(preview),
+                )
+            })
             .into_any_element()
     }
 }

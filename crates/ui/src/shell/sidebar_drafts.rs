@@ -308,6 +308,35 @@ impl Shell {
                 .text_color(theme.accent)
                 .into_any_element()
         };
+        let harness = self
+            .settings
+            .sidebar_show_harness
+            .then(|| row.target.config.as_ref().map(|config| config.harness))
+            .flatten();
+        let title_gap = if compact {
+            4.0
+        } else {
+            SIDEBAR_ACTIVE_HARNESS_TITLE_GAP
+        };
+        let mut title_icons = Some(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(title_gap))
+                .when_some(
+                    harness.map(crate::pickers::harness_brand_icon),
+                    |el, (path, tint)| {
+                        el.child(
+                            icon(path)
+                                .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                .flex_none()
+                                .text_color(tint.unwrap_or(theme.text_muted).opacity(0.8)),
+                        )
+                    },
+                )
+                .child(leading_icon),
+        );
         let host = self
             .state
             .read(cx)
@@ -386,8 +415,8 @@ impl Shell {
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(6.0))
-                    .child(leading_icon)
+                    .gap(px(title_gap))
+                    .when(compact, |el| el.children(title_icons.take()))
                     .child(
                         div()
                             .flex_1()
@@ -434,10 +463,19 @@ impl Shell {
             .when(!compact, |el| {
                 el.child(
                     div()
-                        .truncate()
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .text_color(theme.accent)
-                        .child(preview),
+                        .flex()
+                        .items_center()
+                        .gap(px(title_gap))
+                        .children(title_icons)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(crate::typography::ui_rems(12.0))
+                                .text_color(theme.accent)
+                                .child(preview),
+                        ),
                 )
             })
             .into_any_element()

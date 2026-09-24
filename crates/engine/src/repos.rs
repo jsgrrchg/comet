@@ -1137,11 +1137,18 @@ impl Repos {
         let path = base.join(&name);
         let branch_name = format!("zeron/{name}");
         #[cfg(windows)]
-        let git_path = windows_git_worktree_path(&path.to_string_lossy());
+        self.add_worktree_in_two_steps(repo_path, &path, &branch_name, branch)
+            .await?;
         #[cfg(not(windows))]
-        let git_path = path.to_string_lossy();
         self.git(
-            &["worktree", "add", "-b", &branch_name, &git_path, branch],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch_name,
+                &path.to_string_lossy(),
+                branch,
+            ],
             Some(repo_path),
         )
         .await?;
@@ -1153,6 +1160,101 @@ impl Repos {
             name,
             checkout_id: Some(checkout.id),
         })
+    }
+
+    /// Git's built-in checkout passes `<destination>/.git` in GIT_DIR, whose
+    /// separate PATH_MAX check still rejects long Windows destinations even
+    /// with core.longpaths enabled. Register first, then reset from the new
+    /// checkout using a short, relative GIT_DIR. Keep native add's hook and
+    /// failure semantics: incomplete checkouts are removed, hook failures
+    /// retain the populated worktree (the hook may have written user data).
+    #[cfg(any(windows, test))]
+    async fn add_worktree_in_two_steps(
+        &self,
+        repo_path: &Path,
+        path: &Path,
+        branch_name: &str,
+        base: &str,
+    ) -> Result<(), EngineError> {
+        #[cfg(windows)]
+        let git_path = windows_git_worktree_path(&path.to_string_lossy());
+        #[cfg(not(windows))]
+        let git_path = path.to_string_lossy();
+        self.git(
+            &[
+                "worktree",
+                "add",
+                "--no-checkout",
+                "-b",
+                branch_name,
+                &git_path,
+                base,
+            ],
+            Some(repo_path),
+        )
+        .await?;
+
+        let checkout = async {
+            let head = self
+                .git(
+                    &["--git-dir=.git", "rev-parse", "--verify", "HEAD"],
+                    Some(path),
+                )
+                .await?;
+            self.git(
+                &[
+                    "--git-dir=.git",
+                    "reset",
+                    "--hard",
+                    "--no-recurse-submodules",
+                ],
+                Some(path),
+            )
+            .await?;
+            Ok::<_, EngineError>(head)
+        }
+        .await;
+        let head = match checkout {
+            Ok(head) => head,
+            Err(error) => {
+                // Force is limited to the checkout this call just registered;
+                // a failed reset may have left partially written files. Like
+                // native worktree add, keep the new branch on failure.
+                if let Err(cleanup) = self
+                    .git(
+                        &["worktree", "remove", "--force", &git_path],
+                        Some(repo_path),
+                    )
+                    .await
+                {
+                    return Err(EngineError::Other(format!(
+                        "{error}; could not remove incomplete worktree {}: {cleanup}",
+                        path.display()
+                    )));
+                }
+                return Err(error);
+            }
+        };
+
+        // Match worktree add's null old OID, initial commit, and branch flag.
+        // Let Git find the configured hook and run it from the checkout, with
+        // no explicit GIT_DIR/GIT_WORK_TREE override in the hook environment.
+        let null_oid = "0".repeat(head.len());
+        self.git(
+            &[
+                "hook",
+                "run",
+                "--ignore-missing",
+                "post-checkout",
+                "--",
+                &null_oid,
+                &head,
+                "1",
+            ],
+            Some(path),
+        )
+        .await?;
+        Ok(())
     }
 
     async fn branch_exists(&self, path: &Path, branch: &str) -> bool {
@@ -2231,6 +2333,145 @@ mod tests {
     }
 
     use super::*;
+
+    async fn two_step_fixture(hook_exit: u8) -> (tempfile::TempDir, Repos, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let repos = Repos::with_worktrees_root(
+            &tmp.path().join("data"),
+            "test",
+            tmp.path().join("worktrees"),
+        );
+        repos
+            .git(&["init", "-b", "main"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "user.name", "Test"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "core.autocrlf", "false"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "user.email", "test@example.com"], Some(&repo))
+            .await
+            .unwrap();
+        std::fs::write(repo.join("README.txt"), "original checkout\n").unwrap();
+        std::fs::write(repo.join(".gitattributes"), "*.txt filter=fixture\n").unwrap();
+        std::fs::create_dir(repo.join(".githooks")).unwrap();
+        let hook = repo.join(".githooks/post-checkout");
+        std::fs::write(&hook, format!(
+            "#!/bin/sh\ntest -f README.txt || exit 42\nprintf '%s\\n' \"$1\" \"$2\" \"$3\" >> hook-arguments\nprintf ran >> hook-count\nexit {hook_exit}\n"
+        )).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        repos.git(&["add", "."], Some(&repo)).await.unwrap();
+        repos
+            .git(&["commit", "-m", "fixture"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "core.hooksPath", ".githooks"], Some(&repo))
+            .await
+            .unwrap();
+        (tmp, repos, repo)
+    }
+
+    #[tokio::test]
+    async fn two_step_worktree_runs_configured_hook_once_after_checkout() {
+        let (tmp, repos, repo) = two_step_fixture(0).await;
+        let path = tmp.path().join("new checkout");
+        repos
+            .add_worktree_in_two_steps(&repo, &path, "zeron/test", "main")
+            .await
+            .unwrap();
+        let head = repos
+            .git(&["rev-parse", "HEAD"], Some(&repo))
+            .await
+            .unwrap();
+        let arguments = std::fs::read_to_string(path.join("hook-arguments")).unwrap();
+        assert_eq!(
+            arguments.lines().collect::<Vec<_>>(),
+            ["0".repeat(head.len()), head, "1".into()]
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("hook-count")).unwrap(),
+            "ran"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("README.txt")).unwrap(),
+            "original checkout\n"
+        );
+        assert!(!repo.join("hook-count").exists());
+        assert_eq!(repos.current_branch(&repo).await.unwrap(), "main");
+        assert!(repos.refs(&repo).await.unwrap().iter().any(|entry| {
+            entry
+                .worktree_path
+                .as_ref()
+                .is_some_and(|listed| same_file::is_same_file(listed, &path).unwrap_or(false))
+        }));
+    }
+
+    #[tokio::test]
+    async fn two_step_worktree_removes_partial_checkout_when_reset_fails() {
+        let (tmp, repos, repo) = two_step_fixture(0).await;
+        repos
+            .git(&["config", "filter.fixture.smudge", "exit 1"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(&["config", "filter.fixture.required", "true"], Some(&repo))
+            .await
+            .unwrap();
+        let path = tmp.path().join("failed checkout");
+        let error = repos
+            .add_worktree_in_two_steps(&repo, &path, "zeron/failed", "main")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("smudge"), "{error}");
+        assert!(!path.exists());
+        assert!(repos.refs(&repo).await.unwrap().iter().all(|entry| {
+            entry
+                .worktree_path
+                .as_ref()
+                .is_none_or(|listed| same_file::is_same_file(listed, &repo).unwrap_or(false))
+        }));
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.txt")).unwrap(),
+            "original checkout\n"
+        );
+        assert_eq!(repos.current_branch(&repo).await.unwrap(), "main");
+    }
+
+    #[tokio::test]
+    async fn two_step_worktree_keeps_completed_checkout_when_hook_fails() {
+        let (tmp, repos, repo) = two_step_fixture(1).await;
+        let path = tmp.path().join("hook failure");
+        assert!(
+            repos
+                .add_worktree_in_two_steps(&repo, &path, "zeron/hook-failure", "main")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("hook-count")).unwrap(),
+            "ran"
+        );
+        assert!(path.join("README.txt").is_file());
+        assert!(repos.refs(&repo).await.unwrap().iter().any(|entry| {
+            entry
+                .worktree_path
+                .as_ref()
+                .is_some_and(|listed| same_file::is_same_file(listed, &path).unwrap_or(false))
+        }));
+        assert_eq!(repos.current_branch(&repo).await.unwrap(), "main");
+    }
 
     fn history_commit(sha: String, parent_sha: Option<String>) -> GitHistoryCommit {
         GitHistoryCommit {

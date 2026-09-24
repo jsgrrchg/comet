@@ -457,6 +457,11 @@ async fn worktree_location_supports_long_windows_destinations() {
     std::fs::write(repo.join("README.md"), "hello").unwrap();
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "init"]);
+    std::fs::write(
+        repo.join(".git/hooks/post-checkout"),
+        "#!/bin/sh\ntest -f README.md || exit 42\nprintf '%s\\n' \"$1\" \"$2\" \"$3\" >> hook-arguments\n",
+    )
+    .unwrap();
     let mut destination = root.join("other disk");
     while destination.to_string_lossy().encode_utf16().count() < 300 {
         destination.push("long-folder-with-spaces 日本語");
@@ -474,6 +479,20 @@ async fn worktree_location_supports_long_windows_destinations() {
         .await
         .unwrap();
     let worktree = repos.create_worktree(&repo, "main").await.unwrap();
+    let hook_arguments =
+        std::fs::read_to_string(PathBuf::from(&worktree.path).join("hook-arguments")).unwrap();
+    let head = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo)
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let head = String::from_utf8(head.stdout).unwrap().trim().to_owned();
+    assert_eq!(
+        hook_arguments.lines().collect::<Vec<_>>(),
+        ["0".repeat(head.len()), head, "1".into()]
+    );
+    assert!(!repo.join("hook-arguments").exists());
     assert_eq!(
         std::fs::read_to_string(PathBuf::from(&worktree.path).join("README.md")).unwrap(),
         "hello"

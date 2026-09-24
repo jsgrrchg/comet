@@ -1644,6 +1644,9 @@ pub struct Shell {
     pub(super) pinned_open: bool,
     pub(super) drafts_open: bool,
     draft_changes: Option<sidebar_drafts::PendingDraftChanges>,
+    draft_drop_target: Option<(String, bool)>,
+    draft_drag_scroll: Option<Task<()>>,
+    draft_drag_y: f32,
     pub(super) sessions_open: bool,
     /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
     /// (user request), session-transient. `archived_shown` pages the
@@ -2097,6 +2100,7 @@ impl Shell {
             pinned_open: true,
             drafts_open: true,
             draft_changes: None,
+            draft_drop_target: None, draft_drag_scroll: None, draft_drag_y: 0.0,
             sessions_open: true,
             archived_shown: 0,
             sidebar_collapsed_groups: std::collections::HashSet::new(),

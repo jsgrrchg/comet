@@ -3,11 +3,102 @@
 use super::*;
 use zeron_proto::{DraftChange, PromptDraft};
 
+#[derive(Clone)]
+pub(super) struct DraftDrag {
+    id: String,
+    profile: String,
+    label: String,
+}
+impl Render for DraftDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.global::<Theme>();
+        div()
+            .px(px(12.0))
+            .py(px(8.0))
+            .rounded(px(6.0))
+            .bg(theme.accent_wash)
+            .text_color(theme.accent)
+            .child(self.label.clone())
+    }
+}
+
 pub(super) struct PendingDraftChanges {
     engine: crate::state::EngineHandle,
     queue: std::collections::VecDeque<DraftChange>,
 }
 impl Shell {
+    fn finish_draft_drop(&mut self, payload: &DraftDrag, cx: &mut Context<Self>) {
+        if self.active_sidebar_pin_profile_key(cx).as_ref() != Some(&payload.profile) {
+            return;
+        }
+        let Some((anchor, after)) = self.draft_drop_target.take() else {
+            return;
+        };
+        if anchor == payload.id {
+            return;
+        }
+        let rows: Vec<_> = self
+            .visible_prompt_drafts(cx)
+            .into_iter()
+            .filter(|r| r.id != payload.id)
+            .collect();
+        let Some(index) = rows
+            .iter()
+            .position(|r| r.id == anchor)
+            .map(|i| i + usize::from(after))
+        else {
+            return;
+        };
+        self.change_prompt_draft(
+            DraftChange::Move {
+                id: payload.id.clone(),
+                before: rows.get(index).map(|r| r.id.clone()),
+                after: index.checked_sub(1).map(|i| rows[i].id.clone()),
+            },
+            cx,
+        );
+    }
+    fn scroll_draft_drag(&mut self, y: f32, cx: &mut Context<Self>) {
+        self.draft_drag_y = y;
+        if self.draft_drag_scroll.is_some() {
+            return;
+        }
+        self.draft_drag_scroll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(16))
+                    .await;
+                if !this
+                    .update(cx, |shell, cx| {
+                        if !cx.has_active_drag() {
+                            shell.draft_drag_scroll = None;
+                            shell.draft_drop_target = None;
+                            cx.notify();
+                            return false;
+                        }
+                        let bounds = shell.sidebar_scroll.bounds();
+                        let delta = spaces::pinned_drag_scroll_delta(
+                            shell.draft_drag_y,
+                            f32::from(bounds.top()),
+                            f32::from(bounds.bottom()),
+                        );
+                        let offset = shell.sidebar_scroll.offset();
+                        let next = (-f32::from(offset.y) + delta)
+                            .clamp(0.0, f32::from(shell.sidebar_scroll.max_offset().y));
+                        shell
+                            .sidebar_scroll
+                            .set_offset(gpui::point(offset.x, px(-next)));
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+            }
+        }));
+    }
+
     pub(super) fn visible_prompt_drafts(&self, cx: &App) -> Vec<PromptDraft> {
         let state = self.state.read(cx);
         let mut rows = state.prompt_drafts.drafts.clone();
@@ -194,6 +285,18 @@ impl Shell {
         let id = row.id.clone();
         let discard = row.id.clone();
         let activate = row.clone();
+        let drag = self
+            .active_sidebar_pin_profile_key(cx)
+            .map(|profile| DraftDrag {
+                id: id.clone(),
+                profile,
+                label: row.preview.clone(),
+            });
+        let over_id = id.clone();
+        let drop_above =
+            cx.has_active_drag() && self.draft_drop_target.as_ref() == Some(&(id.clone(), false));
+        let drop_below =
+            cx.has_active_drag() && self.draft_drop_target.as_ref() == Some(&(id.clone(), true));
         div()
             .id(SharedString::from(format!("draft-row-{id}")))
             .h(px(64.0))
@@ -211,6 +314,31 @@ impl Shell {
                 theme.accent_wash
             })
             .hover(|style| style.bg(theme.accent.opacity(0.1)))
+            .when(drop_above, |el| el.border_t_2().border_color(theme.accent))
+            .when(drop_below, |el| el.border_b_2().border_color(theme.accent))
+            .when_some(drag, |el, drag| {
+                el.on_drag(drag, |payload, _, _, cx| cx.new(|_| payload.clone()))
+            })
+            .on_drag_move::<DraftDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<DraftDrag>, _, cx| {
+                    if !event.bounds.contains(&event.event.position) {
+                        return;
+                    }
+                    let payload = event.drag(cx);
+                    if this.active_sidebar_pin_profile_key(cx).as_ref() != Some(&payload.profile) {
+                        return;
+                    }
+                    this.draft_drop_target = Some((
+                        over_id.clone(),
+                        event.event.position.y >= event.bounds.center().y,
+                    ));
+                    this.scroll_draft_drag(f32::from(event.event.position.y), cx);
+                    cx.notify();
+                },
+            ))
+            .on_drop::<DraftDrag>(
+                cx.listener(|this, payload, _, cx| this.finish_draft_drop(payload, cx)),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.route = Route::Chat;
                 this.composer.update(cx, |composer, cx| {

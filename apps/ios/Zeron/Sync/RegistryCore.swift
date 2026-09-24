@@ -545,7 +545,7 @@ final class RegistryDoc {
 
     // MARK: Local writes
 
-    private func nextHlc() -> Hlc {
+    func nextHlc() -> Hlc {
         clock.next(nowMs: nowMs(), device: deviceId)
     }
 

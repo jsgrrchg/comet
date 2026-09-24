@@ -5,6 +5,7 @@
 // carries the agent/model chip, and sending mints the chat, queues the first
 // run, and swaps straight into the live session.
 
+import CryptoKit
 import PhotosUI
 import SwiftUI
 
@@ -12,6 +13,17 @@ struct NewSessionView: View {
     @Environment(AppModel.self) private var model
     let destination: NewSessionDestination
     @Binding var path: [Route]
+    var restoringDraft: PromptDraftRow? = nil
+    @State private var promptDraftId = UUID().uuidString.lowercased()
+    @State private var promptBaseRevision: String?
+    @State private var promptRevision: String?
+    @State private var promptCreatedAt = nowMs()
+    @State private var savedPromptContent: PromptDraftContent?
+    @State private var saveDraftTask: Task<Void, Never>?
+    @State private var loadingDraft = false
+    @State private var submittedDraft = false
+    @State private var restoredAttachmentMetadata: [String: JSONValue] = [:]
+
 
     // Sticky run config (the old app persisted these to prefs.db).
     @AppStorage("newSessionHarness") private var harness = "claude-code"
@@ -264,6 +276,42 @@ struct NewSessionView: View {
             guard !items.isEmpty else { return }
             stage(items)
         }
+        .task {
+            guard let row = restoringDraft, savedPromptContent == nil, let workspace = model.workspace else { return }
+            loadingDraft = true
+            defer { loadingDraft = false }
+            do {
+                let content = try await workspace.draftStorage.load(row.revision)
+                var images: [StagedAttachment] = []
+                for asset in content.attachments {
+                    let bytes = try await workspace.draftStorage.object(asset.blob)
+                    guard let image = UIImage(data: bytes) else { throw CocoaError(.fileReadCorruptFile) }
+                    images.append(StagedAttachment(id: asset.id, name: asset.name, data: bytes, image: image))
+                    if let appshot = asset.appshot { restoredAttachmentMetadata[asset.id] = appshot }
+                }
+                promptDraftId = row.id; promptRevision = row.revision; promptBaseRevision = row.baseRevision; promptCreatedAt = row.createdAt
+                savedPromptContent = content; draft = content.prompt; attachments = images
+                selectedHostId = content.target.deviceId; selectedRef = content.target.branch
+                checkoutKind = content.target.newWorktree ? .newWorktree : .local
+                if let config = content.target.config {
+                    harness = config.harness; storedModel = config.model ?? ""; storedReasoning = config.reasoning ?? ""
+                    optionSelections = config.modelOptions.compactMapValues(\.stringValue)
+                }
+            } catch { attachError = "Couldn't open draft: \(error.localizedDescription)" }
+        }
+        .onChange(of: promptDraftFingerprint) { _, _ in
+            guard !loadingDraft, !busy, !submittedDraft else { return }
+            saveDraftTask?.cancel()
+            saveDraftTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                guard !Task.isCancelled else { return }
+                _ = persistPromptDraft()
+            }
+        }
+        .onDisappear {
+            saveDraftTask?.cancel()
+            if !loadingDraft && !submittedDraft { _ = persistPromptDraft() }
+        }
         .onAppear {
             focused = true
             if model.launchAutosend {
@@ -275,6 +323,35 @@ struct NewSessionView: View {
                 }
             }
         }
+    }
+
+    private var promptDraftFingerprint: String {
+        [draft, harness, storedModel, storedReasoning, selectedRef ?? "", deviceId ?? "", String(describing: checkoutKind),
+         attachments.map(\.id).joined(), optionSelections.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined()].joined(separator: "|")
+    }
+    @discardableResult private func persistPromptDraft() -> PromptDraftSave? {
+        guard !loadingDraft, !submittedDraft, let workspace = model.workspace, let deviceId else { return nil }
+        var assets: [String: Data] = [:]
+        let refs = attachments.map { image -> PromptDraftAttachment in
+            let hash = SHA256.hash(data: image.data).map { String(format: "%02x", $0) }.joined()
+            assets[hash] = image.data
+            return PromptDraftAttachment(id: image.id, name: image.name, blob: hash, appshot: restoredAttachmentMetadata[image.id])
+        }
+        let target = PromptDraftTarget(deviceId: deviceId, spaceId: space?.id, projectName: space?.displayName,
+            config: ChatConfig(harness: harness, model: selectedModel.id, reasoning: reasoning, modelOptions: resolvedModelOptions, sandbox: "workspace-write"),
+            branch: selectedRef, newWorktree: checkoutKind == .newWorktree)
+        let content = PromptDraftContent(prompt: draft, target: target, attachments: refs)
+        guard content.hasContent else {
+            if promptRevision != nil { workspace.discardPromptDraft(promptDraftId); promptDraftId = UUID().uuidString.lowercased(); promptRevision = nil; savedPromptContent = nil }
+            return nil
+        }
+        let changed = savedPromptContent != content
+        let revision = changed ? UUID().uuidString.lowercased() : (promptRevision ?? UUID().uuidString.lowercased())
+        let save = PromptDraftSave(id: promptDraftId, revision: revision, baseRevision: changed ? promptRevision : promptBaseRevision, createdAt: promptCreatedAt, content: content)
+        do {
+            if changed { try workspace.stagePromptDraft(save, assets: assets); promptBaseRevision = save.baseRevision; promptRevision = revision; savedPromptContent = content }
+            return save
+        } catch { attachError = "Couldn't save draft: \(error.localizedDescription)"; return nil }
     }
 
     // MARK: Composer
@@ -449,11 +526,18 @@ struct NewSessionView: View {
         guard let deviceId, canSend else { return }
         let space = space
         let prompt = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        saveDraftTask?.cancel()
+        let promptSave = persistPromptDraft()
+        if model.demo == nil && promptSave == nil { return }
         busy = true
         let config = ChatConfig(harness: harness, model: selectedModel.id,
                                 reasoning: reasoning, modelOptions: resolvedModelOptions,
                                 sandbox: "workspace-write")
         Task { @MainActor in
+            if let save = promptSave, let workspace = model.workspace {
+                do { try await workspace.claimPromptDraft(save) }
+                catch { attachError = "Couldn't reserve draft for sending: \(error.localizedDescription)"; busy = false; return }
+            }
             var cwd: String?
             let branch = space == nil ? nil : selectedRef
             var worktree: WorktreeSpec?
@@ -502,9 +586,9 @@ struct NewSessionView: View {
 
             let createdId: String?
             if let space {
-                createdId = model.createChat(space: space, config: config, branch: branch, cwd: cwd)
+                createdId = model.createChat(space: space, config: config, branch: branch, cwd: cwd, draftId: promptSave?.id)
             } else {
-                createdId = model.createProjectlessChat(deviceId: deviceId, config: config)
+                createdId = model.createProjectlessChat(deviceId: deviceId, config: config, draftId: promptSave?.id)
             }
             guard let chatId = createdId,
                   let chat = model.chat(id: chatId),
@@ -527,19 +611,24 @@ struct NewSessionView: View {
                         name: att.name, data: att.data)
                 }
                 store.sendWithTransfers(prompt: prompt, chat: chat, live: false,
-                                        transfers: transfers, worktree: worktree)
+                                        transfers: transfers, worktree: worktree, draftId: promptSave?.id)
             } else {
                 store.sendRun(prompt: legacyPaths.isEmpty ? prompt
                                   : withAttachments(text: prompt, paths: legacyPaths),
-                              chat: chat, attachments: legacyPaths, worktree: worktree)
+                              chat: chat, attachments: legacyPaths, worktree: worktree, draftId: promptSave?.id)
             }
+            if let save = promptSave {
+                guard await store.flushToDiskAsync() else { attachError = "Couldn't persist the send. Your draft is preserved."; busy = false; return }
+                model.workspace?.discardPromptDraft(save.id)
+            }
+            submittedDraft = true
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             draft = ""
             attachments = []
             busy = false
             // Replace the canvas with the live session (in-place swap, no
             // back-through-canvas).
-            if path.last == .newSession(destination) {
+            if path.last == .newSession(destination) || path.last == .draft(promptDraftId) {
                 path.removeLast()
             }
             path.append(.chat(chatId))

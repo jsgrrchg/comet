@@ -268,6 +268,9 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
             // the last one stopped. Attempt count bounds a flapping link;
             // the ChatClient's own deadline bounds wall clock.
             for _attempt in 0..4 {
+                let _permit = zeron_sync::budget::shared()
+                    .http(zeron_sync::budget::Priority::Background)
+                    .await?;
                 let bearer = edge.bearer().await.map_err(SyncError::from)?;
                 let mut req = http
                     .get(&url)
@@ -380,6 +383,9 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
         let url = self.rows_url();
         let device = self.device_id.clone();
         Box::pin(async move {
+            let _permit = zeron_sync::budget::shared()
+                .http(zeron_sync::budget::Priority::Interactive)
+                .await?;
             let bearer = edge.bearer().await.map_err(SyncError::from)?;
             let res = http
                 .get(&url)
@@ -412,6 +418,9 @@ impl zeron_sync::chat_client::ChatTransport for EdgeChatTransport {
         let url = self.rows_url();
         let device = self.device_id.clone();
         Box::pin(async move {
+            let _permit = zeron_sync::budget::shared()
+                .http(zeron_sync::budget::Priority::Interactive)
+                .await?;
             let bearer = edge.bearer().await.map_err(SyncError::from)?;
             let res = http
                 .post(&url)

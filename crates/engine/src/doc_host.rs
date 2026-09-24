@@ -545,6 +545,8 @@ pub struct ChatDocHandle {
     /// registry names roomGen 2 for this chat and the join resolves.
     chat2: Mutex<Option<zeron_sync::ChatClient>>,
     sync_started: AtomicBool,
+    sync_requested: AtomicBool,
+    sync_last_started: AtomicI64,
     pub(crate) persistence: Option<Arc<crate::chat_persistence::ChatPersistence>>,
     /// Local commits made before the relay connects (the dial can take up
     /// to a minute; offline, forever): buffered here by the subscription
@@ -751,7 +753,7 @@ impl ChatDocHandle {
 
 impl DocHost {
     pub fn new(store: Arc<DocsStore>, config: DocHostConfig) -> Self {
-        Self {
+        let host = Self {
             inner: Arc::new(DocHostInner {
                 store,
                 config,
@@ -775,13 +777,19 @@ impl DocHost {
                 executing: Mutex::new(HashSet::new()),
                 links: OnceLock::new(),
                 http: reqwest::Client::builder()
+                    .pool_max_idle_per_host(2)
+                    .pool_idle_timeout(std::time::Duration::from_secs(10))
                     .connect_timeout(std::time::Duration::from_secs(15))
                     .read_timeout(std::time::Duration::from_secs(30))
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new()),
             }),
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            host.spawn_sync_scheduler();
         }
+        host
     }
 
     /// Every background task rides the tracker, raced against the shutdown
@@ -1363,6 +1371,8 @@ impl DocHost {
             checkpointing: Arc::new(AtomicBool::new(false)),
             chat2: Mutex::new(None),
             sync_started: AtomicBool::new(false),
+            sync_requested: AtomicBool::new(false),
+            sync_last_started: AtomicI64::new(0),
             persistence,
             chat2_pending_local: Mutex::new(Vec::new()),
             publication_failed: AtomicBool::new(false),
@@ -1451,20 +1461,75 @@ impl DocHost {
     /// Connection lifetime is independent of the document and its outbox.
     /// Concurrent callers activate at most one supervisor for this handle.
     pub fn activate_sync(&self, handle: &Arc<ChatDocHandle>) {
-        let Some(edge) = self.inner.config.edge.clone() else {
-            return;
-        };
-        if self.inner.edge_disconnected.load(Ordering::Acquire)
-            || handle.sync_started.swap(true, Ordering::AcqRel)
+        if self.inner.config.edge.is_some() && !self.inner.edge_disconnected.load(Ordering::Acquire)
         {
-            return;
+            handle.sync_requested.store(true, Ordering::Release);
         }
-        if handle.room_gen >= 2 {
-            let cursor = handle.persistence.as_ref().map_or(0, |p| p.cursor());
-            self.spawn_chat2_join(edge, handle, cursor);
-        } else if self.is_host(&handle.chat_id) {
-            self.spawn_chat2_seed_when_quiet(edge, &handle.chat_id, handle);
-        }
+    }
+
+    /// One dispatcher per host; waiting chats are flags on existing handles,
+    /// never a spawned task per connection request. Oldest service wins within
+    /// each class, with one background admission every four selections.
+    fn spawn_sync_scheduler(&self) {
+        let weak = Arc::downgrade(&self.inner);
+        self.spawn_worker(async move {
+            let mut turn = 0u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let Some(inner) = weak.upgrade() else { return };
+                let host = Self { inner };
+                if host.inner.edge_disconnected.load(Ordering::Acquire) {
+                    continue;
+                }
+                let Some(edge) = host.inner.config.edge.clone() else {
+                    continue;
+                };
+                let handles: Vec<_> = lock(&host.inner.handles).values().cloned().collect();
+                let running = handles
+                    .iter()
+                    .filter(|h| h.sync_started.load(Ordering::Acquire))
+                    .count();
+                // Leave half the socket budget available during overlap/teardown
+                // and for another live profile while one is being retired.
+                let available = 12usize.saturating_sub(running);
+                let mut waiting: Vec<_> = handles
+                    .into_iter()
+                    .filter(|h| {
+                        h.sync_requested.load(Ordering::Acquire)
+                            && !h.sync_started.load(Ordering::Acquire)
+                    })
+                    .collect();
+                for _ in 0..available.min(4) {
+                    turn += 1;
+                    waiting.sort_by_key(|h| {
+                        let background = h.messages_tx.receiver_count() == 0;
+                        (
+                            if turn % 4 == 0 {
+                                !background
+                            } else {
+                                background
+                            },
+                            h.sync_last_started.load(Ordering::Relaxed),
+                            h.chat_id.clone(),
+                        )
+                    });
+                    if waiting.is_empty() {
+                        break;
+                    }
+                    let handle = waiting.remove(0);
+                    if handle.sync_started.swap(true, Ordering::AcqRel) {
+                        continue;
+                    }
+                    handle.sync_last_started.store(now_ms(), Ordering::Release);
+                    if handle.room_gen >= 2 {
+                        let cursor = handle.persistence.as_ref().map_or(0, |p| p.cursor());
+                        host.spawn_chat2_join(edge.clone(), &handle, cursor);
+                    } else if host.is_host(&handle.chat_id) {
+                        host.spawn_chat2_seed_when_quiet(edge.clone(), &handle.chat_id, &handle);
+                    }
+                }
+            }
+        });
     }
 
     /// chat2 relay join (docs/chat2-sync.md C3): deadline on every dial,
@@ -1825,6 +1890,10 @@ impl DocHost {
             edge.url.trim_end_matches('/'),
             chat_id
         );
+        let _permit = zeron_sync::budget::shared()
+            .http(zeron_sync::budget::Priority::Background)
+            .await
+            .map_err(|e| e.to_string())?;
         let res = self
             .inner
             .http
@@ -2086,6 +2155,12 @@ impl DocHost {
                     edge_tail.url.trim_end_matches('/'),
                     chat
                 );
+                let Ok(_permit) = zeron_sync::budget::shared()
+                    .http(zeron_sync::budget::Priority::Background)
+                    .await
+                else {
+                    return;
+                };
                 let _ = http
                     .put(&url)
                     .bearer_auth(&bearer)
@@ -2163,6 +2238,10 @@ impl DocHost {
                 chat_id,
                 seq_covered
             );
+            let Ok(_permit) = zeron_sync::budget::shared().http(zeron_sync::budget::Priority::Background).await else {
+                in_flight.store(false, Ordering::Release);
+                return;
+            };
             let size = snapshot.len() as u64;
             match http
                 .post(&url)
@@ -5182,6 +5261,30 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
 mod publication_eviction_tests {
     use super::*;
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opening_many_chats_bounds_active_clients() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "host".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
+            },
+        );
+        for i in 0..300 {
+            host.open(&format!("chat-{i}")).unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let running = lock(&host.inner.handles)
+            .values()
+            .filter(|h| h.sync_started.load(Ordering::Acquire))
+            .count();
+        assert!(running > 0 && running <= 12, "active clients: {running}");
+        host.shutdown_workers().await;
+    }
+
     #[tokio::test]
     async fn local_open_journals_without_starting_sync_and_reuses_the_document() {
         let dir = tempfile::tempdir().unwrap();
@@ -5208,7 +5311,7 @@ mod publication_eviction_tests {
         assert!(lock(&handle.chat2_pending_local).is_empty());
         let same = host.open("local").unwrap();
         assert!(Arc::ptr_eq(&handle, &same));
-        assert!(handle.sync_started.load(Ordering::Acquire));
+        assert!(handle.sync_requested.load(Ordering::Acquire));
         host.shutdown_workers().await;
     }
 

@@ -234,22 +234,23 @@ impl BinConnector for WsBinConnector {
     fn connect(&self) -> BoxFuture<'static, Result<BinPipe, SyncError>> {
         let provider = self.url.clone();
         Box::pin(async move {
+            let socket_permit = crate::budget::shared().socket().await?;
+            let dial_permit = crate::budget::shared().dial().await?;
             let url = provider.url().await?;
             let ws = crate::dial::connect_ws(&url)
                 .await
                 .map_err(|e| SyncError::WebSocket(e.to_string()))?;
+            drop(dial_permit);
             let (out_tx, out_rx) = mpsc::channel(64);
             let (in_tx, in_rx) = mpsc::channel(64);
-            tokio::spawn(crate::socket::pump(
-                ws,
-                out_rx,
-                in_tx,
-                WsMessage::Binary,
-                |frame| match frame {
+            tokio::spawn(async move {
+                let _socket_permit = socket_permit;
+                crate::socket::pump(ws, out_rx, in_tx, WsMessage::Binary, |frame| match frame {
                     WsMessage::Binary(bytes) => Some(bytes),
                     _ => None,
-                },
-            ));
+                })
+                .await;
+            });
             Ok(BinPipe {
                 tx: out_tx,
                 rx: in_rx,

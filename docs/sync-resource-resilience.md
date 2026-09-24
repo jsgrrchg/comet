@@ -14,6 +14,15 @@ recovery sources, not evidence the adopted chat2 transcript is healthy. A real
 candidate waits for catch-up and rechecks under the command/import locks. Failed
 recoveries retry from durable metadata.
 
+Before reserving a slot, the dispatcher selects an operation using the opened
+document's effective generation and current registry ownership. Modern chats
+join normally; only the owning host seeds a legacy chat. Wakes for an explicitly
+foreign legacy chat retire by captured version without touching outgoing batches
+or consuming a slot. A missing registry row still represents a possible new chat,
+and a local chat2 epoch still overrides stale legacy registry metadata. A modern
+registry row overtaking an old handle defers admission until cutover replaces it,
+without retiring its wake.
+
 A single dispatcher per host admits at most 12 clients, up to four per 100 ms tick.
 It gives a background selection one in every four admissions, with oldest-service
 ordering within each class. The disk backlog is paged by chat ID, rather than
@@ -115,3 +124,10 @@ checkpoint rejection, constructor/shutdown cancellation and the view-attachment
 race. Loopback lifecycle tests hold twelve valid checkpoints beyond the idle
 grace, verify durable snapshots after release, and admit an unrelated chat while
 a renewed wake closes a peer stalled before ROWS_DONE.
+
+Admission regressions also queue twelve foreign legacy wakes (including missing
+room-generation metadata), assert prompt interactive admission and receipt
+retirement, then repeat the wake burst. Controls cover a wake preceding its
+registry row, modern non-host readers, a local epoch overriding stale registry
+metadata, host reassignment while waiting, version-fenced retirement, and
+preservation of pending outbox bytes.

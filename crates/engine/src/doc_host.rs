@@ -75,6 +75,12 @@ const SYNC_QUANTUM_MS: i64 = 30_000;
 const ACTIVE_SYNC_CAP: usize = 12;
 const SYNC_ADMISSION_BATCH: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncAdmission {
+    Join,
+    Seed,
+}
+
 /// Queued-attachment transfer pacing: chunk pushes are bounded per call (a
 /// stalled-but-open relay link never fails on its own) and a timeout marks
 /// the link suspect; attempts retry on this backoff, cut short by the online
@@ -1517,6 +1523,43 @@ impl DocHost {
         }
     }
 
+    /// Resolve an actual operation before reserving a client slot. Generation
+    /// comes from the opened handle, including the local epoch override; an
+    /// absent registry row is still the legitimate born-chat2 race.
+    fn prepare_sync_admission(
+        &self,
+        handle: &ChatDocHandle,
+        wake_version: Option<i64>,
+    ) -> Result<Option<SyncAdmission>, EngineError> {
+        if handle.room_gen >= 2 {
+            return Ok(Some(SyncAdmission::Join));
+        }
+        let row = match self.workspace() {
+            Some(workspace) => workspace.chat(&handle.chat_id)?,
+            None => None,
+        };
+        match row {
+            None => Ok(Some(SyncAdmission::Seed)),
+            Some(row) if row.device_id == self.inner.config.device_id => {
+                Ok(Some(SyncAdmission::Seed))
+            }
+            Some(row) if row.room_gen.unwrap_or(1) < 2 => {
+                // Only retire the receipt examined before this decision. A
+                // newer wake must survive, and outgoing updates are untouched.
+                if let Some(version) = wake_version {
+                    self.inner
+                        .store
+                        .complete_sync_job(&handle.chat_id, "wake", version)?;
+                }
+                handle.sync_requested.store(false, Ordering::Release);
+                Ok(None)
+            }
+            // Registry cutover overtook a pinned legacy handle. Let the
+            // cutover watcher replace it; do not lose its pending work.
+            Some(_) => Ok(None),
+        }
+    }
+
     /// One dispatcher per host; waiting chats are flags on existing handles,
     /// never a spawned task per connection request. Oldest service wins within
     /// each class, with one background admission every four selections.
@@ -1700,11 +1743,13 @@ impl DocHost {
                         }
                     }
                 }
-                for _ in 0..if disk_healthy {
+                let admission_limit = if disk_healthy {
                     available.min(SYNC_ADMISSION_BATCH)
                 } else {
                     0
-                } {
+                };
+                let mut admitted = 0;
+                while admitted < admission_limit && !waiting.is_empty() {
                     turn += 1;
                     waiting.sort_by_key(|h| {
                         let background = h.messages_tx.receiver_count() == 0;
@@ -1718,28 +1763,37 @@ impl DocHost {
                             h.chat_id.clone(),
                         )
                     });
-                    if waiting.is_empty() {
-                        break;
-                    }
                     let handle = waiting.remove(0);
+                    // Capture before deciding eligibility, including retirement.
+                    let wake_version = match host.inner.store.sync_job_version(&handle.chat_id, "wake") {
+                        Ok(version) => version,
+                        Err(error) => {
+                            tracing::warn!(chat = %handle.chat_id, %error, "sync admission deferred: wake read failed");
+                            continue;
+                        }
+                    };
+                    let action = match host.prepare_sync_admission(&handle, wake_version) {
+                        Ok(Some(action)) => action,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            tracing::warn!(chat = %handle.chat_id, %error, "sync admission eligibility deferred");
+                            continue;
+                        }
+                    };
                     if handle.sync_started.swap(true, Ordering::AcqRel) {
                         continue;
                     }
+                    admitted += 1;
                     handle.sync_last_started.store(now_ms(), Ordering::Release);
-                    handle.sync_wake_version.store(
-                        host.inner
-                            .store
-                            .sync_job_version(&handle.chat_id, "wake")
-                            .ok()
-                            .flatten()
-                            .unwrap_or(0),
-                        Ordering::Release,
-                    );
-                    if handle.room_gen >= 2 {
-                        let cursor = handle.persistence.as_ref().map_or(0, |p| p.cursor());
-                        host.spawn_chat2_join(edge.clone(), &handle, cursor);
-                    } else if host.is_host(&handle.chat_id) {
-                        host.spawn_chat2_seed_when_quiet(edge.clone(), &handle.chat_id, &handle);
+                    handle.sync_wake_version.store(wake_version.unwrap_or(0), Ordering::Release);
+                    match action {
+                        SyncAdmission::Join => {
+                            let cursor = handle.persistence.as_ref().map_or(0, |p| p.cursor());
+                            host.spawn_chat2_join(edge.clone(), &handle, cursor);
+                        }
+                        SyncAdmission::Seed => {
+                            host.spawn_chat2_seed_when_quiet(edge.clone(), &handle.chat_id, &handle);
+                        }
                     }
                 }
                 drop(waiting);

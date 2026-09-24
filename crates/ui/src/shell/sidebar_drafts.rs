@@ -279,8 +279,6 @@ impl Shell {
         } else {
             row.preview.clone()
         };
-        let active = self.state.read(cx).selected_chat.is_none()
-            && self.composer.read(cx).active_prompt_draft() == Some(row.id.as_str());
         let label = row
             .target
             .project_name
@@ -326,12 +324,7 @@ impl Shell {
             .when(compact, |el| el.justify_center())
             .gap(px(4.0))
             .cursor_pointer()
-            .bg(if active {
-                theme.accent.opacity(0.14)
-            } else {
-                theme.accent_wash
-            })
-            .hover(|style| style.bg(theme.accent.opacity(0.1)))
+            .hover(|style| style.bg(theme.glass_hover()))
             .when(drop_above, |el| el.border_t_2().border_color(theme.accent))
             .when(drop_below, |el| el.border_b_2().border_color(theme.accent))
             .when_some(drag, |el, drag| {
@@ -380,7 +373,7 @@ impl Shell {
                             } else {
                                 11.0
                             }))
-                            .text_color(if compact { theme.text } else { theme.accent })
+                            .text_color(theme.accent)
                             .child(if compact { preview.clone() } else { target }),
                     )
                     .child(
@@ -418,7 +411,7 @@ impl Shell {
                     div()
                         .truncate()
                         .text_size(crate::typography::ui_rems(12.0))
-                        .text_color(theme.text)
+                        .text_color(theme.accent)
                         .child(preview),
                 )
             })

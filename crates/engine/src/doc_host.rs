@@ -72,6 +72,8 @@ const DOC_RESIDENT_FLOOR_BYTES: usize = 512 * 1024;
 /// handles and explicit writers protect the open-to-subscribe handoff.
 const SYNC_IDLE_MS: i64 = 10_000;
 const SYNC_QUANTUM_MS: i64 = 30_000;
+const ACTIVE_SYNC_CAP: usize = 12;
+const SYNC_ADMISSION_BATCH: usize = 4;
 
 /// Queued-attachment transfer pacing: chunk pushes are bounded per call (a
 /// stalled-but-open relay link never fails on its own) and a timeout marks
@@ -545,6 +547,7 @@ pub struct ChatDocHandle {
     chat2: Mutex<Option<zeron_sync::ChatClient>>,
     sync_started: AtomicBool,
     sync_requested: AtomicBool,
+    sync_background: AtomicBool,
     sync_last_started: AtomicI64,
     sync_wake_version: AtomicI64,
     sync_cancel: Mutex<CancellationToken>,
@@ -1163,7 +1166,7 @@ impl DocHost {
     }
 
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
-    /// start the change-driven task, and join the edge room when configured.
+    /// start the change-driven task, and request budgeted sync when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
         let handle = self.open_local(chat_id)?;
         self.activate_sync(&handle);
@@ -1412,6 +1415,7 @@ impl DocHost {
             chat2: Mutex::new(None),
             sync_started: AtomicBool::new(false),
             sync_requested: AtomicBool::new(false),
+            sync_background: AtomicBool::new(false),
             sync_last_started: AtomicI64::new(0),
             sync_wake_version: AtomicI64::new(0),
             sync_cancel: Mutex::new(CancellationToken::new()),
@@ -1506,6 +1510,7 @@ impl DocHost {
     }
 
     pub fn activate_sync(&self, handle: &Arc<ChatDocHandle>) {
+        handle.sync_background.store(false, Ordering::Release);
         if self.inner.config.edge.is_some() && !self.inner.edge_disconnected.load(Ordering::Acquire)
         {
             handle.sync_requested.store(true, Ordering::Release);
@@ -1600,24 +1605,27 @@ impl DocHost {
                         handle.sync_requested.store(true, Ordering::Release);
                         continue;
                     }
-                    if captured != 0 && lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up())
+                    if captured != 0
+                        && lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up())
+                        && host.wakeup_is_durable(handle)
                     {
                         let _ =
                             host.inner
                                 .store
                                 .complete_sync_job(&handle.chat_id, "wake", captured);
                     }
+                    let caught_up = lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up());
                     let idle = handle.messages_tx.receiver_count() == 0
                         && handle.queue_tx.receiver_count() == 0
                         && handle.writers.load(Ordering::Acquire) == 0
-                        && now_ms() - handle.last_access.load(Ordering::Relaxed) >= SYNC_IDLE_MS
+                        && (now_ms() - handle.last_access.load(Ordering::Relaxed) >= SYNC_IDLE_MS
+                            || (handle.sync_background.load(Ordering::Acquire) && caught_up))
                         && !host
                             .inner
                             .store
                             .has_pending_chat_updates(&handle.chat_id)
                             .unwrap_or(true);
                     let age = now_ms() - handle.sync_last_started.load(Ordering::Relaxed);
-                    let caught_up = lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up());
                     let rotate =
                         waiting_exists && age >= SYNC_QUANTUM_MS && (caught_up || age >= 300_000);
                     if idle || rotate {
@@ -1633,7 +1641,7 @@ impl DocHost {
                     .count();
                 // Leave half the socket budget available during overlap/teardown
                 // and for another live profile while one is being retired.
-                let available = 12usize.saturating_sub(running);
+                let available = ACTIVE_SYNC_CAP.saturating_sub(running);
                 let mut waiting: Vec<_> = handles
                     .into_iter()
                     .filter(|h| {
@@ -1647,13 +1655,17 @@ impl DocHost {
                     .values()
                     .any(|h| h.publication_failed.load(Ordering::Acquire));
                 if disk_healthy {
-                    for id in durable.into_iter().take(available.min(4)) {
+                    for id in durable
+                        .into_iter()
+                        .take(available.min(SYNC_ADMISSION_BATCH))
+                    {
                         disk_cursor = id.clone();
                         if waiting.iter().any(|h| h.chat_id == id) {
                             continue;
                         }
                         match host.open_local(&id) {
                             Ok(handle) if !handle.sync_started.load(Ordering::Acquire) => {
+                                handle.sync_background.store(true, Ordering::Release);
                                 handle.sync_requested.store(true, Ordering::Release);
                                 waiting.push(handle);
                             }
@@ -1664,7 +1676,11 @@ impl DocHost {
                         }
                     }
                 }
-                for _ in 0..available.min(4) {
+                for _ in 0..if disk_healthy {
+                    available.min(SYNC_ADMISSION_BATCH)
+                } else {
+                    0
+                } {
                     turn += 1;
                     waiting.sort_by_key(|h| {
                         let background = h.messages_tx.receiver_count() == 0;
@@ -1717,6 +1733,27 @@ impl DocHost {
         handle.sync_started.store(false, Ordering::Release);
     }
 
+    /// Catch-up alone is not a durable handoff: a crash before the snapshot
+    /// debounce/command drain would otherwise lose the only discovery receipt.
+    fn wakeup_is_durable(&self, handle: &ChatDocHandle) -> bool {
+        if handle.publication_failed.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.is_host(&handle.chat_id) {
+            let Ok(commands) = handle.doc.read_commands() else {
+                return false;
+            };
+            if commands.iter().any(|c| {
+                c.status == SessionCommandStatus::Pending
+                    && !self.inner.store.is_processed(&c.id).unwrap_or(false)
+            }) {
+                return false;
+            }
+        }
+        self.save_snapshot(handle);
+        handle.persistence.as_ref().is_some_and(|p| p.is_clean())
+    }
+
     fn spawn_sync_worker(
         &self,
         cancel: CancellationToken,
@@ -1727,13 +1764,16 @@ impl DocHost {
         });
     }
 
-    /// chat2 relay join (docs/chat2-sync.md C3): deadline on every dial,
-    /// capped jittered backoff, wake redial — and the client resolves only
-    /// after full catch-up (checkpoint + rows), so "joined" here means
-    /// "transcript converged".
+    /// Install a supervised chat2 client. Construction is local-first; only
+    /// caught_up() proves the checkpoint and row replay actually completed.
     fn spawn_chat2_join(&self, edge: EdgeConfig, handle: &Arc<ChatDocHandle>, cursor: u64) {
         let cancel = CancellationToken::new();
         *lock(&handle.sync_cancel) = cancel.clone();
+        let priority = if handle.sync_background.load(Ordering::Acquire) {
+            zeron_sync::budget::Priority::Background
+        } else {
+            zeron_sync::budget::Priority::Interactive
+        };
         let chat = handle.chat_id.clone();
         let doc = handle.doc.clone();
         let store = self.inner.store.clone();
@@ -1753,7 +1793,7 @@ impl DocHost {
                 http,
                 edge.clone(),
                 chat.clone(),
-            ));
+            ).with_priority(priority));
             let url = edge.room_url(format!("/chat2/{chat}/ws"));
             let mut wake = zeron_sync::wake::subscribe();
             // Sibling-dial successes end a backoff wait immediately, exactly
@@ -1779,7 +1819,7 @@ impl DocHost {
                     edge.clone(),
                     chat.clone(),
                     device.clone(),
-                ));
+                ).with_priority(priority));
                 let dial = tokio::time::timeout(
                     std::time::Duration::from_secs(60),
                     zeron_sync::ChatClient::connect_via_transport(
@@ -1823,7 +1863,7 @@ impl DocHost {
                             }
                             *client_slot = Some(client);
                         }
-                        tracing::info!(chat = %chat, "chat2 room joined (converged)");
+                        tracing::info!(chat = %chat, "chat2 client admitted (catch-up pending)");
                         // A missed event, failed POST or actor restart must not
                         // forget rejected operations. Any author can checkpoint
                         // its own durable history, including a non-host desktop.
@@ -2597,6 +2637,9 @@ impl DocHost {
     }
 
     fn pinned(&self, handle: &Arc<ChatDocHandle>) -> bool {
+        if handle.sync_started.load(Ordering::Acquire) {
+            return true;
+        }
         // Durable batches may outlive this handle. Only failed disk writes
         // require retaining the in-memory copy until persistence recovers.
         if handle.publication_failed.load(Ordering::Acquire) {
@@ -2763,6 +2806,7 @@ impl DocHost {
                 let stats = stats.unwrap_or_default();
                 let connected = !grace.degraded(GraceKey::Chat(&chat_id), !stats.connected, now);
                 ChatConnectivity {
+                    sync_state: self.chat_sync_state(&chat_id),
                     chat_id,
                     connected,
                     pending_pushes: stats.pending_pushes,
@@ -2799,6 +2843,80 @@ impl DocHost {
             last_failure,
             chats,
         }
+    }
+
+    pub fn chat_sync_state(&self, chat_id: &str) -> zeron_proto::ChatSyncState {
+        use zeron_proto::ChatSyncState as S;
+        let handle = lock(&self.inner.handles).get(chat_id).cloned();
+        let Some(handle) = handle else {
+            return S::Local;
+        };
+        if handle.publication_failed.load(Ordering::Acquire) {
+            return S::StorageError;
+        }
+        if self.inner.config.edge.is_none() {
+            return S::Local;
+        }
+        if !handle.sync_started.load(Ordering::Acquire) {
+            return if handle.sync_requested.load(Ordering::Acquire) {
+                S::Waiting
+            } else {
+                S::Local
+            };
+        }
+        let client = lock(&handle.chat2);
+        match client.as_ref() {
+            Some(c) if c.delivery_live() && c.stats().pending_pushes == 0 => S::Synced,
+            Some(c) if !c.delivery_live() && zeron_sync::wake::path_is_offline() => S::Offline,
+            _ => S::Connecting,
+        }
+    }
+
+    pub fn sync_resources(&self) -> serde_json::Value {
+        let handles = lock(&self.inner.handles);
+        let mut reasons =
+            serde_json::json!({"views":0,"writers":0,"storageFailures":0,"connections":0});
+        let mut waiting = 0usize;
+        let mut oldest = 0i64;
+        for h in handles.values() {
+            if h.messages_tx.receiver_count() > 0 || h.queue_tx.receiver_count() > 0 {
+                reasons["views"] = (reasons["views"].as_u64().unwrap() + 1).into();
+            }
+            if h.writers.load(Ordering::Acquire) > 0 {
+                reasons["writers"] = (reasons["writers"].as_u64().unwrap() + 1).into();
+            }
+            if h.publication_failed.load(Ordering::Acquire) {
+                reasons["storageFailures"] =
+                    (reasons["storageFailures"].as_u64().unwrap() + 1).into();
+            }
+            if h.sync_started.load(Ordering::Acquire) {
+                reasons["connections"] = (reasons["connections"].as_u64().unwrap() + 1).into();
+            } else if h.sync_requested.load(Ordering::Acquire) {
+                waiting += 1;
+                oldest = oldest.max(now_ms() - h.last_access.load(Ordering::Relaxed));
+            }
+        }
+        #[cfg(target_os = "linux")]
+        let open_fds = std::fs::read_dir("/proc/self/fd")
+            .ok()
+            .map(|fds| fds.count());
+        #[cfg(not(target_os = "linux"))]
+        let open_fds: Option<usize> = None;
+        #[cfg(unix)]
+        let fd_limit = unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            (libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0).then_some(limit.rlim_cur as u64)
+        };
+        #[cfg(not(unix))]
+        let fd_limit: Option<u64> = None;
+        serde_json::json!({
+            "budget": zeron_sync::budget::shared().stats(),
+            "activeClientLimit": ACTIVE_SYNC_CAP,
+            "openDocuments": handles.len(), "waitingDocuments": waiting,
+            "oldestWaitingAccessAgeMs": oldest, "retainedBy": reasons,
+            "openFileDescriptors": open_fds, "fileDescriptorLimit": fd_limit,
+            "durable": self.inner.store.sync_work_counts().ok().map(|(batches, jobs)| serde_json::json!({"pendingBatches": batches, "pendingJobs": jobs})),
+        })
     }
 
     /// Per-open-chat room introspection for SyncStatus / `zeron sync`.
@@ -5496,6 +5614,101 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
 #[cfg(test)]
 mod publication_eviction_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wakeup_handoff_waits_for_snapshot_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "host".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open_local("receipt").unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER no_snapshot BEFORE INSERT ON snapshots BEGIN SELECT RAISE(FAIL,'disk unavailable'); END;").unwrap();
+        handle
+            .doc
+            .doc()
+            .get_text("body")
+            .insert(0, "received before crash")
+            .unwrap();
+        handle.doc.doc().commit();
+        assert!(
+            !host.wakeup_is_durable(&handle),
+            "cannot retire receipt while snapshot is only in memory"
+        );
+        db.execute_batch("DROP TRIGGER no_snapshot;").unwrap();
+        assert!(host.wakeup_is_durable(&handle));
+        host.shutdown_workers().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_disk_writes_pin_edits_and_resume_admission_after_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "host".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
+            },
+        );
+        let handle = host.open_local("failed").unwrap();
+        let db = rusqlite::Connection::open(dir.path().join("docs.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER injected_disk_failure BEFORE INSERT ON chat_outbox WHEN NEW.doc_id='failed' BEGIN SELECT RAISE(FAIL,'injected disk failure'); END;").unwrap();
+        handle
+            .doc
+            .doc()
+            .get_text("body")
+            .insert(0, "must survive a failed write")
+            .unwrap();
+        handle.doc.doc().commit();
+        let other = host.open("waiting-for-storage").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            host.chat_sync_state("failed"),
+            zeron_proto::ChatSyncState::StorageError
+        );
+        assert!(!other.sync_started.load(Ordering::Acquire));
+        assert!(host.pinned(&handle));
+        db.execute_batch("DROP TRIGGER injected_disk_failure;")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while handle.publication_failed.load(Ordering::Acquire)
+                || !other.sync_started.load(Ordering::Acquire)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(lock(&handle.chat2_pending_local).is_empty());
+        host.shutdown_workers().await;
+        let reopened = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "host".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        assert_eq!(
+            reopened
+                .open_local("failed")
+                .unwrap()
+                .doc
+                .doc()
+                .get_text("body")
+                .to_string(),
+            "must survive a failed write"
+        );
+        reopened.shutdown_workers().await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn idle_connection_closes_while_caller_keeps_document() {

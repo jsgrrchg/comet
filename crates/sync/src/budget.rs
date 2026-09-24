@@ -39,6 +39,7 @@ pub struct BudgetStats {
     pub http: usize,
     pub http_limit: usize,
     pub waiting: usize,
+    pub resource_paused: bool,
 }
 
 impl Budget {
@@ -61,7 +62,6 @@ impl Budget {
         resource: &Arc<Semaphore>,
         background: bool,
     ) -> Result<Permit, SyncError> {
-        self.wait_for_resources().await;
         // Never allow callers to build an unbounded semaphore wait queue.
         let _waiting =
             self.waiters.clone().try_acquire_owned().map_err(|_| {
@@ -150,6 +150,11 @@ impl Budget {
             http: self.limits[2] - self.http.available_permits(),
             http_limit: self.limits[2],
             waiting: 128 - self.waiters.available_permits(),
+            resource_paused: self
+                .paused_until
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|at| at > Instant::now()),
         }
     }
 }

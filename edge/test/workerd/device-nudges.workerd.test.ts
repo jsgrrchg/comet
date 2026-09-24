@@ -68,3 +68,21 @@ it("drains 300 queued wakes through a bounded acknowledgment window", async () =
   await expect.poll(() => runInDurableObject(room, (_i, state) => pendingNudges(state.storage.sql).length)).toBe(0);
   ws.close();
 });
+
+it("keeps legacy hosts usable without acknowledgment support", async () => {
+  const room = env.DEVICE_ROOMS.get(env.DEVICE_ROOMS.idFromName(crypto.randomUUID()));
+  const response = await room.fetch("https://test/ws?role=host", { headers: { "x-zeron-auth-user": "owner", upgrade: "websocket" } });
+  const ws = response.webSocket!; ws.accept(); ws.binaryType = "arraybuffer";
+  const messages: string[] = [];
+  ws.addEventListener("message", e => {
+    const frame = decodeDeviceFrame(new Uint8Array(e.data as ArrayBuffer));
+    messages.push(JSON.parse(new TextDecoder().decode(frame.payload)).chatId);
+  });
+  await room.fetch("https://test/nudge", {method:"POST",headers:{"x-zeron-auth-user":"owner"},body:JSON.stringify({chatId:"legacy"})});
+  await expect.poll(() => messages).toEqual(["legacy"]);
+  await runInDurableObject(room, async (_i, state) => {
+    expect(pendingNudges(state.storage.sql)).toEqual([]);
+    await state.storage.deleteAlarm();
+  });
+  ws.close();
+});

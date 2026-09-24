@@ -5,6 +5,17 @@ use crate::store::{DocsStore, StoreError, store_blocking};
 use rusqlite::{OptionalExtension, params};
 
 impl DocsStore {
+    /// Counts only; diagnostics must not materialize queued payloads.
+    pub fn sync_work_counts(&self) -> Result<(u64, u64), StoreError> {
+        store_blocking(|| {
+            Ok(self.conn().query_row(
+                "SELECT (SELECT count(*) FROM chat_outbox), (SELECT count(*) FROM chat_sync_jobs)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?)
+        })
+    }
+
     pub fn schedule_sync_job(&self, doc: &str, kind: &str) -> Result<(), StoreError> {
         store_blocking(|| {
             let mut conn = self.conn();

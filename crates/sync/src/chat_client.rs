@@ -717,6 +717,18 @@ impl ChatClient {
         }
     }
 
+    pub fn delivery_live(&self) -> bool {
+        let shared = lock(&self.shared);
+        shared.caught_up
+            && !shared.needs_checkpoint
+            && !shared.gap_repair
+            && (self
+                .flags
+                .connected
+                .load(std::sync::atomic::Ordering::Relaxed)
+                || shared.http_live_epoch == Some(shared.http_replay_epoch))
+    }
+
     pub fn caught_up(&self) -> bool {
         let shared = lock(&self.shared);
         shared.caught_up && !shared.needs_checkpoint && !shared.gap_repair

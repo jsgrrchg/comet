@@ -2474,8 +2474,25 @@ impl DocHost {
         payload: SessionCommandPayload,
         transfers: Vec<crate::uploads::AttachmentTransfer>,
     ) -> Result<String, EngineError> {
+        self.queue_draft_command(chat_id, payload, transfers, new_id())
+    }
+
+    pub fn queue_draft_command(
+        &self,
+        chat_id: &str,
+        payload: SessionCommandPayload,
+        transfers: Vec<crate::uploads::AttachmentTransfer>,
+        id: String,
+    ) -> Result<String, EngineError> {
         let handle = self.open(chat_id)?;
-        let id = new_id();
+        if handle
+            .doc
+            .read_commands()?
+            .iter()
+            .any(|entry| entry.id == id)
+        {
+            return Ok(id);
+        }
         let now = now_ms();
         let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
             turn_id: Some(m.id.clone()),

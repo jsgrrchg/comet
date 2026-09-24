@@ -14,6 +14,7 @@ pub struct DraftStore {
     edge: Option<EdgeConfig>,
     org: String,
     http: reqwest::Client,
+    claims: Arc<std::sync::Mutex<()>>,
 }
 fn error(s: impl ToString) -> EngineError {
     EngineError::Other(s.to_string())
@@ -24,6 +25,7 @@ impl DraftStore {
             store,
             edge,
             org,
+            claims: Arc::new(std::sync::Mutex::new(())),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
@@ -79,6 +81,44 @@ impl DraftStore {
             &serde_json::to_vec(&draft).map_err(error)?,
         )?;
         Ok(draft)
+    }
+    pub async fn claim(&self, id: &str, revision: &str) -> Result<(), EngineError> {
+        if !valid_draft_id(id) || !valid_draft_id(revision) {
+            return Err(error("Invalid draft claim"));
+        }
+        if let Some(edge) = &self.edge {
+            let response = self
+                .http
+                .post(format!(
+                    "{}/registry/{}/draft-claim",
+                    edge.url.trim_end_matches('/'),
+                    self.org
+                ))
+                .bearer_auth(edge.token.token().await?)
+                .json(&serde_json::json!({ "id": id, "revision": revision }))
+                .send()
+                .await
+                .map_err(error)?;
+            if !response.status().is_success() {
+                return Err(error(
+                    "Draft could not be reserved for sending. It may already have been sent from another device.",
+                ));
+            }
+        } else {
+            let _guard = self
+                .claims
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let key = format!("draft-claim:{id}");
+            if let Some(old) = self.store.load_snapshot(&key)? {
+                if old != revision.as_bytes() {
+                    return Err(error("Draft already reserved with a different revision"));
+                }
+            } else {
+                self.store.save_snapshot(&key, revision.as_bytes())?;
+            }
+        }
+        Ok(())
     }
     pub fn pending(&self) -> Result<Vec<SaveDraft>, EngineError> {
         self.store

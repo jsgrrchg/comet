@@ -116,6 +116,10 @@ async fn update_harness_enabled(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct QueueCommandParams {
+    #[serde(default)]
+    draft_id: Option<String>,
+    #[serde(default)]
+    draft_revision: Option<String>,
     chat_id: String,
     command: SessionCommandPayload,
     /// Queued attachments (bytes already committed locally as `pending://`
@@ -1702,12 +1706,86 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)
             }
+            methods::WATCH_DRAFTS => Ok(RpcReply::Stream(watch_stream(
+                self.workspace.watch_drafts(),
+            ))),
+            methods::SAVE_DRAFT => {
+                let draft: zeron_proto::SaveDraft = parse_params(params)?;
+                self.workspace
+                    .save_draft(draft)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::LOAD_DRAFT => {
+                #[derive(Deserialize)]
+                struct Load {
+                    revision: String,
+                }
+                let p: Load = parse_params(params)?;
+                RpcReply::value(
+                    &self
+                        .workspace
+                        .load_draft(&p.revision)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?,
+                )
+            }
+            methods::CHANGE_DRAFT => {
+                let change: zeron_proto::DraftChange = parse_params(params)?;
+                self.workspace
+                    .change_draft(&change)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::CLAIM_DRAFT => {
+                #[derive(Deserialize)]
+                struct Claim {
+                    id: String,
+                    revision: String,
+                }
+                let p: Claim = parse_params(params)?;
+                self.workspace
+                    .claim_draft(&p.id, &p.revision)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(
+                    &serde_json::json!({ "chatId": format!("draft-{}", p.id), "messageId": format!("draft-message-{}", p.id) }),
+                )
+            }
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
-                let command_id = self
-                    .doc_host
-                    .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let command_id = if let Some(id) = p.draft_id {
+                    let revision = p
+                        .draft_revision
+                        .ok_or_else(|| RpcError::Failed("Missing draft revision".into()))?;
+                    if p.chat_id != format!("draft-{id}") {
+                        return Err(RpcError::Failed(
+                            "Draft conversation identity changed".into(),
+                        ));
+                    }
+                    self.workspace
+                        .claim_draft(&id, &revision)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let command_id = self
+                        .doc_host
+                        .queue_draft_command(
+                            &p.chat_id,
+                            p.command,
+                            p.transfers,
+                            format!("draft-command-{id}"),
+                        )
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    // An acknowledged durable command owns the content from here.
+                    self.workspace
+                        .change_draft(&zeron_proto::DraftChange::Discard { id })
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    command_id
+                } else {
+                    self.doc_host
+                        .queue_command_with_transfers(&p.chat_id, p.command, p.transfers)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                };
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
             methods::TAKE_PROJECT_ACTION_SETUP => {

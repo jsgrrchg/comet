@@ -9,9 +9,16 @@ const REVISIONS: &str = "draftRevisions";
 
 impl RegistryDoc {
     pub fn set_draft_order(&mut self, id: &str, key: &str) -> Result<(), DocError> {
-        if !valid_draft_id(id) || !valid_order_key(key) { return Err(DocError::Schema("Invalid draft order".into())); }
+        if !valid_draft_id(id) || !valid_order_key(key) {
+            return Err(DocError::Schema("Invalid draft order".into()));
+        }
         self.observe_sidebar_row(DRAFTS, id);
-        self.write(DRAFTS, id, OpKind::Upsert, fields([("orderKey", json!(key))]));
+        self.write(
+            DRAFTS,
+            id,
+            OpKind::Upsert,
+            fields([("orderKey", json!(key))]),
+        );
         Ok(())
     }
 
@@ -133,7 +140,13 @@ impl RegistryDoc {
         for row in &mut result {
             if row.conflict && self.overlay_row(DRAFTS, &row.id).is_none() {
                 let upper = keys.iter().filter(|key| *key > &row.order_key).min();
-                if let Ok(key) = order_key_between(Some(&row.order_key), upper.map(String::as_str), &row.revision) { row.order_key = key; }
+                if let Ok(key) = order_key_between(
+                    Some(&row.order_key),
+                    upper.map(String::as_str),
+                    &row.revision,
+                ) {
+                    row.order_key = key;
+                }
             }
         }
         result.sort_by(|a, b| a.order_key.cmp(&b.order_key).then(a.id.cmp(&b.id)));

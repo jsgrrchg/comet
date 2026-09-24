@@ -321,6 +321,9 @@ export default {
           `?${deviceParam(url).replace(/^&/, "")}`
         );
       }
+      if (parts[2] === "draft-claim" && request.method === "POST") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/draft-claim", "");
+      }
       if (parts[2] === "stats" && request.method === "GET") {
         return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/stats", "");
       }

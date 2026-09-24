@@ -3580,6 +3580,7 @@ impl Shell {
                     .child(crate::settings::widgets::toggle_switch(
                         theme,
                         self.settings.sidebar_compact,
+                        "sidebar-view-compact",
                     )),
                 )
                 .into_any_element(),

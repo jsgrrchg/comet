@@ -551,7 +551,6 @@ impl Render for PullRequestsPage {
                                         widgets::ghost_action(&theme)
                                             .id("pull-requests-refresh")
                                             .flex_none()
-                                            .hover(|style| widgets::ghost_hover(&theme, style))
                                             .when(
                                                 matches!(
                                                     self.load_state,

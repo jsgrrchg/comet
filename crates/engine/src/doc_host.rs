@@ -544,6 +544,7 @@ pub struct ChatDocHandle {
     /// chat2 relay client (docs/chat2-sync.md C3) — populated once the
     /// registry names roomGen 2 for this chat and the join resolves.
     chat2: Mutex<Option<zeron_sync::ChatClient>>,
+    sync_started: AtomicBool,
     pub(crate) persistence: Option<Arc<crate::chat_persistence::ChatPersistence>>,
     /// Local commits made before the relay connects (the dial can take up
     /// to a minute; offline, forever): buffered here by the subscription
@@ -1116,6 +1117,14 @@ impl DocHost {
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
+        let handle = self.open_local(chat_id)?;
+        self.activate_sync(&handle);
+        Ok(handle)
+    }
+
+    /// Materialize one authoritative local document without acquiring a network
+    /// connection. Durable publication is installed before exposing any writer.
+    pub fn open_local(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
         // The registry names the sync room generation (docs/chat2-sync.md
         // M2): absent row / absent field = legacy s2. Read it BEFORE the
         // cached-handle check — a cached s2-mode handle for a chat another
@@ -1353,6 +1362,7 @@ impl DocHost {
             retired: AtomicBool::new(false),
             checkpointing: Arc::new(AtomicBool::new(false)),
             chat2: Mutex::new(None),
+            sync_started: AtomicBool::new(false),
             persistence,
             chat2_pending_local: Mutex::new(Vec::new()),
             publication_failed: AtomicBool::new(false),
@@ -1374,7 +1384,7 @@ impl DocHost {
         // retried: the exact "transcript frozen until restart" report.
         // Retry on the workspace host's capped, jittered backoff; a system
         // wake redials immediately; eviction/purge ends the loop via `weak`.
-        if let Some(edge) = &self.inner.config.edge {
+        if self.inner.config.edge.is_some() {
             if room_gen >= 2 {
                 // Subscription BEFORE the dial (review B3): every local
                 // commit lands in the client when connected, else in the
@@ -1406,7 +1416,13 @@ impl DocHost {
                             let client_guard = lock(&handle.chat2);
                             match &*client_guard {
                                 Some(client) => client.enqueue_batch(batch_id, bytes.clone()),
-                                None => lock(&handle.chat2_pending_local).push((batch_id, bytes.clone())),
+                                None => {
+                                    // Durable rows are loaded by the next client. Keep
+                                    // only failed writes in memory for retry.
+                                    if handle.publication_failed.load(Ordering::Acquire) {
+                                        lock(&handle.chat2_pending_local).push((batch_id, bytes.clone()));
+                                    }
+                                },
                             }
                         }
                         true
@@ -1422,23 +1438,6 @@ impl DocHost {
                 for command in &requeue_commands {
                     let _ = doc.queue_command(command);
                 }
-                if !self.inner.edge_disconnected.load(Ordering::Acquire) {
-                    self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
-                }
-            } else {
-                // Straggler gen-1 chat (the s2 client is gone — post-cutover,
-                // no device reads or writes an s2 room). The local fat doc
-                // serves reads as-is; if we host the chat, seed it onto chat2
-                // in the background and the flip converges every device.
-                let is_host = chat_row
-                    .as_ref()
-                    .is_some_and(|c| c.device_id == self.inner.config.device_id);
-                if is_host && chat_row.is_some() {
-                    // Quiescent-only (review B1): a seed under a live run or
-                    // watched transcript would strand everything written
-                    // after the rebuild instant in a retired fat lineage.
-                    self.spawn_chat2_seed_when_quiet(edge.clone(), chat_id, &handle);
-                }
             }
         }
         // Publish only after the durable subscription and bootstrap are installed.
@@ -1447,6 +1446,25 @@ impl DocHost {
         self.spawn_worker(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
         self.evict_over_budget();
         Ok(handle)
+    }
+
+    /// Connection lifetime is independent of the document and its outbox.
+    /// Concurrent callers activate at most one supervisor for this handle.
+    pub fn activate_sync(&self, handle: &Arc<ChatDocHandle>) {
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return;
+        };
+        if self.inner.edge_disconnected.load(Ordering::Acquire)
+            || handle.sync_started.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        if handle.room_gen >= 2 {
+            let cursor = handle.persistence.as_ref().map_or(0, |p| p.cursor());
+            self.spawn_chat2_join(edge, handle, cursor);
+        } else if self.is_host(&handle.chat_id) {
+            self.spawn_chat2_seed_when_quiet(edge, &handle.chat_id, handle);
+        }
     }
 
     /// chat2 relay join (docs/chat2-sync.md C3): deadline on every dial,
@@ -1530,6 +1548,12 @@ impl DocHost {
                             // after — never dropped between (verify pass).
                             let mut client_slot = lock(&handle.chat2);
                             if host.inner.edge_disconnected.load(Ordering::Acquire) { return; }
+                            // Include commits made after the sink's initial
+                            // load but before installation. The same lock is
+                            // held by the local-update subscription.
+                            for (id, bytes) in host.inner.store.pending_chat_updates(&chat).unwrap_or_default() {
+                                client.enqueue_batch(id, bytes);
+                            }
                             let pending: Vec<(String, Vec<u8>)> =
                                 std::mem::take(&mut *lock(&handle.chat2_pending_local));
                             for (batch_id, update) in pending {
@@ -5157,6 +5181,36 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
 #[cfg(test)]
 mod publication_eviction_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_open_journals_without_starting_sync_and_reuses_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "writer".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
+            },
+        );
+        let handle = host.open_local("local").unwrap();
+        handle
+            .doc
+            .doc()
+            .get_text("body")
+            .insert(0, "offline update")
+            .unwrap();
+        handle.doc.doc().commit();
+        assert!(!handle.sync_started.load(Ordering::Acquire));
+        assert!(lock(&handle.chat2).is_none());
+        assert!(!store.pending_chat_updates("local").unwrap().is_empty());
+        assert!(lock(&handle.chat2_pending_local).is_empty());
+        let same = host.open("local").unwrap();
+        assert!(Arc::ptr_eq(&handle, &same));
+        assert!(handle.sync_started.load(Ordering::Acquire));
+        host.shutdown_workers().await;
+    }
 
     #[tokio::test]
     async fn salvage_inspection_does_not_open_healthy_or_unrecoverable_chats() {

@@ -52,7 +52,7 @@ impl Entry {
             Self::NewChat => Some(("New chat", icons::PEN_NEW_SQUARE)),
             Self::NewProject => Some(("New project", icons::FOLDER)),
             Self::NewWindow => Some(("New window", icons::WINDOW_RESTORE)),
-            Self::Settings => Some(("Open settings", icons::SETTINGS_MINIMALISTIC)),
+            Self::Settings => Some(("Open settings", icons::SETTINGS)),
             Self::Theme(mode) => Some((
                 match mode {
                     AppearanceMode::System => "Switch to system theme",
@@ -197,7 +197,7 @@ impl Shell {
             Entry::NewChat => self.open_new_session(cx),
             Entry::NewProject => self.open_add_space(cx),
             Entry::NewWindow => crate::app_menus::new_window(cx),
-            Entry::Settings => self.open_settings(SettingsSection::Devices, cx),
+            Entry::Settings => self.open_settings(SettingsSection::General, cx),
             Entry::Theme(_) => unreachable!(),
             Entry::Chat(id) => self.open_chat(id, cx),
         }

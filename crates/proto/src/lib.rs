@@ -5,6 +5,7 @@
 
 pub mod agent;
 pub mod entities;
+pub mod drafts;
 pub mod file_mentions;
 pub mod invocation;
 pub mod motion;
@@ -16,6 +17,7 @@ pub mod workspace;
 
 pub use agent::*;
 pub use entities::*;
+pub use drafts::*;
 pub use preview::*;
 pub use sidebar_pins::*;
 pub use workspace::*;

@@ -65,6 +65,9 @@ pub struct DraftAsset {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveDraft {
+    /// Persist the active canvas without listing it until navigation.
+    #[serde(default)]
+    pub deferred: bool,
     pub id: String,
     pub revision: String,
     pub base_revision: Option<String>,
@@ -72,6 +75,16 @@ pub struct SaveDraft {
     pub content: DraftContent,
     #[serde(default)]
     pub assets: Vec<DraftAsset>,
+}
+impl SaveDraft {
+    /// A visibility promotion must survive an ACK of the same content revision.
+    pub fn publication_key(&self) -> String {
+        if self.deferred {
+            format!("editing-{}", self.revision)
+        } else {
+            self.revision.clone()
+        }
+    }
 }
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

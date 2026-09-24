@@ -1,15 +1,17 @@
 # Prompt drafts
 
 A new-session canvas is an independent draft until its first send. Desktop shows
-nonempty drafts in the theme-accented **Drafts** section above Pinned. New session
-preserves the previous canvas; opening a draft restores its destination, run
+nonempty drafts in the theme-accented **Drafts** section above Pinned after the user
+leaves the canvas for a new session or an existing conversation. Typing autosaves
+an unlisted canvas on every device. New session preserves the previous canvas; opening a draft restores its destination, run
 configuration, prompt, images and Appshot context. Existing conversation composers
 continue using their existing per-chat draft behavior.
 
 ## Persistence and synchronization
 
 - `promptDrafts` registry rows contain the preferred revision, fractional
-  `orderKey`, and discard/send markers. Moving a draft only changes its order.
+  `orderKey`, visibility and discard/send markers. Moving a draft only changes its order.
+  Making a draft visible is permanent: delayed autosaves cannot hide it again.
 - `draftRevisions` rows contain immutable ancestry, a short preview, target and
   creation time. Every surviving revision head is recoverable. Concurrent edits
   appear as separate entries; consuming one head preserves the other heads.
@@ -25,6 +27,8 @@ continue using their existing per-chat draft behavior.
   save. Failed RPCs survive navigation and restart, and replay follows revision
   ancestry. If local recovery storage fails, an in-memory copy remains retryable
   while the application is running. Profiles cannot replay each other's requests.
+  A separate canvas checkpoint allows an interrupted editor to reappear as a
+  recoverable draft on restart; successful sends and navigation clear it.
 - Attachment RPCs transfer 1 MiB chunks. Loading a draft fetches its content first
   and then its assets, avoiding oversized WebSocket frames even for large images.
 - Desktop saves after 300 ms of inactivity and flushes on navigation and normal

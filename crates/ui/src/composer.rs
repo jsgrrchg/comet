@@ -7238,7 +7238,7 @@ impl Composer {
                 .engine()
                 .is_some_and(|new| old.same_connection(new))
         }) {
-            self.flush_prompt_draft(cx);
+            self.park_prompt_draft(cx);
             self.prompt_draft_debounce = None;
             self.prompt_draft_load_generation += 1;
             self.prompt_draft_loading = false;
@@ -7319,7 +7319,7 @@ impl Composer {
         if key != self.current_key {
             self.cancel_prompt_draft_load();
             if self.current_key.is_empty() && !self.sending {
-                self.flush_prompt_draft(cx);
+                self.park_prompt_draft(cx);
             }
             if !key.is_empty() && !self.current_key.is_empty() {
                 // Switching between established chats still snaps to the new
@@ -8338,6 +8338,9 @@ impl Composer {
             this.update(cx, |composer, cx| {
                 composer.sending = false;
                 if result.is_ok() && sending_draft.is_some() {
+                    if let (Some(directory), Some(draft)) = (&composer.prompt_draft_recovery, &sending_draft) {
+                        prompt_drafts::clear_canvas_checkpoint(directory, &draft.id);
+                    }
                     composer.prompt_draft = None;
                     composer.prompt_draft_debounce = None;
                 }

@@ -19,6 +19,8 @@ struct NewSessionView: View {
     @State private var promptBaseRevision: String?
     @State private var promptRevision: String?
     @State private var promptReserved = false
+    @State private var promptDeferred = true
+    @State private var savedPromptDeferred = true
     @State private var promptCreatedAt = nowMs()
     @State private var savedPromptContent: PromptDraftContent?
     @State private var saveDraftTask: Task<Void, Never>?
@@ -294,6 +296,7 @@ struct NewSessionView: View {
                 }
                 guard !Task.isCancelled else { return }
                 promptDraftId = row.id; promptRevision = row.revision; promptBaseRevision = row.baseRevision; promptCreatedAt = row.createdAt
+                promptDeferred = false; savedPromptDeferred = false
                 promptReserved = workspace.draftStorage.hasReservation(row.id)
                 savedPromptContent = content; draft = content.prompt; attachments = images
                 selectedHostId = content.target.deviceId; selectedRef = content.target.branch
@@ -321,7 +324,7 @@ struct NewSessionView: View {
         }
         .onDisappear {
             saveDraftTask?.cancel()
-            if !loadingDraft && !submittedDraft { _ = persistPromptDraft() }
+            if !loadingDraft && !submittedDraft { _ = persistPromptDraft(publish: true) }
         }
         .onAppear {
             focused = true
@@ -340,7 +343,7 @@ struct NewSessionView: View {
         [draft, harness, storedModel, storedReasoning, selectedRef ?? "", deviceId ?? "", String(describing: checkoutKind),
          attachments.map(\.id).joined(), optionSelections.sorted(by: { $0.key < $1.key }).map { "\($0.key)=\($0.value)" }.joined()].joined(separator: "|")
     }
-    @discardableResult private func persistPromptDraft() -> PromptDraftSave? {
+    @discardableResult private func persistPromptDraft(publish: Bool = false) -> PromptDraftSave? {
         guard !loadingDraft, !submittedDraft, let workspace = model.workspace, let deviceId else { return nil }
         var assets: [String: Data] = [:]
         let refs = attachments.map { image -> PromptDraftAttachment in
@@ -360,12 +363,13 @@ struct NewSessionView: View {
         if changed && promptReserved {
             promptDraftId = UUID().uuidString.lowercased()
             promptRevision = nil; promptBaseRevision = nil; promptCreatedAt = nowMs()
-            promptReserved = false
+            promptReserved = false; promptDeferred = true; savedPromptDeferred = true
         }
+        if publish { promptDeferred = false }
         let revision = changed ? UUID().uuidString.lowercased() : (promptRevision ?? UUID().uuidString.lowercased())
-        let save = PromptDraftSave(id: promptDraftId, revision: revision, baseRevision: changed ? promptRevision : promptBaseRevision, createdAt: promptCreatedAt, content: content)
+        let save = PromptDraftSave(deferred: promptDeferred, id: promptDraftId, revision: revision, baseRevision: changed ? promptRevision : promptBaseRevision, createdAt: promptCreatedAt, content: content)
         do {
-            if changed { try workspace.stagePromptDraft(save, assets: assets); promptBaseRevision = save.baseRevision; promptRevision = revision; savedPromptContent = content }
+            if changed || savedPromptDeferred != promptDeferred { try workspace.stagePromptDraft(save, assets: assets); promptBaseRevision = save.baseRevision; promptRevision = revision; savedPromptContent = content; savedPromptDeferred = promptDeferred }
             return save
         } catch { attachError = "Couldn't save draft: \(error.localizedDescription)"; return nil }
     }

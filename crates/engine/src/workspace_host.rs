@@ -1830,6 +1830,7 @@ mod tests {
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let host = WorkspaceHost::open(store.clone(), config.clone()).unwrap();
         let mut draft = SaveDraft {
+            deferred: true,
             id: "draft".into(),
             revision: "revision-1".into(),
             base_revision: None,
@@ -1840,6 +1841,9 @@ mod tests {
             },
             assets: vec![],
         };
+        host.save_draft(draft.clone()).unwrap();
+        assert!(host.watch_drafts().borrow().drafts.is_empty());
+        draft.deferred = false;
         host.save_draft(draft.clone()).unwrap();
         let initial = host.watch_drafts().borrow().clone();
         assert_eq!(initial.drafts.len(), 1);
@@ -2101,7 +2105,11 @@ async fn draft_publication_task(weak: Weak<WorkspaceHostInner>) {
                         room.nudge();
                     }
                 }
-                if inner.draft_store.acknowledge(&draft.revision).is_err() {
+                if inner
+                    .draft_store
+                    .acknowledge(&draft.publication_key())
+                    .is_err()
+                {
                     break;
                 }
                 inner.publish_drafts();

@@ -292,18 +292,20 @@ final class WorkspaceStore {
                         guard DocDisk.saveRegistry(data: try self.doc.toData(), to: DocDisk.registryURL(orgId: self.config.orgId, userId: self.config.userId)) else { return }
                         self.afterLocalWrite()
                     }
-                    try self.draftStorage.acknowledge(save.revision)
+                    try self.draftStorage.acknowledge(save.publicationKey)
                     self.projectPromptDrafts()
                 } catch { return }
             }
         }
     }
     func consumePromptDraft(_ id: String, revision: String) {
+        draftStorage.clearCanvas(id)
         doc.observePromptDraftClock(kind: "promptDrafts", id: id)
         doc.write(kind: "promptDrafts", id: id, op: .upsert, set: ["sentRevision": .string(revision)])
         afterLocalWrite(); flushToDisk()
     }
     func discardPromptDraft(_ id: String) {
+        draftStorage.clearCanvas(id)
         doc.observePromptDraftClock(kind: "promptDrafts", id: id)
         doc.write(kind: "promptDrafts", id: id, op: .upsert, set: ["closed": .bool(true)])
         afterLocalWrite()

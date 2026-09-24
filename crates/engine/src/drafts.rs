@@ -148,7 +148,7 @@ impl DraftStore {
         draft.assets.clear();
         self.store.enqueue_chat_update(
             OUTBOX,
-            &draft.revision,
+            &draft.publication_key(),
             &serde_json::to_vec(&draft).map_err(error)?,
         )?;
         Ok(draft)
@@ -297,6 +297,7 @@ mod tests {
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let drafts = DraftStore::new(store, None, "local".into());
         let draft = SaveDraft {
+            deferred: false,
             id: "draft".into(),
             revision: "revision".into(),
             base_revision: None,
@@ -401,6 +402,37 @@ mod tests {
     }
 
     #[test]
+    fn deferred_save_ack_cannot_erase_pending_visibility_promotion() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = DraftStore::new(
+            Arc::new(DocsStore::open(directory.path()).unwrap()),
+            None,
+            "local".into(),
+        );
+        let draft = SaveDraft {
+            deferred: true,
+            id: "a".into(),
+            revision: "v1".into(),
+            base_revision: None,
+            created_at: 1,
+            content: DraftContent {
+                prompt: "Still typing".into(),
+                ..Default::default()
+            },
+            assets: vec![],
+        };
+        store.stage(draft.clone()).unwrap();
+        let mut listed = draft.clone();
+        listed.deferred = false;
+        store.stage(listed).unwrap();
+        assert_eq!(store.pending().unwrap().len(), 2);
+        store.acknowledge(&draft.publication_key()).unwrap();
+        let pending = store.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(!pending[0].deferred);
+    }
+
+    #[test]
     fn retrying_swift_content_preserves_omitted_optionals_and_original_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
@@ -411,6 +443,7 @@ mod tests {
             .save_snapshot(&DraftStore::key("swift-revision"), raw)
             .unwrap();
         let draft = SaveDraft {
+            deferred: false,
             id: "swift-draft".into(),
             revision: "swift-revision".into(),
             base_revision: None,
@@ -436,6 +469,7 @@ mod tests {
         let bytes = b"image bytes";
         let blob = format!("{:x}", Sha256::digest(bytes));
         let draft = SaveDraft {
+            deferred: false,
             id: "draft".into(),
             revision: "revision".into(),
             base_revision: None,

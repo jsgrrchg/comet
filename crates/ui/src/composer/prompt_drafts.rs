@@ -12,6 +12,8 @@ pub(super) struct EditingDraft {
     pub base_revision: Option<String>,
     pub created_at: i64,
     pub reserved: bool,
+    pub deferred: bool,
+    pub saved_deferred: bool,
     pub saved: Option<DraftContent>,
     pub snapshot: DraftBundle,
 }
@@ -35,7 +37,7 @@ pub(crate) fn quit_saves(
                     if composer.current_key.is_empty() {
                         composer.capture_prompt_draft(cx);
                     }
-                    let request = composer.flush_prompt_draft(cx)?;
+                    let request = composer.park_prompt_draft(cx)?;
                     Some((
                         composer.prompt_draft_engine.clone()?,
                         request,
@@ -211,7 +213,7 @@ fn stage_recovery(directory: &std::path::Path, request: &SaveDraft) -> Result<()
             .unwrap_or_else(|e| e.into_inner())
             .entry(directory.to_owned())
             .or_default()
-            .insert(request.revision.clone(), request.clone());
+            .insert(request.publication_key(), request.clone());
     }
     result
 }
@@ -225,10 +227,47 @@ fn stage_recovery_on_disk(directory: &std::path::Path, request: &SaveDraft) -> R
     }
     let mut manifest = request.clone();
     manifest.assets.clear();
+    let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
     write_recovery_file(
-        &directory.join(format!("{}.json", request.revision)),
-        &serde_json::to_vec(&manifest).map_err(|e| e.to_string())?,
-    )
+        &directory.join(format!("{}.json", request.publication_key())),
+        &bytes,
+    )?;
+    if request.deferred {
+        write_recovery_file(&directory.join(format!("{}.canvas", request.id)), &bytes)?;
+    } else {
+        clear_canvas_checkpoint(directory, &request.id);
+    }
+    Ok(())
+}
+pub(super) fn clear_canvas_checkpoint(directory: &std::path::Path, id: &str) {
+    let _ = std::fs::remove_file(directory.join(format!("{id}.canvas")));
+}
+fn recover_abandoned_canvases(directory: &std::path::Path, active_id: Option<&str>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|s| s.to_str()) != Some("canvas") {
+            continue;
+        }
+        let recover = || -> Option<()> {
+            let mut request: SaveDraft =
+                serde_json::from_slice(&std::fs::read(entry.path()).ok()?).ok()?;
+            if active_id == Some(request.id.as_str()) {
+                return None;
+            }
+            for asset in &request.content.attachments {
+                request.assets.push(DraftAsset {
+                    blob: asset.blob.clone(),
+                    data: std::fs::read_to_string(directory.join(format!("{}.asset", asset.blob)))
+                        .ok()?,
+                });
+            }
+            request.deferred = false;
+            stage_recovery(directory, &request).ok()
+        };
+        recover();
+    }
 }
 fn pending_recovery(directory: &std::path::Path) -> Vec<SaveDraft> {
     let mut requests = std::collections::HashMap::<String, SaveDraft>::new();
@@ -252,7 +291,7 @@ fn pending_recovery(directory: &std::path::Path) -> Vec<SaveDraft> {
                 Some(request)
             })();
             if let Some(request) = request {
-                requests.insert(request.revision.clone(), request);
+                requests.insert(request.publication_key(), request);
             }
         }
     }
@@ -271,9 +310,9 @@ fn pending_recovery(directory: &std::path::Path) -> Vec<SaveDraft> {
                 !request
                     .base_revision
                     .as_ref()
-                    .is_some_and(|base| requests.contains_key(base))
+                    .is_some_and(|base| requests.values().any(|pending| &pending.revision == base))
             })
-            .map(|request| request.revision.clone());
+            .map(|request| request.publication_key());
         let Some(next) = next else { break }; // corrupt ancestry must not invent a publication order
         ordered.push(requests.remove(&next).unwrap());
     }
@@ -318,22 +357,27 @@ impl Composer {
                     .update(cx, |composer, cx| {
                         let state = composer.state.read(cx);
                         (recovery_directory(state).as_ref() == Some(&directory))
-                            .then(|| state.engine().cloned())
+                            .then(|| {
+                                state.engine().cloned().map(|engine| {
+                                    (engine, composer.active_prompt_draft().map(str::to_owned))
+                                })
+                            })
                             .flatten()
                     })
                     .ok()
                     .flatten();
-                let Some(engine) = active else {
+                let Some((engine, active_id)) = active else {
                     cx.background_executor().timer(Duration::from_secs(3)).await;
                     continue;
                 };
+                recover_abandoned_canvases(&directory, active_id.as_deref());
                 let pending = pending_recovery(&directory);
                 for request in pending {
                     let mut known = gate.lock().await;
                     match save_request(&engine, request.clone(), &mut known).await {
-                        Ok(()) => acknowledge_recovery(&directory, &request.revision),
+                        Ok(()) => acknowledge_recovery(&directory, &request.publication_key()),
                         Err(error) if error.contains("already discarded") => {
-                            acknowledge_recovery(&directory, &request.revision)
+                            acknowledge_recovery(&directory, &request.publication_key())
                         }
                         Err(_) => break,
                     }
@@ -417,6 +461,8 @@ impl Composer {
             base_revision: None,
             created_at: chrono::Utc::now().timestamp_millis(),
             reserved: false,
+            deferred: true,
+            saved_deferred: true,
             saved: None,
             snapshot: DraftBundle::default(),
         });
@@ -431,6 +477,8 @@ impl Composer {
             editor.created_at = chrono::Utc::now().timestamp_millis();
             editor.saved = None;
             editor.reserved = false;
+            editor.deferred = true;
+            editor.saved_deferred = true;
         }
 
         editor.snapshot = DraftBundle { content, assets };
@@ -453,6 +501,9 @@ impl Composer {
         let editor = self.prompt_draft.as_mut()?;
         if !editor.snapshot.content.has_content() {
             let id = editor.id.clone();
+            if let Some(directory) = &self.prompt_draft_recovery {
+                clear_canvas_checkpoint(directory, &id);
+            }
             let gate = self.prompt_draft_gate.clone();
             if editor.revision.is_some() {
                 cx.spawn(async move |_, _| {
@@ -470,14 +521,17 @@ impl Composer {
             self.prompt_draft = None;
             return None;
         }
-        let changed = editor.saved.as_ref() != Some(&editor.snapshot.content);
+        let content_changed = editor.saved.as_ref() != Some(&editor.snapshot.content);
+        let changed = content_changed || editor.saved_deferred != editor.deferred;
 
-        if changed || editor.revision.is_none() {
+        if content_changed || editor.revision.is_none() {
             editor.base_revision = editor.revision.clone();
             editor.revision = Some(uuid::Uuid::new_v4().to_string());
             editor.saved = Some(editor.snapshot.content.clone());
         }
+        editor.saved_deferred = editor.deferred;
         let request = SaveDraft {
+            deferred: editor.deferred,
             id: editor.id.clone(),
             revision: editor.revision.clone()?,
             base_revision: editor.base_revision.clone(),
@@ -510,18 +564,11 @@ impl Composer {
                 let result = save_request(&engine, request.clone(), &mut known).await;
                 if result.is_ok() {
                     if let Some(directory) = &recovery {
-                        acknowledge_recovery(directory, &request.revision);
+                        acknowledge_recovery(directory, &request.publication_key());
                     }
                 }
                 this.update(cx, |composer, cx| {
                     if let Err(error) = result {
-                        if composer.prompt_draft.as_ref().is_some_and(|d| {
-                            d.id == request.id && d.revision.as_ref() == Some(&request.revision)
-                        }) {
-                            if let Some(draft) = &mut composer.prompt_draft {
-                                draft.saved = None;
-                            }
-                        }
                         composer.failure = Some(format!("Couldn't save draft: {error}").into());
                         composer.failure_key = Some(String::new());
                     }
@@ -532,6 +579,13 @@ impl Composer {
             .detach();
         }
         Some(request)
+    }
+
+    pub(crate) fn park_prompt_draft(&mut self, cx: &mut Context<Self>) -> Option<SaveDraft> {
+        if let Some(editor) = &mut self.prompt_draft {
+            editor.deferred = false;
+        }
+        self.flush_prompt_draft(cx)
     }
 
     pub(crate) fn start_prompt_draft(&mut self, cx: &mut Context<Self>) {
@@ -545,7 +599,7 @@ impl Composer {
         }
         if self.current_key.is_empty() {
             self.capture_prompt_draft(cx);
-            self.flush_prompt_draft(cx);
+            self.park_prompt_draft(cx);
         }
         self.abandon_prompt_draft(cx);
     }
@@ -573,7 +627,7 @@ impl Composer {
         let origin_chat = self.state.read(cx).selected_chat.clone();
         if self.current_key.is_empty() {
             self.capture_prompt_draft(cx);
-            self.flush_prompt_draft(cx);
+            self.park_prompt_draft(cx);
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -668,6 +722,8 @@ impl Composer {
                                 .push(image);
                         }
                         composer.prompt_draft = Some(EditingDraft {
+                            deferred: false,
+                            saved_deferred: false,
                             reserved: composer.prompt_draft_recovery.as_ref().is_some_and(|d| {
                                 d.join(format!("{}.reservation", row.id)).exists()
                             }),
@@ -721,6 +777,7 @@ mod tests {
     fn unacknowledged_saves_survive_navigation_and_reopening_the_recovery_queue() {
         let directory = tempfile::tempdir().unwrap();
         let request = SaveDraft {
+            deferred: false,
             id: "a".into(),
             revision: "a1".into(),
             base_revision: None,
@@ -746,6 +803,7 @@ mod tests {
         let blocked = directory.path().join("blocked");
         std::fs::write(&blocked, b"not a directory").unwrap();
         let parent = SaveDraft {
+            deferred: false,
             id: "a".into(),
             revision: "z-parent".into(),
             base_revision: None,
@@ -777,6 +835,33 @@ mod tests {
         stage_recovery(directory.path(), &child).unwrap();
         stage_recovery(directory.path(), &parent).unwrap();
         assert_eq!(pending_recovery(directory.path())[0].revision, "z-parent");
+    }
+
+    #[test]
+    fn canvas_checkpoint_is_recovered_only_after_its_editor_is_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = SaveDraft {
+            deferred: true,
+            id: "a".into(),
+            revision: "v1".into(),
+            base_revision: None,
+            created_at: 1,
+            content: DraftContent {
+                prompt: "Unfinished canvas".into(),
+                ..Default::default()
+            },
+            assets: vec![],
+        };
+        stage_recovery(directory.path(), &request).unwrap();
+        acknowledge_recovery(directory.path(), &request.publication_key());
+        recover_abandoned_canvases(directory.path(), Some("a"));
+        assert!(pending_recovery(directory.path()).is_empty());
+        recover_abandoned_canvases(directory.path(), None);
+        let recovered = pending_recovery(directory.path());
+        assert_eq!(recovered.len(), 1);
+        assert!(!recovered[0].deferred);
+        assert_eq!(recovered[0].revision, request.revision);
+        assert!(!directory.path().join("a.canvas").exists());
     }
 
     #[test]
@@ -829,6 +914,7 @@ mod tests {
                 composer.capture_prompt_draft(cx);
                 let first = composer.flush_prompt_draft(cx).unwrap();
                 assert_eq!(first.content.prompt, "First prompt");
+                assert!(first.deferred);
                 composer
                     .input
                     .update(cx, |input, cx| input.set_text("Edited prompt", cx));
@@ -840,6 +926,9 @@ mod tests {
                     composer.flush_prompt_draft(cx).unwrap().base_revision,
                     second.base_revision
                 );
+                let parked = composer.park_prompt_draft(cx).unwrap();
+                assert!(!parked.deferred);
+                assert_eq!(parked.revision, second.revision);
                 composer.reserve_prompt_draft_attempt(&second).unwrap();
                 composer.input.update(cx, |input, cx| {
                     input.set_text("Changed after interrupted send", cx)
@@ -847,6 +936,7 @@ mod tests {
                 composer.capture_prompt_draft(cx);
                 let fork = composer.flush_prompt_draft(cx).unwrap();
                 assert_ne!(fork.id, second.id);
+                assert!(fork.deferred);
                 assert!(fork.base_revision.is_none());
                 composer.start_prompt_draft(cx);
                 assert!(composer.input.read(cx).text().is_empty());
@@ -855,6 +945,7 @@ mod tests {
                     .update(cx, |input, cx| input.set_text("Independent prompt", cx));
                 composer.capture_prompt_draft(cx);
                 let third = composer.flush_prompt_draft(cx).unwrap();
+                assert!(third.deferred);
                 assert_ne!(third.id, second.id);
                 assert!(third.base_revision.is_none());
                 composer.prompt_draft_loading = true;
@@ -868,6 +959,11 @@ mod tests {
                 });
                 composer.on_state_changed(cx);
                 assert!(!composer.prompt_draft_loading);
+                assert!(!composer.prompt_draft.as_ref().unwrap().deferred);
+                assert_eq!(
+                    composer.prompt_draft.as_ref().unwrap().revision.as_deref(),
+                    Some(third.revision.as_str())
+                );
             })
             .unwrap();
     }

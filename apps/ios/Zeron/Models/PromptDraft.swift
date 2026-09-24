@@ -24,6 +24,8 @@ struct PromptDraftContent: Codable, Hashable {
     }
 }
 struct PromptDraftSave: Codable {
+    var deferred: Bool? = nil
+    var publicationKey: String { deferred == true ? "editing-\(revision)" : revision }
     var id: String
     var revision: String
     var baseRevision: String?
@@ -45,11 +47,18 @@ extension RegistryDoc {
     func promptDraftClosed(_ id: String) -> Bool { overlayRow(kind: "promptDrafts", id: id)?.fields["closed"]?.boolValue == true }
     func promptDraftConsumed(_ id: String) -> Bool { overlayRow(kind: "promptDrafts", id: id)?.fields["sentRevision"]?.stringValue != nil }
     func publishPromptDraft(_ save: PromptDraftSave) {
-        guard !promptDraftClosed(save.id), !rowExists(kind: "draftRevisions", id: save.revision) else { return }
+        guard !promptDraftClosed(save.id) else { return }
         observePromptDraftClock(kind: "promptDrafts", id: save.id)
+        if let version = overlayRow(kind: "draftRevisions", id: save.revision) {
+            if save.deferred != true && version.fields["draftId"]?.stringValue == save.id && overlayRow(kind: "promptDrafts", id: save.id)?.fields["listed"]?.boolValue != true {
+                write(kind: "promptDrafts", id: save.id, op: .upsert, set: ["listed": .bool(true)])
+            }
+            return
+        }
         if let base = save.baseRevision { observePromptDraftClock(kind: "draftRevisions", id: base) }
         let stamp = nextHlc()
         var index: [String: JSONValue] = ["revision": .string(save.revision)]
+        index[save.deferred == true ? "deferred" : "listed"] = .bool(true)
         if overlayRows(kind: "draftRevisions").contains(where: { $0.fields["baseRevision"]?.stringValue == save.revision }) {
             index.removeValue(forKey: "revision")
         }
@@ -74,6 +83,7 @@ extension RegistryDoc {
                   let data = try? JSONEncoder().encode(version.fields["target"]),
                   let target = try? JSONDecoder().decode(PromptDraftTarget.self, from: data) else { return nil }
             let index = overlayRow(kind: "promptDrafts", id: root)
+            if index?.fields["deferred"]?.boolValue == true && index?.fields["listed"]?.boolValue != true { return nil }
             let sent = index?.fields["sentRevision"]?.stringValue
             if sent == version.id { return nil }
             let selected = index?.fields["revision"]?.stringValue

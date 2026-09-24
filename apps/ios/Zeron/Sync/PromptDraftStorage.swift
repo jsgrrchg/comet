@@ -13,6 +13,16 @@ final class PromptDraftStorage {
         directory = DocDisk.directory.appendingPathComponent("drafts-\(profile)", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         if let data = try? Data(contentsOf: directory.appendingPathComponent("outbox.json")), let saved = try? JSONDecoder().decode([PromptDraftSave].self, from: data) { pending = saved }
+        // A canvas left by an interrupted process is now an abandoned draft.
+        if let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) {
+            for file in files where file.pathExtension == "canvas" {
+                if let data = try? Data(contentsOf: file), var save = try? JSONDecoder().decode(PromptDraftSave.self, from: data) {
+                    save.deferred = false
+                    if !pending.contains(where: { $0.publicationKey == save.publicationKey }) { pending.append(save) }
+                    if (try? persist()) != nil { try? FileManager.default.removeItem(at: file) }
+                }
+            }
+        }
     }
     private func url(_ id: String) throws -> URL {
         guard !id.isEmpty, id.count <= 128, id.utf8.allSatisfy({ (48...57).contains($0) || (65...90).contains($0) || (97...122).contains($0) || $0 == 45 }) else { throw CocoaError(.fileReadInvalidFileName) }
@@ -30,10 +40,14 @@ final class PromptDraftStorage {
         if let old = try? Data(contentsOf: file) {
             guard try JSONDecoder().decode(PromptDraftContent.self, from: old) == save.content else { throw CocoaError(.fileWriteFileExists) }
         } else { try content.write(to: file, options: .atomic) }
-        if !pending.contains(where: { $0.revision == save.revision }) { pending.append(save) }
+        if !pending.contains(where: { $0.publicationKey == save.publicationKey }) { pending.append(save) }
         try persist()
+        if save.deferred == true {
+            try JSONEncoder().encode(save).write(to: url(save.id).appendingPathExtension("canvas"), options: .atomic)
+        } else { clearCanvas(save.id) }
     }
-    func acknowledge(_ revision: String) throws { pending.removeAll { $0.revision == revision }; try persist() }
+    func clearCanvas(_ id: String) { if let file = try? url(id) { try? FileManager.default.removeItem(at: file.appendingPathExtension("canvas")) } }
+    func acknowledge(_ publicationKey: String) throws { pending.removeAll { $0.publicationKey == publicationKey }; try persist() }
     private func request(_ path: String, method: String = "GET", body: Data? = nil) async throws -> Data {
         guard let token = await config.currentToken() else { throw URLError(.userAuthenticationRequired) }
         var request = URLRequest(url: config.edgeURL.appending(path: path))

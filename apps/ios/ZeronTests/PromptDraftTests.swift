@@ -60,4 +60,18 @@ final class PromptDraftTests: XCTestCase {
         XCTAssertEqual(doc.overlayRow(kind: "promptDrafts", id: "draft")?.fields["orderKey"]?.stringValue, "c")
     }
 
+    @MainActor func testCanvasAppearsOnlyAfterLeavingAndStaysListed() {
+        let doc = RegistryDoc(deviceId: "phone")
+        let content = PromptDraftContent(prompt: "In progress", target: PromptDraftTarget(deviceId: "host"))
+        var save = PromptDraftSave(deferred: true, id: "a", revision: "v1", createdAt: 1, content: content)
+        doc.publishPromptDraft(save)
+        XCTAssertTrue(doc.promptDraftRows.isEmpty)
+        save.deferred = false
+        doc.publishPromptDraft(save)
+        XCTAssertEqual(doc.promptDraftRows.map(\.id), ["a"])
+        save.deferred = true; save.revision = "v2"; save.baseRevision = "v1"
+        doc.publishPromptDraft(save)
+        XCTAssertEqual(doc.promptDraftRows.first?.revision, "v2")
+    }
+
 }

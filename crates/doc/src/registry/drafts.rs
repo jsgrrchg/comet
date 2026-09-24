@@ -36,17 +36,36 @@ impl RegistryDoc {
         if !valid_draft_id(&draft.id) || !valid_draft_id(&draft.revision) {
             return Err(DocError::Schema("Invalid draft ID".into()));
         }
-        if self.draft_discarded(&draft.id) || self.overlay_row(REVISIONS, &draft.revision).is_some()
-        {
+        if self.draft_discarded(&draft.id) {
             return Ok(());
         }
         self.observe_sidebar_row(DRAFTS, &draft.id);
+        if let Some(version) = self.overlay_row(REVISIONS, &draft.revision) {
+            if version.fields.get("draftId").and_then(Value::as_str) == Some(draft.id.as_str())
+                && !draft.deferred
+                && !self
+                    .overlay_row(DRAFTS, &draft.id)
+                    .is_some_and(|r| r.fields.get("listed").and_then(Value::as_bool) == Some(true))
+            {
+                self.write(
+                    DRAFTS,
+                    &draft.id,
+                    OpKind::Upsert,
+                    fields([("listed", json!(true))]),
+                );
+            }
+            return Ok(());
+        }
         if let Some(base) = &draft.base_revision {
             self.observe_sidebar_row(REVISIONS, base);
         }
         let first = self.read_drafts().first().map(|d| d.order_key.clone());
         let stamp = self.next_hlc();
         let mut index = fields([("revision", json!(draft.revision))]);
+        index.insert(
+            if draft.deferred { "deferred" } else { "listed" }.into(),
+            json!(true),
+        );
         // A delayed recovery may publish an ancestor after its child.
         if self.overlay_rows(REVISIONS).iter().any(|r| {
             r.fields.get("baseRevision").and_then(Value::as_str) == Some(draft.revision.as_str())
@@ -122,6 +141,13 @@ impl RegistryDoc {
                 continue;
             }
             let index = self.overlay_row(DRAFTS, root);
+            if index.as_ref().is_some_and(|r| {
+                r.fields.get("deferred").and_then(Value::as_bool) == Some(true)
+                    && r.fields.get("listed").and_then(Value::as_bool) != Some(true)
+            }) {
+                continue;
+            }
+
             let sent = index
                 .as_ref()
                 .and_then(|r| r.fields.get("sentRevision"))
@@ -268,6 +294,7 @@ mod tests {
     use super::*;
     fn draft(id: &str, revision: &str, base: Option<&str>) -> SaveDraft {
         SaveDraft {
+            deferred: false,
             id: id.into(),
             revision: revision.into(),
             base_revision: base.map(str::to_owned),
@@ -279,6 +306,33 @@ mod tests {
             assets: vec![],
         }
     }
+    #[test]
+    fn active_canvas_stays_hidden_until_navigation_and_late_autosave_cannot_hide_it() {
+        let mut doc = RegistryDoc::new("device");
+        let mut save = draft("a", "v1", None);
+        save.deferred = true;
+        doc.publish_draft(&save).unwrap();
+        assert!(doc.read_drafts().is_empty());
+        assert!(doc.overlay_row(REVISIONS, "v1").is_some());
+        save.revision = "v2".into();
+        save.base_revision = Some("v1".into());
+        doc.publish_draft(&save).unwrap();
+        assert!(doc.read_drafts().is_empty());
+        save.deferred = false;
+        doc.publish_draft(&save).unwrap();
+        let rows = doc.read_drafts();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].revision, "v2");
+        let order = rows[0].order_key.clone();
+        save.deferred = true;
+        doc.publish_draft(&save).unwrap();
+        save.revision = "v3".into();
+        save.base_revision = Some("v2".into());
+        doc.publish_draft(&save).unwrap();
+        assert_eq!(doc.read_drafts()[0].revision, "v3");
+        assert_eq!(doc.read_drafts()[0].order_key, order);
+    }
+
     #[test]
     fn edits_keep_order_and_concurrent_heads_are_recoverable() {
         let mut doc = RegistryDoc::new("test");

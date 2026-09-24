@@ -1927,6 +1927,56 @@ impl DocHost {
     }
 
     async fn salvage_chat_transcript(&self, chat_id: &str) -> Result<(), String> {
+        // Inspection must not register a handle or start sync. A healthy
+        // history used to open one room per journal during every boot.
+        let stored = self
+            .inner
+            .store
+            .load_snapshot_with_cursor(chat_id)
+            .map_err(|e| e.to_string())?;
+        if let Some((bytes, _, epoch)) = &stored {
+            // A pre-chat2 snapshot may be discarded by open() during adoption;
+            // its entries are a recovery SOURCE, not proof the new doc is healthy.
+            if *epoch >= crate::chat2_host::CHAT2_DOC_EPOCH || self.inner.config.edge.is_none() {
+                let raw = loro::LoroDoc::new();
+                raw.import(bytes).map_err(|e| e.to_string())?;
+                for (_, update) in self
+                    .inner
+                    .store
+                    .pending_chat_updates(chat_id)
+                    .map_err(|e| e.to_string())?
+                {
+                    raw.import(&update).map_err(|e| e.to_string())?;
+                }
+                if !SessionDoc::from_doc(raw)
+                    .read_entries()
+                    .map_err(|e| e.to_string())?
+                    .is_empty()
+                {
+                    return Ok(());
+                }
+            }
+        }
+        let rollback_id = format!("{chat_id}.pre-chat2");
+        let source = self
+            .inner
+            .store
+            .load_snapshot(&rollback_id)
+            .map_err(|e| e.to_string())?
+            .or_else(|| {
+                stored
+                    .filter(|(_, _, epoch)| *epoch < crate::chat2_host::CHAT2_DOC_EPOCH)
+                    .map(|(bytes, _, _)| bytes)
+            });
+        let Some(bytes) = source else { return Ok(()) };
+        let raw = loro::LoroDoc::new();
+        raw.import(&bytes).map_err(|e| e.to_string())?;
+        let fat = SessionDoc::from_doc(raw);
+        let rebuilt = zeron_doc::rebuild::rebuild_thin_doc(&fat).map_err(|e| e.to_string())?;
+        let entries = rebuilt.doc.read_entries().map_err(|e| e.to_string())?;
+        if entries.is_empty() {
+            return Ok(());
+        }
         let handle = self.open(chat_id).map_err(|e| e.to_string())?;
         if !handle
             .doc()
@@ -1940,32 +1990,22 @@ impl DocHost {
         // source — the legacy s2 room — went away with the s2 client; any
         // transcript that existed only there was salvaged by earlier
         // releases or is reachable in the room's storage server-side.)
-        let rollback_id = format!("{chat_id}.pre-chat2");
-        let fat_bytes = self.inner.store.load_snapshot(&rollback_id).ok().flatten();
-        let Some(bytes) = fat_bytes else {
-            return Ok(()); // no fat lineage anywhere — genuinely empty chat
-        };
-        let raw = loro::LoroDoc::new();
-        raw.import(&bytes).map_err(|e| e.to_string())?;
-        let fat = SessionDoc::from_doc(raw);
         // Thin before appending (docs/chat2-sync.md A2): full outputs are
         // parked, exactly like a seed — they survive in the rollback copy
         // saved below and the run journal.
-        let rebuilt = zeron_doc::rebuild::rebuild_thin_doc(&fat).map_err(|e| e.to_string())?;
-        let entries = rebuilt.doc.read_entries().map_err(|e| e.to_string())?;
-        if entries.is_empty() {
-            return Ok(());
-        }
         if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None)) {
             let _ = self.inner.store.save_snapshot(&rollback_id, &bytes);
         }
         // Re-check emptiness at the last instant: a run that started during
         // the room fetch must not get history interleaved under it.
-        if !handle
-            .doc()
-            .read_entries()
-            .map_err(|e| e.to_string())?
-            .is_empty()
+        let _drain = handle.drain_lock.lock().await;
+        let _import = lock(&handle.transcript_import);
+        if Arc::strong_count(&handle.doc) > 1
+            || !handle
+                .doc()
+                .read_entries()
+                .map_err(|e| e.to_string())?
+                .is_empty()
         {
             return Err("doc gained entries mid-salvage; aborted".into());
         }
@@ -5117,6 +5157,38 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
 #[cfg(test)]
 mod publication_eviction_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn salvage_inspection_does_not_open_healthy_or_unrecoverable_chats() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store.clone(),
+            DocHostConfig {
+                device_id: "host".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
+            },
+        );
+        for n in 0..300 {
+            let id = format!("healthy-{n}");
+            let doc = SessionDoc::init(&id).unwrap();
+            let entry: SessionMessageEntry = serde_json::from_value(serde_json::json!({
+                "id": "message", "role": "user", "parts": [], "createdAt": 1, "deviceId": "host"
+            }))
+            .unwrap();
+            doc.push_message(&entry).unwrap();
+            store
+                .save_snapshot_with_cursor(&id, &doc.export_snapshot().unwrap(), 0, 2)
+                .unwrap();
+            host.salvage_chat_transcript(&id).await.unwrap();
+        }
+        host.salvage_chat_transcript("no-recovery-source")
+            .await
+            .unwrap();
+        assert!(lock(&host.inner.handles).is_empty());
+        host.shutdown_workers().await;
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lru_eviction_replays_unacknowledged_updates_after_reopen() {

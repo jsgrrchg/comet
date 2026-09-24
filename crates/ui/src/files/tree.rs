@@ -317,24 +317,14 @@ impl FilesSurface {
                             );
                         }),
                     )
-                    .when(
-                        crate::click_activation_drag_enabled() && !renaming,
-                        |element| {
-                            element.on_drag(drag_payload.clone(), move |payload, _, _, cx| {
-                                let _ = drag_owner
-                                    .update(cx, |files, cx| files.close_tree_context_menu(cx));
-                                cx.stop_propagation();
-                                workspace_path_drag_ghost(payload, cx)
-                            })
-                        },
-                    )
-                    .when(
-                        !crate::click_activation_drag_enabled() && !renaming,
-                        |element| {
-                            element
-                                .child(super::workspace_drag_handle(drag_payload.clone(), &theme))
-                        },
-                    )
+                    .when(!renaming, |element| {
+                        element.on_drag(drag_payload, move |payload, _, _, cx| {
+                            let _ = drag_owner
+                                .update(cx, |files, cx| files.close_tree_context_menu(cx));
+                            cx.stop_propagation();
+                            workspace_path_drag_ghost(payload, cx)
+                        })
+                    })
                     .child(
                         div()
                             .size(px(14.0))

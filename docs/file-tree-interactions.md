@@ -21,10 +21,10 @@ workspace root. A drop in the current parent is a no-op; a folder cannot move
 into itself or a descendant. Existing destinations are never overwritten or
 merged. The source remains visible until the host confirms the operation.
 
-On macOS and Linux, drag from the row. On Windows, use the drag handle: the row
-body retains protection against accidental drags caused by click jitter. Search
-results and file tabs continue to support references into the conversation;
-this release accepts tree-originated moves only.
+Drag from the row on macOS, Linux, and Windows. The Windows drag threshold
+protects ordinary clicks from small pointer jitter. Search results and file
+tabs continue to support references into the conversation; only tree-originated
+drags can move entries.
 
 Holding a compatible drag over a closed folder opens it after 650 ms. Dragging
 near the top or bottom of the list scrolls it. Escape, leaving the tree,
@@ -90,7 +90,7 @@ cargo check --release --locked -p zeron
 This implementation was exercised on Linux with GPUI's test backend. Native
 macOS/Windows interaction, Windows junctions, and the case-insensitive-volume
 fallback require verification on those hosts. A Windows-specific regression is
-included for row-click jitter and intentional handle dragging. A desktop visual
+included for row-click jitter and intentional row dragging. A desktop visual
 review of themes, narrow windows and pointer feel is still required; headless
 tests do not establish native rendering quality.
 

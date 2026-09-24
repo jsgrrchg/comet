@@ -233,9 +233,6 @@ mod tests {
 
     #[gpui::test]
     fn tree_and_production_chat_dropzones_are_exclusive(cx: &mut TestAppContext) {
-        if !crate::click_activation_drag_enabled() {
-            return;
-        }
         let (shell, files, cx) = setup(cx);
         let events = Rc::new(RefCell::new(Vec::new()));
         let recorded = events.clone();

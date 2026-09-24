@@ -359,45 +359,40 @@ mod tests {
         });
         let start = cx.debug_bounds("tree-entry:a.txt").unwrap().center();
         let end = cx.debug_bounds("tree-entry:folder").unwrap().center();
-        if crate::click_activation_drag_enabled() {
-            cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
-            cx.simulate_mouse_move(
-                start + gpui::point(px(9.), px(0.)),
-                Some(gpui::MouseButton::Left),
-                gpui::Modifiers::default(),
-            );
-            cx.simulate_mouse_move(
-                end,
-                Some(gpui::MouseButton::Left),
-                gpui::Modifiers::default(),
-            );
-            cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
-            cx.run_until_parked();
-            let events = events.borrow();
-            let moves = events
+        cx.simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_move(
+            start + gpui::point(px(9.), px(0.)),
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(
+            end,
+            Some(gpui::MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(end, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let events = events.borrow();
+        let moves = events
+            .iter()
+            .filter_map(|event| {
+                if let FilesEvent::Mutate(intent) = event {
+                    Some(intent)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].destination.as_deref(), Some("folder/a.txt"));
+        assert!(
+            !events
                 .iter()
-                .filter_map(|event| {
-                    if let FilesEvent::Mutate(intent) = event {
-                        Some(intent)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(moves.len(), 1);
-            assert_eq!(moves[0].destination.as_deref(), Some("folder/a.txt"));
-            assert!(
-                !events
-                    .iter()
-                    .any(|event| matches!(event, FilesEvent::AddToChat { .. }))
-            );
-        }
+                .any(|event| matches!(event, FilesEvent::AddToChat { .. }))
+        );
     }
     #[gpui::test]
     fn hover_expands_only_after_delay_and_escape_stops_tasks(cx: &mut gpui::TestAppContext) {
-        if !crate::click_activation_drag_enabled() {
-            return;
-        }
         let (files, cx) = super::super::test_support::setup(cx);
         let start = cx.debug_bounds("tree-entry:a.txt").unwrap().center();
         let end = cx.debug_bounds("tree-entry:folder").unwrap().center();
@@ -431,7 +426,7 @@ mod tests {
     }
     #[cfg(target_os = "windows")]
     #[gpui::test]
-    fn windows_row_jitter_preserves_click_and_handle_starts_drag(cx: &mut gpui::TestAppContext) {
+    fn windows_row_jitter_preserves_click_and_row_starts_drag(cx: &mut gpui::TestAppContext) {
         let (files, cx) = super::super::test_support::setup(cx);
         let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let recorded = events.clone();
@@ -443,13 +438,13 @@ mod tests {
         let row = cx.debug_bounds("tree-entry:a.txt").unwrap().center();
         cx.simulate_mouse_down(row, gpui::MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_move(
-            row + gpui::point(px(8.), px(0.)),
+            row + gpui::point(px(3.), px(0.)),
             Some(gpui::MouseButton::Left),
             gpui::Modifiers::default(),
         );
         cx.update(|_, cx| assert!(!cx.has_active_drag()));
         cx.simulate_mouse_up(
-            row + gpui::point(px(8.), px(0.)),
+            row + gpui::point(px(3.), px(0.)),
             gpui::MouseButton::Left,
             gpui::Modifiers::default(),
         );
@@ -460,13 +455,9 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event,FilesEvent::OpenFile(path) if path=="a.txt"))
         );
-        let handle = cx
-            .debug_bounds("workspace-drag-handle:a.txt")
-            .unwrap()
-            .center();
-        cx.simulate_mouse_down(handle, gpui::MouseButton::Left, gpui::Modifiers::default());
+        cx.simulate_mouse_down(row, gpui::MouseButton::Left, gpui::Modifiers::default());
         cx.simulate_mouse_move(
-            handle + gpui::point(px(9.), px(0.)),
+            row + gpui::point(px(9.), px(0.)),
             Some(gpui::MouseButton::Left),
             gpui::Modifiers::default(),
         );

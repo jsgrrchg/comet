@@ -7,10 +7,12 @@ use zeron_rpc::methods;
 use super::widgets;
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons;
-use crate::pickers::{child_path, parent_path, typed_path_target};
 use crate::popover::{self, Loadable};
 use crate::state::AppState;
 use crate::theme::Theme;
+use zeron_proto::device_paths::{
+    child_folder as child_path, expand_home, parent_folder as folder_parent,
+};
 
 pub(super) struct WorktreeSettingsCard {
     state: Entity<AppState>,
@@ -192,7 +194,10 @@ impl WorktreeSettingsCard {
         self.folder_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<FolderListing, String> = async {
                 let mut path = path;
-                if let Some(query) = path.as_deref().filter(|p| *p == "~" || p.starts_with("~/")) {
+                if let Some(query) = path
+                    .as_deref()
+                    .filter(|p| *p == "~" || p.starts_with("~/") || p.starts_with(r"~\"))
+                {
                     let home = engine
                         .client()
                         .call(
@@ -203,7 +208,8 @@ impl WorktreeSettingsCard {
                         .map_err(|error| error.to_string())?;
                     let home: FolderListing =
                         serde_json::from_value(home).map_err(|error| error.to_string())?;
-                    path = typed_path_target(query, Some(&home.path));
+                    path =
+                        Some(expand_home(query, &home.path).unwrap_or_else(|| query.to_string()));
                 }
                 let value = engine
                     .client()
@@ -585,26 +591,4 @@ fn description(theme: &Theme, text: &str) -> gpui::Div {
         .text_size(crate::typography::ui_rems(widgets::ROW_DESCRIPTION_SIZE))
         .text_color(theme.text_muted.opacity(0.65))
         .child(text.to_owned())
-}
-
-/// Interpret the host's paths, including Windows paths when this UI runs on Unix.
-fn folder_parent(path: &str) -> Option<String> {
-    if path.starts_with("\\\\") || path.as_bytes().get(1) == Some(&b':') {
-        let path = path.replace('\\', "/");
-        let path = path
-            .strip_prefix("//?/UNC/")
-            .map(|path| format!("//{path}"))
-            .unwrap_or_else(|| path.strip_prefix("//?/").unwrap_or(&path).to_owned());
-        if path.starts_with("//") && path.trim_matches('/').split('/').count() <= 2 {
-            return None;
-        }
-        return parent_path(&path).map(|parent| {
-            if parent.ends_with(':') {
-                format!("{parent}/")
-            } else {
-                parent
-            }
-        });
-    }
-    parent_path(path)
 }

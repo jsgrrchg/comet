@@ -144,17 +144,22 @@ fn git(cwd: &std::path::Path, args: &[&str]) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn run_with_worktree_spec_materializes_on_host_and_reuses() {
-    check_worktree_setup_and_reuse(false).await;
+    check_worktree_setup_and_reuse(false, true).await;
     #[cfg(unix)]
-    check_worktree_setup_and_reuse(true).await;
+    check_worktree_setup_and_reuse(true, true).await;
 }
 
-async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn worktree_location_supports_native_path_aliases() {
+    check_worktree_setup_and_reuse(false, false).await;
+}
+
+async fn check_worktree_setup_and_reuse(use_project_symlink: bool, test_setup: bool) {
     let tmp = tempfile::tempdir().unwrap();
     // Canonicalize: git records canonical paths in worktree gitdir links, and
     // macOS tempdirs live behind the /var → /private/var symlink.
     let tmp_path = tmp.path().canonicalize().unwrap();
-    let worktrees_root = tmp_path.join("worktrees");
+    let worktrees_root = tmp_path.join("Worktrees con espacios 日本語");
 
     let repo_dir = tmp_path.join("repo");
     std::fs::create_dir_all(&repo_dir).unwrap();
@@ -214,7 +219,8 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
         )
         .await
         .expect("choose initial worktree directory");
-    client
+    if test_setup {
+        client
         .call(
             zeron_rpc::methods::UPSERT_PROJECT_ACTION,
             serde_json::json!({
@@ -229,6 +235,7 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
         )
         .await
         .expect("save setup Action");
+    }
 
     // Mirror the composer: createChat lands first (cwd-less; the engine
     // resolves the project folder), then the queued Run carries the spec.
@@ -280,18 +287,22 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
         "setup failed: {:?}",
         setup.setup_error
     );
-    assert!(setup.setup_action.is_some());
-    wait_for(|| first.join("setup-marker").is_file(), "setup Action").await;
-    assert_eq!(
-        std::fs::read_to_string(first.join("setup-project-root")).unwrap(),
-        repo_path
-    );
-    assert_eq!(
-        std::fs::read_to_string(first.join("setup-worktree-path")).unwrap(),
-        first_cwd
-    );
-    // Reusing this checkout must not execute setup a second time.
-    std::fs::remove_file(first.join("setup-marker")).unwrap();
+    if test_setup {
+        assert!(setup.setup_action.is_some());
+        wait_for(|| first.join("setup-marker").is_file(), "setup Action").await;
+        assert_eq!(
+            std::fs::read_to_string(first.join("setup-project-root")).unwrap(),
+            repo_path
+        );
+        assert_eq!(
+            std::fs::read_to_string(first.join("setup-worktree-path")).unwrap(),
+            first_cwd
+        );
+        // Reusing this checkout must not execute setup a second time.
+        std::fs::remove_file(first.join("setup-marker")).unwrap();
+    } else {
+        assert!(setup.setup_action.is_none());
+    }
 
     // The chat row follows: cwd repointed at the worktree, branch stamped
     // with the actual zeron/<name> (the composer only knew the base).
@@ -320,11 +331,20 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
         )
         .await
         .expect("change destination while the old chat exists");
+    // Exercise identity across different spellings, including Windows verbatim
+    // versus Git-style paths. Avoid lowercasing names on case-sensitive volumes.
+    #[cfg(windows)]
+    let retry_path = repo_path
+        .strip_prefix(r"\\?\")
+        .unwrap_or(&repo_path)
+        .replace('\\', "/");
+    #[cfg(not(windows))]
+    let retry_path = format!("{repo_path}/.");
     let second_command = core
         .doc_host
         .queue_command(
             CHAT,
-            run_payload("msg-wt-2", &repo_path, Some("space-worktree-run")),
+            run_payload("msg-wt-2", &retry_path, Some("space-worktree-run")),
         )
         .expect("queue second run");
     wait_for(|| complete_assistant_count(&core) == 2, "second turn").await;
@@ -344,6 +364,23 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     assert!(reused.setup_action.is_none(), "setup must not run on reuse");
     assert!(reused.setup_error.is_none());
     assert!(!first.join("setup-marker").exists());
+
+    assert_eq!(std::fs::read_dir(&next_root).unwrap().count(), 0);
+    // The browser must be able to descend from the canonical saved location.
+    let nested =
+        zeron_proto::device_paths::child_folder(&next_root.to_string_lossy(), "Carpeta 日本語");
+    std::fs::create_dir(&nested).unwrap();
+    assert!(std::path::Path::new(&nested).is_dir());
+    let listing = core.repos.list_folders(Some(nested.clone())).await.unwrap();
+    assert!(same_file::is_same_file(&listing.path, &nested).unwrap());
+    let parent = zeron_proto::device_paths::parent_folder(&listing.path).unwrap();
+    let listing = core.repos.list_folders(Some(parent)).await.unwrap();
+    assert!(
+        listing
+            .entries
+            .iter()
+            .any(|entry| entry.name == "Carpeta 日本語" && entry.is_dir)
+    );
 
     let next_chat = "chat-after-location-change";
     client
@@ -387,8 +424,10 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
     let refs = core.repos.refs(&repo_dir).await.unwrap();
     for cwd in [&first_cwd, &next_cwd] {
         assert!(
-            refs.iter()
-                .any(|entry| entry.worktree_path.as_ref() == Some(cwd)),
+            refs.iter().any(|entry| entry
+                .worktree_path
+                .as_ref()
+                .is_some_and(|path| same_file::is_same_file(path, cwd).unwrap_or(false))),
             "Git selector retains {cwd}"
         );
     }
@@ -397,6 +436,7 @@ async fn check_worktree_setup_and_reuse(use_project_symlink: bool) {
         "keep my original checkout"
     );
     assert_eq!(core.repos.current_branch(&repo_dir).await.unwrap(), "main");
+    assert_eq!(core.workspace.read_spaces().unwrap().len(), 1);
 
     core.shutdown().await;
 }

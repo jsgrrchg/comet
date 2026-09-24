@@ -71,12 +71,16 @@ pub struct CheckoutIdentity {
 
 /// Best-effort home directory (the `ListFolders` default and worktree root base).
 pub(crate) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("USERPROFILE")
-                .filter(|s| !s.is_empty())
+    let variables = if cfg!(windows) {
+        ["USERPROFILE", "HOME"]
+    } else {
+        ["HOME", "USERPROFILE"]
+    };
+    variables
+        .into_iter()
+        .find_map(|name| {
+            std::env::var_os(name)
+                .filter(|value| !value.is_empty())
                 .map(PathBuf::from)
         })
         .unwrap_or_else(|| PathBuf::from("/"))

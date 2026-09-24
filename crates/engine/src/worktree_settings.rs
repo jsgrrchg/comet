@@ -129,13 +129,10 @@ impl WorktreePreferences {
 
 fn validate_directory(value: &str) -> Result<PathBuf, EngineError> {
     let value = value.trim();
-    let path = if value == "~" {
-        crate::repos::home_dir()
-    } else if let Some(relative) = value.strip_prefix("~/") {
-        crate::repos::home_dir().join(relative)
-    } else {
-        PathBuf::from(value)
-    };
+    let home = crate::repos::home_dir();
+    let path = zeron_proto::device_paths::expand_home(value, &home.to_string_lossy())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(value));
     if !path.is_absolute() {
         return Err(EngineError::Other(
             "Choose an absolute folder path on the selected device".into(),

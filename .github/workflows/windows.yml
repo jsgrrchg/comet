@@ -83,6 +83,11 @@ jobs:
         run: cargo test --release --locked -p zeron -p zeron-update
       - name: Engine unit tests
         run: cargo test --release --locked -p zeron-engine --lib
+      - name: Worktree path compatibility
+        run: |
+          cargo test --release --locked -p zeron-proto --lib device_paths
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --release --locked -p zeron-engine --test worktree_on_run worktree_location_supports_native_path_aliases
       - name: Harness catalog and login tests
         run: cargo test --release --locked -p zeron-engine --test codex_catalog --test codex_login_resolution
       - name: Auth integration tests

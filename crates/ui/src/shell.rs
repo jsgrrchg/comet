@@ -245,21 +245,28 @@ fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
     (viewport - sidebar - right).max(0.0)
 }
 
-/// The host-resolved checkout root for a chat, falling back to its current
-/// working directory when source context has not landed yet. Source context
-/// from a previous cwd must not make a retargeted chat copy the old checkout.
-fn chat_checkout_path(chat: &zeron_proto::Chat) -> Option<&str> {
-    let cwd = chat
-        .cwd
+/// The chat's working directory as the host device spells it — the folder the
+/// harness runs in (a worktree chat's worktree). Projectless `~` chats have
+/// none. Deliberately not `source_context.repo_root`: that is canonicalized
+/// (symlinks resolved, `\\?\` verbatim prefix on Windows hosts).
+fn chat_copy_path(chat: &zeron_proto::Chat) -> Option<&str> {
+    chat.cwd
         .as_deref()
         .map(str::trim)
-        .filter(|cwd| !cwd.is_empty() && std::path::Path::new(cwd).is_absolute())?;
-    chat.source_context
-        .as_ref()
-        .filter(|source| source.cwd.trim() == cwd)
-        .map(|source| source.repo_root.trim())
-        .filter(|root| !root.is_empty() && std::path::Path::new(root).is_absolute())
-        .or(Some(cwd))
+        .filter(|cwd| is_host_absolute_path(cwd))
+}
+
+/// Absolute on the HOST, whatever the viewer's OS: a remote engine may hand a
+/// POSIX path to a Windows viewport (no drive, so `Path::is_absolute` says
+/// no) or a drive path to a POSIX one.
+fn is_host_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
 }
 
 fn composer_target_width(panel_width: f32, content_width: f32, docked: bool) -> f32 {
@@ -4067,17 +4074,18 @@ impl Shell {
         cx.notify();
     }
 
-    fn copy_chat_checkout_path(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+    fn copy_chat_path(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         let path = self
             .state
             .read(cx)
             .chats
             .iter()
             .find(|chat| chat.id == chat_id)
-            .and_then(chat_checkout_path)
+            .and_then(chat_copy_path)
             .map(str::to_owned);
         if let Some(path) = path {
             cx.write_to_clipboard(ClipboardItem::new_string(path));
+            self.sidebar_notice = Some("Path copied".into());
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -8544,7 +8552,7 @@ impl Shell {
                         .as_ref()
                         .and_then(|chat| chat.harness_session_id.as_deref())
                         .is_some_and(|id| !id.trim().is_empty());
-                    let has_checkout_path = chat.as_ref().and_then(chat_checkout_path).is_some();
+                    let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
                     let zeron_id = chat_id.clone();
                     let harness_id = chat_id.clone();
                     let session_chat_id = chat_id.clone();
@@ -8566,19 +8574,19 @@ impl Shell {
                             .child(SharedString::from("Back")),
                     )
                     .child(popover::menu_separator())
-                    .when(has_checkout_path, |menu| {
+                    .when(has_path, |menu| {
                         menu.child(
                             popover::menu_row(&theme, false, format!("chat-copy-path-{chat_id}"))
                                 .id("chat-copy-path")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_chat_checkout_path(&path_chat_id, cx)
+                                    this.copy_chat_path(&path_chat_id, cx)
                                 }))
                                 .child(
                                     icon(icons::COPY)
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Copy Path")),
+                                .child(SharedString::from("Path")),
                         )
                     })
                     .child(
@@ -11745,10 +11753,7 @@ impl Render for Shell {
 mod tests {
     use super::*;
 
-    fn chat_with_checkout_path(
-        cwd: Option<&str>,
-        source: Option<(&str, &str)>,
-    ) -> zeron_proto::Chat {
+    fn chat_with_path(cwd: Option<&str>, source: Option<(&str, &str)>) -> zeron_proto::Chat {
         zeron_proto::Chat {
             id: "chat".into(),
             device_id: "remote-device".into(),
@@ -11781,33 +11786,46 @@ mod tests {
     }
 
     #[test]
-    fn copy_path_prefers_the_matching_host_resolved_checkout_root() {
-        let chat = chat_with_checkout_path(
+    fn copy_path_copies_the_chat_cwd_not_the_canonical_repo_root() {
+        let chat = chat_with_path(
             Some("/remote/repo/packages/app"),
             Some(("/remote/repo/packages/app", "/remote/repo")),
         );
+        assert_eq!(chat_copy_path(&chat), Some("/remote/repo/packages/app"));
 
-        assert_eq!(chat_checkout_path(&chat), Some("/remote/repo"));
+        let windows = chat_with_path(
+            Some(r"C:\Users\me\repo"),
+            Some((r"C:\Users\me\repo", r"\\?\C:\Users\me\repo")),
+        );
+        assert_eq!(chat_copy_path(&windows), Some(r"C:\Users\me\repo"));
     }
 
     #[test]
-    fn copy_path_falls_back_to_current_cwd_when_source_context_is_stale() {
-        let chat = chat_with_checkout_path(
-            Some("/remote/worktrees/new-checkout"),
-            Some(("/remote/repo", "/remote/repo")),
-        );
-
-        assert_eq!(
-            chat_checkout_path(&chat),
-            Some("/remote/worktrees/new-checkout")
-        );
+    fn copy_path_accepts_host_absolute_paths_from_any_os() {
+        for cwd in [
+            "/home/me/repo",
+            r"C:\Users\me\repo",
+            "D:/work/repo",
+            r"\\server\share\repo",
+        ] {
+            let chat = chat_with_path(Some(cwd), None);
+            assert_eq!(chat_copy_path(&chat), Some(cwd));
+        }
     }
 
     #[test]
-    fn copy_path_is_unavailable_without_an_absolute_checkout_path() {
-        for cwd in [None, Some(""), Some("~"), Some(".")] {
-            let chat = chat_with_checkout_path(cwd, None);
-            assert_eq!(chat_checkout_path(&chat), None);
+    fn copy_path_is_unavailable_without_an_absolute_path() {
+        for cwd in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("~"),
+            Some("~/repo"),
+            Some("."),
+            Some("C:"),
+        ] {
+            let chat = chat_with_path(cwd, None);
+            assert_eq!(chat_copy_path(&chat), None);
         }
     }
 

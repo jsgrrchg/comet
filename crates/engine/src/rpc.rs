@@ -992,7 +992,7 @@ impl EngineRpc {
                 });
                 return Ok(RpcReply::Stream(stream.boxed()));
             }
-            let rx = match client.subscribe(method, params).await {
+            let rx = match client.subscribe_scoped(method, params).await {
                 Ok(rx) => rx,
                 Err(err) => {
                     if should_invalidate_link(&err) {
@@ -1780,6 +1780,13 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "outcome": outcome }))
             }
+            methods::FOCUS_CHAT => {
+                let p: ChatParams = parse_params(params)?;
+                self.doc_host
+                    .focus_chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({}))
+            }
             methods::WATCH_DOC_MESSAGES => {
                 // Opt-in: older viewports retain the full-reset contract.
                 let opening_tail = params
@@ -1989,6 +1996,7 @@ impl RpcService for EngineRpc {
                         serde_json::json!({
                             "chatId": chat_id,
                             "room": room.as_ref().map(chat2_json),
+                            "state": self.doc_host.chat_sync_state(chat_id),
                         })
                     })
                     .collect();
@@ -1997,6 +2005,7 @@ impl RpcService for EngineRpc {
                     "nowMs": crate::now_ms(),
                     "workspace": workspace.as_ref().map(room_json),
                     "chats": chats,
+                    "resources": self.doc_host.sync_resources(),
                 }))
             }
             methods::WATCH_CONNECTIVITY => Ok(RpcReply::Stream(watch_stream(
@@ -3457,6 +3466,7 @@ mod tests {
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::FOCUS_CHAT));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
         assert!(forwardable(methods::QUEUE_COMMAND));

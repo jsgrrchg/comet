@@ -1,4 +1,4 @@
-//! The Providers page's device-addressed worktree destination settings.
+//! Settings → General: device-addressed worktree destination settings.
 
 use gpui::{AnyElement, Context, Entity, Render, Subscription, Task, Window, div, prelude::*, px};
 use zeron_proto::{FolderListing, WorktreeSettings, WorktreeSettingsStatus};
@@ -17,6 +17,7 @@ use zeron_proto::device_paths::{
 pub(super) struct WorktreeSettingsCard {
     state: Entity<AppState>,
     target: Option<String>,
+    device_select: widgets::SelectState,
     settings: Loadable<WorktreeSettingsStatus>,
     enabled: bool,
     input: Entity<ComposerInput>,
@@ -46,9 +47,10 @@ impl WorktreeSettingsCard {
             }
             cx.notify();
         });
-        Self {
+        let mut card = Self {
             state,
             target: None,
+            device_select: widgets::SelectState::default(),
             settings: Loadable::Idle,
             enabled: false,
             input,
@@ -59,10 +61,90 @@ impl WorktreeSettingsCard {
             folders: Loadable::Idle,
             folder_task: None,
             _input_events: events,
-        }
+        };
+        card.load(None, cx);
+        card
     }
 
-    pub fn load(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+    fn render_device_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        use crate::icons::{self, icon};
+        let (mut devices, local_id) = {
+            let s = self.state.read(cx);
+            (s.devices.clone(), s.local_device_id.clone())
+        };
+        devices.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let effective = self.target.clone().or_else(|| local_id.clone());
+        let platform_glyph = |platform: &str| match platform {
+            "macos" | "darwin" => icons::LAPTOP,
+            "ios" | "android" => icons::SMARTPHONE,
+            _ => icons::MONITOR,
+        };
+        // Local device = no passthrough (calls stay direct).
+        let mut targets: Vec<Option<String>> = Vec::new();
+        let mut options = Vec::new();
+        for device in &devices {
+            let is_local = local_id.as_deref() == Some(device.id.as_str());
+            let glyph = platform_glyph(&device.platform);
+            let muted = theme.text_muted;
+            let option = widgets::SelectOption::new(device.name.clone()).leading(move || {
+                icon(glyph)
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(muted)
+                    .into_any_element()
+            });
+            options.push(if is_local {
+                option.detail("You")
+            } else {
+                option
+            });
+            targets.push((!is_local).then(|| device.id.clone()));
+        }
+        let selected = match devices
+            .iter()
+            .position(|d| Some(d.id.as_str()) == effective.as_deref())
+        {
+            Some(ix) => ix,
+            // Not registered (yet): keep the current target reachable.
+            None => {
+                let muted = theme.text_muted;
+                options.push(widgets::SelectOption::new("This device").leading(move || {
+                    icon(icons::LAPTOP)
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(muted)
+                        .into_any_element()
+                }));
+                targets.push(self.target.clone());
+                options.len() - 1
+            }
+        };
+        widgets::select(
+            "worktrees-device-switcher",
+            "Device",
+            theme,
+            |page: &mut Self| &mut page.device_select,
+        )
+        .options(options, selected)
+        .menu_width(260.0)
+        .heading("Devices")
+        .on_select(move |page, ix, _, cx| {
+            if let Some(target) = targets.get(ix) {
+                widgets::close_select(page, |card: &mut Self| &mut card.device_select, cx);
+                if page.target != *target {
+                    page.load(target.clone(), cx);
+                }
+            }
+        })
+        .render(&self.device_select, cx)
+        .into_any_element()
+    }
+
+    fn load(&mut self, target: Option<String>, cx: &mut Context<Self>) {
         self.task = None;
         self.folder_task = None;
         self.target = target;
@@ -405,9 +487,14 @@ impl WorktreeSettingsCard {
 impl Render for WorktreeSettingsCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_settings_surface();
-        let mut card = widgets::section_card(&theme).mt(px(0.0));
+        let switcher = self.render_device_switcher(&theme, cx);
+        let mut card = widgets::section_card(&theme).mt(px(0.0)).child(
+            widgets::card_row(&theme, true)
+                .child(widgets::row_title(&theme, "Device"))
+                .child(switcher),
+        );
         let Loadable::Ready(status) = &self.settings else {
-            let header = widgets::card_row(&theme, true)
+            let header = widgets::card_row(&theme, false)
                 .child(widgets::row_title(&theme, "Custom worktree location"));
             card = card.child(header);
             let card =
@@ -447,7 +534,7 @@ impl Render for WorktreeSettingsCard {
             status.effective_directory.clone()
         };
         card = card.child(
-            widgets::card_row(&theme, true)
+            widgets::card_row(&theme, false)
                 .child(
                     div()
                         .flex_1()

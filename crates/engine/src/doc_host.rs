@@ -390,6 +390,36 @@ impl DegradeGrace {
     }
 }
 
+/// One read of an open chat's admission flags and client. Connectivity and
+/// sync-state reporting share it so a tick does not re-fetch each handle.
+struct ChatConnectionSnapshot {
+    sync_started: bool,
+    sync_requested: bool,
+    stats: Option<zeron_sync::ChatStatsSnapshot>,
+    delivery_live: bool,
+}
+
+impl ChatConnectionSnapshot {
+    fn read(handle: &ChatDocHandle) -> Self {
+        let sync_started = handle.sync_started.load(Ordering::Acquire);
+        let sync_requested = handle.sync_requested.load(Ordering::Acquire);
+        let client = lock(&handle.chat2);
+        Self {
+            sync_started,
+            sync_requested,
+            stats: client.as_ref().map(|client| client.stats()),
+            delivery_live: sync_started
+                && client
+                    .as_ref()
+                    .is_some_and(|client| client.delivery_live()),
+        }
+    }
+
+    fn sync_expected(&self) -> bool {
+        self.sync_started || self.sync_requested
+    }
+}
+
 #[derive(Clone)]
 pub struct DocHost {
     inner: Arc<DocHostInner>,
@@ -3078,30 +3108,28 @@ impl DocHost {
             return Connectivity::default();
         }
         let now = std::time::Instant::now();
+        let mut handles: Vec<Arc<ChatDocHandle>> =
+            lock(&self.inner.handles).values().cloned().collect();
+        handles.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
         let mut grace = lock(&self.inner.connectivity_grace);
-        let statuses = self.sync_statuses();
-        grace.retain_chats(|id| statuses.iter().any(|(chat_id, _)| chat_id == id));
-        let chats = statuses
+        grace.retain_chats(|id| handles.iter().any(|handle| handle.chat_id == id));
+        let chats = handles
             .into_iter()
-            .map(|(chat_id, stats)| {
-                let stats = stats.unwrap_or_default();
+            .map(|handle| {
+                let snapshot = ChatConnectionSnapshot::read(&handle);
+                let stats = snapshot.stats.unwrap_or_default();
                 // An idle chat deliberately has no room. Clear any previous
                 // timer so selecting it starts a fresh grace window.
-                let sync_expected = lock(&self.inner.handles)
-                    .get(&chat_id)
-                    .is_some_and(|handle| {
-                        handle.sync_started.load(Ordering::Acquire)
-                            || handle.sync_requested.load(Ordering::Acquire)
-                    });
                 let connected = !grace.degraded(
-                    GraceKey::Chat(&chat_id),
-                    sync_expected && !stats.connected,
+                    GraceKey::Chat(&handle.chat_id),
+                    snapshot.sync_expected() && !stats.connected,
                     now,
                 );
                 ChatConnectivity {
-                    sync_state: self.chat_sync_state(&chat_id),
-                    chat_id,
+                    sync_state: self.chat_sync_state_for_handle(&handle, &snapshot),
+                    chat_id: handle.chat_id.clone(),
                     connected,
+                    delivery_live: snapshot.delivery_live,
                     pending_pushes: stats.pending_pushes,
                 }
             })
@@ -3144,23 +3172,32 @@ impl DocHost {
         let Some(handle) = handle else {
             return S::Local;
         };
+        let snapshot = ChatConnectionSnapshot::read(&handle);
+        self.chat_sync_state_for_handle(&handle, &snapshot)
+    }
+
+    fn chat_sync_state_for_handle(
+        &self,
+        handle: &ChatDocHandle,
+        snapshot: &ChatConnectionSnapshot,
+    ) -> zeron_proto::ChatSyncState {
+        use zeron_proto::ChatSyncState as S;
         if handle.publication_failed.load(Ordering::Acquire) {
             return S::StorageError;
         }
         if self.inner.config.edge.is_none() {
             return S::Local;
         }
-        if !handle.sync_started.load(Ordering::Acquire) {
-            return if handle.sync_requested.load(Ordering::Acquire) {
+        if !snapshot.sync_started {
+            return if snapshot.sync_requested {
                 S::Waiting
             } else {
                 S::Local
             };
         }
-        let client = lock(&handle.chat2);
-        match client.as_ref() {
-            Some(c) if c.delivery_live() && c.stats().pending_pushes == 0 => S::Synced,
-            Some(c) if !c.delivery_live() && zeron_sync::wake::path_is_offline() => S::Offline,
+        match snapshot.stats {
+            Some(stats) if snapshot.delivery_live && stats.pending_pushes == 0 => S::Synced,
+            Some(_) if !snapshot.delivery_live && zeron_sync::wake::path_is_offline() => S::Offline,
             _ => S::Connecting,
         }
     }
@@ -5836,6 +5873,7 @@ mod degrade_grace_tests {
         let dormant = host.compute_connectivity();
         assert_eq!(dormant.chats[0].sync_state, ChatSyncState::Local);
         assert!(dormant.chats[0].connected);
+        assert!(!dormant.chats[0].delivery_live);
         assert!(
             !lock(&host.inner.connectivity_grace)
                 .chats
@@ -5848,6 +5886,7 @@ mod degrade_grace_tests {
         let waking = host.compute_connectivity();
         assert_eq!(waking.chats[0].sync_state, ChatSyncState::Waiting);
         assert!(waking.chats[0].connected);
+        assert!(!waking.chats[0].delivery_live);
 
         lock(&host.inner.connectivity_grace)
             .chats
@@ -5860,6 +5899,7 @@ mod degrade_grace_tests {
         let active = host.compute_connectivity();
         assert_eq!(active.chats[0].sync_state, ChatSyncState::Connecting);
         assert!(!active.chats[0].connected);
+        assert!(!active.chats[0].delivery_live);
         host.shutdown_workers().await;
     }
 }

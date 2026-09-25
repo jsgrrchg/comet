@@ -2101,6 +2101,9 @@ impl AppState {
     /// watch server-side. Selecting a chat also lands in its space and marks it
     /// seen (a global-list click must switch the tab strip too).
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
+        if let Some(id) = &chat_id {
+            self.focus_chat_sync(id, cx);
+        }
         if self.selected_chat == chat_id {
             // Re-selecting still clears a fresh "completed" badge.
             if let Some(id) = chat_id {
@@ -2308,6 +2311,33 @@ impl AppState {
             }
         })
         .detach();
+    }
+
+    /// Navigation signal is separate from watch lifetime: resubscribing,
+    /// receiving agent output and MCP reads cannot refresh focus priority.
+    pub(crate) fn focus_chat_sync(&self, chat_id: &str, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        let chat_id = chat_id.to_owned();
+        cx.spawn(async move |_, _| {
+            if let Err(error) = handle
+                .client()
+                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
+                .await
+            {
+                tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");
+            }
+        })
+        .detach();
+    }
+
+    pub(crate) fn focus_subagent_sync(&self, doc_id: &str, cx: &mut Context<Self>) {
+        // Frozen transcripts are static blobs: navigation must not open their
+        // old room just to report focus.
+        if self.sub_watch_tasks.contains_key(doc_id) {
+            self.focus_chat_sync(doc_id, cx);
+        }
     }
 }
 
@@ -2578,6 +2608,8 @@ fn spawn_transcript_watch(
     handle: EngineHandle,
     chat_id: String,
 ) -> Task<()> {
+    // The scoped subscription cancels even a silent server stream on drop;
+    // otherwise a deselected chat would retain its protected sync slot.
     cx.spawn(async move |this, cx| {
         // Outer loop: a delta desync (missed frame) resubscribes immediately
         // and the fresh stream's opening reset heals the copy; a subscribe
@@ -2592,7 +2624,7 @@ fn spawn_transcript_watch(
             let params = serde_json::json!({ "chatId": chat_id, "openingTail": true });
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .subscribe_checked(methods::WATCH_DOC_MESSAGES, params)
                 .await
             {
                 Ok(rx) => rx,
@@ -2688,7 +2720,7 @@ fn spawn_queue_watch(
             let params = serde_json::json!({ "chatId": chat_id });
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_QUEUE, params)
+                .subscribe_checked(methods::WATCH_QUEUE, params)
                 .await
             {
                 Ok(rx) => rx,
@@ -2742,7 +2774,7 @@ fn spawn_subagent_watch(
             let params = serde_json::json!({ "chatId": doc_id });
             let mut rx = match handle
                 .client()
-                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .subscribe_checked(methods::WATCH_DOC_MESSAGES, params)
                 .await
             {
                 Ok(rx) => rx,

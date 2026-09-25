@@ -8373,6 +8373,11 @@ impl Shell {
             cx.notify();
             return true;
         }
+        if self.discard_working_tree.is_some() {
+            self.discard_working_tree = None;
+            cx.notify();
+            return true;
+        }
         // The folded-breadcrumbs menu floats over the palette; it closes first.
         if self.add_space.is_some() && self.project_crumb_menu.is_open() {
             self.close_project_crumb_menu(cx);
@@ -8772,12 +8777,6 @@ impl Shell {
             let card = match flow {
                 DiscardWorkingTreeFlow::Confirm(_) => {
                     popover::dialog_card(&theme)
-                        .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
-                            if ev.keystroke.key == "escape" {
-                                this.discard_working_tree = None;
-                                cx.notify();
-                            }
-                        }))
                         .child(popover::dialog_title(
                             &theme,
                             "Discard working tree changes?",

@@ -241,6 +241,7 @@ struct DocHostInner {
     /// Tracks every spawned worker so `shutdown_workers` can await them.
     tasks: TaskTracker,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
+    document_loads: AtomicU64,
     /// Serialize cold opens without blocking access to already-live handles.
     opening: Mutex<()>,
     /// chat2 seeds in flight (one per chat — reopen storms must not race
@@ -603,7 +604,8 @@ impl Drop for ChatDocHandle {
 }
 
 impl ChatDocHandle {
-    /// Live views and agents retain their transport until their lease ends.
+    /// Live views and agents resist background rotation. Only a newer
+    /// interactive request may displace a view-only client; never a writer.
     fn sync_protected(&self) -> bool {
         self.messages_tx.receiver_count() > 0
             || self.queue_tx.receiver_count() > 0
@@ -822,6 +824,7 @@ impl DocHost {
                 edge_disconnected: AtomicBool::new(false),
                 tasks: TaskTracker::new(),
                 handles: Mutex::new(HashMap::new()),
+                document_loads: AtomicU64::new(0),
                 opening: Mutex::new(()),
                 seeding: Mutex::new(HashSet::new()),
                 seed_waiting: Mutex::new(HashSet::new()),
@@ -1245,6 +1248,7 @@ impl DocHost {
         // room's fat doc would merge into the unrelated thin lineage and
         // duplicate every message. Local epoch >= 2 forces the chat2 branch
         // and best-effort completes the flip.
+        self.inner.document_loads.fetch_add(1, Ordering::Relaxed);
         let stored = self.inner.store.load_snapshot_with_cursor(chat_id)?;
         let stored_epoch = stored.as_ref().map(|(_, _, e)| *e).unwrap_or(0);
         let room_gen = if stored_epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
@@ -1569,6 +1573,37 @@ impl DocHost {
         }
     }
 
+    /// Cold candidates stay metadata-only until a connection can be admitted.
+    /// Local epoch wins over an older registry row, exactly as in `open_local`.
+    fn prepare_stored_sync_admission(
+        &self,
+        chat_id: &str,
+        wake_version: Option<i64>,
+    ) -> Result<Option<SyncAdmission>, EngineError> {
+        if self.inner.store.snapshot_epoch(chat_id)? >= crate::chat2_host::CHAT2_DOC_EPOCH {
+            return Ok(Some(SyncAdmission::Join));
+        }
+        let row = match self.workspace() {
+            Some(ws) => ws.chat(chat_id)?,
+            None => None,
+        };
+        match row {
+            None => Ok(Some(SyncAdmission::Join)),
+            Some(row) if row.room_gen.unwrap_or(1) >= 2 => Ok(Some(SyncAdmission::Join)),
+            Some(row) if row.device_id == self.inner.config.device_id => {
+                Ok(Some(SyncAdmission::Seed))
+            }
+            Some(_) => {
+                if let Some(version) = wake_version {
+                    self.inner
+                        .store
+                        .complete_sync_job(chat_id, "wake", version)?;
+                }
+                Ok(None)
+            }
+        }
+    }
+
     /// One dispatcher per host; waiting chats are flags on existing handles,
     /// never a spawned task per connection request. Oldest service wins within
     /// each class, with one background admission every four selections.
@@ -1578,6 +1613,7 @@ impl DocHost {
             use futures::{StreamExt, stream::FuturesUnordered};
             let mut turn = 0u64;
             let mut disk_cursor = String::new();
+            let mut view_handoff: Option<String> = None;
             // Closing clients keep their admission slots until teardown ends,
             // but no individual close can suspend unrelated admissions/work.
             // Track teardown independently of this cancellable dispatcher:
@@ -1656,46 +1692,49 @@ impl DocHost {
                 // a client. A connected chat's outbox is not slot contention.
                 let disk_healthy = !handles.iter()
                     .any(|h| h.publication_failed.load(Ordering::Acquire));
+                // A None handle is a cold, metadata-only candidate. Discovery
+                // advances at capacity without loading and evicting its history.
                 let mut candidates: Vec<_> = handles.iter()
                     .filter(|h| h.sync_requested.load(Ordering::Acquire)
                         && !h.sync_started.load(Ordering::Acquire)
                         && !stopping_ids.contains(&h.chat_id))
-                    .cloned().collect();
+                    .map(|h| (h.chat_id.clone(), Some(h.clone()))).collect();
                 if disk_healthy {
                     for id in durable {
-                        // Advance even at capacity: active outboxes must not
-                        // hide waiting work later in the disk index.
                         disk_cursor = id.clone();
-                        if candidates.iter().any(|h| h.chat_id == id)
+                        if candidates.iter().any(|(chat, _)| chat == &id)
                             || stopping_ids.contains(&id)
                             || handles.iter().any(|h| h.chat_id == id && h.sync_started.load(Ordering::Acquire))
                         {
                             continue;
                         }
-                        match host.open_local(&id) {
-                            Ok(handle) => {
-                                handle.sync_background.store(true, Ordering::Release);
-                                handle.sync_requested.store(true, Ordering::Release);
-                                candidates.push(handle);
-                            }
-                            Err(err) => tracing::warn!(chat = %id, %err, "durable sync work deferred"),
-                        }
+                        candidates.push((id, None));
                     }
                 }
                 let mut waiting = Vec::new();
-                for handle in candidates {
-                    let wake_version = match host.inner.store.sync_job_version(&handle.chat_id, "wake") {
+                for (id, handle) in candidates {
+                    let wake_version = match host.inner.store.sync_job_version(&id, "wake") {
                         Ok(version) => version,
                         Err(error) => {
-                            tracing::warn!(chat = %handle.chat_id, %error, "sync admission deferred: wake read failed");
+                            tracing::warn!(chat = %id, %error, "sync admission deferred: wake read failed");
                             continue;
                         }
                     };
-                    match host.prepare_sync_admission(&handle, wake_version) {
-                        Ok(Some(action)) => waiting.push((handle, action, wake_version)),
+                    let admission = match &handle {
+                        Some(h) => host.prepare_sync_admission(h, wake_version),
+                        None => host.prepare_stored_sync_admission(&id, wake_version),
+                    };
+                    match admission {
+                        Ok(Some(_)) => waiting.push((id, handle, wake_version)),
                         Ok(None) => {},
-                        Err(error) => tracing::warn!(chat = %handle.chat_id, %error, "sync admission eligibility deferred"),
+                        Err(error) => tracing::warn!(chat = %id, %error, "sync admission eligibility deferred"),
                     }
+                }
+                // An ownership/cutover change can make the pending handoff
+                // ineligible. It must not block another interactive request.
+                if view_handoff.as_ref().is_some_and(|id| !waiting.iter().any(|(chat, h, _)|
+                    chat == id && h.as_ref().is_some_and(|h| h.sync_protected()))) {
+                    view_handoff = None;
                 }
                 for handle in &handles {
                     if !handle.sync_started.load(Ordering::Acquire)
@@ -1720,10 +1759,10 @@ impl DocHost {
                             captured = version;
                         }
                     }
-                    if captured != 0
+                    let wake_read_complete = captured != 0
                         && lock(&handle.chat2).as_ref().is_some_and(|c|
-                            c.catch_up_completed(handle.sync_wake_ticket.load(Ordering::Acquire)))
-                        && host.wakeup_is_durable(handle)
+                            c.catch_up_completed(handle.sync_wake_ticket.load(Ordering::Acquire)));
+                    if wake_read_complete && host.wakeup_is_durable(handle)
                     {
                         let _ =
                             host.inner
@@ -1754,41 +1793,63 @@ impl DocHost {
                     h.sync_started.load(Ordering::Acquire) || stopping_ids.contains(&h.chat_id)
                 ).count();
                 let available = ACTIVE_SYNC_CAP.saturating_sub(running);
-                // Only release the deficit for the next admission batch, and
-                // account for closures already in progress. Never rotate a
-                // viewed chat or an agent writer to serve background work.
+                // Never preempt a writer. A newer interactive request may
+                // displace an older view-only client; an automatic retry of the
+                // displaced view cannot displace it back. Background work still
+                // cannot retire a viewed client.
+                let newest_interactive = waiting.iter().filter_map(|(_, h, _)| {
+                    h.as_ref().filter(|h| h.sync_protected())
+                        .map(|h| (h.last_access.load(Ordering::Relaxed), h.chat_id.clone()))
+                }).max();
                 let deficit = if disk_healthy && available == 0 {
                     waiting.len().min(SYNC_ADMISSION_BATCH)
                         .saturating_sub(stopping_ids.len())
                 } else { 0 };
-                let mut victims: Vec<_> = handles.iter().filter(|h| {
-                    if !h.sync_started.load(Ordering::Acquire)
-                        || stopping_ids.contains(&h.chat_id) || h.sync_protected() {
-                        return false;
+                let mut victims = Vec::new();
+                for h in &handles {
+                    if deficit == 0 || !h.sync_started.load(Ordering::Acquire)
+                        || stopping_ids.contains(&h.chat_id)
+                        || h.writers.load(Ordering::Acquire) > 0 {
+                        continue;
                     }
-                    let age = now_ms() - h.sync_last_started.load(Ordering::Relaxed);
+                    let viewed = h.sync_protected();
+                    let access = h.last_access.load(Ordering::Relaxed);
+                    if viewed && (view_handoff.is_some() || !newest_interactive.as_ref().is_some_and(|(newest, _)| *newest > access)) {
+                        continue;
+                    }
                     let caught_up = lock(&h.chat2).as_ref().is_some_and(|c| c.caught_up());
-                    // Reuse grace never makes a newly selected chat wait on a
-                    // quiet, fully served client when every slot is occupied.
-                    (caught_up && (age >= SYNC_QUANTUM_MS
-                        || !host.inner.store.has_pending_chat_updates(&h.chat_id).unwrap_or(true)))
-                        || age >= 300_000
-                }).collect();
-                victims.sort_by_key(|h| (
-                    host.inner.store.has_pending_chat_updates(&h.chat_id).unwrap_or(true),
-                    h.sync_last_started.load(Ordering::Relaxed),
-                    h.chat_id.clone(),
+                    let pending = host.inner.store.has_pending_chat_updates(&h.chat_id).unwrap_or(true);
+                    let age = now_ms() - h.sync_last_started.load(Ordering::Relaxed);
+                    if viewed || (caught_up && (age >= SYNC_QUANTUM_MS || !pending)) || age >= 300_000 {
+                        victims.push((viewed, pending, access, h.clone(), caught_up));
+                    }
+                }
+                victims.sort_by_key(|(viewed, pending, access, h, _)| (
+                    *viewed, *pending, *access, h.chat_id.clone(),
                 ));
-                for handle in victims.into_iter().take(deficit) {
-                    // A served quiet client has no reason to compete again.
-                    // Preserve only unfinished catch-up or durable obligations.
-                    let unfinished = !lock(&handle.chat2).as_ref().is_some_and(|c| c.caught_up())
-                        || host.inner.store.has_pending_chat_updates(&handle.chat_id).unwrap_or(true)
+                // One newer interactive request must not retire a batch of
+                // protected views just because cold background work is queued.
+                let mut view_preemptions = 0;
+                let mut unprotected_preemptions = 0;
+                for (viewed, pending, _, handle, caught_up) in victims.into_iter().take(deficit) {
+                    // An unprotected victim already supplies the interactive
+                    // slot; the background deficit cannot justify evicting a view.
+                    if viewed && (view_preemptions >= 1 || unprotected_preemptions > 0) { break; }
+                    if handle.writers.load(Ordering::Acquire) > 0 { continue; }
+                    if view_handoff.is_none() {
+                        view_handoff = newest_interactive.as_ref().map(|(_, id)| id.clone());
+                    }
+                    if viewed {
+                        view_preemptions += 1;
+                    } else {
+                        unprotected_preemptions += 1;
+                    }
+                    let unfinished = !caught_up || pending || viewed
                         || host.inner.store.sync_job_version(&handle.chat_id, "wake")
                             .map_or(true, |v| v.is_some());
                     handle.sync_requested.store(unfinished, Ordering::Release);
                     stopping_ids.insert(handle.chat_id.clone());
-                    stopping.push(host.inner.tasks.spawn(host.stop_sync_owned(handle.clone())));
+                    stopping.push(host.inner.tasks.spawn(host.stop_sync_owned(handle)));
                 }
                 let admission_limit = if disk_healthy {
                     available.min(SYNC_ADMISSION_BATCH)
@@ -1798,19 +1859,44 @@ impl DocHost {
                 let mut admitted = 0;
                 while admitted < admission_limit && !waiting.is_empty() {
                     turn += 1;
-                    waiting.sort_by_key(|(h, _, _)| {
-                        let background = !h.sync_protected();
+                    waiting.sort_by_key(|(id, h, _)| {
+                        let protected = h.as_ref().is_some_and(|h| h.sync_protected());
                         (
-                            if turn % 4 == 0 {
-                                !background
-                            } else {
-                                background
-                            },
-                            h.sync_last_started.load(Ordering::Relaxed),
-                            h.chat_id.clone(),
+                            // Honor an in-flight view handoff without removing
+                            // the regular background fairness allocation.
+                            view_handoff.as_ref() != Some(id),
+                            if turn % 4 == 0 { protected } else { !protected },
+                            std::cmp::Reverse(h.as_ref().filter(|_| protected)
+                                .map_or(0, |h| h.last_access.load(Ordering::Relaxed))),
+                            h.as_ref().map_or(0, |h| h.sync_last_started.load(Ordering::Relaxed)),
+                            id.clone(),
                         )
                     });
-                    let (handle, action, wake_version) = waiting.remove(0);
+                    let (id, cached, wake_version) = waiting.remove(0);
+                    let handle = match cached {
+                        Some(h) => h,
+                        None => match host.open_local(&id) {
+                            Ok(h) => {
+                                h.sync_background.store(true, Ordering::Release);
+                                h.sync_requested.store(true, Ordering::Release);
+                                h
+                            }
+                            Err(error) => {
+                                tracing::warn!(chat = %id, %error, "durable sync work deferred");
+                                continue;
+                            }
+                        },
+                    };
+                    // Opening may observe a newer registry/lineage. Recheck
+                    // ownership before admission, retaining the captured wake.
+                    let action = match host.prepare_sync_admission(&handle, wake_version) {
+                        Ok(Some(action)) => action,
+                        Ok(None) => continue,
+                        Err(error) => {
+                            tracing::warn!(chat = %id, %error, "sync admission recheck failed");
+                            continue;
+                        }
+                    };
                     if handle.sync_started.swap(true, Ordering::AcqRel) {
                         continue;
                     }
@@ -3034,6 +3120,7 @@ impl DocHost {
             "budget": zeron_sync::budget::shared().stats(),
             "activeClientLimit": ACTIVE_SYNC_CAP,
             "openDocuments": handles.len(), "waitingDocuments": waiting,
+            "documentLoads": self.inner.document_loads.load(Ordering::Relaxed),
             "oldestWaitingAccessAgeMs": oldest, "retainedBy": reasons,
             "openFileDescriptors": open_fds, "fileDescriptorLimit": fd_limit,
             "durable": self.inner.store.sync_work_counts().ok().map(|(batches, jobs)| serde_json::json!({"pendingBatches": batches, "pendingJobs": jobs})),

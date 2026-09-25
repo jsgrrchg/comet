@@ -297,7 +297,11 @@ struct Shared {
     /// wedge); instead this flag asks the session loop for a rowsReq
     /// backfill from the honest cursor.
     gap_repair: bool,
+    /// Serialization is independent of whether imported rows are historical.
+    rows_req_outstanding: bool,
     replaying_gap: bool,
+    /// A complete HTTP pull may repair an old socket gap, never a newer one.
+    row_gap_generation: u64,
     /// HTTP polling also has a live mode. Reopening/probing a chat or losing
     /// delivery starts a new replay epoch; a complete pull establishes its
     /// baseline. Failed socket dials alone do not disable live HTTP animation.
@@ -380,6 +384,7 @@ fn apply_remote_row(
         let mut shared = lock(shared);
         if seq > shared.cursor.saturating_add(1) {
             shared.gap_repair = true;
+            shared.row_gap_generation = shared.row_gap_generation.wrapping_add(1);
             shared.cursor
         } else {
             shared.cursor.max(seq)
@@ -1024,7 +1029,11 @@ impl Actor {
         use std::sync::atomic::Ordering::Relaxed;
 
         // ── hello / state ───────────────────────────────────────────────────
-        lock(&self.shared).replaying_gap = false;
+        {
+            let mut shared = lock(&self.shared);
+            shared.replaying_gap = false;
+            shared.rows_req_outstanding = false;
+        }
         let cursor = lock(&self.shared).cursor;
         let hello = wire::encode(
             frame_type::HELLO,
@@ -1061,7 +1070,11 @@ impl Actor {
             return SessionEnd::Reconnect;
         };
         lock(&self.shared).server = Some(state);
-        lock(&self.shared).replaying_gap = false;
+        {
+            let mut shared = lock(&self.shared);
+            shared.replaying_gap = false;
+            shared.rows_req_outstanding = false;
+        }
         // Server behind our cursor = the room was reset/wiped. Detect on the
         // RAW persisted cursor, BEFORE the amnesty below rewrites it —
         // plan_catch_up treats the cursor as fresh; SURFACE the signal too:
@@ -1283,9 +1296,9 @@ impl Actor {
                 let pending = refresh_in_flight.is_none()
                     && shared.refresh_requested > shared.refresh_completed;
                 (
-                    (pending && !shared.replaying_gap)
+                    (pending && !shared.rows_req_outstanding)
                         .then_some((shared.refresh_requested, shared.cursor)),
-                    pending && shared.replaying_gap,
+                    pending && shared.rows_req_outstanding,
                 )
             };
             if waiting_on_gap {
@@ -1295,7 +1308,7 @@ impl Actor {
                 refresh_gap_deadline = None;
             }
             if let Some((ticket, after)) = refresh {
-                lock(&self.shared).replaying_gap = true;
+                lock(&self.shared).rows_req_outstanding = true;
                 let request = wire::encode(
                     frame_type::ROWS_REQ,
                     &wire::RowsReqHeader {
@@ -1348,6 +1361,7 @@ impl Actor {
                             // Missing rows use bounded gap repair, not an
                             // endless loop of fresh wake requests.
                             shared.gap_repair = true;
+                            shared.row_gap_generation = shared.row_gap_generation.wrapping_add(1);
                         }
                     }
                     if !self.maybe_repair_gap(&mut pipe, &mut gap_repairs).await {
@@ -1499,7 +1513,7 @@ impl Actor {
                     }
                 }
             }
-            let (cursor, replay_epoch, mut was_live, refresh_ticket) = {
+            let (cursor, replay_epoch, mut was_live, refresh_ticket, gap_generation) = {
                 let mut sh = lock(&shared);
                 let was_live = sh.http_live_epoch.take() == Some(sh.http_replay_epoch);
                 (
@@ -1507,6 +1521,7 @@ impl Actor {
                     sh.http_replay_epoch,
                     was_live,
                     sh.refresh_requested,
+                    sh.row_gap_generation,
                 )
             };
             let body = match transport.fetch_rows(cursor).await {
@@ -1633,6 +1648,9 @@ impl Actor {
                             {
                                 sh.http_live_epoch = Some(replay_epoch);
                                 sh.caught_up = true;
+                                if sh.row_gap_generation == gap_generation {
+                                    sh.gap_repair = false;
+                                }
                                 if !sh.gap_repair {
                                     sh.refresh_completed = sh.refresh_completed.max(refresh_ticket);
                                 }
@@ -1664,7 +1682,7 @@ impl Actor {
                 // bypass frontier precision on the next catch-up.
                 return false;
             }
-            if shared.replaying_gap {
+            if shared.rows_req_outstanding {
                 return true;
             }
             (std::mem::take(&mut shared.gap_repair), shared.cursor)
@@ -1672,7 +1690,11 @@ impl Actor {
         if !repair {
             return true;
         }
-        lock(&self.shared).replaying_gap = true;
+        {
+            let mut shared = lock(&self.shared);
+            shared.replaying_gap = true;
+            shared.rows_req_outstanding = true;
+        }
         *repairs += 1;
         if *repairs > MAX_GAP_REPAIRS_PER_SESSION {
             tracing::warn!("chat2: gap repairs exhausted; redialing for a full catch-up");
@@ -1775,6 +1797,7 @@ impl Actor {
                 // HAVE the interleaved ones from other devices.
                 if ack.seq > shared.cursor + 1 {
                     shared.gap_repair = true;
+                    shared.row_gap_generation = shared.row_gap_generation.wrapping_add(1);
                     tracing::warn!(
                         seq = ack.seq,
                         cursor = shared.cursor,
@@ -1801,7 +1824,9 @@ impl Actor {
                 let _ = self.events.send(ChatEvent::Presence);
             }
             frame_type::ROWS_DONE => {
-                lock(&self.shared).replaying_gap = false;
+                let mut shared = lock(&self.shared);
+                shared.replaying_gap = false;
+                shared.rows_req_outstanding = false;
             }
             frame_type::PROBE_OK => {
                 if let Ok(probe) = serde_json::from_value::<wire::ProbeOkHeader>(frame.header) {

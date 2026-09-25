@@ -5,6 +5,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeron_sync::chat_frames::{decode, encode, frame_type};
 
+// These scenarios exercise the production process-wide budget. Keep the
+// complete scenario, including transport shutdown, inside the same guard.
+static SYNC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Clone, Copy)]
 enum Hold {
     Checkpoint,
@@ -156,6 +160,7 @@ fn host(store: Arc<DocsStore>, relay: &Relay) -> DocHost {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slow_checkpoints_survive_idle_grace_with_all_slots_occupied() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Checkpoint).await;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(DocsStore::open(dir.path()).unwrap());
@@ -198,6 +203,7 @@ async fn slow_checkpoints_survive_idle_grace_with_all_slots_occupied() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn new_wake_during_stalled_backfill_does_not_block_other_admissions() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Backfill).await;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(DocsStore::open(dir.path()).unwrap());
@@ -227,6 +233,7 @@ async fn new_wake_during_stalled_backfill_does_not_block_other_admissions() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn idle_connection_closes_while_caller_keeps_document() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Checkpoint).await;
     relay.release.send_replace(true);
     let dir = tempfile::tempdir().unwrap();
@@ -273,6 +280,7 @@ fn legacy_chat(workspace: &WorkspaceHost, id: &str, device: &str, generation: Op
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn twelve_foreign_legacy_wakes_do_not_block_interactive_sync() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Checkpoint).await;
     relay.release.send_replace(true);
     let dir = tempfile::tempdir().unwrap();
@@ -335,6 +343,7 @@ async fn twelve_foreign_legacy_wakes_do_not_block_interactive_sync() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn admissible_wakes_preserve_missing_rows_modern_readers_and_local_epoch() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Checkpoint).await;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(DocsStore::open(dir.path()).unwrap());
@@ -387,6 +396,7 @@ async fn admissible_wakes_preserve_missing_rows_modern_readers_and_local_epoch()
 
 #[tokio::test]
 async fn legacy_admission_rechecks_owner_and_retires_only_the_captured_wake() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(DocsStore::open(dir.path()).unwrap());
     let workspace = workspace(store.clone());
@@ -453,6 +463,7 @@ async fn legacy_admission_rechecks_owner_and_retires_only_the_captured_wake() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forty_eight_chats_drain_without_restarting_views_or_writers() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     const CHATS: usize = 48;
     const PROTECTED: usize = 8;
     let relay = relay(Hold::Backfill).await;
@@ -540,6 +551,7 @@ async fn forty_eight_chats_drain_without_restarting_views_or_writers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn active_outboxes_do_not_rotate_clients_even_at_capacity() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Backfill).await;
     relay.release.send_replace(true);
     let dir = tempfile::tempdir().unwrap();
@@ -579,6 +591,7 @@ async fn active_outboxes_do_not_rotate_clients_even_at_capacity() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spare_capacity_admits_waiters_without_rotating_aged_clients() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Backfill).await;
     relay.release.send_replace(true);
     let dir = tempfile::tempdir().unwrap();
@@ -611,6 +624,7 @@ async fn spare_capacity_admits_waiters_without_rotating_aged_clients() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn contention_retires_only_one_unprotected_client_for_one_waiter() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Backfill).await;
     relay.release.send_replace(true);
     let dir = tempfile::tempdir().unwrap();
@@ -647,6 +661,7 @@ async fn contention_retires_only_one_unprotected_client_for_one_waiter() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn forty_eight_chats_preserve_twelve_views_then_drain_when_one_view_closes() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
     let relay = relay(Hold::Backfill).await;
     relay.release.send_replace(true);
     let dir = tempfile::tempdir().unwrap();
@@ -698,5 +713,163 @@ async fn forty_eight_chats_preserve_twelve_views_then_drain_when_one_view_closes
     .await
     .expect("background work did not resume when a view closed");
     assert_eq!(lock(&relay.joins_by_chat).len(), 48);
+    host.shutdown_workers().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn saturated_protected_clients_do_not_load_cold_backlog() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Backfill).await;
+    relay.release.send_replace(true);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let host = host(store.clone(), &relay);
+    let mut views = Vec::new();
+    for n in 0..ACTIVE_SYNC_CAP {
+        let id = format!("view-{n}");
+        store.initialize_chat_outbox(&id, &[]).unwrap();
+        views.push(host.open(&id).unwrap().watch_messages());
+    }
+    until(|| relay.joins.load(Ordering::SeqCst) == ACTIVE_SYNC_CAP).await;
+    let loads = host.inner.document_loads.load(Ordering::Relaxed);
+    for n in 0..128 {
+        let id = format!("cold-{n:03}");
+        store.initialize_chat_outbox(&id, &[]).unwrap();
+        host.enqueue_wakeup(&id).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(1300)).await;
+    assert_eq!(host.inner.document_loads.load(Ordering::Relaxed), loads);
+    assert_eq!(lock(&host.inner.handles).len(), ACTIVE_SYNC_CAP);
+    assert_eq!(store.sync_work_counts().unwrap(), (0, 128));
+    host.shutdown_workers().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn newer_view_displaces_one_older_view_without_reconnect_ping_pong() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Backfill).await;
+    relay.release.send_replace(true);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let host = host(store.clone(), &relay);
+    let mut handles = Vec::new();
+    let mut views = Vec::new();
+    let mut writers = Vec::new();
+    for n in 0..ACTIVE_SYNC_CAP {
+        let id = format!("view-{n:02}");
+        store.initialize_chat_outbox(&id, &[]).unwrap();
+        let h = host.open(&id).unwrap();
+        views.push(h.watch_messages());
+        if n == 0 {
+            writers.push(h.writer());
+        }
+        handles.push(h);
+    }
+    until(|| {
+        handles
+            .iter()
+            .all(|h| lock(&h.chat2).as_ref().is_some_and(|c| c.caught_up()))
+    })
+    .await;
+    // Make the writer the oldest candidate: it must still never be retired.
+    for (n, h) in handles.iter().enumerate() {
+        h.last_access
+            .store(now_ms() - 2000 + n as i64, Ordering::Relaxed);
+    }
+    for n in 0..32 {
+        host.enqueue_wakeup(&format!("cold-{n}")).unwrap();
+    }
+    let fresh = host.open("new-view").unwrap();
+    let _fresh_view = fresh.watch_messages();
+    until(|| lock(&fresh.chat2).as_ref().is_some_and(|c| c.caught_up())).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(relay.joins.load(Ordering::SeqCst), ACTIVE_SYNC_CAP + 1);
+    assert_eq!(
+        handles
+            .iter()
+            .filter(|h| !h.sync_started.load(Ordering::Acquire))
+            .count(),
+        1
+    );
+    assert!(handles[0].sync_started.load(Ordering::Acquire));
+    assert!(!handles[1].sync_started.load(Ordering::Acquire));
+    // Refocusing the displaced view makes it an explicit interactive request.
+    host.open(&handles[1].chat_id).unwrap();
+    until(|| handles[1].sync_started.load(Ordering::Acquire)).await;
+    assert!(handles[0].sync_started.load(Ordering::Acquire));
+    host.shutdown_workers().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_waiter_cannot_displace_a_running_writer() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Backfill).await;
+    relay.release.send_replace(true);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let host = host(store.clone(), &relay);
+    let mut writers = Vec::new();
+    for n in 0..ACTIVE_SYNC_CAP {
+        let id = format!("writer-{n}");
+        store.initialize_chat_outbox(&id, &[]).unwrap();
+        writers.push(host.open(&id).unwrap().writer());
+    }
+    until(|| relay.joins.load(Ordering::SeqCst) == ACTIVE_SYNC_CAP).await;
+    let fresh = host.open("new-view").unwrap();
+    let _view = fresh.watch_messages();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!fresh.sync_started.load(Ordering::Acquire));
+    assert_eq!(relay.joins.load(Ordering::SeqCst), ACTIVE_SYNC_CAP);
+    drop(writers.pop());
+    until(|| lock(&fresh.chat2).as_ref().is_some_and(|c| c.caught_up())).await;
+    host.shutdown_workers().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_handoff_prefers_an_unprotected_slot_over_a_view() {
+    let _budget_guard = SYNC_TEST_LOCK.lock().await;
+    let relay = relay(Hold::Backfill).await;
+    relay.release.send_replace(true);
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+    let host = host(store.clone(), &relay);
+    // Put the next admission after the twelve residents on the normal
+    // background-fairness turn. The freed slot must still serve the handoff.
+    for n in 0..3 {
+        host.enqueue_wakeup(&format!("phase-{n}")).unwrap();
+    }
+    until(|| relay.joins.load(Ordering::SeqCst) == 3).await;
+    until(|| host.sync_resources()["retainedBy"]["connections"] == 0).await;
+    let mut handles = Vec::new();
+    let mut views = Vec::new();
+    for n in 0..ACTIVE_SYNC_CAP {
+        let id = format!("existing-{n:02}");
+        store.initialize_chat_outbox(&id, &[]).unwrap();
+        let h = host.open(&id).unwrap();
+        if n > 0 {
+            views.push(h.watch_messages());
+        }
+        handles.push(h);
+    }
+    until(|| {
+        handles
+            .iter()
+            .all(|h| lock(&h.chat2).as_ref().is_some_and(|c| c.caught_up()))
+    })
+    .await;
+    for h in &handles {
+        h.last_access.store(now_ms() - 1000, Ordering::Relaxed);
+    }
+    for n in 0..32 {
+        host.enqueue_wakeup(&format!("cold-{n}")).unwrap();
+    }
+    let fresh = host.open("new-view").unwrap();
+    let _view = fresh.watch_messages();
+    until(|| lock(&fresh.chat2).as_ref().is_some_and(|c| c.caught_up())).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for h in &handles[1..] {
+        assert!(h.sync_started.load(Ordering::Acquire));
+        assert_eq!(lock(&relay.joins_by_chat).get(h.chat_id()), Some(&1));
+    }
     host.shutdown_workers().await;
 }

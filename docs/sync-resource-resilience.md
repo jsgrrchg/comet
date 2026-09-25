@@ -14,8 +14,11 @@ recovery sources, not evidence the adopted chat2 transcript is healthy. A real
 candidate waits for catch-up and rechecks under the command/import locks. Failed
 recoveries retry from durable metadata.
 
-Before reserving a slot, the dispatcher selects an operation using the opened
-document's effective generation and current registry ownership. Modern chats
+Before reserving a slot, the dispatcher selects an operation using snapshot
+epoch metadata and current registry ownership. Cold snapshots are loaded only
+after a slot is available, then eligibility is checked again against the opened
+document. A saturated host can scan durable jobs without deserializing their
+histories. Modern chats
 join normally; only the owning host seeds a legacy chat. Wakes for an explicitly
 foreign legacy chat retire by captured version without touching outgoing batches
 or consuming a slot. A missing registry row still represents a possible new chat,
@@ -39,17 +42,24 @@ interruptible by shutdown. Rotation requires all 12 slots to be occupied and an
 eligible chat without a client to be waiting. Pending batches on an existing
 client do not count as contention. Only the next admission batch's missing slots
 are retired, accounting for teardown already in progress. Transcript/queue views
-and agent writer leases protect their clients; if all slots are protected, other
-chats wait until a lease ends. Unprotected, caught-up clients without outgoing
+and agent writer leases protect their clients from background work. A newer
+interactive request can displace the oldest view-only client; that client stays
+requested but cannot displace a newer view until it is accessed again. One
+handoff reserves the freed slot for its interactive winner, avoiding cascaded
+view eviction or reconnect ping-pong. Writer leases cannot be displaced; when
+every slot has a writer, other chats wait until a writer ends.
+Unprotected, caught-up clients without outgoing
 updates yield immediately under contention, without waiting out the reuse grace.
 Those with pending updates can yield after 30 s. An unprotected client still
 catching up has up to five minutes before rotation so slow checkpoint downloads
 are not continually cancelled. These are initial policy constants, not measured
 optimal values for all devices.
 
-Desktop transcript, queue and subagent watches own an explicit RPC cancellation
-handle, so deselecting/closing a quiet view releases its lease without waiting
-for another document event.
+Desktop transcript, queue and subagent watches, MCP reads and remote watch
+proxies own explicit RPC cancellation handles. Closing a quiet view or finishing
+a one-shot MCP read releases its lease without waiting for another document
+event. `subscribe_scoped` owns cancellation without waiting for the first item;
+`subscribe_checked` additionally waits for server acknowledgement.
 
 Process-wide chat data budgets allow 24 socket lifetimes, four simultaneous dials
 and eight HTTP requests. At most six background HTTP requests hold slots, leaving
@@ -88,7 +98,10 @@ A renewed wake on an existing client requests a fresh row read on that transport
 instead of closing the socket. Monotonic catch-up tickets fence each receipt:
 neither an older in-flight backfill nor an older HTTP pull can acknowledge a newer
 wake. Wake reads and gap repairs are serialized on the socket; HTTP fallback can
-also satisfy a ticket with a complete subsequent pull. Receipt retirement still
+also satisfy a ticket with a complete subsequent pull. Request serialization is
+separate from replay classification: fresh wake rows remain live. A complete
+HTTP pull clears an existing row gap only if no newer gap was observed during
+that pull. Receipt retirement still
 requires command acceptance and snapshot persistence. Failed reads retain the
 durable job and use the existing transport recovery deadlines.
 
@@ -113,7 +126,7 @@ the new delivery/resource guarantees.
 ## Diagnostics and validation
 
 `SyncStatus.resources` exposes process budget use/limits, pending admissions, open
-documents, retention reasons, durable batch/job counts, Linux descriptor count
+documents, cumulative document loads, retention reasons, durable batch/job counts, Linux descriptor count
 and the Unix soft descriptor limit. A per-chat `state` and additive
 `ChatConnectivity.syncState` distinguish local, queued, connecting, synchronized,
 offline and storage-error states. The selected chat's connection caption displays
@@ -150,6 +163,12 @@ spare capacity, active outboxes at capacity, retiring only one client for one
 waiter, and stale socket/HTTP replies arriving after a newer wake.
 Another 48-chat case holds all 12 slots with views, verifies that the 36 waiting
 jobs remain durable, then closes one view and drains them through the freed slot.
+Lifecycle tests serialize their use of the process-wide budget while the normal
+test runner remains parallel. Additional regressions hold 128 cold jobs behind
+protected clients without loading documents, hand off an older view to a newer
+one without displacing a writer, and release a quiet watch after an MCP read or
+remote proxy cancellation. Socket and HTTP tests distinguish live wake imports
+from replay and protect a newer gap against an older HTTP response.
 
 Admission regressions also queue twelve foreign legacy wakes (including missing
 room-generation metadata), assert prompt interactive admission and receipt

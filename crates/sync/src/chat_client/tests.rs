@@ -2161,6 +2161,10 @@ async fn renewed_wakes_require_fresh_reads_without_reconnecting() {
     assert!(client.catch_up_completed(third));
     assert_eq!(client.stats().disconnects, 0);
     assert_eq!(*lock(&sink.rows), vec![(b"remote edit".to_vec(), 1)]);
+    assert!(
+        lock(&sink.replay_rows).is_empty(),
+        "wake reads classified live edits as history"
+    );
     client.shutdown().await;
 }
 
@@ -2358,4 +2362,86 @@ async fn a_stalled_wake_or_older_gap_read_retains_its_ticket_and_recovers() {
         );
         client.shutdown().await;
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn http_repairs_socket_gap_without_clearing_a_newer_gap() {
+    struct GatedHttp(mpsc::UnboundedSender<oneshot::Sender<Vec<u8>>>);
+    impl ChatTransport for GatedHttp {
+        fn fetch_rows(&self, _: u64) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
+            let (tx, rx) = oneshot::channel();
+            self.0.send(tx).unwrap();
+            Box::pin(async move { rx.await.map_err(|_| SyncError::Closed) })
+        }
+        fn push(&self, _: String, _: Vec<u8>) -> BoxFuture<'static, Result<String, SyncError>> {
+            Box::pin(async { panic!("no outgoing updates") })
+        }
+    }
+    fn response(head: u64) -> Vec<u8> {
+        let mut frames = vec![encode(
+            frame_type::STATE,
+            &serde_json::json!({
+                "headSeq":head,"seqFloor":0,"checkpointSeq":0,"checkpointSize":0,
+                "rowCount":head,"rowBytes":0
+            }),
+            &[],
+        )];
+        for seq in 1..=head {
+            frames.push(encode(
+                frame_type::ROW,
+                &serde_json::json!({
+                    "seq":seq,"device":"peer","batchId":format!("b{seq}")
+                }),
+                b"edit",
+            ));
+        }
+        frames.push(encode(
+            frame_type::ROWS_DONE,
+            &serde_json::json!({"headSeq":head}),
+            &[],
+        ));
+        let mut body = Vec::new();
+        for f in frames {
+            body.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            body.extend(f);
+        }
+        body
+    }
+    let (requests, mut pulls) = mpsc::unbounded_channel();
+    let sink = Arc::new(RecordingSink::default());
+    let (fetch, _) = fetcher(b"");
+    let client = ChatClient::connect_with_transport(
+        connector(vec![]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+        Some(Arc::new(GatedHttp(requests))),
+    )
+    .await
+    .unwrap();
+    let initial = pulls.recv().await.unwrap();
+    apply_remote_row(&client.shared, sink.as_ref(), b"edit", 2, false);
+    let ticket = client.request_catch_up();
+    initial.send(response(0)).unwrap();
+    let fresh = pulls.recv().await.unwrap();
+    assert!(!client.catch_up_completed(ticket));
+    // A socket row proves another hole while this HTTP response is in flight.
+    apply_remote_row(&client.shared, sink.as_ref(), b"edit", 4, false);
+    fresh.send(response(2)).unwrap();
+    let repair = pulls.recv().await.unwrap();
+    assert!(
+        !client.catch_up_completed(ticket),
+        "HTTP cleared a newer row gap"
+    );
+    assert!(!client.delivery_live());
+    repair.send(response(4)).unwrap();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(client.catch_up_completed(ticket));
+    assert!(client.delivery_live(), "HTTP alone must restore delivery");
+    assert_eq!(client.stats().cursor, 4);
+    client.shutdown().await;
 }

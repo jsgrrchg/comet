@@ -72,8 +72,14 @@ const DOC_RESIDENT_FLOOR_BYTES: usize = 512 * 1024;
 /// handles and explicit writers protect the open-to-subscribe handoff.
 const SYNC_IDLE_MS: i64 = 10_000;
 const SYNC_QUANTUM_MS: i64 = 30_000;
-const ACTIVE_SYNC_CAP: usize = 12;
+const ACTIVE_SYNC_CAP: usize = 28;
 const SYNC_ADMISSION_BATCH: usize = 4;
+const SYNC_CATCH_UP_QUANTUM_MS: i64 = 300_000;
+
+// All live-transport scenarios share the process budget, including tests in
+// sibling modules. Hold through shutdown so one fixture cannot rotate another.
+#[cfg(test)]
+static SYNC_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SyncAdmission {
@@ -242,6 +248,7 @@ struct DocHostInner {
     tasks: TaskTracker,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
     document_loads: AtomicU64,
+    focus_clock: AtomicU64,
     /// Serialize cold opens without blocking access to already-live handles.
     opening: Mutex<()>,
     /// chat2 seeds in flight (one per chat — reopen storms must not race
@@ -529,6 +536,9 @@ pub struct ChatDocHandle {
     mirror_dirty: AtomicBool,
     /// Epoch ms of the last open/watch touch — the LRU eviction key.
     last_access: AtomicI64,
+    /// User navigation only. Opens, watches, writes and reconnects never bump it.
+    last_focus: AtomicU64,
+    sync_focus_served: AtomicU64,
     /// Last known snapshot blob size — the eviction budget estimate's input.
     snapshot_bytes: AtomicUsize,
     /// The sync generation this handle was BUILT for (1 = legacy s2,
@@ -556,6 +566,9 @@ pub struct ChatDocHandle {
     sync_requested: AtomicBool,
     sync_background: AtomicBool,
     sync_last_started: AtomicI64,
+    sync_wait_since: AtomicI64,
+    /// A fairness admission gets a full turn, even under repeated navigation.
+    sync_service_until: AtomicI64,
     sync_wake_version: AtomicI64,
     sync_wake_ticket: AtomicU64,
     sync_cancel: Mutex<CancellationToken>,
@@ -604,8 +617,8 @@ impl Drop for ChatDocHandle {
 }
 
 impl ChatDocHandle {
-    /// Live views and agents resist background rotation. Only a newer
-    /// interactive request may displace a view-only client; never a writer.
+    /// Live views and agents retain their documents and resist idle retirement.
+    /// At capacity their transports can yield without dropping these leases.
     fn sync_protected(&self) -> bool {
         self.messages_tx.receiver_count() > 0
             || self.queue_tx.receiver_count() > 0
@@ -825,6 +838,7 @@ impl DocHost {
                 tasks: TaskTracker::new(),
                 handles: Mutex::new(HashMap::new()),
                 document_loads: AtomicU64::new(0),
+                focus_clock: AtomicU64::new(0),
                 opening: Mutex::new(()),
                 seeding: Mutex::new(HashSet::new()),
                 seed_waiting: Mutex::new(HashSet::new()),
@@ -1190,6 +1204,16 @@ impl DocHost {
         Ok(handle)
     }
 
+    /// Explicit viewport navigation; automatic watch retries and MCP reads use
+    /// `open` instead. The sequence also orders focuses in the same millisecond.
+    pub fn focus_chat(&self, chat_id: &str) -> Result<(), EngineError> {
+        let handle = self.open_local(chat_id)?;
+        let focus = self.inner.focus_clock.fetch_add(1, Ordering::AcqRel) + 1;
+        handle.last_focus.fetch_max(focus, Ordering::AcqRel);
+        self.activate_sync(&handle);
+        Ok(())
+    }
+
     /// Materialize one authoritative local document without acquiring a network
     /// connection. Durable publication is installed before exposing any writer.
     pub fn open_local(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -1426,6 +1450,8 @@ impl DocHost {
             queue_paused: AtomicBool::new(recovered_queue_pending),
             mirror_dirty: AtomicBool::new(true),
             last_access: AtomicI64::new(now_ms()),
+            last_focus: AtomicU64::new(0),
+            sync_focus_served: AtomicU64::new(0),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room_gen,
             retired: AtomicBool::new(false),
@@ -1435,6 +1461,8 @@ impl DocHost {
             sync_requested: AtomicBool::new(false),
             sync_background: AtomicBool::new(false),
             sync_last_started: AtomicI64::new(0),
+            sync_wait_since: AtomicI64::new(0),
+            sync_service_until: AtomicI64::new(0),
             sync_wake_version: AtomicI64::new(0),
             sync_wake_ticket: AtomicU64::new(0),
             sync_cancel: Mutex::new(CancellationToken::new()),
@@ -1530,6 +1558,14 @@ impl DocHost {
 
     pub fn activate_sync(&self, handle: &Arc<ChatDocHandle>) {
         handle.sync_background.store(false, Ordering::Release);
+        if !handle.sync_started.load(Ordering::Acquire) {
+            let _ = handle.sync_wait_since.compare_exchange(
+                0,
+                now_ms(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
         if self.inner.config.edge.is_some() && !self.inner.edge_disconnected.load(Ordering::Acquire)
         {
             handle.sync_requested.store(true, Ordering::Release);
@@ -1613,7 +1649,10 @@ impl DocHost {
             use futures::{StreamExt, stream::FuturesUnordered};
             let mut turn = 0u64;
             let mut disk_cursor = String::new();
-            let mut view_handoff: Option<String> = None;
+            // (winner, fairness turn). Reserve a released slot until teardown
+            // ends; a disk-page change must not steal it from the winner.
+            let mut handoff: Option<(String, bool)> = None;
+            let mut contention_since = None;
             // Closing clients keep their admission slots until teardown ends,
             // but no individual close can suspend unrelated admissions/work.
             // Track teardown independently of this cancellable dispatcher:
@@ -1711,6 +1750,11 @@ impl DocHost {
                         candidates.push((id, None));
                     }
                 }
+                if let Some((id, _)) = &handoff {
+                    if !candidates.iter().any(|(chat, _)| chat == id) {
+                        candidates.push((id.clone(), handles.iter().find(|h| &h.chat_id == id).cloned()));
+                    }
+                }
                 let mut waiting = Vec::new();
                 for (id, handle) in candidates {
                     let wake_version = match host.inner.store.sync_job_version(&id, "wake") {
@@ -1730,11 +1774,9 @@ impl DocHost {
                         Err(error) => tracing::warn!(chat = %id, %error, "sync admission eligibility deferred"),
                     }
                 }
-                // An ownership/cutover change can make the pending handoff
-                // ineligible. It must not block another interactive request.
-                if view_handoff.as_ref().is_some_and(|id| !waiting.iter().any(|(chat, h, _)|
-                    chat == id && h.as_ref().is_some_and(|h| h.sync_protected()))) {
-                    view_handoff = None;
+                // Ownership/cutover changes can invalidate a reserved winner.
+                if handoff.as_ref().is_some_and(|(id, _)| !waiting.iter().any(|(chat, _, _)| chat == id)) {
+                    handoff = None;
                 }
                 for handle in &handles {
                     if !handle.sync_started.load(Ordering::Acquire)
@@ -1742,6 +1784,10 @@ impl DocHost {
                     {
                         continue;
                     }
+                    // A focus during teardown remains unserved and can
+                    // reclaim a slot. Only resident, non-closing clients
+                    // acknowledge focus here.
+                    handle.sync_focus_served.fetch_max(handle.last_focus.load(Ordering::Acquire), Ordering::AcqRel);
                     let mut captured = handle.sync_wake_version.load(Ordering::Acquire);
                     let pending_wake = host
                         .inner
@@ -1793,63 +1839,83 @@ impl DocHost {
                     h.sync_started.load(Ordering::Acquire) || stopping_ids.contains(&h.chat_id)
                 ).count();
                 let available = ACTIVE_SYNC_CAP.saturating_sub(running);
-                // Never preempt a writer. A newer interactive request may
-                // displace an older view-only client; an automatic retry of the
-                // displaced view cannot displace it back. Background work still
-                // cannot retire a viewed client.
-                let newest_interactive = waiting.iter().filter_map(|(_, h, _)| {
-                    h.as_ref().filter(|h| h.sync_protected())
-                        .map(|h| (h.last_access.load(Ordering::Relaxed), h.chat_id.clone()))
-                }).max();
-                let deficit = if disk_healthy && available == 0 {
-                    waiting.len().min(SYNC_ADMISSION_BATCH)
-                        .saturating_sub(stopping_ids.len())
-                } else { 0 };
-                let mut victims = Vec::new();
-                for h in &handles {
-                    if deficit == 0 || !h.sync_started.load(Ordering::Acquire)
-                        || stopping_ids.contains(&h.chat_id)
-                        || h.writers.load(Ordering::Acquire) > 0 {
-                        continue;
-                    }
-                    let viewed = h.sync_protected();
-                    let access = h.last_access.load(Ordering::Relaxed);
-                    if viewed && (view_handoff.is_some() || !newest_interactive.as_ref().is_some_and(|(newest, _)| *newest > access)) {
-                        continue;
-                    }
-                    let caught_up = lock(&h.chat2).as_ref().is_some_and(|c| c.caught_up());
-                    let pending = host.inner.store.has_pending_chat_updates(&h.chat_id).unwrap_or(true);
-                    let age = now_ms() - h.sync_last_started.load(Ordering::Relaxed);
-                    if viewed || (caught_up && (age >= SYNC_QUANTUM_MS || !pending)) || age >= 300_000 {
-                        victims.push((viewed, pending, access, h.clone(), caught_up));
+                let now = now_ms();
+                let contended = available == 0 && !waiting.is_empty();
+                let budget = zeron_sync::budget::shared().stats();
+                let global_contended = !budget.resource_paused && budget.sockets >= budget.socket_limit && budget.socket_waiting > 0;
+                // A teardown gap or the end of a paged disk scan is not the
+                // end of contention. Resetting there starves cold jobs under
+                // continuous navigation or a full set of active writers.
+                if available > 0 && waiting.is_empty() {
+                    contention_since = None;
+                }
+                let since = if !waiting.is_empty() { *contention_since.get_or_insert(now) } else { now };
+                for (_, h, _) in &waiting {
+                    if let Some(h) = h {
+                        let _ = h.sync_wait_since.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
                     }
                 }
-                victims.sort_by_key(|(viewed, pending, access, h, _)| (
-                    *viewed, *pending, *access, h.chat_id.clone(),
+                let newest_focus = waiting.iter().filter_map(|(id, h, _)| {
+                    let h = h.as_ref()?;
+                    let focus = h.last_focus.load(Ordering::Acquire);
+                    (focus > h.sync_focus_served.load(Ordering::Acquire)).then(|| (focus, id.clone()))
+                }).max();
+                let oldest_waiter = waiting.iter().filter(|(_, h, _)| {
+                    now - h.as_ref().map_or(since, |h| h.sync_wait_since.load(Ordering::Acquire)) >= SYNC_QUANTUM_MS
+                }).min_by_key(|(id, h, _)| (
+                    h.as_ref().map_or(0, |h| h.sync_last_started.load(Ordering::Acquire)), id.clone(),
                 ));
-                // One newer interactive request must not retire a batch of
-                // protected views just because cold background work is queued.
-                let mut view_preemptions = 0;
-                let mut unprotected_preemptions = 0;
-                for (viewed, pending, _, handle, caught_up) in victims.into_iter().take(deficit) {
-                    // An unprotected victim already supplies the interactive
-                    // slot; the background deficit cannot justify evicting a view.
-                    if viewed && (view_preemptions >= 1 || unprotected_preemptions > 0) { break; }
-                    if handle.writers.load(Ordering::Acquire) > 0 { continue; }
-                    if view_handoff.is_none() {
-                        view_handoff = newest_interactive.as_ref().map(|(_, id)| id.clone());
+                // Three focus turns, then one overdue service turn. A served
+                // focus cannot immediately take its slot back after rotation.
+                let fair = oldest_waiter.is_some() && (newest_focus.is_none() || (turn + 1) % 4 == 0);
+                let winner = if fair {
+                    oldest_waiter.map(|(id, _, _)| id.clone())
+                } else {
+                    newest_focus.as_ref().map(|(_, id)| id.clone())
+                };
+                let latest_focus = handles.iter().map(|h| h.last_focus.load(Ordering::Acquire)).max().unwrap_or(0);
+                if disk_healthy && (contended || global_contended) && handoff.is_none() && stopping_ids.is_empty() {
+                    let mut victims = Vec::new();
+                    for h in &handles {
+                        if !h.sync_started.load(Ordering::Acquire)
+                            || h.sync_service_until.load(Ordering::Acquire) > now {
+                            continue;
+                        }
+                        let protected = h.sync_protected();
+                        let focus = h.last_focus.load(Ordering::Acquire);
+                        let caught_up = lock(&h.chat2).as_ref().is_some_and(|c| c.caught_up());
+                        if !contended && !caught_up { continue; }
+                        let pending = host.inner.store.has_pending_chat_updates(&h.chat_id).unwrap_or(true);
+                        let age = now - h.sync_last_started.load(Ordering::Acquire);
+                        let service_complete = (caught_up && age >= SYNC_QUANTUM_MS) || age >= SYNC_CATCH_UP_QUANTUM_MS;
+                        let eligible = if !protected {
+                            (caught_up && !pending) || service_complete
+                        } else if fair || !contended {
+                            // Keep the most recently focused thread live while
+                            // the other slots provide bounded service turns.
+                            service_complete && (focus == 0 || focus != latest_focus || running == 1)
+                        } else {
+                            newest_focus.as_ref().is_some_and(|(newest, _)| *newest > focus)
+                        };
+                        if eligible {
+                            victims.push((protected, h.writers.load(Ordering::Acquire) > 0, focus,
+                                h.sync_last_started.load(Ordering::Acquire), h.clone(), caught_up, pending));
+                        }
                     }
-                    if viewed {
-                        view_preemptions += 1;
-                    } else {
-                        unprotected_preemptions += 1;
+                    // Reclaim idle work first, then viewed-only docs, then
+                    // writers in least-recent-user-focus order. One handoff
+                    // retires one transport, never a whole batch of agents.
+                    victims.sort_by_key(|(protected, writer, focus, started, h, _, _)|
+                        (*protected, *writer, *focus, *started, h.chat_id.clone()));
+                    if let Some((protected, _, _, _, handle, caught_up, pending)) = victims.into_iter().next() {
+                        let unfinished = protected || !caught_up || pending
+                            || host.inner.store.sync_job_version(&handle.chat_id, "wake").map_or(true, |v| v.is_some());
+                        handle.sync_requested.store(unfinished, Ordering::Release);
+                        handle.sync_wait_since.store(now, Ordering::Release);
+                        handoff = winner.map(|id| (id, fair));
+                        stopping_ids.insert(handle.chat_id.clone());
+                        stopping.push(host.inner.tasks.spawn(host.stop_sync_owned(handle)));
                     }
-                    let unfinished = !caught_up || pending || viewed
-                        || host.inner.store.sync_job_version(&handle.chat_id, "wake")
-                            .map_or(true, |v| v.is_some());
-                    handle.sync_requested.store(unfinished, Ordering::Release);
-                    stopping_ids.insert(handle.chat_id.clone());
-                    stopping.push(host.inner.tasks.spawn(host.stop_sync_owned(handle)));
                 }
                 let admission_limit = if disk_healthy {
                     available.min(SYNC_ADMISSION_BATCH)
@@ -1861,14 +1927,15 @@ impl DocHost {
                     turn += 1;
                     waiting.sort_by_key(|(id, h, _)| {
                         let protected = h.as_ref().is_some_and(|h| h.sync_protected());
+                        let focus = h.as_ref().map_or(0, |h| {
+                            let focus = h.last_focus.load(Ordering::Acquire);
+                            if focus > h.sync_focus_served.load(Ordering::Acquire) { focus } else { 0 }
+                        });
                         (
-                            // Honor an in-flight view handoff without removing
-                            // the regular background fairness allocation.
-                            view_handoff.as_ref() != Some(id),
+                            handoff.as_ref().map(|(chat, _)| chat) != Some(id),
                             if turn % 4 == 0 { protected } else { !protected },
-                            std::cmp::Reverse(h.as_ref().filter(|_| protected)
-                                .map_or(0, |h| h.last_access.load(Ordering::Relaxed))),
-                            h.as_ref().map_or(0, |h| h.sync_last_started.load(Ordering::Relaxed)),
+                            std::cmp::Reverse(if turn % 4 == 0 { 0 } else { focus }),
+                            h.as_ref().map_or(0, |h| h.sync_last_started.load(Ordering::Acquire)),
                             id.clone(),
                         )
                     });
@@ -1901,6 +1968,13 @@ impl DocHost {
                         continue;
                     }
                     admitted += 1;
+                    let fair_turn = handoff.as_ref().is_some_and(|(chat, fair)| chat == &id && *fair);
+                    if handoff.as_ref().is_some_and(|(chat, _)| chat == &id) {
+                        handoff = None;
+                    }
+                    handle.sync_wait_since.store(0, Ordering::Release);
+                    handle.sync_service_until.store(if fair_turn { now_ms() + SYNC_QUANTUM_MS } else { 0 }, Ordering::Release);
+                    handle.sync_focus_served.fetch_max(handle.last_focus.load(Ordering::Acquire), Ordering::AcqRel);
                     handle.sync_last_started.store(now_ms(), Ordering::Release);
                     handle.sync_wake_version.store(wake_version.unwrap_or(0), Ordering::Release);
                     handle.sync_wake_ticket.store(0, Ordering::Release);
@@ -5856,6 +5930,7 @@ mod publication_eviction_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_disk_writes_pin_edits_and_resume_admission_after_recovery() {
+        let _budget_guard = SYNC_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let host = DocHost::new(
@@ -5948,6 +6023,7 @@ mod publication_eviction_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn opening_many_chats_bounds_active_clients() {
+        let _budget_guard = SYNC_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let host = DocHost::new(
@@ -5966,12 +6042,16 @@ mod publication_eviction_tests {
             .values()
             .filter(|h| h.sync_started.load(Ordering::Acquire))
             .count();
-        assert!(running > 0 && running <= 12, "active clients: {running}");
+        assert!(
+            running > 0 && running <= ACTIVE_SYNC_CAP,
+            "active clients: {running}"
+        );
         host.shutdown_workers().await;
     }
 
     #[tokio::test]
     async fn local_open_journals_without_starting_sync_and_reuses_the_document() {
+        let _budget_guard = SYNC_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let host = DocHost::new(
@@ -6034,6 +6114,7 @@ mod publication_eviction_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lru_eviction_replays_unacknowledged_updates_after_reopen() {
+        let _budget_guard = SYNC_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
         let host = DocHost::new(

@@ -332,16 +332,26 @@ impl CheckoutDiffSync {
             .get(checkout_id)
             .cloned()
             .ok_or_else(|| EngineError::Other("checkout is no longer available".into()))?;
-        let _guard = entry.discard_lock.lock().await;
-        let result =
-            discard_working_tree(&self.inner.repos, &entry.identity.root, expected_checksum).await;
+        let inner = self.inner.clone();
+        let expected_checksum = expected_checksum.to_owned();
+        // Own task: a started discard always runs to completion even if the
+        // RPC caller goes away, and the nested git captures start from a fresh
+        // worker stack instead of stacking on the RPC dispatcher's frames
+        // (which overflowed the 2 MiB worker stack in debug builds).
+        tokio::spawn(async move {
+            let _guard = entry.discard_lock.lock().await;
+            let result =
+                discard_working_tree(&inner.repos, &entry.identity.root, &expected_checksum).await;
 
-        // Publish immediately instead of waiting for the watcher debounce.
-        // The watcher kick remains useful if an external writer races this
-        // operation after the final capture.
-        sync_entry(&self.inner, &entry).await;
-        let _ = entry.kick_tx.send(());
-        result
+            // Publish immediately instead of waiting for the watcher debounce.
+            // The watcher kick remains useful if an external writer races this
+            // operation after the final capture.
+            sync_entry(&inner, &entry).await;
+            let _ = entry.kick_tx.send(());
+            result
+        })
+        .await
+        .map_err(|error| EngineError::Other(format!("discard task failed: {error}")))?
     }
 }
 
@@ -1432,15 +1442,54 @@ fn path_argument(path: &[u8]) -> OsString {
     OsString::from(String::from_utf8_lossy(path).into_owned())
 }
 
+/// Path bytes per git invocation. Windows caps a whole command line at 32,767
+/// UTF-16 units (macOS/Linux at 1-2 MiB including the environment); a change
+/// set past that must not fail to spawn halfway through a discard.
+const MAX_PATH_ARGUMENT_BYTES: usize = 16 * 1024;
+
+/// Split `paths` into consecutive batches of at most `budget` bytes (one NUL
+/// per path included). A single path over budget still forms its own batch.
+fn path_batches(paths: &[Vec<u8>], budget: usize) -> Vec<&[Vec<u8>]> {
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (index, path) in paths.iter().enumerate() {
+        let cost = path.len() + 1;
+        if index > start && bytes + cost > budget {
+            batches.push(&paths[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes += cost;
+    }
+    if start < paths.len() {
+        batches.push(&paths[start..]);
+    }
+    batches
+}
+
 async fn run_git_for_paths(
     root: &Path,
     fixed_args: &[OsString],
     paths: &[Vec<u8>],
 ) -> Result<(), EngineError> {
-    if paths.is_empty() {
-        return Ok(());
+    for batch in path_batches(paths, MAX_PATH_ARGUMENT_BYTES) {
+        run_git_for_path_batch(root, fixed_args, batch).await?;
     }
+    Ok(())
+}
+
+async fn run_git_for_path_batch(
+    root: &Path,
+    fixed_args: &[OsString],
+    paths: &[Vec<u8>],
+) -> Result<(), EngineError> {
     let mut command = tokio::process::Command::new("git");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.as_std_mut().creation_flags(0x08000000);
+    }
     command
         .arg("-C")
         .arg(root)
@@ -1509,12 +1558,23 @@ pub async fn discard_working_tree(
         ));
     }
     let (tracked, untracked) = status_paths(&status.stdout);
-    if untracked.iter().any(|path| {
+    let is_directory = |path: &Vec<u8>| {
         std::fs::symlink_metadata(root.join(PathBuf::from(path_argument(path))))
             .is_ok_and(|metadata| metadata.is_dir())
-    }) {
+    };
+    if untracked.iter().any(is_directory) {
         return Err(EngineError::Other(
             "cannot discard an untracked nested repository safely".into(),
+        ));
+    }
+    // Git tracks files and symlinks, so a tracked path that is a directory on
+    // disk is a submodule or a file replaced by a directory. `git restore`
+    // leaves submodule contents in place (the final check would then fail
+    // after everything else was already discarded) and removes a replacing
+    // directory wholesale, ignored files included. Refuse before mutating.
+    if tracked.iter().any(is_directory) {
+        return Err(EngineError::Other(
+            "cannot discard submodule or directory changes safely".into(),
         ));
     }
 
@@ -1808,8 +1868,22 @@ pub async fn capture_turn_diff(
 mod watch_budget_tests {
     use super::{
         CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, has_non_utf8_status_path,
-        watch_targets,
+        path_batches, watch_targets,
     };
+
+    #[test]
+    fn path_batches_split_on_budget_and_keep_every_path() {
+        let paths: Vec<Vec<u8>> = ["aaa", "bbb", "cc", "dddddddddd", "e"]
+            .iter()
+            .map(|path| path.as_bytes().to_vec())
+            .collect();
+        let batches = path_batches(&paths, 8);
+        let sizes: Vec<usize> = batches.iter().map(|batch| batch.len()).collect();
+        // "aaa\0bbb\0" fills 8; "cc\0" alone; the oversized path stands alone.
+        assert_eq!(sizes, vec![2, 1, 1, 1]);
+        assert_eq!(batches.concat(), paths);
+        assert!(path_batches(&[], 8).is_empty());
+    }
 
     #[test]
     fn non_utf8_status_paths_are_marked_unsafe_for_destructive_actions() {

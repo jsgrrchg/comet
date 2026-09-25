@@ -741,6 +741,133 @@ async fn discard_working_tree_never_removes_an_untracked_nested_repository() {
 }
 
 #[tokio::test]
+async fn discard_working_tree_refuses_a_dirty_submodule_before_mutating() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream = tmp.path().join("upstream");
+    init_repo(&upstream).await;
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    git(
+        &repo_dir,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            upstream.to_str().unwrap(),
+            "sub",
+        ],
+    )
+    .await;
+    git(&repo_dir, &["commit", "-m", "submodule"]).await;
+    std::fs::write(repo_dir.join("sub/a.txt"), "submodule edit\n").expect("submodule edit");
+    std::fs::write(repo_dir.join("a.txt"), "parent edit\n").expect("parent edit");
+    std::fs::write(repo_dir.join("untracked.txt"), "untracked\n").expect("untracked");
+    let repos = test_repos(&tmp.path().join("data"));
+    let snapshot = capture_diff(&repos, &repo_dir).await.expect("snapshot");
+
+    let error = discard_working_tree(&repos, &repo_dir, &snapshot.checksum)
+        .await
+        .expect_err("dirty submodule is refused");
+    assert!(error.to_string().contains("submodule"), "{error}");
+    // All-or-nothing: nothing else was discarded either.
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("sub/a.txt")).unwrap(),
+        "submodule edit\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("a.txt")).unwrap(),
+        "parent edit\n"
+    );
+    assert!(repo_dir.join("untracked.txt").exists());
+}
+
+#[tokio::test]
+async fn discard_working_tree_refuses_a_tracked_file_replaced_by_a_directory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join(".gitignore"), "*.log\n").expect("gitignore");
+    std::fs::write(repo_dir.join("tracked"), "file\n").expect("tracked");
+    git(&repo_dir, &["add", ".gitignore", "tracked"]).await;
+    git(&repo_dir, &["commit", "-m", "fixtures"]).await;
+    // Only an ignored file lives in the replacing directory, so status reports
+    // just ` D tracked`; restoring it would delete the ignored file.
+    std::fs::remove_file(repo_dir.join("tracked")).expect("remove tracked");
+    std::fs::create_dir(repo_dir.join("tracked")).expect("replacing dir");
+    std::fs::write(repo_dir.join("tracked/keep.log"), "keep me\n").expect("ignored");
+    let repos = test_repos(&tmp.path().join("data"));
+    let snapshot = capture_diff(&repos, &repo_dir).await.expect("snapshot");
+
+    let error = discard_working_tree(&repos, &repo_dir, &snapshot.checksum)
+        .await
+        .expect_err("directory replacement is refused");
+    assert!(error.to_string().contains("directory"), "{error}");
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("tracked/keep.log")).unwrap(),
+        "keep me\n"
+    );
+}
+
+#[tokio::test]
+async fn discard_working_tree_handles_more_paths_than_one_command_line() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    // ~40 KiB of path arguments: several git invocations per step.
+    std::fs::create_dir(repo_dir.join("generated")).expect("generated dir");
+    for index in 0..800 {
+        std::fs::write(
+            repo_dir.join(format!(
+                "generated/untracked-file-with-a-long-name-{index:04}.txt"
+            )),
+            "x\n",
+        )
+        .expect("untracked file");
+    }
+    std::fs::write(repo_dir.join("a.txt"), "edited\n").expect("tracked edit");
+    let repos = test_repos(&tmp.path().join("data"));
+    let snapshot = capture_diff(&repos, &repo_dir).await.expect("snapshot");
+    assert!(!snapshot.truncated);
+
+    let clean = discard_working_tree(&repos, &repo_dir, &snapshot.checksum)
+        .await
+        .expect("discard succeeds");
+    assert!(clean.files.is_empty());
+    assert!(!repo_dir.join("generated").exists());
+    assert_eq!(
+        std::fs::read_to_string(repo_dir.join("a.txt")).unwrap(),
+        "one\ntwo\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn discard_working_tree_removes_untracked_symlinks_without_following_them() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).expect("outside dir");
+    std::fs::write(outside.join("precious.txt"), "outside\n").expect("outside file");
+    std::os::unix::fs::symlink(&outside, repo_dir.join("dir-link")).expect("dir symlink");
+    std::os::unix::fs::symlink(outside.join("precious.txt"), repo_dir.join("file-link"))
+        .expect("file symlink");
+    let repos = test_repos(&tmp.path().join("data"));
+    let snapshot = capture_diff(&repos, &repo_dir).await.expect("snapshot");
+
+    discard_working_tree(&repos, &repo_dir, &snapshot.checksum)
+        .await
+        .expect("discard succeeds");
+    assert!(std::fs::symlink_metadata(repo_dir.join("dir-link")).is_err());
+    assert!(std::fs::symlink_metadata(repo_dir.join("file-link")).is_err());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("precious.txt")).unwrap(),
+        "outside\n"
+    );
+}
+
+#[tokio::test]
 async fn git_status_preserves_index_changes_even_when_head_diff_is_empty() {
     use zeron_proto::GitFileState::*;
     let tmp = tempfile::tempdir().unwrap();

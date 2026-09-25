@@ -3085,7 +3085,19 @@ impl DocHost {
             .into_iter()
             .map(|(chat_id, stats)| {
                 let stats = stats.unwrap_or_default();
-                let connected = !grace.degraded(GraceKey::Chat(&chat_id), !stats.connected, now);
+                // An idle chat deliberately has no room. Clear any previous
+                // timer so selecting it starts a fresh grace window.
+                let sync_expected = lock(&self.inner.handles)
+                    .get(&chat_id)
+                    .is_some_and(|handle| {
+                        handle.sync_started.load(Ordering::Acquire)
+                            || handle.sync_requested.load(Ordering::Acquire)
+                    });
+                let connected = !grace.degraded(
+                    GraceKey::Chat(&chat_id),
+                    sync_expected && !stats.connected,
+                    now,
+                );
                 ChatConnectivity {
                     sync_state: self.chat_sync_state(&chat_id),
                     chat_id,
@@ -5798,6 +5810,57 @@ mod degrade_grace_tests {
         assert!(g.chats.is_empty());
         // OsPath kept its own timer through the retain.
         assert!(g.degraded(GraceKey::OsPath, true, t0 + DEGRADE_GRACE));
+    }
+
+    #[tokio::test]
+    async fn dormant_chat_clears_old_degradation_before_reconnection() {
+        use super::{DocHost, DocHostConfig, EdgeConfig, lock};
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+        use zeron_proto::{ChatSyncState, HarnessId};
+
+        let dir = tempfile::tempdir().unwrap();
+        let host = DocHost::new(
+            Arc::new(zeron_sync::DocsStore::open(dir.path()).unwrap()),
+            DocHostConfig {
+                device_id: "local".into(),
+                default_harness: HarnessId::Mock,
+                edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
+            },
+        );
+        let handle = host.open_local("dormant").unwrap();
+        lock(&host.inner.connectivity_grace)
+            .chats
+            .insert("dormant".into(), Instant::now() - DEGRADE_GRACE * 2);
+
+        let dormant = host.compute_connectivity();
+        assert_eq!(dormant.chats[0].sync_state, ChatSyncState::Local);
+        assert!(dormant.chats[0].connected);
+        assert!(
+            !lock(&host.inner.connectivity_grace)
+                .chats
+                .contains_key("dormant")
+        );
+
+        // Focus requests a connection. Its first down sample gets a new grace
+        // period even though the doc was dormant longer than DEGRADE_GRACE.
+        handle.sync_requested.store(true, Ordering::Release);
+        let waking = host.compute_connectivity();
+        assert_eq!(waking.chats[0].sync_state, ChatSyncState::Waiting);
+        assert!(waking.chats[0].connected);
+
+        lock(&host.inner.connectivity_grace)
+            .chats
+            .insert("dormant".into(), Instant::now() - DEGRADE_GRACE);
+        assert!(!host.compute_connectivity().chats[0].connected);
+
+        // An active chat with the same sustained outage also reports down.
+        handle.sync_started.store(true, Ordering::Release);
+        handle.sync_requested.store(false, Ordering::Release);
+        let active = host.compute_connectivity();
+        assert_eq!(active.chats[0].sync_state, ChatSyncState::Connecting);
+        assert!(!active.chats[0].connected);
+        host.shutdown_workers().await;
     }
 }
 

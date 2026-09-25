@@ -591,7 +591,12 @@ impl FilesSurface {
             .and_then(|path| self.preview.documents.get_mut(path))
         {
             // Source line numbers do not map to the rendered Markdown blocks.
-            document.show_markdown = false;
+            if document.show_markdown {
+                document.show_markdown = false;
+                if let Some(view) = &document.markdown {
+                    view.update(cx, |view, cx| view.suspend(cx));
+                }
+            }
         }
         cx.notify();
     }
@@ -700,8 +705,11 @@ impl FilesSurface {
                 });
                 return false;
             };
+            // The editor paints this offset before clamping it, so a line near
+            // the top would briefly push the first line down the viewport.
+            let y = (offset.y + target_y - line_y).min(px(0.0));
             editor.update(cx, |state, cx| {
-                state.set_scroll_offset(point(offset.x, offset.y + target_y - line_y), cx);
+                state.set_scroll_offset(point(offset.x, y), cx);
             });
             return true;
         }
@@ -3858,6 +3866,155 @@ mod markdown_buffer_tests {
                         - (viewport.origin.y + viewport.size.height / 2.0),
                 );
                 assert!(distance.abs() <= f32::from(line_bounds.size.height));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn chat_line_link_near_the_top_never_scrolls_above_the_first_line(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let path = "src/lib.rs";
+        let source = (1..=180)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            FilesSurface::new_editor(
+                state,
+                "chat".into(),
+                path.into(),
+                false,
+                1000,
+                13.0,
+                false,
+                false,
+                cx,
+            )
+        });
+        window
+            .update(cx, |surface, _, _| {
+                let mut document = FileDocument::loading(DocumentKey {
+                    chat_id: "chat".into(),
+                    checkout_id: Some("checkout".into()),
+                    path: path.into(),
+                });
+                document.set_loaded(zeron_proto::WorkspaceFileText {
+                    checkout_id: "checkout".into(),
+                    path: path.into(),
+                    text: Some(source.clone()),
+                    content_hash: Some("hash".into()),
+                    size: source.len() as u64,
+                    modified_at: None,
+                    encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                    line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                    read_only_reason: None,
+                    truncated: false,
+                });
+                surface.preview.active = Some(path.into());
+                surface.preview.documents.insert(path.into(), document);
+                surface.sync_preview_list();
+            })
+            .unwrap();
+        let draw = |cx: &mut TestAppContext| {
+            cx.update_window(window.into(), |_, window, cx| {
+                window.refresh();
+                let _ = window.draw(cx);
+                window.simulate_next_frame(cx);
+            })
+            .unwrap();
+        };
+        let first_line_top = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |surface, _, cx| {
+                    let editor = surface.preview.documents[path].editor.as_ref()?.read(cx);
+                    editor.range_to_bounds(&(0..0)).map(|bounds| bounds.top())
+                })
+                .unwrap()
+        };
+        for _ in 0..3 {
+            draw(cx);
+        }
+        let resting_top = first_line_top(cx).expect("first line laid out");
+
+        window
+            .update(cx, |surface, _, cx| surface.navigate_to_line(3, None, cx))
+            .unwrap();
+        for _ in 0..5 {
+            draw(cx);
+            if let Some(top) = first_line_top(cx) {
+                assert!(top <= resting_top, "{top:?} painted below {resting_top:?}");
+            }
+        }
+        window
+            .update(cx, |surface, _, cx| {
+                let editor = surface.preview.documents[path]
+                    .editor
+                    .as_ref()
+                    .unwrap()
+                    .read(cx);
+                assert_eq!(
+                    editor.cursor_position(),
+                    gpui_base::input::Position::new(2, 0)
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn chat_line_link_suspends_an_open_markdown_preview(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        let path = "README.md";
+        let source = "# Title\n\nBody\n";
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            FilesSurface::new_editor(
+                state,
+                "chat".into(),
+                path.into(),
+                false,
+                1000,
+                13.0,
+                false,
+                false,
+                cx,
+            )
+        });
+        window
+            .update(cx, |surface, _, cx| {
+                let mut document = FileDocument::loading(DocumentKey {
+                    chat_id: "chat".into(),
+                    checkout_id: Some("checkout".into()),
+                    path: path.into(),
+                });
+                document.set_loaded(zeron_proto::WorkspaceFileText {
+                    checkout_id: "checkout".into(),
+                    path: path.into(),
+                    text: Some(source.into()),
+                    content_hash: Some("hash".into()),
+                    size: source.len() as u64,
+                    modified_at: None,
+                    encoding: zeron_proto::WorkspaceTextEncoding::Utf8,
+                    line_ending: Some(zeron_proto::WorkspaceLineEnding::Lf),
+                    read_only_reason: None,
+                    truncated: false,
+                });
+                assert!(document.show_markdown);
+                surface.preview.active = Some(path.into());
+                surface.preview.documents.insert(path.into(), document);
+                let view = surface.prepare_markdown_preview(path, None, cx).unwrap();
+                assert!(!view.read(cx).test_suspended());
+
+                surface.navigate_to_line(2, None, cx);
+
+                assert!(!surface.preview.documents[path].show_markdown);
+                assert!(view.read(cx).test_suspended());
             })
             .unwrap();
     }

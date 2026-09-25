@@ -27,7 +27,7 @@ use zeron_engine::InstanceLock;
 use zeron_proto::{AuthState, WorkspaceScope};
 use zeron_rpc::methods;
 
-use crate::changes::{Changes, ChangesEvent};
+use crate::changes::{Changes, ChangesEvent, DiscardWorkingTreeRequest};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
 use crate::icons::{self, icon};
@@ -70,6 +70,20 @@ mod spaces;
 mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
+
+/// `connected` already includes the engine's degradation grace. A brief
+/// focus-triggered dial needs no sidebar status; queued changes or a sustained
+/// outage still deserve one.
+fn chat_sync_pill_caption(chat: &zeron_proto::ChatConnectivity) -> Option<&'static str> {
+    use zeron_proto::ChatSyncState as S;
+    let sustained_or_queued = !chat.connected || chat.pending_pushes > 0;
+    match chat.sync_state {
+        S::Waiting if sustained_or_queued => Some("Sync queued — changes are saved"),
+        S::Connecting if sustained_or_queued => Some("Syncing…"),
+        S::Offline if !chat.connected => Some("Offline — changes are saved"),
+        _ => None,
+    }
+}
 
 actions!(
     shell,
@@ -230,6 +244,30 @@ fn right_panel_content_width(
 
 fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
     (viewport - sidebar - right).max(0.0)
+}
+
+/// The chat's working directory as the host device spells it — the folder the
+/// harness runs in (a worktree chat's worktree). Projectless `~` chats have
+/// none. Deliberately not `source_context.repo_root`: that is canonicalized
+/// (symlinks resolved, `\\?\` verbatim prefix on Windows hosts).
+fn chat_copy_path(chat: &zeron_proto::Chat) -> Option<&str> {
+    chat.cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| is_host_absolute_path(cwd))
+}
+
+/// Absolute on the HOST, whatever the viewer's OS: a remote engine may hand a
+/// POSIX path to a Windows viewport (no drive, so `Path::is_absolute` says
+/// no) or a drive path to a POSIX one.
+fn is_host_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
 }
 
 fn composer_target_width(panel_width: f32, content_width: f32, docked: bool) -> f32 {
@@ -1368,6 +1406,12 @@ enum AccountMenuAction {
     SignOut,
 }
 
+#[derive(Debug, Clone)]
+enum DiscardWorkingTreeFlow {
+    Confirm(DiscardWorkingTreeRequest),
+    Failed(SharedString),
+}
+
 const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
 const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -1732,6 +1776,10 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// Global confirmation/error dialog for the Changes-pane trash action. The
+    /// RPC task is retained separately so rerenders do not cancel it.
+    discard_working_tree: Option<DiscardWorkingTreeFlow>,
+    discard_working_tree_task: Option<Task<()>>,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
@@ -1746,6 +1794,8 @@ pub struct Shell {
     /// The add-space palette (device tabs + folder search), `Some`
     /// while open.
     add_space: Option<AddSpaceFlow>,
+    /// The New project palette's collapsed-breadcrumbs (`…`) menu.
+    project_crumb_menu: popover::Popup<()>,
     command_palette: Option<command_palette::CommandPalette>,
     pending_workspace_command: Option<crate::composer::WorkspaceCommand>,
     /// The sidebar's space-filter dropdown.
@@ -1925,6 +1975,12 @@ impl Shell {
             this.on_state_changed(&state, cx);
             cx.notify();
         });
+        // A reopened window reuses AppState, so the engine may already be
+        // ready. Only show the boot splash while it is actually connecting.
+        let splash = match &state.read(cx).connection {
+            ConnectionStatus::Connecting => SplashPhase::Visible,
+            ConnectionStatus::Ready | ConnectionStatus::Failed(_) => SplashPhase::Gone,
+        };
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
@@ -2150,6 +2206,8 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            discard_working_tree: None,
+            discard_working_tree_task: None,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             sidebar_section_migration: None,
@@ -2160,6 +2218,7 @@ impl Shell {
             section_menu_active: None,
             delete_space_confirm: None,
             add_space: None,
+            project_crumb_menu: popover::Popup::default(),
             command_palette: None,
             pending_workspace_command: None,
             spaces_menu: popover::Popup::default(),
@@ -2235,7 +2294,7 @@ impl Shell {
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
             render_time: None,
-            splash: SplashPhase::Visible,
+            splash,
             splash_task: None,
             focus_sub: None,
             shortcut_focus: cx.focus_handle(),
@@ -2967,6 +3026,13 @@ impl Shell {
     }
 
     fn set_right_active(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
+        if let RightSurface::Subagent(id) = surface
+            && let Some(tab) = self.subagent_tabs.get(&id)
+        {
+            let doc_id = tab.doc_id.clone();
+            self.state
+                .update(cx, |state, cx| state.focus_subagent_sync(&doc_id, cx));
+        }
         if self.resolved_right_active(cx) != surface {
             self.suspend_file_images(cx);
         }
@@ -3204,13 +3270,23 @@ impl Shell {
     /// The picker's Diffs card / the `+` menu's Diff row: every click opens a
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
-    fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
+    fn add_diff_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
-        self.register_diff_surface(changes, cx);
+        self.register_diff_surface(changes, window, cx);
     }
 
     /// Open or focus a session-owned editor tab. The explorer is independent.
     fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_file_surface_at(path, None, window, cx);
+    }
+
+    fn add_file_surface_at(
+        &mut self,
+        path: String,
+        location: Option<(u32, Option<u32>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_chat.is_empty() {
             return;
         }
@@ -3220,6 +3296,11 @@ impl Shell {
         if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
             let surface = RightSurface::File(id);
             self.set_right_active(surface, cx);
+            if let Some((line, column)) = location
+                && let Some(file) = self.file_surfaces.get(&id).cloned()
+            {
+                file.update(cx, |file, cx| file.navigate_to_line(line, column, cx));
+            }
             self.focus_right_file_editor(surface, window, cx);
             return;
         }
@@ -3322,6 +3403,11 @@ impl Shell {
             RightSurface::File(id),
         );
         self.set_right_active(RightSurface::File(id), cx);
+        if let Some((line, column)) = location
+            && let Some(file) = self.file_surfaces.get(&id).cloned()
+        {
+            file.update(cx, |file, cx| file.navigate_to_line(line, column, cx));
+        }
     }
 
     fn open_workspace_file_link(
@@ -3353,7 +3439,12 @@ impl Shell {
         if !was_open {
             self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         }
-        self.add_file_surface(link.path, window, cx);
+        self.add_file_surface_at(
+            link.path,
+            link.line.map(|line| (line, link.column)),
+            window,
+            cx,
+        );
         true
     }
 
@@ -3379,9 +3470,9 @@ impl Shell {
 
     /// The dedicated History surface. Keeping it as its own tab preserves its
     /// graph/search state while Diff tabs retain their ordinary scope picker.
-    fn add_history_surface(&mut self, cx: &mut Context<Self>) {
+    fn add_history_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let history = cx.new(|cx| Changes::for_history(self.state.clone(), cx));
-        self.register_diff_surface(history, cx);
+        self.register_diff_surface(history, window, cx);
     }
 
     /// A History row click: the commit opens as its own pinned diff tab
@@ -3389,20 +3480,41 @@ impl Shell {
     fn add_commit_diff_surface(
         &mut self,
         commit: zeron_proto::GitHistoryCommit,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cx));
-        self.register_diff_surface(changes, cx);
+        self.register_diff_surface(changes, window, cx);
     }
 
-    fn register_diff_surface(&mut self, changes: Entity<Changes>, cx: &mut Context<Self>) {
+    fn register_diff_surface(
+        &mut self,
+        changes: Entity<Changes>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.diff_seq += 1;
         let id = self.diff_seq;
-        let sub = cx.subscribe(&changes, |this: &mut Self, _, event, cx| match event {
-            ChangesEvent::OpenCommit(commit) => {
-                this.add_commit_diff_surface(commit.clone(), cx);
-            }
-        });
+        let sub =
+            cx.subscribe_in(
+                &changes,
+                window,
+                |this: &mut Self, _, event, window, cx| match event {
+                    ChangesEvent::OpenCommit(commit) => {
+                        this.add_commit_diff_surface(commit.clone(), window, cx);
+                    }
+                    ChangesEvent::OpenFile(path) => {
+                        this.add_file_surface(path.clone(), window, cx);
+                    }
+                    ChangesEvent::DiscardWorkingTree(request) => {
+                        if this.discard_working_tree_task.is_none() {
+                            this.discard_working_tree =
+                                Some(DiscardWorkingTreeFlow::Confirm(request.clone()));
+                            cx.notify();
+                        }
+                    }
+                },
+            );
         self.diffs.insert(id, changes);
         self.diff_subs.insert(id, sub);
         let key = self.panel_key(cx);
@@ -4074,6 +4186,23 @@ impl Shell {
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
             self.sidebar_notice = Some("Harness session ID copied".into());
+        }
+        self.close_chat_menu(cx);
+        cx.notify();
+    }
+
+    fn copy_chat_path(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let path = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .and_then(chat_copy_path)
+            .map(str::to_owned);
+        if let Some(path) = path {
+            cx.write_to_clipboard(ClipboardItem::new_string(path));
+            self.sidebar_notice = Some("Path copied".into());
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -4793,6 +4922,60 @@ impl Shell {
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
             cx,
         );
+        cx.notify();
+    }
+
+    fn confirm_discard_working_tree(&mut self, cx: &mut Context<Self>) {
+        if self.discard_working_tree_task.is_some() {
+            return;
+        }
+        let Some(DiscardWorkingTreeFlow::Confirm(request)) = self.discard_working_tree.clone()
+        else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.discard_working_tree = Some(DiscardWorkingTreeFlow::Failed(
+                "Engine is not connected.".into(),
+            ));
+            cx.notify();
+            return;
+        };
+
+        let mut params = serde_json::Map::new();
+        params.insert("chatId".into(), serde_json::Value::String(request.chat_id));
+        params.insert(
+            "checkoutId".into(),
+            serde_json::Value::String(request.checkout_id),
+        );
+        params.insert(
+            "expectedChecksum".into(),
+            serde_json::Value::String(request.expected_checksum),
+        );
+        if let Some(target) = request.target_device_id {
+            params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+        }
+
+        // Dismiss the confirmation immediately. The task remains retained so
+        // repeat clicks cannot issue a second destructive request.
+        self.discard_working_tree = None;
+        self.discard_working_tree_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::DISCARD_WORKING_TREE,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.discard_working_tree_task = None;
+                shell.discard_working_tree = match result {
+                    Ok(_) => None,
+                    Err(error) => Some(DiscardWorkingTreeFlow::Failed(format!("{error}").into())),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
@@ -7003,17 +7186,35 @@ impl Shell {
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
-    /// The global connection line. `None` while healthy (`Connected`) or on
-    /// local profiles (`Disabled`) — and the engine's degrade grace means it
-    /// only exists during REAL outages, never join/wake blips. No surface,
+    /// Global connection health, with selected-chat queue and storage status.
+    /// Persistence failures take precedence even when the network is offline.
+    /// No surface,
     /// no border (v0.2.12 feedback): a bare spinner + faint caption while
     /// reconnecting; an amber dot only when the OS says offline. The
     /// transport error belongs in logs, not the sidebar.
     fn render_connection_pill(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         use zeron_proto::ConnectivityState as S;
         let conn = self.state.read(cx).connectivity.clone();
+        let selected = self.state.read(cx).selected_chat.as_deref();
+        let chat = conn.chats.iter()
+            .find(|c| Some(c.chat_id.as_str()) == selected);
+        let chat_state = chat.map(|c| c.sync_state);
         let (label, glyph): (SharedString, AnyElement) = match conn.state {
-            S::Disabled | S::Connected => return None,
+            _ if chat_state == Some(zeron_proto::ChatSyncState::StorageError) => (
+                "Changes could not be saved".into(),
+                div().size(px(5.0)).rounded_full().bg(theme.warning).into_any_element(),
+            ),
+            S::Disabled => return None,
+            S::Connected => {
+                let caption = chat_sync_pill_caption(chat?)?;
+                (
+                    caption.into(),
+                    loaders::mini_mono_spinner(
+                        "chat-sync-spinner", 2.0, theme.text_muted,
+                        self.sidebar_pane.entity_id(), cx,
+                    ).into_any_element(),
+                )
+            }
             S::Offline => (
                 "Offline — sends are saved".into(),
                 div()
@@ -8311,6 +8512,16 @@ impl Shell {
             cx.notify();
             return true;
         }
+        if self.discard_working_tree.is_some() {
+            self.discard_working_tree = None;
+            cx.notify();
+            return true;
+        }
+        // The folded-breadcrumbs menu floats over the palette; it closes first.
+        if self.add_space.is_some() && self.project_crumb_menu.is_open() {
+            self.close_project_crumb_menu(cx);
+            return true;
+        }
         if self.add_space.is_some() {
             self.add_space = None;
             cx.notify();
@@ -8517,9 +8728,11 @@ impl Shell {
                         .as_ref()
                         .and_then(|chat| chat.harness_session_id.as_deref())
                         .is_some_and(|id| !id.trim().is_empty());
+                    let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
                     let zeron_id = chat_id.clone();
                     let harness_id = chat_id.clone();
                     let session_chat_id = chat_id.clone();
+                    let path_chat_id = chat_id.clone();
                     menu.child(
                         popover::menu_row(&theme, false, format!("chat-copy-back-{chat_id}"))
                             .id("chat-copy-back")
@@ -8537,6 +8750,21 @@ impl Shell {
                             .child(SharedString::from("Back")),
                     )
                     .child(popover::menu_separator())
+                    .when(has_path, |menu| {
+                        menu.child(
+                            popover::menu_row(&theme, false, format!("chat-copy-path-{chat_id}"))
+                                .id("chat-copy-path")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.copy_chat_path(&path_chat_id, cx)
+                                }))
+                                .child(
+                                    icon(icons::COPY)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Path")),
+                        )
+                    })
                     .child(
                         popover::menu_row(&theme, false, format!("chat-copy-zeron-{chat_id}"))
                             .id("chat-copy-zeron")
@@ -8699,6 +8927,69 @@ impl Shell {
                 )
                 .into_any_element();
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
+        }
+
+        if let Some(flow) = self.discard_working_tree.clone() {
+            let card = match flow {
+                DiscardWorkingTreeFlow::Confirm(_) => {
+                    popover::dialog_card(&theme)
+                        .child(popover::dialog_title(
+                            &theme,
+                            "Discard working tree changes?",
+                        ))
+                        .child(div().mt(px(6.0)).child(popover::dialog_body(
+                            &theme,
+                            "Discard all uncommitted changes in this working tree? This can’t be undone.",
+                        )))
+                        .child(
+                            div()
+                                .mt(px(16.0))
+                                .flex()
+                                .flex_row()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(
+                                    popover::btn_ghost(
+                                        &theme,
+                                        "Cancel",
+                                        "discard-working-tree-cancel",
+                                    )
+                                    .id("discard-working-tree-cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_working_tree = None;
+                                        cx.notify();
+                                    })),
+                                )
+                                .child(
+                                    popover::btn_danger(&theme, "Discard changes")
+                                        .id("discard-working-tree-confirm")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.confirm_discard_working_tree(cx)
+                                        })),
+                                ),
+                        )
+                        .into_any_element()
+                }
+                DiscardWorkingTreeFlow::Failed(error) => popover::dialog_card(&theme)
+                    .child(popover::dialog_title(&theme, "Couldn’t discard changes"))
+                    .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, error)))
+                    .child(
+                        div().mt(px(16.0)).flex().justify_end().child(
+                            popover::btn_primary(&theme, "Close")
+                                .id("discard-working-tree-error-close")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.discard_working_tree = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .into_any_element(),
+            };
+            overlays.push(popover::modal(
+                "discard-working-tree-dialog",
+                viewport,
+                card,
+            ));
         }
 
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
@@ -9648,14 +9939,14 @@ impl Shell {
                     // no longer gates on it (terminals work anywhere).
                     .when(self.space_git_detected(cx), |el| {
                         el.child(row("surface-card-diffs", icons::LIST, "Diffs").on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.add_diff_surface(cx);
+                            cx.listener(|this, _, window, cx| {
+                                this.add_diff_surface(window, cx);
                             }),
                         ))
                         .child(
                             row("surface-card-history", icons::GIT_BRANCH, "History").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.add_history_surface(cx);
+                                cx.listener(|this, _, window, cx| {
+                                    this.add_history_surface(window, cx);
                                 }),
                             ),
                         )
@@ -10188,8 +10479,8 @@ impl Shell {
                             menu.child(
                                 popover::menu_row(&theme, false, "right-plus-diff")
                                     .id("right-plus-diff-row")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_diff_surface(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_diff_surface(window, cx);
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
@@ -10202,8 +10493,8 @@ impl Shell {
                             .child(
                                 popover::menu_row(&theme, false, "right-plus-history")
                                     .id("right-plus-history-row")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.add_history_surface(cx);
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_history_surface(window, cx);
                                         this.close_right_plus(cx);
                                     }))
                                     .child(
@@ -10988,7 +11279,9 @@ impl Render for Shell {
                 WorkspaceCommand::New => self.open_new_session(cx),
                 WorkspaceCommand::Resume => self.toggle_command_palette(window, cx),
                 WorkspaceCommand::Settings => self.open_last_settings(cx),
-                WorkspaceCommand::Diff if !self.active_chat.is_empty() => self.add_diff_surface(cx),
+                WorkspaceCommand::Diff if !self.active_chat.is_empty() => {
+                    self.add_diff_surface(window, cx)
+                }
                 WorkspaceCommand::Files if !self.active_chat.is_empty() => {
                     self.add_files_surface(window, cx)
                 }
@@ -11707,6 +12000,118 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn chat_with_path(cwd: Option<&str>, source: Option<(&str, &str)>) -> zeron_proto::Chat {
+        zeron_proto::Chat {
+            id: "chat".into(),
+            device_id: "remote-device".into(),
+            title: None,
+            archived: false,
+            cwd: cwd.map(str::to_owned),
+            branch: None,
+            checkout_id: None,
+            source_context: source.map(|(source_cwd, repo_root)| {
+                zeron_proto::ConversationSourceContext {
+                    checkout_id: "checkout".into(),
+                    repo_root: repo_root.into(),
+                    cwd: source_cwd.into(),
+                    branch: "main".into(),
+                    head_sha: None,
+                    observed_at: chrono::Utc::now(),
+                }
+            }),
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+            parent_chat_id: None,
+        }
+    }
+
+    #[test]
+    fn copy_path_copies_the_chat_cwd_not_the_canonical_repo_root() {
+        let chat = chat_with_path(
+            Some("/remote/repo/packages/app"),
+            Some(("/remote/repo/packages/app", "/remote/repo")),
+        );
+        assert_eq!(chat_copy_path(&chat), Some("/remote/repo/packages/app"));
+
+        let windows = chat_with_path(
+            Some(r"C:\Users\me\repo"),
+            Some((r"C:\Users\me\repo", r"\\?\C:\Users\me\repo")),
+        );
+        assert_eq!(chat_copy_path(&windows), Some(r"C:\Users\me\repo"));
+    }
+
+    #[test]
+    fn copy_path_accepts_host_absolute_paths_from_any_os() {
+        for cwd in [
+            "/home/me/repo",
+            r"C:\Users\me\repo",
+            "D:/work/repo",
+            r"\\server\share\repo",
+        ] {
+            let chat = chat_with_path(Some(cwd), None);
+            assert_eq!(chat_copy_path(&chat), Some(cwd));
+        }
+    }
+
+    #[test]
+    fn copy_path_is_unavailable_without_an_absolute_path() {
+        for cwd in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("~"),
+            Some("~/repo"),
+            Some("."),
+            Some("C:"),
+        ] {
+            let chat = chat_with_path(cwd, None);
+            assert_eq!(chat_copy_path(&chat), None);
+        }
+    }
+
+    #[test]
+    fn sidebar_sync_status_waits_for_grace_or_queued_changes() {
+        use zeron_proto::{ChatConnectivity, ChatSyncState as S};
+
+        let mut chat = ChatConnectivity {
+            chat_id: "remote".into(),
+            sync_state: S::Local,
+            connected: false,
+            delivery_live: false,
+            pending_pushes: 0,
+        };
+        assert_eq!(chat_sync_pill_caption(&chat), None);
+
+        for state in [S::Waiting, S::Connecting, S::Offline] {
+            chat.sync_state = state;
+            chat.connected = true;
+            assert_eq!(chat_sync_pill_caption(&chat), None, "transient {state:?}");
+        }
+
+        chat.sync_state = S::Waiting;
+        chat.connected = false;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
+        chat.sync_state = S::Connecting;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
+        chat.sync_state = S::Offline;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Offline — changes are saved"));
+
+        // Real pending pushes remain visible even with a live room.
+        chat.connected = true;
+        chat.pending_pushes = 1;
+        chat.sync_state = S::Waiting;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
+        chat.sync_state = S::Connecting;
+        assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
+    }
 
     #[test]
     fn update_strip_labels_cover_every_install_kind() {
@@ -12834,6 +13239,53 @@ mod tests {
 mod exit_regressions {
     use super::*;
     use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn new_shell_only_shows_boot_splash_while_connecting(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let boot = EngineBootConfig {
+            data_dir: dir.path().into(),
+            ipc_port: 0,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: zeron_proto::HarnessId::Mock,
+        };
+        for (connection, expected) in [
+            (ConnectionStatus::Connecting, SplashPhase::Visible),
+            (ConnectionStatus::Ready, SplashPhase::Gone),
+            (
+                ConnectionStatus::Failed("offline".into()),
+                SplashPhase::Gone,
+            ),
+        ] {
+            let window = cx.add_window(|_, cx| {
+                let state = cx.new(|_| {
+                    let mut state = AppState::new();
+                    state.connection = connection;
+                    state
+                });
+                Shell::new(state, boot.clone(), cx)
+            });
+            window
+                .update(cx, |shell, _, _| assert_eq!(shell.splash, expected))
+                .unwrap();
+        }
+    }
 
     #[gpui::test]
     fn appshot_destinations_retain_last_session_and_use_new_canvas_defaults(

@@ -264,6 +264,8 @@ pub struct FilesSurface {
     watch_error: Option<SharedString>,
     preview: FilePreviewState,
     tree_context_menu: crate::popover::Popup<context_menu::TreeContextMenu>,
+    pending_line_navigation: Option<(u32, Option<u32>)>,
+    line_navigation_generation: u64,
     editor_context_menu: crate::popover::Popup<EditorContextMenu>,
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
@@ -612,6 +614,8 @@ impl FilesSurface {
                 editor_font_size,
             ),
             tree_context_menu: crate::popover::Popup::default(),
+            pending_line_navigation: None,
+            line_navigation_generation: 0,
             editor_context_menu: crate::popover::Popup::default(),
             loads: HashMap::new(),
             error: None,
@@ -1053,6 +1057,8 @@ impl FilesSurface {
         self.tree_context_menu = crate::popover::Popup::default();
         self.editor_context_menu = crate::popover::Popup::default();
         self.preview.reset();
+        self.pending_line_navigation = None;
+        self.line_navigation_generation = self.line_navigation_generation.wrapping_add(1);
         self.tree.reset();
         self.selected_editor_path = None;
         self.cancel_reveal();

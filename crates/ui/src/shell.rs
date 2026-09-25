@@ -11703,6 +11703,7 @@ mod tests {
             chat_id: "remote".into(),
             sync_state: S::Local,
             connected: false,
+            delivery_live: false,
             pending_pushes: 0,
         };
         assert_eq!(chat_sync_pill_caption(&chat), None);

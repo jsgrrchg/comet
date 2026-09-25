@@ -246,21 +246,28 @@ fn conversation_width(viewport: f32, sidebar: f32, right: f32) -> f32 {
     (viewport - sidebar - right).max(0.0)
 }
 
-/// The host-resolved checkout root for a chat, falling back to its current
-/// working directory when source context has not landed yet. Source context
-/// from a previous cwd must not make a retargeted chat copy the old checkout.
-fn chat_checkout_path(chat: &zeron_proto::Chat) -> Option<&str> {
-    let cwd = chat
-        .cwd
+/// The chat's working directory as the host device spells it — the folder the
+/// harness runs in (a worktree chat's worktree). Projectless `~` chats have
+/// none. Deliberately not `source_context.repo_root`: that is canonicalized
+/// (symlinks resolved, `\\?\` verbatim prefix on Windows hosts).
+fn chat_copy_path(chat: &zeron_proto::Chat) -> Option<&str> {
+    chat.cwd
         .as_deref()
         .map(str::trim)
-        .filter(|cwd| !cwd.is_empty() && std::path::Path::new(cwd).is_absolute())?;
-    chat.source_context
-        .as_ref()
-        .filter(|source| source.cwd.trim() == cwd)
-        .map(|source| source.repo_root.trim())
-        .filter(|root| !root.is_empty() && std::path::Path::new(root).is_absolute())
-        .or(Some(cwd))
+        .filter(|cwd| is_host_absolute_path(cwd))
+}
+
+/// Absolute on the HOST, whatever the viewer's OS: a remote engine may hand a
+/// POSIX path to a Windows viewport (no drive, so `Path::is_absolute` says
+/// no) or a drive path to a POSIX one.
+fn is_host_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with("\\\\")
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
 }
 
 fn composer_target_width(panel_width: f32, content_width: f32, docked: bool) -> f32 {
@@ -1979,6 +1986,12 @@ impl Shell {
             this.on_state_changed(&state, cx);
             cx.notify();
         });
+        // A reopened window reuses AppState, so the engine may already be
+        // ready. Only show the boot splash while it is actually connecting.
+        let splash = match &state.read(cx).connection {
+            ConnectionStatus::Connecting => SplashPhase::Visible,
+            ConnectionStatus::Ready | ConnectionStatus::Failed(_) => SplashPhase::Gone,
+        };
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
@@ -2295,7 +2308,7 @@ impl Shell {
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
             render_time: None,
-            splash: SplashPhase::Visible,
+            splash,
             splash_task: None,
             focus_sub: None,
             shortcut_focus: cx.focus_handle(),
@@ -3240,6 +3253,16 @@ impl Shell {
 
     /// Open or focus a session-owned editor tab. The explorer is independent.
     fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_file_surface_at(path, None, window, cx);
+    }
+
+    fn add_file_surface_at(
+        &mut self,
+        path: String,
+        location: Option<(u32, Option<u32>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active_chat.is_empty() {
             return;
         }
@@ -3249,6 +3272,11 @@ impl Shell {
         if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
             let surface = RightSurface::File(id);
             self.set_right_active(surface, cx);
+            if let Some((line, column)) = location
+                && let Some(file) = self.file_surfaces.get(&id).cloned()
+            {
+                file.update(cx, |file, cx| file.navigate_to_line(line, column, cx));
+            }
             self.focus_right_file_editor(surface, window, cx);
             return;
         }
@@ -3323,6 +3351,11 @@ impl Shell {
             RightSurface::File(id),
         );
         self.set_right_active(RightSurface::File(id), cx);
+        if let Some((line, column)) = location
+            && let Some(file) = self.file_surfaces.get(&id).cloned()
+        {
+            file.update(cx, |file, cx| file.navigate_to_line(line, column, cx));
+        }
     }
 
     fn open_workspace_file_link(
@@ -3354,7 +3387,12 @@ impl Shell {
         if !was_open {
             self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         }
-        self.add_file_surface(link.path, window, cx);
+        self.add_file_surface_at(
+            link.path,
+            link.line.map(|line| (line, link.column)),
+            window,
+            cx,
+        );
         true
     }
 
@@ -4117,17 +4155,18 @@ impl Shell {
         cx.notify();
     }
 
-    fn copy_chat_checkout_path(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+    fn copy_chat_path(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         let path = self
             .state
             .read(cx)
             .chats
             .iter()
             .find(|chat| chat.id == chat_id)
-            .and_then(chat_checkout_path)
+            .and_then(chat_copy_path)
             .map(str::to_owned);
         if let Some(path) = path {
             cx.write_to_clipboard(ClipboardItem::new_string(path));
+            self.sidebar_notice = Some("Path copied".into());
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -8514,6 +8553,11 @@ impl Shell {
             cx.notify();
             return true;
         }
+        if self.discard_working_tree.is_some() {
+            self.discard_working_tree = None;
+            cx.notify();
+            return true;
+        }
         // The folded-breadcrumbs menu floats over the palette; it closes first.
         if self.add_space.is_some() && self.project_crumb_menu.is_open() {
             self.close_project_crumb_menu(cx);
@@ -8725,7 +8769,7 @@ impl Shell {
                         .as_ref()
                         .and_then(|chat| chat.harness_session_id.as_deref())
                         .is_some_and(|id| !id.trim().is_empty());
-                    let has_checkout_path = chat.as_ref().and_then(chat_checkout_path).is_some();
+                    let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
                     let zeron_id = chat_id.clone();
                     let harness_id = chat_id.clone();
                     let session_chat_id = chat_id.clone();
@@ -8747,19 +8791,19 @@ impl Shell {
                             .child(SharedString::from("Back")),
                     )
                     .child(popover::menu_separator())
-                    .when(has_checkout_path, |menu| {
+                    .when(has_path, |menu| {
                         menu.child(
                             popover::menu_row(&theme, false, format!("chat-copy-path-{chat_id}"))
                                 .id("chat-copy-path")
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_chat_checkout_path(&path_chat_id, cx)
+                                    this.copy_chat_path(&path_chat_id, cx)
                                 }))
                                 .child(
                                     icon(icons::COPY)
                                         .size(px(16.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Copy Path")),
+                                .child(SharedString::from("Path")),
                         )
                     })
                     .child(
@@ -12075,10 +12119,7 @@ impl Render for Shell {
 mod tests {
     use super::*;
 
-    fn chat_with_checkout_path(
-        cwd: Option<&str>,
-        source: Option<(&str, &str)>,
-    ) -> zeron_proto::Chat {
+    fn chat_with_path(cwd: Option<&str>, source: Option<(&str, &str)>) -> zeron_proto::Chat {
         zeron_proto::Chat {
             id: "chat".into(),
             device_id: "remote-device".into(),
@@ -12111,33 +12152,46 @@ mod tests {
     }
 
     #[test]
-    fn copy_path_prefers_the_matching_host_resolved_checkout_root() {
-        let chat = chat_with_checkout_path(
+    fn copy_path_copies_the_chat_cwd_not_the_canonical_repo_root() {
+        let chat = chat_with_path(
             Some("/remote/repo/packages/app"),
             Some(("/remote/repo/packages/app", "/remote/repo")),
         );
+        assert_eq!(chat_copy_path(&chat), Some("/remote/repo/packages/app"));
 
-        assert_eq!(chat_checkout_path(&chat), Some("/remote/repo"));
+        let windows = chat_with_path(
+            Some(r"C:\Users\me\repo"),
+            Some((r"C:\Users\me\repo", r"\\?\C:\Users\me\repo")),
+        );
+        assert_eq!(chat_copy_path(&windows), Some(r"C:\Users\me\repo"));
     }
 
     #[test]
-    fn copy_path_falls_back_to_current_cwd_when_source_context_is_stale() {
-        let chat = chat_with_checkout_path(
-            Some("/remote/worktrees/new-checkout"),
-            Some(("/remote/repo", "/remote/repo")),
-        );
-
-        assert_eq!(
-            chat_checkout_path(&chat),
-            Some("/remote/worktrees/new-checkout")
-        );
+    fn copy_path_accepts_host_absolute_paths_from_any_os() {
+        for cwd in [
+            "/home/me/repo",
+            r"C:\Users\me\repo",
+            "D:/work/repo",
+            r"\\server\share\repo",
+        ] {
+            let chat = chat_with_path(Some(cwd), None);
+            assert_eq!(chat_copy_path(&chat), Some(cwd));
+        }
     }
 
     #[test]
-    fn copy_path_is_unavailable_without_an_absolute_checkout_path() {
-        for cwd in [None, Some(""), Some("~"), Some(".")] {
-            let chat = chat_with_checkout_path(cwd, None);
-            assert_eq!(chat_checkout_path(&chat), None);
+    fn copy_path_is_unavailable_without_an_absolute_path() {
+        for cwd in [
+            None,
+            Some(""),
+            Some("  "),
+            Some("~"),
+            Some("~/repo"),
+            Some("."),
+            Some("C:"),
+        ] {
+            let chat = chat_with_path(cwd, None);
+            assert_eq!(chat_copy_path(&chat), None);
         }
     }
 
@@ -13331,6 +13385,53 @@ mod tests {
 mod exit_regressions {
     use super::*;
     use gpui::{AppContext, TestAppContext};
+
+    #[gpui::test]
+    fn new_shell_only_shows_boot_splash_while_connecting(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let boot = EngineBootConfig {
+            data_dir: dir.path().into(),
+            ipc_port: 0,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: zeron_proto::HarnessId::Mock,
+        };
+        for (connection, expected) in [
+            (ConnectionStatus::Connecting, SplashPhase::Visible),
+            (ConnectionStatus::Ready, SplashPhase::Gone),
+            (
+                ConnectionStatus::Failed("offline".into()),
+                SplashPhase::Gone,
+            ),
+        ] {
+            let window = cx.add_window(|_, cx| {
+                let state = cx.new(|_| {
+                    let mut state = AppState::new();
+                    state.connection = connection;
+                    state
+                });
+                Shell::new(state, boot.clone(), cx)
+            });
+            window
+                .update(cx, |shell, _, _| assert_eq!(shell.splash, expected))
+                .unwrap();
+        }
+    }
 
     #[gpui::test]
     fn appshot_destinations_retain_last_session_and_use_new_canvas_defaults(

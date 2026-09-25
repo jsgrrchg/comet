@@ -259,8 +259,47 @@ impl WorktreeSettingsCard {
     }
 
     fn browse_input(&mut self, cx: &mut Context<Self>) {
+        if self.target.is_none() {
+            self.choose_local_folder(cx);
+            return;
+        }
         let path = self.input.read(cx).text().trim().to_owned();
         self.browse((!path.is_empty()).then_some(path), cx);
+    }
+
+    fn choose_local_folder(&mut self, cx: &mut Context<Self>) {
+        if self.saving {
+            return;
+        }
+        self.browsing = false;
+        self.error = None;
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose Worktree Folder".into()),
+        });
+        // Retargeting the card cancels this task, so a local selection cannot
+        // overwrite the draft for a remote host.
+        self.folder_task = Some(cx.spawn(async move |this, cx| {
+            let result = receiver.await;
+            let _ = this.update(cx, |card, cx| {
+                match result {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(path) = paths.into_iter().next() {
+                            card.input.update(cx, |input, cx| {
+                                input.set_text(path.to_string_lossy().into_owned(), cx)
+                            });
+                        }
+                    }
+                    Ok(Err(error)) => card.error = Some(error.to_string()),
+                    // Cancelling the system dialog keeps the current draft.
+                    Ok(Ok(None)) | Err(_) => {}
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
 
     fn browse(&mut self, path: Option<String>, cx: &mut Context<Self>) {

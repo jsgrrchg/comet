@@ -9651,6 +9651,9 @@ impl Render for Composer {
 }
 
 #[cfg(test)]
+mod modal_selection_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

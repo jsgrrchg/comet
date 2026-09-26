@@ -31,8 +31,8 @@
 //! - AUTH: the SDK's credentials are SEPARATE from `cursor-agent login`
 //!   (verified live). Runs need `CURSOR_API_KEY` (or a prior SDK browser
 //!   login); the shim surfaces the exact fix as an error chip otherwise.
-//! - Steering: turn-boundary — steers queue and become the next turn on the
-//!   parked session (parity with the previous ACP behavior).
+//! - Steering: native SDK input at the next model step, acknowledged only
+//!   when consumed. Inputs that race turn completion become a coalesced follow-up.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -57,7 +57,7 @@ use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_ch
 
 /// The pinned SDK (public beta 1.0.x line; inspected against 1.0.31's
 /// typings). Bump deliberately — see the module header.
-const CURSOR_SDK_PIN: &str = "@cursor/sdk@1.0.31";
+const CURSOR_SDK_PIN: &str = "@cursor/sdk@1.0.32";
 const SHIM_NAME: &str = "zeron-cursor-shim.mjs";
 const SHIM_SOURCE: &str = include_str!("shim.mjs");
 
@@ -94,7 +94,7 @@ pub struct CursorHarness {
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Credential-scoped successful catalog, with bounded refresh and backoff.
-    models_cache: catalog::Catalog,
+    pub(crate) models_cache: catalog::Catalog,
 }
 
 impl Default for CursorHarness {
@@ -229,9 +229,9 @@ impl Harness for CursorHarness {
     fn supports_steering(&self) -> bool {
         true
     }
-    /// The SDK has no mid-turn injection; steers queue for the next turn.
+    /// Native SDK steering appends input to the active turn.
     fn steering_mode(&self) -> SteeringMode {
-        SteeringMode::TurnBoundary
+        SteeringMode::StepBoundary
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[]
@@ -250,10 +250,39 @@ impl Harness for CursorHarness {
 
     /// Keep a successful catalog during transient outages. A cold failure
     /// is an error, never a fabricated two-model success.
-    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+    fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
+        use sha2::{Digest, Sha256};
+        let binary = self
+            .executable
+            .clone()
+            .or_else(|| std::env::var_os("CURSOR_SDK_SHIM_EXECUTABLE").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from(CURSOR_SDK_PIN));
+        let binary = binary.canonicalize().unwrap_or(binary);
+        let mut hash = Sha256::new();
+        hash.update(catalog::credential_context()?);
+        hash.update(binary.as_os_str().as_encoded_bytes());
+        hash.update(Self::sdk_version().as_bytes());
+        if let Ok(metadata) = binary.metadata() {
+            hash.update(format!("{:?}:{}", metadata.modified().ok(), metadata.len()));
+        }
+        Ok(Some(crate::ModelContext {
+            hash: format!("{:x}", hash.finalize()),
+            binary_path: binary,
+            binary_version: Some(Self::sdk_version().into()),
+        }))
+    }
+    async fn model_catalog(&self, force: bool) -> Result<crate::ModelCatalog, HarnessError> {
+        self.model_context()?.unwrap().log();
         self.models_cache
-            .get(catalog::credential_context, || self.discover_models())
+            .get_with(
+                force,
+                || self.model_context().map(|c| c.unwrap().key()),
+                || self.discover_models(),
+            )
             .await
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        self.model_catalog(false).await.map(|c| c.models)
     }
 
     // No `commands()` override: @cursor/sdk 1.0.28 exposes no slash-command
@@ -323,6 +352,7 @@ impl Harness for CursorHarness {
             // shim folds them into the SDK's ModelSelection params.
             "modelOptions": request.model_options,
             "resume": request.resume,
+            "mcp": request.mcp,
             "storeDir": lease.as_ref().and_then(|lease| lease.store_dir.as_ref()),
         });
         let _ = stdin_tx.send(first.to_string());
@@ -495,7 +525,7 @@ async fn run_session(session: Session) {
     let mut done_after_interrupt = false;
     // A turn is settled and the session is parked awaiting the next prompt.
     let mut parked = false;
-    let mut queued_steers: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut pending_steers = 0usize;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
 
     let send = |ev: AgentEvent| {
@@ -557,6 +587,16 @@ async fn run_session(session: Session) {
                                 break 'main;
                             }
                         }
+                        "steered" => {
+                            pending_steers = pending_steers.saturating_sub(1);
+                            parked = false;
+                            any_done = false;
+                            let prev = std::mem::replace(&mut assistant_message_id, new_message_id());
+                            if !send(AgentEvent::Steered {
+                                assistant_message_id: Some(prev),
+                                next_assistant_message_id: Some(assistant_message_id.clone()),
+                            }).await { break 'main; }
+                        }
                         _ => {
                             if frame.get("ev").and_then(Value::as_str) == Some("fatal")
                                 || frame.get("status").and_then(Value::as_str) == Some("error")
@@ -586,33 +626,10 @@ async fn run_session(session: Session) {
                                         break 'main;
                                     }
                                     if failed { break 'main; }
-                                    // Turn boundary: a queued steer becomes
-                                    // the next turn; otherwise park for the
-                                    // mailbox (caller owns teardown).
-                                    if let Some(text) = queued_steers.pop_front() {
-                                        any_done = false;
-                                        let prev = std::mem::replace(
-                                            &mut assistant_message_id,
-                                            new_message_id(),
-                                        );
-                                        if !send(AgentEvent::Steered {
-                                            assistant_message_id: Some(prev),
-                                            next_assistant_message_id: Some(
-                                                assistant_message_id.clone(),
-                                            ),
-                                        })
-                                        .await
-                                        {
-                                            break 'main;
-                                        }
-                                        let _ = stdin_tx.send(
-                                            json!({ "op": "user", "prompt": text }).to_string(),
-                                        );
-                                    } else if !steering_open {
+                                    if !steering_open && pending_steers == 0 {
                                         break 'main;
-                                    } else {
-                                        parked = true;
                                     }
+                                    parked = pending_steers == 0;
                                 }
                             }
                         }
@@ -627,28 +644,14 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    if parked {
-                        parked = false;
-                        any_done = false;
-                        let prev = std::mem::replace(&mut assistant_message_id, new_message_id());
-                        if !send(AgentEvent::Steered {
-                            assistant_message_id: Some(prev),
-                            next_assistant_message_id: Some(assistant_message_id.clone()),
-                        })
-                        .await
-                        {
-                            break 'main;
-                        }
-                        let _ = stdin_tx
-                            .send(json!({ "op": "user", "prompt": msg.prompt }).to_string());
-                    } else {
-                        // Turn-boundary steering: queue for the next boundary.
-                        queued_steers.push_back(msg.prompt);
-                    }
+                    pending_steers += 1;
+                    parked = false;
+                    any_done = false;
+                    let _ = stdin_tx.send(json!({ "op": "steer", "prompt": msg.prompt }).to_string());
                 }
                 None => {
                     steering_open = false;
-                    if parked && queued_steers.is_empty() {
+                    if parked && pending_steers == 0 {
                         break 'main;
                     }
                 }

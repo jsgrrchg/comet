@@ -27,6 +27,7 @@ const VIEWER: &str = "viewer-device";
 
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
+        mcp: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -810,9 +811,9 @@ async fn retry_reissues_a_swallowed_send() {
     .await;
     wait_for(
         || {
-            entries_now(&core)
-                .iter()
-                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "re-issued send runs to completion",
     )
@@ -872,6 +873,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
             device_id: device_id.into(),
             status: Some(MessageStatus::Complete),
             continuation_of: None,
+            duration_ms: None,
         })
         .unwrap();
         let mut writer = SegmentWriter::begin(&doc, "m-assist", device_id, 2).unwrap();
@@ -1908,6 +1910,7 @@ async fn real_claude_sees_uploaded_image_inline() {
          Attached images (local files — open them to view):\n- {path}"
     );
     let request = RunRequest {
+        mcp: None,
         prompt,
         harness: None,
         model: Some("haiku".into()),
@@ -2019,11 +2022,9 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     );
     wait_for(
         || {
-            entries(&core)
-                .iter()
-                .any(|e| {
-                    e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
-                })
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
         "run completes",
     )
@@ -2455,12 +2456,21 @@ async fn pending_steer_handoff_does_not_publish_a_completion() {
                 zeron_engine::sessions::SteerOutcome::Accepted
             );
         }
+        let before_done = core.sessions.session_status(CHAT).unwrap().updated_at;
         tx.send(done(DoneStatus::Completed)).unwrap();
         wait_for(
-            || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+            || {
+                core.sessions
+                    .session_status(CHAT)
+                    .is_some_and(|s| s.updated_at > before_done)
+            },
             "internal handoff",
         )
         .await;
+        assert_eq!(
+            core.sessions.session_status(CHAT).unwrap().status,
+            SessionStatus::Working
+        );
         assert_eq!(
             core.sessions
                 .session_status(CHAT)

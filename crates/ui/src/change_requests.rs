@@ -80,7 +80,7 @@ impl Render for ChangeRequestTooltip {
             .border_1()
             .border_color(theme.border_strong)
             .bg(crate::popover::surface_bg(theme))
-            .shadow_md()
+            .when(!theme.is_frost(), |el| el.shadow_md())
             .child(
                 div()
                     .text_size(px(11.0))
@@ -379,6 +379,7 @@ mod tests {
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
             harness_session_id: None,
             harness_session_cwd: None,
+            parent_chat_id: None,
             space_id: Some("space".into()),
             last_seen_at: None,
             room_gen: None,

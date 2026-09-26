@@ -32,6 +32,7 @@
 //!   interrupt control request, then escalates to SIGTERM and SIGKILL.
 
 pub mod catalog;
+mod discovery;
 mod normalize;
 mod wire;
 
@@ -53,7 +54,7 @@ use zeron_proto::{
 
 use crate::process::{Child, ChildStdin, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use catalog::{apply_ultrathink, static_models, to_effort};
+use catalog::{apply_ultrathink, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 
@@ -75,6 +76,21 @@ fn resolve_claude_executable() -> Option<PathBuf> {
     crate::executable::find_on_paths("claude", extra)
 }
 
+/// The inline `--mcp-config` JSON for an injected server (the CLI accepts a
+/// JSON string as well as a file path).
+fn mcp_config_arg(mcp: &zeron_proto::McpServer) -> String {
+    serde_json::json!({
+        "mcpServers": {
+            &mcp.name: {
+                "command": mcp.command,
+                "args": mcp.args,
+                "env": mcp.env,
+            }
+        }
+    })
+    .to_string()
+}
+
 fn option_is_on(options: &serde_json::Map<String, Value>, key: &str) -> bool {
     match options.get(key) {
         Some(Value::Bool(b)) => *b,
@@ -91,9 +107,9 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    initialize: discovery::InitializeCache,
+    models_cache: crate::catalog::Catalog,
+    workspace_commands: crate::skills::CommandDiscovery,
 }
 
 impl Default for ClaudeHarness {
@@ -102,7 +118,9 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
+            initialize: discovery::InitializeCache::default(),
+            models_cache: crate::catalog::Catalog::default(),
+            workspace_commands: crate::skills::CommandDiscovery::default(),
         }
     }
 }
@@ -158,6 +176,7 @@ impl ClaudeHarness {
             // Required by the CLI alongside `-p --output-format stream-json`.
             "--verbose",
             "--include-partial-messages",
+            "--replay-user-messages",
             // Newer Claude models emit no readable thinking text unless a
             // summary is asked for (raw reasoning stays provider-private).
             "--thinking-display",
@@ -223,14 +242,34 @@ impl ClaudeHarness {
         cmd
     }
 
-    /// Short-lived discovery probe: spawn the CLI in stream-json mode, send
-    /// the `initialize` control request, and read the commands out of its
-    /// control_response. No user message is ever written, so no turn (and no
-    /// API call) happens; the child is torn down as soon as the response
-    /// lands.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// Share the complete initialize response between model and command discovery.
+    /// No user message is written; the short-lived child is retired after initialize.
+    async fn initialize(&self) -> Result<Value, HarnessError> {
+        self.initialize
+            .get(
+                || self.model_context().map(|c| c.unwrap().key()),
+                || self.probe_initialize(None),
+            )
+            .await
+    }
+
+    async fn discover_commands(
+        &self,
+        cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
+        let response = match cwd {
+            Some(cwd) => self.probe_initialize(Some(cwd)).await?,
+            None => self.initialize().await?,
+        };
+        Ok(parse_initialize_commands(&response))
+    }
+
+    async fn probe_initialize(&self, cwd: Option<&std::path::Path>) -> Result<Value, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
+        if let Some(cwd) = cwd {
+            cmd.current_dir(cwd);
+        }
         crate::compose_child_path(&mut cmd, &exe);
         cmd.args([
             "--print",
@@ -248,7 +287,7 @@ impl ClaudeHarness {
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
+                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
             } else {
                 HarnessError::Io(e)
             }
@@ -288,7 +327,7 @@ impl ClaudeHarness {
                         .unwrap_or("initialize control request failed");
                     return Err(HarnessError::Protocol(msg.into()));
                 }
-                return Ok(parse_initialize_commands(&response));
+                return Ok(response);
             }
             Err(HarnessError::Protocol(
                 "claude exited before answering the initialize control request".into(),
@@ -298,7 +337,7 @@ impl ClaudeHarness {
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
-            Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
+            Err(_) => Err(HarnessError::Protocol("Claude initialize timed out".into())),
         }
     }
 }
@@ -370,12 +409,36 @@ impl Harness for ClaudeHarness {
         true
     }
 
-    /// The curated static catalog (see [`catalog`]); requires an installed CLI
-    /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here,
-    /// like the discovery call would.
+    /// Credential and executable identity scopes both initialize and catalog caches.
+    fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
+        crate::model_context::context(self.id(), &self.resolve_executable()?, &[]).map(Some)
+    }
+    fn fallback_models(&self) -> Vec<Model> {
+        catalog::configured_models()
+    }
+    async fn model_catalog(&self, force: bool) -> Result<crate::ModelCatalog, HarnessError> {
+        self.model_context()?.unwrap().log();
+        self.models_cache
+            .get_with_timeout(
+                force,
+                Duration::from_secs(35),
+                || self.model_context().map(|c| c.unwrap().key()),
+                || async {
+                    let response = self.initialize().await?;
+                    catalog::with_discovered_models(catalog::configured_models(), &response)
+                },
+            )
+            .await
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        Ok(static_models())
+        match self.model_catalog(false).await {
+            Ok(catalog) => Ok(catalog.models),
+            Err(error) => {
+                tracing::warn!(%error, source = "static", "Claude model discovery failed");
+                Ok(self.fallback_models())
+            }
+        }
     }
 
     /// Slash commands from the CLI's `initialize` control-request handshake —
@@ -383,11 +446,49 @@ impl Harness for ClaudeHarness {
     /// carries every command with description + argument hint and involves no
     /// model turn (verified live, 2.1.228: the control_response is the first
     /// stdout line, well before any API traffic). Cached on success.
+    async fn skills(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Result<Option<Vec<zeron_proto::invocation::Skill>>, HarnessError> {
+        let (skills, commands) = tokio::try_join!(
+            crate::skills::discover(self.id(), cwd),
+            self.workspace_commands
+                .get(cwd, self.discover_commands(Some(cwd)))
+        )?;
+        // The native advertised catalog controls availability (including plugin
+        // enablement and skillOverrides). Shared Agent Skills can use file delivery.
+        Ok(Some(
+            skills
+                .into_iter()
+                .filter_map(|mut skill| {
+                    if crate::skills::is_shared_skill(&skill.path) {
+                        // Shared files are not Claude command definitions. A
+                        // same-named built-in must not replace their identity.
+                        Some(skill)
+                    } else if zeron_proto::invocation::valid_skill_command_name(&skill.name)
+                        && commands.iter().any(|command| command.name == skill.name)
+                    {
+                        skill.command = Some(zeron_proto::invocation::SkillCommand {
+                            name: skill.name.clone(),
+                            harness: self.id(),
+                        });
+                        Some(skill)
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        ))
+    }
+
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        self.commands
-            .get_or_try_init(|| self.discover_commands())
+        self.discover_commands(None).await
+    }
+
+    async fn commands_for(&self, cwd: &std::path::Path) -> Result<Vec<SlashCommand>, HarnessError> {
+        self.workspace_commands
+            .get(cwd, self.discover_commands(Some(cwd)))
             .await
-            .cloned()
     }
 
     async fn run(
@@ -406,6 +507,7 @@ impl Harness for ClaudeHarness {
         request.resume = None;
         request.worktree = None;
         request.attachments.clear();
+        request.mcp = None;
         request.model_options.clear();
         request.auto_approve = false;
         self.run_with_mode(request, controls, true).await
@@ -433,10 +535,15 @@ impl ClaudeHarness {
                 "--setting-sources",
                 "",
             ]);
+        } else if let Some(mcp) = &request.mcp {
+            // Zeron's own server rides beside the user's configured servers
+            // (no `--strict-mcp-config`): the CLI merges an inline JSON
+            // config with settings-sourced ones.
+            cmd.args(["--mcp-config", &mcp_config_arg(mcp)]);
         }
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
+                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
             } else {
                 HarnessError::Io(e)
             }
@@ -640,10 +747,21 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     let mut norm = Normalizer::new();
+    let mut pending_steers = std::collections::VecDeque::new();
+    // Top-level tool calls in flight: a steer must not abort them (see
+    // `wire::steer_message_line`).
+    let mut open_tools = std::collections::HashSet::new();
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
     let mut any_done = false;
+    // A turn end held back while steers wait for their replay. Rapid `now`
+    // steers each interrupt the turn the previous one started, and the CLI
+    // replays only the last (verified on 2.1.280; the earlier texts still
+    // reach the model). If nothing follows the held result, the steers were
+    // absorbed: release them and the turn end instead of spinning forever.
+    const HELD_DONE_SETTLE: Duration = Duration::from_secs(5);
+    let mut held_done: Option<(AgentEvent, tokio::time::Instant)> = None;
     let mut done_after_interrupt = false;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -654,6 +772,11 @@ async fn run_session(session: Session) {
                     let line = line.trim();
                     if line.is_empty() {
                         continue;
+                    }
+                    // The CLI is still producing: whatever it is doing is not
+                    // the quiet end the held turn end waits for.
+                    if let Some((_, deadline)) = held_done.as_mut() {
+                        *deadline = tokio::time::Instant::now() + HELD_DONE_SETTLE;
                     }
                     let frame = match wire::parse_frame(line) {
                         Ok(frame) => frame,
@@ -673,8 +796,49 @@ async fn run_session(session: Session) {
                         }
                         continue;
                     }
+                    // Only the CLI's replay confirms that a prompt joined its
+                    // conversation. Writing stdin must not split ongoing text.
+                    if let Frame::User(ref user) = frame {
+                        // A replay confirms its steer and every earlier one:
+                        // superseded steers are never replayed themselves.
+                        if user.parent_tool_use_id.is_none()
+                            && let Some(at) = user
+                                .uuid
+                                .as_ref()
+                                .and_then(|id| pending_steers.iter().position(|p| p == id))
+                        {
+                            for _ in 0..=at {
+                                pending_steers.pop_front();
+                                let (prev, next) = norm.rotate_for_steer();
+                                if event_tx.send(Ok(AgentEvent::Steered {
+                                    assistant_message_id: Some(prev), next_assistant_message_id: Some(next),
+                                })).await.is_err() { break 'main; }
+                            }
+                        }
+                    }
                     for ev in norm.normalize(frame, interrupted) {
+                        match &ev {
+                            AgentEvent::ToolCall { id, .. } => {
+                                open_tools.insert(id.clone());
+                            }
+                            AgentEvent::ToolResult { id, .. } => {
+                                open_tools.remove(id);
+                            }
+                            AgentEvent::Done { .. } => open_tools.clear(),
+                            _ => {}
+                        }
                         let is_done = matches!(ev, AgentEvent::Done { .. });
+                        // A `now` steer ends the turn it interrupts with a
+                        // result frame; the steer continues the run, so that
+                        // result is a steer boundary, not the end of the turn.
+                        if is_done && !interrupted && !pending_steers.is_empty() {
+                            held_done =
+                                Some((ev, tokio::time::Instant::now() + HELD_DONE_SETTLE));
+                            continue;
+                        }
+                        if is_done {
+                            held_done = None;
+                        }
                         if event_tx.send(Ok(ev)).await.is_err() {
                             break 'main; // consumer gone — reap below
                         }
@@ -696,19 +860,14 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    let line = wire::user_message_line(&apply_ultrathink(reasoning, &msg.prompt));
-                    let _ = stdin_tx.send(StdinMsg::Line(line));
-                    // The CLI consumes the queued line at its own step
-                    // boundary; rotate the assistant message id so post-steer
-                    // output folds into a fresh message.
-                    let (prev, next) = norm.rotate_for_steer();
-                    let ev = AgentEvent::Steered {
-                        assistant_message_id: Some(prev),
-                        next_assistant_message_id: Some(next),
-                    };
-                    if event_tx.send(Ok(ev)).await.is_err() {
-                        break 'main;
-                    }
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let line = wire::steer_message_line(
+                        &apply_ultrathink(reasoning, &msg.prompt),
+                        &id,
+                        open_tools.is_empty(),
+                    );
+                    pending_steers.push_back(id);
+                    if stdin_tx.send(StdinMsg::Line(line)).is_err() { break 'main; }
                 }
                 None => {
                     // Mailbox closed: end the input so the run can finish
@@ -735,8 +894,33 @@ async fn run_session(session: Session) {
                 }
             },
 
+            _ = tokio::time::sleep_until(
+                held_done.as_ref().map_or_else(tokio::time::Instant::now, |(_, d)| *d)
+            ), if held_done.is_some() => {
+                // The steers were absorbed into the turn that just ended.
+                while pending_steers.pop_front().is_some() {
+                    let (prev, next) = norm.rotate_for_steer();
+                    if event_tx.send(Ok(AgentEvent::Steered {
+                        assistant_message_id: Some(prev), next_assistant_message_id: Some(next),
+                    })).await.is_err() { break 'main; }
+                }
+                let (done, _) = held_done.take().expect("guarded by if");
+                if event_tx.send(Ok(done)).await.is_err() {
+                    break 'main;
+                }
+                any_done = true;
+            },
+
             _ = event_tx.closed() => break 'main,
         }
+    }
+
+    // A turn end still held when the CLI exited is the run's real end.
+    if let Some((done, _)) = held_done.take()
+        && !event_tx.is_closed()
+        && event_tx.send(Ok(done)).await.is_ok()
+    {
+        any_done = true;
     }
 
     // Terminal bookkeeping: never end the stream without a Done unless the
@@ -932,5 +1116,32 @@ mod tests {
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
         // Original input is preserved alongside the answers.
         assert!(updated["questions"].is_array());
+    }
+}
+
+#[cfg(test)]
+mod mcp_injection_tests {
+    use super::*;
+
+    #[test]
+    fn mcp_config_arg_spells_the_server_the_way_the_cli_reads_it() {
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "/opt/zeron/zeron".into(),
+            args: vec!["mcp".into()],
+            env: [("ZERON_CHAT_ID".to_owned(), "chat-1".to_owned())]
+                .into_iter()
+                .collect(),
+        };
+        let parsed: Value = serde_json::from_str(&mcp_config_arg(&mcp)).unwrap();
+        assert_eq!(parsed["mcpServers"]["zeron"]["command"], "/opt/zeron/zeron");
+        assert_eq!(
+            parsed["mcpServers"]["zeron"]["args"],
+            serde_json::json!(["mcp"])
+        );
+        assert_eq!(
+            parsed["mcpServers"]["zeron"]["env"]["ZERON_CHAT_ID"],
+            "chat-1"
+        );
     }
 }

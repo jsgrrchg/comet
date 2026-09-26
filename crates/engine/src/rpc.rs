@@ -24,7 +24,7 @@
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
 //! - Workspace files: lazy directory listing, recursive path search, bounded text
 //!   reads, hash-guarded writes, and a checkout-scoped filesystem change stream.
-//! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
+//! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows, cwd?}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
@@ -73,7 +73,7 @@ use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::project_actions::ProjectActionsStore;
 use crate::registry::HarnessRegistry;
-use crate::repos::{Repos, home_dir};
+use crate::repos::{Repos, session_home_dir};
 use crate::sessions::SessionsEngine;
 use crate::terminals::Terminals;
 use crate::uploads::Uploads;
@@ -92,6 +92,8 @@ struct ChatParams {
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -101,29 +103,11 @@ struct SetHarnessEnabledParams {
     enabled: bool,
 }
 
-async fn update_harness_enabled<F>(
+async fn update_harness_enabled(
     registry: &HarnessRegistry,
     harness: HarnessId,
     enabled: bool,
-    sign_out: F,
-) -> Result<(), RpcError>
-where
-    F: std::future::Future<Output = Result<(), zeron_harness::HarnessError>>,
-{
-    let enabled_harnesses = registry.enabled_set();
-    let was_enabled = enabled_harnesses.contains(&harness);
-    if was_enabled && !enabled && harness == HarnessId::Antigravity {
-        if enabled_harnesses.len() == 1 {
-            return Err(RpcError::Failed(
-                "cannot disable the last enabled harness".into(),
-            ));
-        }
-        sign_out.await.map_err(|error| {
-            RpcError::Failed(format!(
-                "Antigravity sign-out failed; it remains enabled so you can retry: {error}"
-            ))
-        })?;
-    }
+) -> Result<(), RpcError> {
     registry
         .set_enabled(harness, enabled)
         .map_err(RpcError::Failed)
@@ -269,6 +253,14 @@ struct DeleteWorktreeParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct DiscardWorkingTreeParams {
+    chat_id: String,
+    checkout_id: String,
+    expected_checksum: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ListProjectActionsParams {
     space_id: String,
 }
@@ -342,6 +334,46 @@ struct OpenTerminalParams {
     chat_id: String,
     cols: u16,
     rows: u16,
+    /// Explicit working directory (new-chat canvas: the selected project
+    /// folder, or `~`). When omitted, the chat row's cwd is used, then the
+    /// space named by a `space-canvas:{spaceId}` chat id.
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// Matches the UI canvas panel key (`AppState::panel_session_key`).
+const CANVAS_TERMINAL_PREFIX: &str = "space-canvas:";
+
+/// A cwd the user (or a project-less chat) meant as "host home", not a folder.
+fn meaningful_cwd(cwd: Option<String>) -> Option<String> {
+    cwd.filter(|cwd| {
+        let trimmed = cwd.trim();
+        !trimmed.is_empty() && trimmed != "~"
+    })
+}
+
+/// Space id encoded in a new-chat canvas terminal key, if any.
+fn canvas_space_id(chat_id: &str) -> Option<&str> {
+    chat_id
+        .strip_prefix(CANVAS_TERMINAL_PREFIX)
+        .filter(|id| !id.is_empty())
+}
+
+/// Resolve the PTY cwd: a real explicit path wins, then the chat row, then
+/// the project folder named by `space-canvas:{spaceId}`, then `~`.
+/// The portable `~` marker is a fallback, not an override — otherwise a
+/// canvas OpenTerminal that still says `~` (spaces watch not landed in the
+/// UI) would ignore the selected project encoded in `chatId`.
+fn resolve_open_terminal_cwd(
+    explicit: Option<String>,
+    chat_cwd: Option<String>,
+    space_cwd: Option<String>,
+) -> Result<String, &'static str> {
+    let raw = meaningful_cwd(explicit)
+        .or_else(|| meaningful_cwd(chat_cwd))
+        .or_else(|| meaningful_cwd(space_cwd))
+        .unwrap_or_else(|| "~".to_string());
+    crate::repos::expand_home(&raw)
 }
 
 #[derive(Debug, Deserialize)]
@@ -392,6 +424,15 @@ struct AgentAccountParams {
 #[serde(rename_all = "camelCase")]
 struct StartAgentLoginParams {
     harness: HarnessId,
+    /// Stamped by the requesting engine when it forwards the start: the
+    /// device whose browser finishes the sign-in. The login's callback port
+    /// is served over P2P to that device alone.
+    #[serde(default)]
+    requester_device_id: Option<String>,
+    /// For agents that keep a login per model provider (OpenCode, Pi,
+    /// Hermes): which provider to sign in to; `None` = the agent's default.
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +504,10 @@ enum MutateParams {
         /// Cwd override (isolated-worktree path); default = the space's folder.
         #[serde(default)]
         cwd: Option<String>,
+        /// The chat whose agent is creating this one (Zeron MCP); recorded
+        /// on the row as `parentChatId` for orchestration trees.
+        #[serde(default)]
+        parent_chat_id: Option<String>,
     },
     /// Create a space (device + folder pair). Idempotent by id; a live
     /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
@@ -683,6 +728,32 @@ impl EngineRpc {
             .map_err(Into::into)
     }
 
+    /// Catalogs also serve projectless sessions, which have no workspace space.
+    /// Keep workspace validation for project targets and use only a known local
+    /// chat's persisted cwd (or home) for a projectless conversation.
+    async fn catalog_root(&self, p: &FileSearchParams) -> Result<std::path::PathBuf, RpcError> {
+        if p.space_id.is_none() && p.path.is_none() {
+            let Some(chat_id) = &p.chat_id else {
+                return session_home_dir().map_err(|error| RpcError::Failed(error.to_string()));
+            };
+            let chat = self
+                .workspace
+                .chat(chat_id)
+                .map_err(|e| RpcError::Failed(e.to_string()))?
+                .ok_or_else(|| RpcError::BadParams("chat not found".into()))?;
+            if chat.device_id != self.doc_host.device_id() {
+                return Err(RpcError::BadParams("chat belongs to another device".into()));
+            }
+            if chat.space_id.is_none() {
+                let cwd = chat.cwd.as_deref().unwrap_or("~");
+                return crate::repos::expand_home(cwd)
+                    .map(std::path::PathBuf::from)
+                    .map_err(|error| RpcError::Failed(error.to_string()));
+            }
+        }
+        self.file_search_root(p).await
+    }
+
     /// Accept only a checkout already named by a local chat or contained in a
     /// local space. Remote clients must not turn this RPC into an arbitrary path probe.
     async fn change_request_root(&self, cwd: &str) -> Result<std::path::PathBuf, RpcError> {
@@ -782,6 +853,122 @@ impl EngineRpc {
         paths
     }
 
+    /// An agent login runs on `target`, but the browser that finishes it runs
+    /// HERE: while the login waits on a loopback callback, this device's same
+    /// port forwards to it over P2P ([`zeron_preview::login`]). The forwarder
+    /// opens when a reply first names the port and closes when the login
+    /// finishes, fails, is cancelled or its time runs out; a port taken here
+    /// fails the login with that reason instead of stranding the browser.
+    async fn forward_agent_login(
+        &self,
+        target: &str,
+        method: &str,
+        mut params: serde_json::Value,
+    ) -> Result<RpcReply, RpcError> {
+        use zeron_proto::{AgentLoginPoll, AgentLoginStart, AgentLoginStatus};
+        let login_id = params
+            .get("loginId")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if method == methods::START_AGENT_LOGIN
+            && let Some(object) = params.as_object_mut()
+        {
+            object.insert(
+                "requesterDeviceId".into(),
+                serde_json::json!(self.doc_host.device_id()),
+            );
+        }
+        let reply = self.forward(target, method, params).await;
+        let Some(previews) = &self.previews else {
+            return reply;
+        };
+        let value = match &reply {
+            Ok(RpcReply::Value(value)) => Some(value.clone()),
+            _ => None,
+        };
+        match method {
+            methods::START_AGENT_LOGIN => {
+                let Some(start) =
+                    value.and_then(|v| serde_json::from_value::<AgentLoginStart>(v).ok())
+                else {
+                    return reply;
+                };
+                if let Some(port) = start.callback_port
+                    && let Err(error) = if crate::agent_accounts::tunnel_port_allowed(
+                        port,
+                        Some(start.url.as_str()),
+                    ) {
+                        previews
+                            .open_login_tunnel(&start.login_id, target, port, LOGIN_TUNNEL_TTL)
+                            .await
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "The other device reported an unexpected sign-in port."
+                        ))
+                    }
+                {
+                    self.cancel_remote_login(target, &start.login_id).await;
+                    return Err(RpcError::Failed(error.to_string()));
+                }
+                reply
+            }
+            methods::POLL_AGENT_LOGIN => {
+                let Some(login_id) = login_id else {
+                    return reply;
+                };
+                let poll = value.and_then(|v| serde_json::from_value::<AgentLoginPoll>(v).ok());
+                match poll {
+                    Some(poll) if poll.status == AgentLoginStatus::Pending => {
+                        if let Some(port) = poll.callback_port
+                            && let Err(error) = if crate::agent_accounts::tunnel_port_allowed(
+                                port,
+                                poll.url.as_deref(),
+                            ) {
+                                previews
+                                    .open_login_tunnel(&login_id, target, port, LOGIN_TUNNEL_TTL)
+                                    .await
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "The other device reported an unexpected sign-in port."
+                                ))
+                            }
+                        {
+                            self.cancel_remote_login(target, &login_id).await;
+                            return RpcReply::value(&AgentLoginPoll {
+                                status: AgentLoginStatus::Error,
+                                message: Some(error.to_string()),
+                                url: None,
+                                callback_port: None,
+                            });
+                        }
+                        reply
+                    }
+                    // Done, failed, expired, or unreachable: the login is over.
+                    _ => {
+                        previews.close_login_tunnel(&login_id);
+                        reply
+                    }
+                }
+            }
+            _ => {
+                if let Some(login_id) = login_id {
+                    previews.close_login_tunnel(&login_id);
+                }
+                reply
+            }
+        }
+    }
+
+    async fn cancel_remote_login(&self, target: &str, login_id: &str) {
+        let params = serde_json::json!({ "loginId": login_id, "targetDeviceId": target });
+        if let Err(error) = self
+            .forward(target, methods::CANCEL_AGENT_LOGIN, params)
+            .await
+        {
+            tracing::debug!(%error, "cancelling the remote login failed (best-effort)");
+        }
+    }
+
     /// Forward a device-addressed call over the target device's relay. On transport
     /// failure the cached link is invalidated so the next call re-dials.
     async fn forward(
@@ -817,7 +1004,7 @@ impl EngineRpc {
                 });
                 return Ok(RpcReply::Stream(stream.boxed()));
             }
-            let rx = match client.subscribe(method, params).await {
+            let rx = match client.subscribe_scoped(method, params).await {
                 Ok(rx) => rx,
                 Err(err) => {
                     if should_invalidate_link(&err) {
@@ -869,14 +1056,16 @@ impl EngineRpc {
                 config,
                 branch,
                 cwd,
+                parent_chat_id,
             } => {
                 self.workspace
-                    .create_chat(
+                    .create_chat_with_parent(
                         &chat_id,
                         space_id.as_deref(),
                         device_id.as_deref(),
                         config,
                         cwd,
+                        parent_chat_id,
                     )
                     .map_err(failed)?;
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
@@ -997,16 +1186,101 @@ fn should_invalidate_link(error: &RpcError) -> bool {
 /// (the composer's permanent "Sending…", 2026-08-18). Network-bound git and
 /// update methods get a long leash; worktree creation checks out a full tree;
 /// everything else is interactive and must fail fast.
+#[derive(Default)]
+pub(crate) struct Installations(
+    std::sync::Mutex<std::collections::HashMap<HarnessId, zeron_harness::CancellationToken>>,
+);
+
+struct Installing<'a> {
+    installs: &'a Installations,
+    harness: HarnessId,
+    cancel: zeron_harness::CancellationToken,
+}
+impl Drop for Installing<'_> {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        self.installs
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.harness);
+    }
+}
+impl Installations {
+    fn begin(&self, harness: HarnessId) -> Result<Installing<'_>, RpcError> {
+        let mut installs = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if installs.contains_key(&harness) {
+            return Err(RpcError::Failed("already installing".into()));
+        }
+        let cancel = zeron_harness::CancellationToken::new();
+        installs.insert(harness, cancel.clone());
+        Ok(Installing {
+            installs: self,
+            harness,
+            cancel,
+        })
+    }
+    fn cancel(&self, harness: HarnessId) {
+        if let Some(cancel) = self
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&harness)
+        {
+            cancel.cancel();
+        }
+    }
+}
+
+async fn run_requested_install(
+    harness: HarnessId,
+    cancel: zeron_harness::CancellationToken,
+) -> Result<(), zeron_harness::HarnessError> {
+    #[cfg(test)]
+    if let Ok(script) = std::env::var(format!("ZERON_INSTALLER_COMMAND_{harness:?}").to_uppercase())
+    {
+        return zeron_harness::install::install_with_command(harness, &script, cancel).await;
+    }
+    zeron_harness::install::install_harness(harness, cancel).await
+}
+
+async fn install_harness_with<F, Fut>(
+    registry: &HarnessRegistry,
+    harness: HarnessId,
+    install: F,
+) -> Result<Vec<crate::registry::HarnessDescriptor>, RpcError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), zeron_harness::HarnessError>>,
+{
+    if !zeron_harness::install::can_install(harness) {
+        return Err(RpcError::Failed(
+            "No supported installer or required tools available on this device".into(),
+        ));
+    }
+    install()
+        .await
+        .map_err(|error| RpcError::Failed(error.to_string()))?;
+    Ok(registry.descriptors())
+}
+
 fn forward_deadline(method: &str) -> std::time::Duration {
     use std::time::Duration;
     match method {
         methods::CLONE_REPO | methods::FETCH_ALL | methods::APPLY_UPDATE => {
             Duration::from_secs(15 * 60)
         }
+        methods::INSTALL_HARNESS => Duration::from_secs(15 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        // Allow the adapter discovery budget plus relay and shutdown overhead.
+        methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
     }
 }
+
+/// How long this device forwards a remote login's callback at most — the
+/// running engine reaps an abandoned login after the same 15 minutes.
+const LOGIN_TUNNEL_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
@@ -1014,11 +1288,15 @@ fn forward_deadline(method: &str) -> std::time::Duration {
 fn forwardable(method: &str) -> bool {
     matches!(
         method,
-        methods::LIST_HARNESSES
+        methods::FORK_SIDE_CHAT
+            | methods::LIST_HARNESSES
+            | methods::INSTALL_HARNESS
+            | methods::CANCEL_INSTALL
             | methods::GET_TITLE_SETTINGS
             | methods::SET_TITLE_SETTINGS
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
+            | methods::LIST_SKILLS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
             | methods::TAKE_PROJECT_ACTION_SETUP
@@ -1068,6 +1346,7 @@ fn forwardable(method: &str) -> bool {
             | methods::WATCH_WORKSPACE_GIT_STATUS
             | methods::WATCH_CHECKOUT_CHANGE_REQUEST
             | methods::GET_CHECKOUT_DIFF
+            | methods::DISCARD_WORKING_TREE
             | methods::GET_CHECKOUT_FILE_DIFF_TEXT
             // Terminals live on the chat's host device.
             | methods::OPEN_TERMINAL
@@ -1355,6 +1634,15 @@ impl RpcService for EngineRpc {
             && target != self.doc_host.device_id()
         {
             let target = target.to_string();
+            if matches!(
+                method,
+                methods::START_AGENT_LOGIN
+                    | methods::POLL_AGENT_LOGIN
+                    | methods::COMPLETE_AGENT_LOGIN
+                    | methods::CANCEL_AGENT_LOGIN
+            ) {
+                return self.forward_agent_login(&target, method, params).await;
+            }
             return self.forward(&target, method, params).await;
         }
         if AuthRpc::handles(method) {
@@ -1366,6 +1654,20 @@ impl RpcService for EngineRpc {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::INSTALL_HARNESS => {
+                let p: ListModelsParams = parse_params(params)?;
+                let installing = self.registry.installs.begin(p.harness)?;
+                let descriptors = install_harness_with(&self.registry, p.harness, || {
+                    run_requested_install(p.harness, installing.cancel.clone())
+                })
+                .await?;
+                RpcReply::value(&descriptors)
+            }
+            methods::CANCEL_INSTALL => {
+                let p: ListModelsParams = parse_params(params)?;
+                self.registry.installs.cancel(p.harness);
+                RpcReply::value(&serde_json::json!({}))
+            }
             methods::GET_TITLE_SETTINGS => RpcReply::value(&self.registry.title_settings()),
             methods::SET_TITLE_SETTINGS => {
                 let p: crate::registry::TitleSettings = parse_params(params)?;
@@ -1376,13 +1678,7 @@ impl RpcService for EngineRpc {
             }
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
-                update_harness_enabled(
-                    &self.registry,
-                    p.harness,
-                    p.enabled,
-                    zeron_harness::AcpHarness::antigravity().sign_out(),
-                )
-                .await?;
+                update_harness_enabled(&self.registry, p.harness, p.enabled).await?;
                 // Fresh catalog in the reply: the page repaints from it in one
                 // round trip, and a refused/raced toggle self-corrects.
                 RpcReply::value(&self.registry.descriptors())
@@ -1393,26 +1689,69 @@ impl RpcService for EngineRpc {
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let models = harness
-                    .models()
+                let models = crate::model_catalogs::list(self.repos.data_dir(), harness, p.force)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)
             }
+            methods::LIST_SKILLS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    harness: HarnessId,
+                    #[serde(default)]
+                    chat_id: Option<String>,
+                    #[serde(default)]
+                    space_id: Option<String>,
+                    #[serde(default)]
+                    path: Option<String>,
+                }
+                let p: Params = parse_params(params)?;
+                let root = self
+                    .catalog_root(&FileSearchParams {
+                        query: String::new(),
+                        chat_id: p.chat_id,
+                        space_id: p.space_id,
+                        path: p.path,
+                    })
+                    .await?;
+                let harness = self
+                    .registry
+                    .resolve(p.harness)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let skills = harness
+                    .skills(&root)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&skills)
+            }
             methods::LIST_COMMANDS => {
-                // Same shape as ListModels: forces a lazy resolve, then the
-                // harness's own (cached) discovery — ACP agents advertise
-                // availableCommands, claude answers the initialize control
-                // request, codex lists skills; only harnesses whose wire has
-                // no listing (cursor, mock) fall through to the trait's
-                // empty default.
-                let p: ListModelsParams = parse_params(params)?;
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    harness: HarnessId,
+                    #[serde(default)]
+                    chat_id: Option<String>,
+                    #[serde(default)]
+                    space_id: Option<String>,
+                    #[serde(default)]
+                    path: Option<String>,
+                }
+                let p: Params = parse_params(params)?;
+                let root = self
+                    .catalog_root(&FileSearchParams {
+                        query: String::new(),
+                        chat_id: p.chat_id,
+                        space_id: p.space_id,
+                        path: p.path,
+                    })
+                    .await?;
                 let harness = self
                     .registry
                     .resolve(p.harness)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let commands = harness
-                    .commands()
+                    .commands_for(&root)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&commands)
@@ -1454,6 +1793,132 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "outcome": outcome }))
+            }
+            methods::FORK_SIDE_CHAT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct ForkParams {
+                    chat_id: String,
+                    source_chat_id: String,
+                    /// Where the fork hangs in the tree. Defaults to the
+                    /// source; a side chat's own fork button passes the
+                    /// side chat's parent so the copy lists as a sibling.
+                    #[serde(default)]
+                    parent_chat_id: Option<String>,
+                }
+                let p: ForkParams = parse_params(params)?;
+                let parent_chat_id = p
+                    .parent_chat_id
+                    .clone()
+                    .filter(|id| !id.trim().is_empty())
+                    .unwrap_or_else(|| p.source_chat_id.clone());
+                let failed = |e: crate::EngineError| RpcError::Failed(e.to_string());
+                let source = self
+                    .workspace
+                    .chat(&p.source_chat_id)
+                    .map_err(failed)?
+                    .ok_or_else(|| RpcError::Failed("Source chat no longer exists".into()))?;
+                if source.device_id != self.doc_host.device_id() {
+                    return Err(RpcError::Failed(
+                        "Fork must be created on the source device".into(),
+                    ));
+                }
+                if let Some(existing) = self.workspace.chat(&p.chat_id).map_err(failed)? {
+                    if existing.parent_chat_id.as_deref() == Some(parent_chat_id.as_str()) {
+                        return RpcReply::value(&existing);
+                    }
+                    return Err(RpcError::Failed("Chat id already exists".into()));
+                }
+                let source_doc = self.doc_host.open(&p.source_chat_id).map_err(failed)?;
+                let entries = source_doc
+                    .doc()
+                    .read_entries()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let boundary = entries
+                    .iter()
+                    .rposition(|entry| {
+                        entry.role == zeron_doc::MessageRole::Assistant
+                            && entry.status == Some(zeron_doc::MessageStatus::Complete)
+                    })
+                    .ok_or_else(|| {
+                        RpcError::Failed(
+                            "Wait for a completed response before starting a side chat".into(),
+                        )
+                    })?;
+                let mut chat = source.clone();
+                chat.id = p.chat_id;
+                chat.parent_chat_id = Some(parent_chat_id);
+                chat.title = None; // First side-chat turn receives its own generated title.
+                chat.archived = false;
+                chat.created_at = chrono::Utc::now();
+                chat.last_message_at = None;
+                chat.last_message_preview = None;
+                chat.last_seen_at = None;
+                chat.harness_session_id = None;
+                chat.harness_session_cwd = None;
+                chat.room_gen = Some(2);
+                // Missing rows open on chat2. Persist history before publishing
+                // the registry row so a crash cannot leave a discoverable empty fork.
+                let target = self.doc_host.open(&chat.id).map_err(failed)?;
+                let existing = target
+                    .doc()
+                    .read_entries()
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                for entry in entries[..=boundary]
+                    .iter()
+                    .filter(|entry| !existing.iter().any(|e| e.id == entry.id))
+                {
+                    let mut entry = entry.clone();
+                    // Historical approvals belong to the source runtime; they
+                    // must never block or send answers from the new composer.
+                    for part in &mut entry.parts {
+                        if let zeron_doc::MessagePart::Input { resolved, .. } = part {
+                            *resolved = true;
+                        }
+                    }
+                    target
+                        .doc()
+                        .push_message(&entry)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
+                // The seam: everything above came from the source. Its own
+                // entry (system role, complete) so the copied history and the
+                // fork's first turn never share a row.
+                let marker_id = format!("fork:{}", chat.id);
+                if !existing.iter().any(|e| e.id == marker_id) {
+                    let source_title = source
+                        .title
+                        .clone()
+                        .or_else(|| source.last_message_preview.clone())
+                        .unwrap_or_else(|| "New session".into());
+                    target
+                        .doc()
+                        .push_message(&zeron_doc::SessionMessageEntry {
+                            duration_ms: None,
+                            id: marker_id.clone(),
+                            role: zeron_doc::MessageRole::System,
+                            parts: vec![zeron_doc::MessagePart::Fork {
+                                id: marker_id,
+                                source_chat_id: source.id.clone(),
+                                source_title,
+                            }],
+                            created_at: chrono::Utc::now().timestamp_millis(),
+                            device_id: self.doc_host.device_id().to_owned(),
+                            status: Some(zeron_doc::MessageStatus::Complete),
+                            continuation_of: None,
+                        })
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
+                self.doc_host.persist_fork(&target).map_err(failed)?;
+                self.workspace.import_chat_row(&chat).map_err(failed)?;
+                RpcReply::value(&chat)
+            }
+            methods::FOCUS_CHAT => {
+                let p: ChatParams = parse_params(params)?;
+                self.doc_host
+                    .focus_chat(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({}))
             }
             methods::WATCH_DOC_MESSAGES => {
                 // Opt-in: older viewports retain the full-reset contract.
@@ -1664,6 +2129,7 @@ impl RpcService for EngineRpc {
                         serde_json::json!({
                             "chatId": chat_id,
                             "room": room.as_ref().map(chat2_json),
+                            "state": self.doc_host.chat_sync_state(chat_id),
                         })
                     })
                     .collect();
@@ -1672,6 +2138,7 @@ impl RpcService for EngineRpc {
                     "nowMs": crate::now_ms(),
                     "workspace": workspace.as_ref().map(room_json),
                     "chats": chats,
+                    "resources": self.doc_host.sync_resources(),
                 }))
             }
             methods::WATCH_CONNECTIVITY => Ok(RpcReply::Stream(watch_stream(
@@ -1942,6 +2409,86 @@ impl RpcService for EngineRpc {
                         checksum: snapshot.checksum,
                         updated_at: chrono::Utc::now(),
                     })
+                })
+                .await
+            }
+            methods::DISCARD_WORKING_TREE => {
+                // This destructive branch performs several nested filesystem
+                // futures. Box it so unrelated RPC calls do not inherit that
+                // state in the already-large dispatcher stack frame.
+                Box::pin(async move {
+                    let p: DiscardWorkingTreeParams = parse_params(params)?;
+                    let chat = self
+                        .workspace
+                        .chat(&p.chat_id)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?
+                        .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
+                    if chat.device_id != self.doc_host.device_id() {
+                        return Err(RpcError::Failed("chat is not hosted by this device".into()));
+                    }
+                    let cwd = chat
+                        .cwd
+                        .as_deref()
+                        .ok_or_else(|| RpcError::Failed("chat has no checkout".into()))?;
+                    let identity = self
+                        .repos
+                        .checkout_identity(std::path::Path::new(cwd))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if identity.id != p.checkout_id {
+                        return Err(RpcError::Failed(
+                            "chat checkout changed since the confirmation was opened".into(),
+                        ));
+                    }
+
+                    // Refuse the mutation when any local chat on this exact
+                    // checkout has a live run. We never interrupt an agent as a
+                    // side effect of discarding files.
+                    let chats = self.workspace.watch_chats().borrow().clone();
+                    for candidate in chats {
+                        if candidate.device_id != self.doc_host.device_id() {
+                            continue;
+                        }
+                        let same_checkout =
+                            if candidate.checkout_id.as_deref() == Some(identity.id.as_str()) {
+                                true
+                            } else if let Some(candidate_cwd) = candidate.cwd.as_deref() {
+                                self.repos
+                                    .checkout_identity(std::path::Path::new(candidate_cwd))
+                                    .await
+                                    .is_ok_and(|candidate_identity| {
+                                        candidate_identity.id == identity.id
+                                    })
+                            } else {
+                                false
+                            };
+                        if same_checkout
+                            && self
+                                .sessions
+                                .session_status(&candidate.id)
+                                .is_some_and(|session| {
+                                    matches!(
+                                        session.status,
+                                        zeron_proto::SessionStatus::Working
+                                            | zeron_proto::SessionStatus::AwaitingInput
+                                    )
+                                })
+                        {
+                            return Err(RpcError::Failed(
+                                "an agent is active in this working tree".into(),
+                            ));
+                        }
+                    }
+
+                    let snapshot = self
+                        .diff_sync
+                        .discard_working_tree(&identity.id, &p.expected_checksum)
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    RpcReply::value(&serde_json::json!({
+                        "ok": true,
+                        "checksum": snapshot.checksum,
+                    }))
                 })
                 .await
             }
@@ -2546,15 +3093,24 @@ impl RpcService for EngineRpc {
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
-                // The terminal runs in the chat's checkout; a chat with no cwd (or
-                // no row yet) gets the home directory.
-                let cwd = self
+                // Prefer an explicit real path (new-chat canvas has no row
+                // yet). `space-canvas:{spaceId}` names the selected project
+                // so a missing/tilde cwd still lands in that folder.
+                let chat_cwd = self
                     .workspace
                     .chat(&p.chat_id)
                     .ok()
                     .flatten()
-                    .and_then(|chat| chat.cwd)
-                    .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
+                    .and_then(|chat| chat.cwd);
+                let space_cwd = canvas_space_id(&p.chat_id).and_then(|space_id| {
+                    self.workspace
+                        .space(space_id)
+                        .ok()
+                        .flatten()
+                        .map(|space| space.path)
+                });
+                let cwd = resolve_open_terminal_cwd(p.cwd, chat_cwd, space_cwd)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -2624,9 +3180,17 @@ impl RpcService for EngineRpc {
             }
             methods::START_AGENT_LOGIN => {
                 let p: StartAgentLoginParams = parse_params(params)?;
+                // A requester naming this device is no remote login at all:
+                // publishing a callback route for ourselves would be a no-op
+                // at best, so never register one.
+                let own_id = self.doc_host.device_id();
+                let requester = p
+                    .requester_device_id
+                    .as_deref()
+                    .filter(|requester| !requester.is_empty() && *requester != own_id);
                 let start = self
                     .agent_accounts
-                    .start_login(p.harness)
+                    .start_login_with(p.harness, p.provider.as_deref(), requester)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&start)
@@ -2707,6 +3271,272 @@ impl RpcService for EngineRpc {
 mod tests {
     use super::*;
 
+    // Each subprocess has private HOME/PATH/overrides, avoiding process-global test races.
+    #[cfg(unix)]
+    async fn installer_rpc_fixture(mode: &str) {
+        use std::{os::unix::fs::PermissionsExt, sync::Arc};
+        if std::env::var_os("ZERON_INSTALL_FIXTURE_CHILD").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let bin = root.path().join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let script = match mode {
+                "success" => {
+                    "test -z \"$ZERON_INSTALL_FIXTURE_CHILD\" && test -z \"$CLAUDECODE\" && printf '#!/bin/sh\\necho 99.0.0\\n' > \"$CODEX_EXECUTABLE\" && /bin/chmod +x \"$CODEX_EXECUTABLE\""
+                }
+                "failure" => "echo 'fixture failure api_key=private' >&2; exit 7",
+                "missing" => "exit 0",
+                "cancel" => "echo ready > \"$READY_FILE\"; sleep 60",
+                "npm" => "npm install -g @openai/codex",
+                _ => unreachable!(),
+            };
+            let test = format!("rpc::tests::installer_rpc_{mode}");
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture", "--include-ignored"])
+                .env("ZERON_INSTALL_FIXTURE_CHILD", root.path())
+                .env("ZERON_INSTALLER_COMMAND_CODEX", script)
+                .env("ZERON_NO_LOGIN_SHELL", "1")
+                .env("HOME", root.path())
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("CODEX_EXECUTABLE", bin.join("codex"))
+                .env("CLAUDECODE", "nested-test")
+                .env("READY_FILE", root.path().join("ready"))
+                .env("npm_config_prefix", root.path())
+                .env("npm_config_cache", root.path().join("npm-cache"))
+                .env(
+                    "PATH",
+                    std::env::join_paths(
+                        std::iter::once(bin)
+                            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+                    )
+                    .unwrap(),
+                )
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+        let root =
+            std::path::PathBuf::from(std::env::var_os("ZERON_INSTALL_FIXTURE_CHILD").unwrap());
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(zeron_harness::CodexHarness::new()));
+        let core = crate::EngineCore::assemble(
+            &root.join("engine"),
+            registry.clone(),
+            HarnessId::Codex,
+            None,
+        )
+        .unwrap();
+        let rpc = core.rpc_service();
+        let params = serde_json::json!({"harness": "codex"});
+        assert!(!registry.descriptors()[0].installed);
+        assert_eq!(registry.descriptors()[0].enabled, Some(false));
+        let result = if mode == "cancel" {
+            let rpc = rpc.clone();
+            let task = tokio::spawn(async move {
+                rpc.handle(
+                    methods::INSTALL_HARNESS,
+                    serde_json::json!({"harness": "codex"}),
+                )
+                .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !root.join("ready").exists() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+            // A second service for the same device must share the in-flight guard.
+            let other = core.rpc_service();
+            assert!(
+                matches!(other.handle(methods::INSTALL_HARNESS, params.clone()).await, Err(RpcError::Failed(e)) if e == "already installing")
+            );
+            other.handle(methods::CANCEL_INSTALL, params).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .unwrap()
+                .unwrap()
+        } else {
+            rpc.handle(methods::INSTALL_HARNESS, params).await
+        };
+        match mode {
+            "success" | "npm" => {
+                let RpcReply::Value(value) = result.unwrap() else {
+                    panic!("expected descriptors");
+                };
+                let list: Vec<crate::registry::HarnessDescriptor> =
+                    serde_json::from_value(value).unwrap();
+                assert!(list[0].installed);
+                assert_eq!(list[0].enabled, Some(true));
+                assert!(list[0].can_install);
+                let path = root.join("bin/codex");
+                assert!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o111 != 0);
+                println!(
+                    "InstallHarness ({mode}): installed=false/enabled=false -> installed=true/enabled=true; {}",
+                    path.display()
+                );
+            }
+            "failure" => assert!(
+                matches!(result, Err(RpcError::Failed(e)) if e.contains("fixture failure") && e.contains("[REDACTED]") && !e.contains("private"))
+            ),
+            "missing" => assert!(
+                matches!(result, Err(RpcError::Failed(e)) if e.contains("installer finished but `codex` was not found on PATH"))
+            ),
+            "cancel" => {
+                assert!(matches!(result, Err(RpcError::Failed(e)) if e.contains("cancelled")));
+                assert!(registry.installs.begin(HarnessId::Codex).is_ok());
+            }
+            _ => unreachable!(),
+        }
+        assert!(forwardable(methods::CANCEL_INSTALL));
+        core.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_rpc_success() {
+        installer_rpc_fixture("success").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_rpc_failure() {
+        installer_rpc_fixture("failure").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_rpc_missing() {
+        installer_rpc_fixture("missing").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installer_rpc_cancel() {
+        installer_rpc_fixture("cancel").await;
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "downloads the official npm package into an isolated temporary prefix"]
+    async fn installer_rpc_npm() {
+        installer_rpc_fixture("npm").await;
+    }
+
+    #[tokio::test]
+    async fn explicit_install_rpc_verifies_archive_and_refreshes_descriptors() {
+        use sha2::{Digest, Sha512};
+        use std::io::Write;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use zeron_harness::archive_install::{ArchivePin, ensure_installed, installed_entry};
+        if std::env::var_os("ZERON_INSTALL_RPC_TEST").is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "rpc::tests::explicit_install_rpc_verifies_archive_and_refreshes_descriptors",
+                    "--nocapture",
+                ])
+                .env("ZERON_INSTALL_RPC_TEST", "1")
+                .env("ZERON_ADAPTERS_DIR", root.path())
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        if !zeron_harness::acp::can_install(HarnessId::Antigravity) {
+            return;
+        }
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("server", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        let bytes = zip.finish().unwrap().into_inner();
+        let digest = Box::leak(format!("{:x}", Sha512::digest(&bytes)).into_boxed_str());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Box::leak(
+            format!("http://{}/archive.zip", listener.local_addr().unwrap()).into_boxed_str(),
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            let mut buf = [0; 4096];
+            while !headers.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = socket.read(&mut buf).await.unwrap();
+                assert!(count > 0, "archive request closed before its headers");
+                headers.extend_from_slice(&buf[..count]);
+            }
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        bytes.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            socket.write_all(&bytes).await.unwrap();
+        });
+        let pin = ArchivePin {
+            name: "explicit-install-test",
+            version: "1",
+            url,
+            entry: "server",
+            sha512: digest,
+        };
+        let registry = HarnessRegistry::new();
+        let descriptor = serde_json::from_value(serde_json::json!({
+            "id": "antigravity", "name": "Antigravity", "supportsSteering": true,
+            "steeringMode": "turn-boundary", "reasoningLevels": [], "installed": false
+        }))
+        .unwrap();
+        registry.register_lazy(
+            descriptor,
+            Box::new(move || installed_entry(&pin).is_some()),
+            Box::new(|| panic!("installation must not spawn the harness")),
+        );
+        assert!(!registry.descriptors()[0].installed);
+        let result = install_harness_with(&registry, HarnessId::Antigravity, || async {
+            ensure_installed(pin, "Test adapter").await.map(|_| ())
+        })
+        .await
+        .unwrap();
+        assert!(result[0].installed);
+        assert_eq!(result[0].enabled, Some(true));
+        assert!(result[0].can_install);
+        assert!(installed_entry(&pin).unwrap().is_file());
+        server.await.unwrap();
+        // The verified marker makes another explicit install idempotent, even
+        // after the archive server has stopped.
+        install_harness_with(&registry, HarnessId::Antigravity, || async {
+            ensure_installed(pin, "Test adapter").await.map(|_| ())
+        })
+        .await
+        .unwrap();
+        assert!(
+            install_harness_with(&registry, HarnessId::Mock, || async {
+                panic!("unsupported harness must not invoke an installer")
+            })
+            .await
+            .is_err()
+        );
+        assert!(forwardable(methods::INSTALL_HARNESS));
+        assert_eq!(
+            forward_deadline(methods::INSTALL_HARNESS),
+            std::time::Duration::from_secs(15 * 60)
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn local_opening_tail_arrives_before_full_mirror_and_keeps_all_history() {
         use crate::doc_host::{DocHost, DocHostConfig};
@@ -2737,6 +3567,7 @@ mod tests {
                 device_id: "host".into(),
                 status: None,
                 continuation_of: None,
+                duration_ms: None,
             })
             .unwrap();
         // Hold publication blocked: the opening must not await the full mirror.
@@ -2790,7 +3621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn antigravity_sign_out_failure_stays_enabled_and_can_be_retried() {
+    async fn antigravity_disable_does_not_launch_the_server() {
         let registry = HarnessRegistry::new();
         let executable = std::env::current_exe().unwrap();
         registry.register(std::sync::Arc::new(
@@ -2801,29 +3632,24 @@ mod tests {
         ));
         registry.set_enabled(HarnessId::Antigravity, true).unwrap();
 
-        let error = update_harness_enabled(&registry, HarnessId::Antigravity, false, async {
-            Err(zeron_harness::HarnessError::Protocol(
-                "logout rejected".into(),
-            ))
-        })
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(error, RpcError::Failed(ref message) if message.contains("remains enabled")),
-            "{error}"
-        );
-        assert!(registry.enabled_set().contains(&HarnessId::Antigravity));
-
-        update_harness_enabled(&registry, HarnessId::Antigravity, false, async {
-            Ok::<(), zeron_harness::HarnessError>(())
-        })
-        .await
-        .unwrap();
+        update_harness_enabled(&registry, HarnessId::Antigravity, false)
+            .await
+            .unwrap();
         assert!(!registry.enabled_set().contains(&HarnessId::Antigravity));
     }
 
     /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional
     /// `targetDeviceId`); the extra fields must be tolerated, `accountId` wins.
+    #[test]
+    fn list_models_force_is_optional_and_backward_compatible() {
+        let old: ListModelsParams =
+            serde_json::from_value(serde_json::json!({"harness":"codex"})).unwrap();
+        assert!(!old.force);
+        let forced: ListModelsParams =
+            serde_json::from_value(serde_json::json!({"harness":"codex","force":true})).unwrap();
+        assert!(forced.force);
+    }
+
     #[test]
     fn agent_account_params_accept_ui_shape() {
         let p: AgentAccountParams = parse_params(serde_json::json!({
@@ -2854,6 +3680,7 @@ mod tests {
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::FOCUS_CHAT));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));
         assert!(forwardable(methods::QUEUE_COMMAND));
@@ -2863,6 +3690,7 @@ mod tests {
         assert!(forwardable(methods::RESOLVE_GIT_AVATARS));
         assert!(forwardable(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
         assert!(is_stream_method(methods::WATCH_CHECKOUT_CHANGE_REQUEST));
+        assert!(forwardable(methods::DISCARD_WORKING_TREE));
         assert!(forwardable(methods::LIST_WORKSPACE_DIRECTORY));
         assert!(forwardable(methods::SEARCH_WORKSPACE_FILES));
         assert!(forwardable(methods::READ_WORKSPACE_FILE));
@@ -2883,6 +3711,12 @@ mod tests {
     /// long leash, and nothing awaits forever (the "Sending…" wedge).
     #[test]
     fn forward_deadlines_are_tiered_and_bounded() {
+        for method in [methods::LIST_MODELS, methods::LIST_COMMANDS] {
+            assert_eq!(
+                forward_deadline(method),
+                std::time::Duration::from_secs(100)
+            );
+        }
         use std::time::Duration;
         assert_eq!(
             forward_deadline(methods::CREATE_WORKTREE),
@@ -2900,6 +3734,48 @@ mod tests {
             forward_deadline(methods::QUEUE_COMMAND),
             Duration::from_secs(30)
         );
+    }
+
+    #[test]
+    fn open_terminal_cwd_prefers_explicit_then_chat_then_space_then_home() {
+        let home = crate::repos::session_home_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            resolve_open_terminal_cwd(
+                Some("/proj".into()),
+                Some("/chat".into()),
+                Some("/space".into())
+            )
+            .unwrap(),
+            "/proj"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(None, Some("/chat".into()), Some("/space".into())).unwrap(),
+            "/chat"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(Some("~".into()), None, Some("/space".into())).unwrap(),
+            "/space",
+            "tilde is a fallback, not an override of the selected project"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(None, None, Some("/space".into())).unwrap(),
+            "/space"
+        );
+        assert_eq!(resolve_open_terminal_cwd(None, None, None).unwrap(), home);
+        assert_eq!(
+            resolve_open_terminal_cwd(Some("~".into()), Some("/chat".into()), None).unwrap(),
+            "/chat"
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(Some("  ".into()), Some("/chat".into()), None).unwrap(),
+            "/chat"
+        );
+        assert_eq!(canvas_space_id("space-canvas:s1"), Some("s1"));
+        assert_eq!(canvas_space_id("space-canvas:"), None);
+        assert_eq!(canvas_space_id("chat-1"), None);
     }
 
     #[test]
@@ -2963,6 +3839,7 @@ mod context_usage_tests {
                     device_id: "writer".into(),
                     status: Some(zeron_doc::MessageStatus::Streaming),
                     continuation_of: None,
+                    duration_ms: None,
                 })
                 .unwrap()
         };
@@ -3083,6 +3960,7 @@ mod context_usage_tests {
             device_id: "host".into(),
             status: Some(zeron_doc::MessageStatus::Streaming),
             continuation_of: None,
+            duration_ms: None,
         };
         handle.doc().push_message(&entry("local-before")).unwrap();
         source.update_context_usage(Some(10), Some(100)).unwrap();

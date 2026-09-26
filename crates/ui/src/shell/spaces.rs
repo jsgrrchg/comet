@@ -130,7 +130,9 @@ fn sidebar_session_drop_pins(
 ) -> Vec<String> {
     let mut next = saved.to_vec();
     match target {
-        SidebarSessionDrop::Regular => next.retain(|id| id != chat_id),
+        SidebarSessionDrop::Regular | SidebarSessionDrop::Section(_) => {
+            next.retain(|id| id != chat_id)
+        }
         SidebarSessionDrop::Pinned(index) => {
             if let Some(from) = visible.iter().position(|id| id == chat_id) {
                 return reorder_visible_pins(saved, visible, from, index.min(visible.len() - 1));
@@ -281,6 +283,7 @@ mod pinned_session_tests {
 
     fn pin_snapshot(revision: u64, pins: &[&str]) -> zeron_proto::SidebarPreferencesState {
         zeron_proto::SidebarPreferencesState {
+            sections: vec![],
             revision,
             synced: true,
             initialized: true,
@@ -568,7 +571,7 @@ mod pinned_session_tests {
                         .sidebar_notice
                         .as_deref()
                         .unwrap()
-                        .contains("Couldn't save pins")
+                        .contains("Couldn't save sidebar changes")
                 );
             })
             .unwrap();
@@ -1843,6 +1846,11 @@ pub(super) struct SpacesMenu {
 }
 
 pub(super) struct SidebarViewMenu {
+    submenu: Option<usize>,
+    submenu_active: Option<usize>,
+    submenu_bounds: Option<gpui::Bounds<gpui::Pixels>>,
+    submenu_on_left: bool,
+    hover_intent: popover::HoverIntent<usize>,
     /// Keyboard cursor. Mouse-opened menus start without one so the persisted
     /// radio/check state is the only selection signal until an arrow key is
     /// pressed.
@@ -1885,9 +1893,9 @@ enum SidebarViewRow {
 }
 
 impl SidebarViewRow {
-    /// Radio-style presentation choices behave like the project selector and
-    /// dismiss after selection. Show toggles stay open for batch changes.
-    fn closes_menu(self) -> bool {
+    /// Radio choices dismiss their submenu after selection. Show toggles
+    /// stay open for batch changes.
+    fn closes_submenu(self) -> bool {
         matches!(
             self,
             Self::ByProject | Self::ByDevice | Self::InOneList | Self::LastUpdated | Self::Created
@@ -1895,7 +1903,10 @@ impl SidebarViewRow {
     }
 }
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
+const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
+    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..10)];
+
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 10] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
@@ -1906,7 +1917,6 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
     SidebarViewRow::ShowHarness,
     SidebarViewRow::ShowProjectIcon,
     SidebarViewRow::ShowProjectLabel,
-    SidebarViewRow::Compact,
 ];
 
 // list items stay tightly related at 2px, while section boundaries use 12px
@@ -2021,11 +2031,55 @@ pub(super) struct AddSpaceFlow {
     /// Folder-list scroll — keyboard navigation keeps the highlighted row in
     /// view (`scroll_to_item`).
     list_scroll: gpui::ScrollHandle,
+    /// Horizontal breadcrumb strip; `crumb_key` is the path it last revealed.
+    crumb_scroll: gpui::ScrollHandle,
+    crumb_key: String,
     focus_pending: bool,
     load_task: Option<Task<()>>,
     drives_task: Option<Task<()>>,
     submit_task: Option<Task<()>>,
     _search_events: Subscription,
+}
+
+/// Folder crumbs shown before the middle folds into `…`, and how many of the
+/// deepest stay visible once it does.
+const CRUMB_FOLDERS_MAX: usize = 3;
+const CRUMB_FOLDERS_TAIL: usize = 2;
+
+/// Fold the middle of a deep trail: returns the folders hidden behind `…`,
+/// leaving the deepest [`CRUMB_FOLDERS_TAIL`] in `folders`.
+fn fold_crumb_folders<T>(folders: &mut Vec<T>) -> Vec<T> {
+    if folders.len() <= CRUMB_FOLDERS_MAX {
+        return Vec::new();
+    }
+    folders
+        .drain(..folders.len() - CRUMB_FOLDERS_TAIL)
+        .collect()
+}
+
+struct Crumb {
+    name: SharedString,
+    glyph: Option<&'static str>,
+    current: bool,
+    target: CrumbTarget,
+}
+
+enum CrumbTarget {
+    Devices,
+    Locations,
+    Location(String, Option<String>),
+    Folder(String),
+    /// The `…` fold; opens [`Shell::render_project_crumb_menu`].
+    More,
+}
+
+fn device_glyph(platform: &str) -> &'static str {
+    match platform {
+        "macos" | "darwin" => icons::LAPTOP,
+        "web" => icons::GLOBAL,
+        "ios" | "android" => icons::SMARTPHONE,
+        _ => icons::MONITOR,
+    }
 }
 
 /// Segment-aware "is `path` at or under `base`" (`/media/a` is not under
@@ -2044,7 +2098,7 @@ pub(super) struct RenameSpaceDialog {
 }
 
 /// Dot color for a chat's display status (tab dots + Sessions rows).
-pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
+pub(crate) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
     match status {
         // Preset activity tone, not warning amber: running is routine.
         // Non-done statuses sit well below full
@@ -2077,7 +2131,7 @@ impl popover::ScrollRailHost for Shell {
 }
 
 impl Shell {
-    fn begin_sidebar_disclosure_motion(
+    pub(super) fn begin_sidebar_disclosure_motion(
         &mut self,
         key: &str,
         resting_height: f32,
@@ -2095,7 +2149,7 @@ impl Shell {
         );
     }
 
-    fn render_sidebar_disclosure_body(
+    pub(super) fn render_sidebar_disclosure_body(
         &self,
         key: &str,
         open: bool,
@@ -2129,7 +2183,12 @@ impl Shell {
             .into_any_element()
     }
 
-    fn sidebar_disclosure_chevron(&self, key: &str, open: bool, theme: &Theme) -> AnyElement {
+    pub(super) fn sidebar_disclosure_chevron(
+        &self,
+        key: &str,
+        open: bool,
+        theme: &Theme,
+    ) -> AnyElement {
         let resting_reveal = if open { 1.0 } else { 0.0 };
         let chevron = icon(icons::ALT_ARROW_RIGHT)
             .size(px(12.0))
@@ -2572,9 +2631,37 @@ impl Shell {
             self.cancel_sidebar_session_transfer(cx);
             return;
         }
-        let saved = self.sidebar_pins_for_profile(&payload.profile_key, cx);
-        let next =
-            sidebar_session_drop_pins(&saved, &payload.visible_ids, &payload.chat_id, target);
+        if let SidebarSessionDrop::Section(id) = &target {
+            if !self
+                .active_sidebar_sections(cx)
+                .iter()
+                .any(|section| &section.id == id)
+            {
+                self.cancel_sidebar_session_transfer(cx);
+                return;
+            }
+        }
+        let saved = self.raw_sidebar_pins(cx);
+        let next = sidebar_session_drop_pins(
+            &saved,
+            &payload.visible_ids,
+            &payload.chat_id,
+            target.clone(),
+        );
+        let sections = self.active_sidebar_sections(cx);
+        let source_section = sections
+            .iter()
+            .find(|section| section.session_ids.contains(&payload.chat_id))
+            .map(|section| section.id.as_str());
+        let target_section = match &target {
+            SidebarSessionDrop::Section(id) => Some(id.as_str()),
+            _ => None,
+        };
+        if saved == next && source_section == target_section {
+            // A no-op drop still animates home; ordinary groups retain recency order.
+            self.cancel_sidebar_session_transfer(cx);
+            return;
+        }
         // Validate and accept before ending the preview. Rejected drops use
         // the same animated return path as dropping outside a destination.
         let change = if let Some(index) = next.iter().position(|id| id == &payload.chat_id) {
@@ -2598,9 +2685,39 @@ impl Shell {
                 session_id: payload.chat_id.clone(),
             }
         };
-        if !self.apply_sidebar_pin_change(payload.profile_key.clone(), change, cx) {
-            self.cancel_sidebar_session_transfer(cx);
-            return;
+        if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Local)
+            && !matches!(target, SidebarSessionDrop::Pinned(_))
+        {
+            if !self.change_sidebar_section(
+                zeron_proto::SidebarSectionChange::Assign {
+                    session_id: payload.chat_id.clone(),
+                    section_id: target_section.map(str::to_owned),
+                },
+                cx,
+            ) {
+                self.cancel_sidebar_session_transfer(cx);
+                return;
+            }
+        } else {
+            if saved != next
+                && !self.apply_sidebar_pin_change(payload.profile_key.clone(), change, cx)
+            {
+                self.cancel_sidebar_session_transfer(cx);
+                return;
+            }
+            if !matches!(target, SidebarSessionDrop::Pinned(_))
+                || self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local)
+                || saved == next
+            {
+                self.assign_sidebar_section(
+                    &payload.chat_id,
+                    match &target {
+                        SidebarSessionDrop::Section(id) => Some(id.as_str()),
+                        _ => None,
+                    },
+                    cx,
+                );
+            }
         }
         self.sidebar_session_transfer = None;
         self.cancel_pinned_session_drag(cx);
@@ -2609,7 +2726,7 @@ impl Shell {
         } else {
             self.sessions_open = true;
         }
-        // Only pin preferences change. Regular rows keep their live activity sort.
+        // Membership changes preserve each group's live activity sort.
         // Drag previews already animated this move. Establish a fresh layout
         // baseline so the automatic resort glide does not replay it on release.
         self.sidebar_prev_order.clear();
@@ -2977,7 +3094,10 @@ impl Shell {
         }
     }
 
-    fn close_sidebar_view_menu(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_sidebar_view_menu(&mut self, cx: &mut Context<Self>) {
+        if let Some(menu) = self.sidebar_view_menu.open_mut() {
+            menu.hover_intent.reset();
+        }
         if self.sidebar_view_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.sidebar_view_menu);
             cx.notify();
@@ -2988,6 +3108,11 @@ impl Shell {
         self.close_spaces_menu(cx);
         let focus = cx.focus_handle();
         self.sidebar_view_menu.open(SidebarViewMenu {
+            submenu: None,
+            submenu_active: None,
+            submenu_bounds: None,
+            submenu_on_left: false,
+            hover_intent: popover::HoverIntent::default(),
             active: None,
             focus: focus.clone(),
         });
@@ -2996,6 +3121,9 @@ impl Shell {
     }
 
     fn activate_sidebar_view_row(&mut self, row: SidebarViewRow, cx: &mut Context<Self>) {
+        if let Some(menu) = self.sidebar_view_menu.open_mut() {
+            menu.hover_intent.cancel();
+        }
         self.cancel_sidebar_session_transfer(cx);
         self.cancel_pinned_session_drag(cx);
         match row {
@@ -3034,41 +3162,144 @@ impl Shell {
             }
         }
         self.schedule_save(cx);
-        if row.closes_menu() {
-            self.close_sidebar_view_menu(cx);
+        if row.closes_submenu() {
+            if let Some(menu) = self.sidebar_view_menu.open_mut() {
+                menu.submenu = None;
+                menu.submenu_active = None;
+                menu.submenu_bounds = None;
+                menu.hover_intent.cancel();
+            }
         }
         cx.notify();
     }
 
-    fn sidebar_view_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
-        if !self.sidebar_view_menu.is_open() {
-            return;
+    fn open_sidebar_view_submenu(&mut self, group: usize, keyboard: bool, cx: &mut Context<Self>) {
+        if let Some(menu) = self.sidebar_view_menu.open_mut() {
+            menu.hover_intent.reset();
+            menu.active = Some(group);
+            menu.submenu = (group < SIDEBAR_VIEW_GROUPS.len()).then_some(group);
+            menu.submenu_active = keyboard.then_some(0);
+            menu.submenu_bounds = None;
+            cx.notify();
         }
-        match popover::classify_key(
+    }
+
+    fn hover_sidebar_view_group(
+        &mut self,
+        group: usize,
+        pointer: gpui::Point<gpui::Pixels>,
+        moved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.sidebar_view_menu.open_mut() else {
+            return;
+        };
+        let action = if moved {
+            menu.hover_intent.moved(
+                menu.submenu.as_ref(),
+                &group,
+                pointer,
+                menu.submenu_bounds,
+                menu.submenu_on_left,
+            )
+        } else {
+            menu.hover_intent.enter(
+                menu.submenu.as_ref(),
+                &group,
+                pointer,
+                menu.submenu_bounds,
+                menu.submenu_on_left,
+            )
+        };
+        match action {
+            popover::HoverAction::None => {}
+            popover::HoverAction::Open => {
+                self.open_sidebar_view_submenu(group, false, cx);
+                if let Some(menu) = self.sidebar_view_menu.open_mut() {
+                    menu.hover_intent.record_origin(pointer);
+                }
+            }
+            popover::HoverAction::Defer => {
+                let source = menu.submenu;
+                menu.hover_intent.defer(cx, move |this, cx| {
+                    if this.sidebar_view_menu.open_mut().is_some_and(|menu| {
+                        menu.submenu == source && menu.hover_intent.pending() == Some(&group)
+                    }) {
+                        this.open_sidebar_view_submenu(group, false, cx);
+                        if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                            menu.hover_intent.record_origin(pointer);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    fn sidebar_view_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(menu) = self.sidebar_view_menu.open_mut() else {
+            return;
+        };
+        menu.hover_intent.cancel();
+        let key = match popover::classify_key(
             event.keystroke.key.as_str(),
             event.keystroke.modifiers.platform,
             event.keystroke.modifiers.control,
         ) {
-            popover::MenuKey::Escape => self.close_sidebar_view_menu(cx),
-            popover::MenuKey::Up | popover::MenuKey::Down => {
-                let up = event.keystroke.key.eq_ignore_ascii_case("arrowup");
-                if let Some(menu) = self.sidebar_view_menu.open_mut() {
-                    menu.active = popover::menu_step(
-                        menu.active,
-                        SIDEBAR_VIEW_ROWS.len(),
-                        if up { -1 } else { 1 },
-                    );
+            popover::MenuKey::Up => "up",
+            popover::MenuKey::Down => "down",
+            _ => event.keystroke.key.as_str(),
+        };
+        match key {
+            "escape" | "left" => {
+                if menu.submenu.take().is_some() {
+                    menu.submenu_active = None;
+                    menu.submenu_bounds = None;
                     cx.notify();
+                } else if key == "escape" {
+                    self.close_sidebar_view_menu(cx);
                 }
             }
-            popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
-                let active = self.sidebar_view_menu.get().and_then(|m| m.active);
-                if let Some(row) = active.and_then(|ix| SIDEBAR_VIEW_ROWS.get(ix)).copied() {
-                    self.activate_sidebar_view_row(row, cx);
+            "up" | "down" => {
+                let delta = if key == "up" { -1 } else { 1 };
+                if let Some(group) = menu.submenu {
+                    menu.submenu_active = popover::menu_step(
+                        menu.submenu_active,
+                        SIDEBAR_VIEW_GROUPS[group].1.len(),
+                        delta,
+                    );
+                } else {
+                    menu.active =
+                        popover::menu_step(menu.active, SIDEBAR_VIEW_GROUPS.len() + 2, delta);
+                }
+                cx.notify();
+            }
+            "right" | "enter" | "space" => {
+                if let Some(group) = menu.submenu {
+                    if key == "enter" {
+                        if let Some(choice) = menu.submenu_active {
+                            let row =
+                                SIDEBAR_VIEW_ROWS[SIDEBAR_VIEW_GROUPS[group].1.start + choice];
+                            self.activate_sidebar_view_row(row, cx);
+                        }
+                    }
+                } else {
+                    let group = menu.active.unwrap_or(0);
+                    if group == SIDEBAR_VIEW_GROUPS.len() + 1 {
+                        if key != "right" && !event.is_held {
+                            self.open_section_dialog(None, cx);
+                        }
+                    } else if group == SIDEBAR_VIEW_GROUPS.len() {
+                        if key != "right" && !event.is_held {
+                            self.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
+                        }
+                    } else if key != "space" {
+                        self.open_sidebar_view_submenu(group, true, cx);
+                    }
                 }
             }
-            popover::MenuKey::Backspace | popover::MenuKey::Other => {}
+            _ => return,
         }
+        cx.stop_propagation();
     }
 
     fn render_sidebar_view_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -3077,6 +3308,9 @@ impl Shell {
             return div().into_any_element();
         };
         let active = menu_state.active;
+        let submenu = menu_state.submenu;
+        let submenu_active = menu_state.submenu_active;
+        let on_left = menu_state.submenu_on_left;
         let focus = menu_state.focus.clone();
         let organization = self.settings.sidebar_organization;
         let sort = self.settings.sidebar_sort;
@@ -3087,7 +3321,7 @@ impl Shell {
         let labels = [
             "By device",
             "By project",
-            "In one list",
+            "None",
             "Last updated",
             "Created",
             "Branch",
@@ -3095,7 +3329,6 @@ impl Shell {
             "Harness",
             "Project icon",
             "Location",
-            "Compact mode",
         ];
         let icons = [
             icons::LAPTOP,
@@ -3108,7 +3341,6 @@ impl Shell {
             icons::BOT,
             icons::PROJECT_DEFAULT,
             icons::FOLDER,
-            icons::LIST,
         ];
         let selected = [
             organization == SidebarOrganization::ByDevice,
@@ -3121,76 +3353,297 @@ impl Shell {
             show_harness,
             self.settings.sidebar_show_project_icon,
             self.settings.sidebar_show_project_label,
-            self.settings.sidebar_compact,
         ];
-        let mut rows: Vec<AnyElement> = SIDEBAR_VIEW_ROWS
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(ix, row)| {
-                popover::menu_row_nav(
-                    theme,
-                    selected[ix],
-                    active == Some(ix),
-                    format!("sidebar-view-row-{ix}"),
+        let values = [
+            labels[selected[..3].iter().position(|v| *v).unwrap_or(0)].to_string(),
+            labels[3 + selected[3..5].iter().position(|v| *v).unwrap_or(0)].to_string(),
+        ];
+        let mut groups: Vec<AnyElement> = Vec::new();
+        for (group, (label, range)) in SIDEBAR_VIEW_GROUPS.iter().enumerate() {
+            if group == 2 {
+                groups.push(popover::menu_separator().into_any_element());
+            }
+            let open = submenu == Some(group);
+            let entity = cx.entity().downgrade();
+            let exit_entity = cx.entity().downgrade();
+            let mut trigger = popover::menu_row_nav(
+                theme,
+                open,
+                active == Some(group),
+                format!("sidebar-view-group-{group}"),
+            )
+            .id(("sidebar-view-group", group))
+            .relative()
+            .h(px(30.0))
+            .py(px(0.0))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                // Match model settings: hover opens; clicking dismisses, including
+                // a sibling crossed during hover grace, without delayed reopening.
+                if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                    menu.active = Some(group);
+                    menu.submenu = None;
+                    menu.submenu_active = None;
+                    menu.submenu_bounds = None;
+                    menu.hover_intent.reset();
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }))
+            .child(div().flex_1().child(*label))
+            .when(group < values.len(), |el| {
+                el.child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .child(values[group].clone()),
                 )
-                .id(("sidebar-view-row", ix))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(menu) = this.sidebar_view_menu.open_mut() {
-                        menu.active = None;
+            })
+            .child(
+                icon(icons::ALT_ARROW_RIGHT)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let left = bounds.right() + px(244.0) > window.viewport_size().width;
+                        let _ = entity.update(cx, |this, cx| {
+                            if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                                if menu.submenu_on_left != left {
+                                    menu.submenu_on_left = left;
+                                    cx.notify();
+                                }
+                            }
+                        });
+                    },
+                    move |trigger, _, window, _| {
+                        if !open {
+                            return;
+                        }
+                        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            let _ = exit_entity.update(cx, |this, cx| {
+                                let Some(menu) = this.sidebar_view_menu.open_mut() else {
+                                    return;
+                                };
+                                if menu.submenu != Some(group)
+                                    || menu.hover_intent.contains_pointer(
+                                        trigger,
+                                        menu.submenu_bounds,
+                                        event.position,
+                                        menu.submenu_on_left,
+                                    )
+                                {
+                                    return;
+                                }
+                                menu.hover_intent.reset();
+                                menu.submenu = None;
+                                menu.submenu_bounds = None;
+                                menu.submenu_active = None;
+                                menu.active = None;
+                                cx.notify();
+                            });
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            );
+            if open {
+                let mut choices = Vec::new();
+                for (choice, ix) in range.clone().enumerate() {
+                    let row = SIDEBAR_VIEW_ROWS[ix];
+                    choices.push(
+                        popover::menu_row_nav(
+                            theme,
+                            selected[ix],
+                            submenu_active == Some(choice),
+                            format!("sidebar-view-row-{ix}"),
+                        )
+                        .id(("sidebar-view-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.activate_sidebar_view_row(row, cx);
+                            cx.stop_propagation();
+                        }))
+                        .child(
+                            icon(icons[ix])
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(div().flex_1().child(labels[ix]))
+                        .child(div().w(px(14.0)).flex_none().when(selected[ix], |el| {
+                            el.child(
+                                icon(icons::CHECK)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            )
+                        })),
+                    );
+                }
+                let entity = cx.entity().downgrade();
+                let child = popover::popover_card(theme)
+                    .w(px(232.0))
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(popover::menu_heading(theme, label))
+                    .children(choices)
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, cx| {
+                                let _ = entity.update(cx, |this, _| {
+                                    if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                                        menu.submenu_bounds = Some(bounds);
+                                    }
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    );
+                trigger = trigger.child(popover::nested_menu(
+                    format!("sidebar-view-child-{group}"),
+                    child.into_any_element(),
+                    on_left,
+                ));
+            }
+            groups.push(
+                div()
+                    .id(("sidebar-view-hover", group))
+                    .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                        if *hovered {
+                            this.hover_sidebar_view_group(
+                                group,
+                                window.mouse_position(),
+                                false,
+                                cx,
+                            );
+                        } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                            menu.hover_intent.leave(&group);
+                        }
+                    }))
+                    .on_mouse_move(
+                        cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                            this.hover_sidebar_view_group(group, event.position, true, cx);
+                        }),
+                    )
+                    .child(trigger)
+                    .into_any_element(),
+            );
+        }
+        groups.push(popover::menu_separator().into_any_element());
+        groups.push(
+            div()
+                .id("sidebar-view-compact-hover")
+                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                    if *hovered {
+                        this.hover_sidebar_view_group(
+                            SIDEBAR_VIEW_GROUPS.len(),
+                            window.mouse_position(),
+                            false,
+                            cx,
+                        );
+                    } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                        menu.hover_intent.leave(&SIDEBAR_VIEW_GROUPS.len());
                     }
-                    this.activate_sidebar_view_row(row, cx)
+                }))
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    this.hover_sidebar_view_group(
+                        SIDEBAR_VIEW_GROUPS.len(),
+                        event.position,
+                        true,
+                        cx,
+                    );
                 }))
                 .child(
-                    icon(icons[ix])
-                        .size(px(15.0))
-                        .flex_none()
-                        .text_color(theme.text_muted),
+                    popover::menu_row_nav(
+                        theme,
+                        false,
+                        active == Some(SIDEBAR_VIEW_GROUPS.len()),
+                        "sidebar-view-compact",
+                    )
+                    .id("sidebar-view-compact")
+                    .h(px(30.0))
+                    .py(px(0.0))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_sidebar_view_submenu(SIDEBAR_VIEW_GROUPS.len(), false, cx);
+                        this.activate_sidebar_view_row(SidebarViewRow::Compact, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(div().flex_1().child("Compact"))
+                    .child(crate::settings::widgets::toggle_switch(
+                        theme,
+                        self.settings.sidebar_compact,
+                        "sidebar-view-compact",
+                    )),
                 )
-                .child(div().flex_1().child(SharedString::from(labels[ix])))
-                .child(div().w(px(14.0)).flex_none().when(selected[ix], |el| {
-                    el.child(
-                        icon(icons::CHECK)
+                .into_any_element(),
+        );
+        groups.push(popover::menu_separator().into_any_element());
+        groups.push(
+            div()
+                .id("sidebar-create-section-hover")
+                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                    let target = SIDEBAR_VIEW_GROUPS.len() + 1;
+                    if *hovered {
+                        this.hover_sidebar_view_group(target, window.mouse_position(), false, cx);
+                    } else if let Some(menu) = this.sidebar_view_menu.open_mut() {
+                        menu.hover_intent.leave(&target);
+                    }
+                }))
+                .on_mouse_move(cx.listener(|this, event: &gpui::MouseMoveEvent, _, cx| {
+                    this.hover_sidebar_view_group(
+                        SIDEBAR_VIEW_GROUPS.len() + 1,
+                        event.position,
+                        true,
+                        cx,
+                    );
+                }))
+                .child(
+                    popover::menu_row_nav(
+                        theme,
+                        false,
+                        active == Some(SIDEBAR_VIEW_GROUPS.len() + 1),
+                        "sidebar-create-section",
+                    )
+                    .id("sidebar-create-section")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_section_dialog(None, cx);
+                        cx.stop_propagation();
+                    }))
+                    .child(
+                        icon(icons::PLUS)
                             .size(px(14.0))
                             .text_color(theme.text_muted),
                     )
-                }))
-                .into_any_element()
-            })
-            .collect();
-        // Compact mode is a layout choice, not a row-content toggle, so it
-        // gets its own section under Show.
-        let layout_rows = rows.split_off(10);
-        let show_rows = rows.split_off(5);
-        let sort_rows = rows.split_off(3);
-        let organization_rows = rows;
-
+                    .child("Create Section"),
+                )
+                .into_any_element(),
+        );
         popover::popover_card(theme)
             .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
             .track_focus(&focus)
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 this.sidebar_view_menu_key(event, cx)
             }))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_sidebar_view_menu(cx)))
+            .on_mouse_down_out(cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                if !this
+                    .sidebar_view_menu
+                    .get()
+                    .and_then(|m| m.submenu_bounds)
+                    .is_some_and(|bounds| bounds.contains(&event.position))
+                {
+                    this.close_sidebar_view_menu(cx);
+                }
+            }))
             .flex()
             .flex_col()
-            .child(popover::menu_heading(theme, "Organize"))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .children(organization_rows),
-            )
-            .child(popover::menu_separator())
-            .child(popover::menu_heading(theme, "Sort"))
-            .child(div().flex().flex_col().gap(px(2.0)).children(sort_rows))
-            .child(popover::menu_separator())
-            .child(popover::menu_heading(theme, "Show"))
-            .child(div().flex().flex_col().gap(px(2.0)).children(show_rows))
-            .child(popover::menu_separator())
-            .child(popover::menu_heading(theme, "Layout"))
-            .child(div().flex().flex_col().gap(px(2.0)).children(layout_rows))
+            .gap(px(2.0))
+            .children(groups)
             .into_any_element()
     }
 
@@ -3377,7 +3830,7 @@ impl Shell {
             .tooltip(|_, cx| cx.new(|_| SidebarViewOptionsTooltip).into())
             .tooltip_show_delay(std::time::Duration::from_millis(350))
             .child(
-                icon(icons::SORT)
+                icon(icons::MORE_HORIZONTAL)
                     .size(px(16.0))
                     .text_color(theme.text_muted.opacity(0.6)),
             );
@@ -3632,6 +4085,26 @@ impl Shell {
         let (pinned_chats, chats): (Vec<_>, Vec<_>) = chats
             .into_iter()
             .partition(|chat| pinned_order.contains(&chat.id));
+        let custom_sections = self.active_sidebar_sections(cx);
+        let mut custom_order = Vec::new();
+        for section in &custom_sections {
+            if !section.collapsed {
+                custom_order.extend(
+                    chats
+                        .iter()
+                        .filter(|chat| section.session_ids.contains(&chat.id))
+                        .map(|chat| chat.id.clone()),
+                );
+            }
+        }
+        let chats: Vec<_> = chats
+            .into_iter()
+            .filter(|chat| {
+                !custom_sections
+                    .iter()
+                    .any(|section| section.session_ids.contains(&chat.id))
+            })
+            .collect();
         let ordered = if self.settings.sidebar_organization != SidebarOrganization::InOneList {
             let mut groups: Vec<(Option<(String, String)>, Vec<zeron_proto::Chat>)> = Vec::new();
             for chat in chats {
@@ -3665,13 +4138,14 @@ impl Shell {
         let ordered = pinned_chats
             .into_iter()
             .map(|chat| chat.id)
+            .chain(custom_order.iter().cloned())
             .chain(ordered)
             .collect::<Vec<_>>();
         let mut visible = project_pinned_first(&ordered, pinned_order);
         if !self.sessions_open
             && self.settings.sidebar_organization == SidebarOrganization::InOneList
         {
-            visible.retain(|id| pinned_order.contains(id));
+            visible.retain(|id| pinned_order.contains(id) || custom_order.contains(id));
         }
         if !self.pinned_open {
             let pins: HashSet<&str> = pinned_order.iter().map(String::as_str).collect();
@@ -3807,8 +4281,26 @@ impl Shell {
                 .collect::<Vec<_>>(),
         );
 
+        let custom_sections = self.active_sidebar_sections(cx);
+        let custom_count = custom_sections.len();
+        let mut custom_groups: Vec<_> = custom_sections
+            .iter()
+            .map(|section| {
+                (
+                    Some((format!("section:{}", section.id), section.name.clone())),
+                    Vec::new(),
+                )
+            })
+            .collect();
         let mut regular_groups: Vec<(Option<(String, String)>, Vec<ActiveChatRow>)> = Vec::new();
         for row in regular_rows {
+            if let Some(index) = custom_sections
+                .iter()
+                .position(|section| section.session_ids.contains(&row.chat.id))
+            {
+                custom_groups[index].1.push(row);
+                continue;
+            }
             if let Some((_, existing)) = regular_groups
                 .iter_mut()
                 .find(|(group, _)| group == &row.group)
@@ -3826,6 +4318,11 @@ impl Shell {
         if !pinned_rows.is_empty() {
             sections.push((None, pinned_rows));
         }
+        let custom_sessions = custom_groups
+            .iter()
+            .map(|(_, rows)| rows.len())
+            .sum::<usize>();
+        sections.extend(custom_groups);
         sections.extend(regular_groups);
 
         let returning = self.sidebar_session_transfer.is_none();
@@ -3929,6 +4426,12 @@ impl Shell {
         // Flat top-to-bottom slot across groups: the same order
         // `sidebar_visible_order` hands the jump shortcuts and cycling, so a
         // chip always names the key that opens its row.
+        let visible_slots: std::collections::HashMap<_, _> = self
+            .sidebar_visible_order(cx)
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| (id, index))
+            .collect();
         let mut slot = 0usize;
         let mut rendered = Vec::new();
         let mut moving_row = None;
@@ -3967,7 +4470,7 @@ impl Shell {
                 );
                 // Only rows a jump slot can reach wear a chip; row 10 onward
                 // keeps its time-ago.
-                let jump_slot = slot.checked_sub(if self.pinned_open { 0 } else { pinned_count });
+                let jump_slot = visible_slots.get(&chat.id).copied();
                 let jump_label: Option<SharedString> = if jump_hints && let Some(slot) = jump_slot {
                     let combo = keymap.get(ShortcutId::JumpSession(slot));
                     (slot < JUMP_SLOTS && !combo.is_empty()).then(|| badge_combo(combo).into())
@@ -4112,6 +4615,18 @@ impl Shell {
                 }
                 continue;
             };
+            if let Some(id) = key.strip_prefix("section:") {
+                if let Some(section) = custom_sections.iter().find(|section| section.id == id) {
+                    rendered.push(self.render_custom_sidebar_section(
+                        section.clone(),
+                        rendered_rows,
+                        drag_group,
+                        theme,
+                        cx,
+                    ));
+                    continue;
+                }
+            }
             let organization = match self.settings.sidebar_organization {
                 SidebarOrganization::ByDevice => "device",
                 SidebarOrganization::ByProject => "project",
@@ -4187,7 +4702,10 @@ impl Shell {
             rendered.push((format!("g:{collapse_key}"), height, element));
         }
         SidebarSessionRows {
-            regular_count: base_ids.len().saturating_sub(pinned_count),
+            custom_count,
+            regular_count: base_ids
+                .len()
+                .saturating_sub(pinned_count + custom_sessions),
             rows: rendered,
             pinned_count,
             moving_row,
@@ -4363,7 +4881,9 @@ impl Shell {
             state
                 .chats
                 .iter()
-                .filter(|c| c.archived)
+                // Spawned children stay out of the Archived section too — the
+                // same top-level rule as `visible_chats`.
+                .filter(|c| c.archived && c.parent_chat_id.is_none())
                 .filter(|chat| match &filter {
                     Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
                     None => true,
@@ -4520,6 +5040,7 @@ impl Shell {
 
     pub(super) fn open_add_space(&mut self, cx: &mut Context<Self>) {
         self.command_palette = None;
+        self.project_crumb_menu = popover::Popup::default();
         // "PaletteSearch" context: navigation keys stay unbound so ↑↓/←/→/⏎
         // bubble to the palette frame (`add_space_key`) instead of moving the
         // text caret — Enter and ⌘Enter are both handled there.
@@ -4556,6 +5077,8 @@ impl Shell {
             error: None,
             focus: cx.focus_handle(),
             list_scroll: gpui::ScrollHandle::new(),
+            crumb_scroll: gpui::ScrollHandle::new(),
+            crumb_key: String::new(),
             focus_pending: true,
             load_task: None,
             drives_task: None,
@@ -5169,6 +5692,56 @@ impl Shell {
         }
     }
 
+    pub(super) fn close_project_crumb_menu(&mut self, cx: &mut Context<Self>) {
+        if self.project_crumb_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.project_crumb_menu);
+            cx.notify();
+        }
+    }
+
+    /// The folders folded into the `…` crumb, in path order.
+    fn render_project_crumb_menu(
+        &self,
+        hidden: &[(String, String)],
+        closing: Option<std::time::Instant>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rows = hidden.iter().enumerate().map(|(ix, (name, full))| {
+            let full = full.clone();
+            popover::menu_row(theme, false, format!("project-crumb-menu-{ix}"))
+                .id(("project-crumb-menu", ix))
+                .child(
+                    icon(icons::FOLDER)
+                        .size(px(16.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(div().min_w_0().truncate().child(name.clone()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.project_crumb_menu = popover::Popup::default();
+                    this.add_space_descend(full.clone(), false, cx);
+                }))
+        });
+        let card = popover::popover_card(theme)
+            .id("project-crumb-menu")
+            .min_w(px(180.0))
+            .max_w(px(280.0))
+            .max_h(px(280.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_project_crumb_menu(cx)))
+            .children(rows);
+        popover::anchored_menu_below_layer(
+            "project-crumb-menu",
+            card.into_any_element(),
+            closing,
+            6.0,
+            3,
+        )
+    }
+
     /// The same glass, header, row rhythm, scroll gutters and footer as Cmd+K.
     pub(super) fn render_add_space_overlay(
         &mut self,
@@ -5189,6 +5762,7 @@ impl Shell {
         let listing = flow.browser.ready().cloned();
         let location = flow.location.clone();
         let home = flow.home.clone();
+        let browser_path = flow.browser_path.clone();
         let load_error = flow.browser.error().map(str::to_string);
         let error = flow.error.clone();
         let busy = flow.submit_busy;
@@ -5202,37 +5776,61 @@ impl Shell {
             input.set_ghost(ghost, cx);
         });
         let query = search.read(cx).text().to_string();
+        // Cmd+K's row rhythm: 30px rows, 16px muted glyphs, 8px list gutters.
         let row = |ix: usize| {
             popover::menu_row(&theme, ix == active, format!("project-result-{ix}"))
                 .id(("project-result", ix))
                 .rounded(px(popover::PALETTE_ITEM_RADIUS))
-                .h(px(32.0))
-                .flex_none()
+                .min_h(px(30.0))
+                .py(px(4.0))
+                // Pointer motion moves the highlight, so hover and keyboard
+                // never light two rows. Motion only: rows scrolling under a
+                // resting pointer must not steal the keyboard's place.
+                .on_mouse_move(cx.listener(move |this, _: &gpui::MouseMoveEvent, _, cx| {
+                    if let Some(flow) = this.add_space.as_mut()
+                        && flow.active != ix
+                    {
+                        flow.active = ix;
+                        cx.notify();
+                    }
+                }))
         };
-        let mut rows = Vec::new();
+        let glyph_el = |glyph: &'static str| {
+            icon(glyph)
+                .size(px(16.0))
+                .flex_none()
+                .text_color(theme.text_muted)
+        };
+        let label_el = |label: String| {
+            div().flex_1().min_w_0().child(popover::search_highlight(
+                label.into(),
+                Some(&query),
+                &theme,
+            ))
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
         match step {
             ProjectStep::Devices => {
                 for (ix, device) in self.add_space_devices(cx).into_iter().enumerate() {
-                    let glyph = match device.platform.as_str() {
-                        "macos" | "darwin" => icons::LAPTOP,
-                        "web" => icons::GLOBAL,
-                        "ios" | "android" => icons::SMARTPHONE,
-                        _ => icons::MONITOR,
-                    };
                     let online = self.state.read(cx).device_online(&device.id, Utc::now());
                     let name = device.name.clone();
                     rows.push(
                         row(ix)
+                            .child(glyph_el(device_glyph(&device.platform)))
+                            .child(label_el(name))
+                            .child(
+                                div()
+                                    .size(px(5.0))
+                                    .flex_none()
+                                    .rounded_full()
+                                    .bg(if online {
+                                        theme.success
+                                    } else {
+                                        theme.text_faint
+                                    }),
+                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.add_space_pick_device(device.clone(), cx)
-                            }))
-                            .child(icon(glyph).size(px(17.0)).text_color(theme.text_muted))
-                            .child(popover::search_highlight(name.into(), Some(&query), &theme))
-                            .child(div().flex_1())
-                            .child(div().size(px(5.0)).rounded_full().bg(if online {
-                                theme.success
-                            } else {
-                                theme.text_faint
                             }))
                             .into_any_element(),
                     );
@@ -5248,15 +5846,11 @@ impl Shell {
                     let label = name.clone();
                     rows.push(
                         row(ix)
+                            .child(glyph_el(glyph))
+                            .child(label_el(label))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.add_space_goto_location(name.clone(), path.clone(), cx)
                             }))
-                            .child(icon(glyph).size(px(17.0)).text_color(theme.text_muted))
-                            .child(popover::search_highlight(
-                                label.into(),
-                                Some(&query),
-                                &theme,
-                            ))
                             .into_any_element(),
                     );
                 }
@@ -5269,27 +5863,19 @@ impl Shell {
                         let is_repo = entry.is_repo;
                         rows.push(
                             row(ix)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.add_space_descend(full.clone(), is_repo, cx)
-                                }))
-                                .child(
-                                    icon(icons::FOLDER)
-                                        .size(px(17.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(popover::search_highlight(
-                                    entry.name.into(),
-                                    Some(&query),
-                                    &theme,
-                                ))
-                                .child(div().flex_1())
+                                .child(glyph_el(icons::FOLDER))
+                                .child(label_el(entry.name))
                                 .when(is_repo, |el| {
                                     el.child(
                                         icon(icons::GIT_BRANCH)
                                             .size(px(14.0))
+                                            .flex_none()
                                             .text_color(theme.text_muted),
                                     )
                                 })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.add_space_descend(full.clone(), is_repo, cx)
+                                }))
                                 .into_any_element(),
                         );
                     }
@@ -5299,28 +5885,38 @@ impl Shell {
         if let Some(flow) = self.add_space.as_mut() {
             flow.active = flow.active.min(rows.len().saturating_sub(1));
         }
-        let empty = rows.is_empty();
+        let count = rows.len();
+        // End spacing belongs to the content, so it scrolls out of the fade
+        // instead of leaving a permanent gutter beside the chrome (Cmd+K).
+        let rows = rows.into_iter().enumerate().map(|(ix, content)| {
+            div()
+                .flex_none()
+                .px(px(8.0))
+                .when(ix == 0, |row| row.pt(px(8.0)))
+                .when(ix + 1 == count, |row| row.pb(px(8.0)))
+                .child(content)
+        });
         let mut results = div()
             .id("project-results")
-            .max_h(px((f32::from(viewport.height) - 220.0).clamp(100.0, 424.0)))
+            .min_h_0()
+            .max_h(px(command_palette::palette_results_height(viewport)))
             .overflow_y_scroll()
             .track_scroll(&scroll)
-            .px(px(popover::CARD_INSET))
             .flex()
             .flex_col()
             .gap(px(SIDEBAR_LIST_GAP))
             .children(rows);
         if step == ProjectStep::Folders && loading {
-            results = results.child(popover::skeleton_rows(
+            results = results.child(div().p(px(8.0)).child(popover::skeleton_rows(
                 "project-loading",
                 &theme,
                 5,
                 cx.entity_id(),
                 cx,
-            ));
+            )));
         } else if let Some(message) = load_error.filter(|_| step == ProjectStep::Folders) {
             results = results.child(
-                popover::error_row(&theme, &message).p(px(14.0)).child(
+                popover::error_row(&theme, &message).p(px(16.0)).child(
                     popover::btn_ghost(&theme, "Retry", "project-retry")
                         .id("project-retry")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -5329,297 +5925,373 @@ impl Shell {
                         })),
                 ),
             );
-        } else if empty {
-            results = results.child(div().p(px(24.0)).text_color(theme.text_muted).child(
-                match step {
-                    ProjectStep::Devices => "No devices found",
-                    ProjectStep::Locations => "No locations found",
-                    ProjectStep::Folders if query.is_empty() => "No folders here",
-                    ProjectStep::Folders => "No folders match",
-                },
-            ));
+        } else if count == 0 && !(step == ProjectStep::Locations && drives_loading) {
+            let (title, hint) = match step {
+                ProjectStep::Devices => ("No devices found", "Try another device name.".into()),
+                ProjectStep::Locations => {
+                    ("No locations found", "Try Home or a drive name.".into())
+                }
+                ProjectStep::Folders if query.is_empty() => (
+                    "No folders here",
+                    format!(
+                        "Add this folder with {}, or go back with ←.",
+                        crate::settings::badge_combo("mod-enter")
+                    ),
+                ),
+                ProjectStep::Folders => (
+                    "No folders match",
+                    "Type a path like ~/code or /mnt to jump there.".to_string(),
+                ),
+            };
+            results = results.child(command_palette::palette_empty(&theme, title, hint));
         }
         if step == ProjectStep::Locations && drives_loading {
             results = results.child(
                 div()
-                    .px(px(8.0))
-                    .py(px(6.0))
+                    .px(px(16.0))
+                    .pb(px(8.0))
                     .text_color(theme.text_muted)
                     .text_size(crate::typography::ui_rems(11.0))
                     .child("Loading locations…"),
             );
         }
-        let crumb =
-            |id: SharedString, name: SharedString, glyph: Option<&'static str>, current: bool| {
-                div()
-                    .id(id)
-                    .h(px(26.0))
-                    .px(px(7.0))
-                    .rounded(px(6.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .cursor_pointer()
-                    .text_color(if current {
-                        theme.text
-                    } else {
-                        theme.text_muted
-                    })
-                    .when(current, |el| el.bg(theme.element_hover))
-                    .hover(|s| s.bg(theme.element_hover).text_color(theme.text))
-                    .when_some(glyph, |el, glyph| {
-                        el.child(
-                            icon(glyph)
-                                .size(px(14.0))
-                                .flex_none()
-                                .text_color(if current {
-                                    theme.text
-                                } else {
-                                    theme.text_muted
-                                }),
-                        )
-                    })
-                    .child(div().max_w(px(140.0)).truncate().child(name))
-            };
-        // Keep each chevron with its destination when a long path wraps.
-        let segment = |item: gpui::Stateful<gpui::Div>| {
-            div()
-                .flex()
-                .items_center()
-                .gap(px(2.0))
-                .child(
-                    icon(icons::ALT_ARROW_RIGHT)
-                        .size(px(12.0))
-                        .text_color(theme.text_faint),
-                )
-                .child(item)
-        };
-        let mut trail = div()
-            .flex_1()
-            .min_w_0()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(px(2.0))
-            .child(
-                crumb(
-                    "project-crumb-root".into(),
-                    "New project".into(),
-                    None,
-                    step == ProjectStep::Devices,
-                )
-                .on_click(
-                    cx.listener(|this, _, _, cx| this.add_space_back_to(ProjectStep::Devices, cx)),
-                ),
-            );
+        let results = command_palette::palette_results_fade(results, &scroll);
+
+        // Breadcrumbs: one line that scrolls sideways under edge fades rather
+        // than wrapping, and follows the open folder as the path grows. Deep
+        // paths fold their middle folders into a `…` menu.
+        let mut specs: Vec<Crumb> = vec![Crumb {
+            name: "New project".into(),
+            glyph: None,
+            current: step == ProjectStep::Devices,
+            target: CrumbTarget::Devices,
+        }];
+        let mut crumb_key = String::new();
         if let Some(device) = device {
-            let glyph = match device.platform.as_str() {
-                "macos" | "darwin" => icons::LAPTOP,
-                "ios" | "android" => icons::SMARTPHONE,
-                _ => icons::MONITOR,
-            };
-            trail =
-                trail.child(segment(
-                    crumb(
-                        "project-crumb-device".into(),
-                        device.name.into(),
-                        Some(glyph),
-                        step == ProjectStep::Locations,
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.add_space_back_to(ProjectStep::Locations, cx)
-                    })),
-                ));
+            crumb_key.push_str(&device.id);
+            specs.push(Crumb {
+                name: device.name.into(),
+                glyph: Some(device_glyph(&device.platform)),
+                current: step == ProjectStep::Locations,
+                target: CrumbTarget::Locations,
+            });
         }
+        let mut hidden: Vec<(String, String)> = Vec::new();
         if let Some((name, path)) = location {
-            let glyph = if path.is_none() {
-                icons::HOME
-            } else {
-                icons::HARD_DRIVE
-            };
-            let root = path.clone().or(home);
-            let at_root = listing
+            let root = path.clone().or(home.clone());
+            // While a descend loads, keep showing the REQUESTED path so the
+            // trail doesn't collapse to the location and pop back.
+            let open_path = listing
                 .as_ref()
-                .is_none_or(|l| root.as_deref() == Some(l.path.as_str()));
-            trail = trail.child(segment(
-                crumb(
-                    "project-crumb-location".into(),
-                    name.clone().into(),
-                    Some(glyph),
-                    at_root,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.add_space_goto_location(name.clone(), path.clone(), cx)
-                })),
-            ));
-            if let Some(listing) = listing.as_ref() {
-                for (ix, (name, full)) in breadcrumbs(&listing.path).into_iter().enumerate() {
-                    if root.as_deref().is_some_and(|root| path_under(root, &full)) {
-                        continue;
-                    }
-                    trail = trail.child(segment(
-                        crumb(
-                            format!("project-crumb-folder-{ix}").into(),
-                            name.into(),
-                            Some(icons::FOLDER),
-                            full == listing.path,
-                        )
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.add_space_descend(full.clone(), false, cx)
-                        })),
-                    ));
+                .map(|l| l.path.clone())
+                .or(browser_path)
+                .or(root.clone());
+            let at_root = open_path.is_none() || open_path == root;
+            crumb_key.push_str(&name);
+            specs.push(Crumb {
+                name: name.clone().into(),
+                glyph: Some(if path.is_none() {
+                    icons::HOME
+                } else {
+                    icons::HARD_DRIVE
+                }),
+                current: at_root,
+                target: CrumbTarget::Location(name, path),
+            });
+            if let Some(open_path) = open_path {
+                crumb_key.push_str(&open_path);
+                let mut folders: Vec<(String, String)> = breadcrumbs(&open_path)
+                    .into_iter()
+                    .filter(|(_, full)| !root.as_deref().is_some_and(|root| path_under(root, full)))
+                    .collect();
+                hidden = fold_crumb_folders(&mut folders);
+                if !hidden.is_empty() {
+                    specs.push(Crumb {
+                        name: "…".into(),
+                        glyph: None,
+                        current: false,
+                        target: CrumbTarget::More,
+                    });
+                }
+                for (name, full) in folders {
+                    specs.push(Crumb {
+                        name: name.into(),
+                        glyph: None,
+                        current: full == open_path,
+                        target: CrumbTarget::Folder(full),
+                    });
                 }
             }
         }
-        let crumbs = div()
-            .px(px(14.0))
-            .py(px(8.0))
+        if hidden.is_empty() && self.project_crumb_menu.get().is_some() {
+            self.project_crumb_menu = popover::Popup::default();
+        }
+        let menu_open = self.project_crumb_menu.is_open();
+        let menu_closing = self.project_crumb_menu.closing_since();
+        let menu_mounted = self.project_crumb_menu.get().is_some();
+        let mut trail: Vec<AnyElement> = Vec::new();
+        for (ix, spec) in specs.into_iter().enumerate() {
+            if ix > 0 {
+                trail.push(
+                    icon(icons::ALT_ARROW_RIGHT)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(theme.text_faint)
+                        .into_any_element(),
+                );
+            }
+            let group: SharedString = format!("project-crumb-{ix}").into();
+            let more = matches!(spec.target, CrumbTarget::More);
+            let color = if spec.current || (more && menu_open) {
+                theme.text
+            } else {
+                theme.text_muted
+            };
+            let long = spec.name.chars().count() > 26;
+            let mut el = div()
+                .id(group.clone())
+                .group(group.clone())
+                .relative()
+                .flex_none()
+                .h(px(24.0))
+                .px(px(6.0))
+                .rounded(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(5.0))
+                .text_color(color)
+                .when(more, |el| el.min_w(px(24.0)).justify_center())
+                .when(more && menu_open, |el| el.bg(theme.element_hover))
+                .when_some(spec.glyph, |el, glyph| {
+                    el.child(
+                        icon(glyph)
+                            .size(px(14.0))
+                            .flex_none()
+                            .text_color(color)
+                            .group_hover(group.clone(), |s| s.text_color(theme.text)),
+                    )
+                })
+                .child(div().max_w(px(180.0)).truncate().child(spec.name.clone()))
+                .when(long, |el| {
+                    el.tooltip(crate::settings::widgets::text_tooltip(spec.name.clone()))
+                });
+            // The open crumb is where you already are: no hover, no click.
+            if !spec.current {
+                el = el
+                    .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label(if more {
+                        SharedString::from("Show hidden folders")
+                    } else {
+                        spec.name.clone()
+                    })
+                    .hover(|s| s.bg(theme.element_hover).text_color(theme.text));
+                el = match spec.target {
+                    CrumbTarget::Devices => el.on_click(cx.listener(|this, _, _, cx| {
+                        this.add_space_back_to(ProjectStep::Devices, cx)
+                    })),
+                    CrumbTarget::Locations => el.on_click(cx.listener(|this, _, _, cx| {
+                        this.add_space_back_to(ProjectStep::Locations, cx)
+                    })),
+                    CrumbTarget::Location(name, path) => {
+                        el.on_click(cx.listener(move |this, _, _, cx| {
+                            this.add_space_goto_location(name.clone(), path.clone(), cx)
+                        }))
+                    }
+                    CrumbTarget::Folder(full) => el.on_click(cx.listener(move |this, _, _, cx| {
+                        this.add_space_descend(full.clone(), false, cx)
+                    })),
+                    CrumbTarget::More => el
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(|this, _, _, _| {
+                                this.project_crumb_menu.note_trigger_press()
+                            }),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            // A press that found the menu open closes it.
+                            if this.project_crumb_menu.take_press_was_open() {
+                                this.close_project_crumb_menu(cx);
+                            } else {
+                                this.project_crumb_menu.open(());
+                            }
+                            cx.notify();
+                        })),
+                };
+            }
+            if more && menu_mounted {
+                el = el.child(self.render_project_crumb_menu(&hidden, menu_closing, &theme, cx));
+            }
+            trail.push(el.into_any_element());
+        }
+        let crumb_scroll = self.add_space.as_mut().map(|flow| {
+            // Reveal the open folder whenever the path changes; otherwise
+            // leave the strip where the user scrolled it.
+            if flow.crumb_key != crumb_key {
+                flow.crumb_key = crumb_key;
+                flow.crumb_scroll
+                    .scroll_to_item(trail.len().saturating_sub(1));
+            }
+            flow.crumb_scroll.clone()
+        })?;
+        let trail = div()
+            .id("project-crumbs")
+            .flex_1()
+            .min_w_0()
+            .h_full()
             .flex()
-            .items_start()
-            .gap(px(8.0))
+            .items_center()
+            .gap(px(2.0))
+            .overflow_x_scroll()
+            .track_scroll(&crumb_scroll)
+            .children(trail);
+        // ← mirrors the Left key: up one level, and back to Cmd+K from the
+        // first step.
+        let back_label = if step == ProjectStep::Devices {
+            "Back to commands"
+        } else {
+            "Back"
+        };
+        let crumbs = div()
+            .h(px(36.0))
+            .flex_none()
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .border_b_1()
+            .border_color(crate::theme::hairline(0.06))
             .text_size(crate::typography::ui_rems(12.0))
             .child(
                 div()
                     .id("project-crumb-back")
-                    .size(px(26.0))
+                    .group("project-crumb-back")
+                    .size(px(24.0))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
                     .rounded(px(6.0))
                     .cursor_pointer()
-                    .text_color(theme.text_muted)
-                    .hover(|s| s.bg(theme.element_hover).text_color(theme.text))
+                    .role(gpui::Role::Button)
+                    .aria_label(back_label)
+                    .tooltip(crate::settings::widgets::text_tooltip(back_label))
+                    .hover(|s| s.bg(theme.element_hover))
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.add_space = None;
-                        this.toggle_command_palette(window, cx);
+                        if this.add_space.as_ref().map(|f| f.step) == Some(ProjectStep::Devices) {
+                            this.add_space = None;
+                            this.toggle_command_palette(window, cx);
+                        } else {
+                            this.add_space_go_up(cx);
+                        }
                     }))
                     .child(
                         icon(icons::ARROW_LEFT)
                             .size(px(16.0))
-                            .text_color(theme.text_muted),
+                            .text_color(theme.text_muted)
+                            .group_hover("project-crumb-back", |s| s.text_color(theme.text)),
                     ),
             )
             .child(
-                div()
-                    .w(px(1.0))
-                    .h(px(16.0))
-                    .mt(px(5.0))
-                    .flex_none()
-                    .bg(theme.border),
-            )
-            .child(trail);
-        let header = div()
-            .h(px(58.0))
-            .flex_none()
-            .px(px(18.0))
-            .flex()
-            .items_center()
-            .gap(px(12.0))
-            .border_b_1()
-            .border_color(theme.border)
-            .child(popover::palette_search_icon(&theme))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_size(crate::typography::ui_rems(15.0))
-                    .child(search),
-            )
-            .child(popover::key_hint_text(&theme, "esc", ""));
-        let footer = div()
-            .flex_none()
-            .px(px(18.0))
-            .py(px(12.0))
-            .border_t_1()
-            .border_color(theme.border)
-            .flex()
-            .items_center()
-            .gap(px(18.0))
-            .child(popover::key_hint_pair(
+                crate::edge_fade::edge_faded(18.0, false, false, trail)
+                    .fade_left(true)
+                    .fade_right(true)
+                    .fade_overflow_x(&crumb_scroll),
+            );
+
+        let shortcut = {
+            let id = ShortcutId::NewProject;
+            let combo = self.settings.keymap.get(id);
+            let valid = Keystroke::parse(&platform_combo(combo)).is_ok();
+            crate::settings::badge_combo(if valid { combo } else { id.default_combo() })
+        };
+        let can_add = !busy && listing.is_some();
+        let footer = command_palette::palette_footer()
+            .child(command_palette::command_key_hint(&theme, "↑ ↓", "Navigate"))
+            .child(command_palette::command_key_hint(
                 &theme,
-                icons::ARROW_UP,
-                icons::ARROW_DOWN,
-                "Navigate",
+                "↵",
+                if step == ProjectStep::Folders {
+                    "Open"
+                } else {
+                    "Select"
+                },
             ))
-            .child(popover::key_hint_text(&theme, "↵", "Open"))
-            .child(popover::key_hint_text(&theme, "esc", "Close"))
-            .child(div().flex_1())
+            .when(step != ProjectStep::Devices, |el| {
+                el.child(command_palette::command_key_hint(&theme, "←", "Back"))
+            })
+            .child(command_palette::command_key_hint(&theme, "Esc", "Close"))
             .when(step == ProjectStep::Folders, |el| {
-                el.child(
-                    popover::btn_ghost(
-                        &theme,
-                        if busy { "Adding…" } else { "Add project" },
-                        "project-add",
-                    )
-                    .id("project-add")
-                    .h(px(22.0))
-                    .py(px(0.0))
-                    .flex_none()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .when(busy || listing.is_none(), |el| el.opacity(0.5))
-                    .on_click(cx.listener(|this, _, _, cx| this.submit_add_space(cx)))
-                    .child(
-                        popover::key_cap(&theme)
-                            .text_size(crate::typography::ui_rems(11.0))
-                            .child(crate::settings::badge_combo("mod-enter")),
-                    ),
+                el.child(div().flex_1()).child(
+                    div()
+                        .id("project-add")
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        // Even 3px around the key chip, concentric corners
+                        // (chip 5px + 3px); negative margins keep the footer
+                        // height and the label on the footer's right inset.
+                        .pl(px(3.0))
+                        .pr(px(8.0))
+                        .py(px(3.0))
+                        .my(px(-3.0))
+                        .mr(px(-8.0))
+                        .rounded(px(8.0))
+                        .role(gpui::Role::Button)
+                        .aria_label("Add project")
+                        .when(can_add, |el| {
+                            el.cursor_pointer()
+                                .hover(|s| s.bg(crate::theme::card_selected_bg()))
+                                .active(|s| s.opacity(0.8))
+                                .on_click(cx.listener(|this, _, _, cx| this.submit_add_space(cx)))
+                        })
+                        .when(!can_add, |el| el.opacity(0.5))
+                        .child(popover::kbd_hint(
+                            &theme,
+                            &crate::settings::badge_combo("mod-enter"),
+                        ))
+                        .child(
+                            div()
+                                .text_size(crate::typography::ui_rems(10.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(if busy { "Adding…" } else { "Add project" }),
+                        ),
                 )
             });
         let card =
-            div()
-                .id("add-space-palette")
-                .track_focus(&focus)
-                .w(px(600.0_f32.min(f32::from(viewport.width) - 32.0)))
-                .flex()
-                .flex_col()
-                .rounded(px(14.0))
-                .border_1()
-                .border_color(theme.border)
-                .when(!theme.is_frost(), |el| el.shadow_lg())
-                .bg(popover::surface_bg(&theme))
-                .text_color(theme.text)
+            command_palette::palette_card("add-space-palette", &focus, viewport, &theme)
                 .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                     this.add_space_key(event, cx)
                 }))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    // The crumb menu floats outside the card; its own
+                    // mouse-down-out dismisses it without closing the palette.
+                    if this.project_crumb_menu.get().is_some() {
+                        return;
+                    }
                     this.add_space = None;
                     cx.notify();
                 }))
-                .child(header)
+                .child(command_palette::palette_header(
+                    &theme,
+                    search.into_any_element(),
+                    popover::kbd_hint(&theme, &shortcut),
+                ))
                 .child(crumbs)
-                .child(div().min_h_0().py(px(popover::CARD_INSET)).child(results))
+                .child(results)
                 .when_some(error, |el, error| {
                     el.child(
                         div()
-                            .px(px(18.0))
+                            .px(px(16.0))
                             .pb(px(8.0))
+                            .text_size(crate::typography::ui_rems(12.0))
                             .text_color(theme.danger)
                             .child(error),
                     )
                 })
                 .child(footer);
-        Some(
-            gpui::deferred(
-                gpui::anchored()
-                    .position(gpui::point(px(0.0), px(0.0)))
-                    .child(
-                        div()
-                            .occlude()
-                            .w(viewport.width)
-                            .h(viewport.height)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(crate::frost::frosted(14.0, crate::frost::MENU_BLUR, card)),
-                    ),
-            )
-            .priority(2)
-            .into_any_element(),
-        )
+        Some(command_palette::palette_overlay(viewport, card))
     }
 
     // ---- space context menu / rename / delete overlays ----
@@ -5866,6 +6538,7 @@ mod tests {
             created_at: Utc.timestamp_opt(5, 0).unwrap(),
             harness_session_id: None,
             harness_session_cwd: None,
+            parent_chat_id: None,
             space_id: None,
             last_seen_at: None,
             room_gen: None,
@@ -5941,7 +6614,20 @@ impl Shell {
                 flow.home = Some(path.clone());
             }
             let names = match path.as_str() {
-                "/home/alex" => vec!["Desktop", "Documents", "Downloads", "Projects"],
+                "/home/alex" => vec![
+                    "Desktop",
+                    "Documents",
+                    "Downloads",
+                    "Movies",
+                    "Music",
+                    "Pictures",
+                    "Projects",
+                    "Public",
+                    "dotfiles",
+                    "notes",
+                    "sandbox",
+                    "scratch",
+                ],
                 "/projects" | "/home/alex/Projects" => vec!["fieldnotes", "mobile-app", "website"],
                 _ => vec!["assets", "docs", "src", "tests"],
             };
@@ -5962,6 +6648,16 @@ impl Shell {
 #[cfg(test)]
 mod project_flow_tests {
     use super::*;
+
+    #[test]
+    fn deep_crumb_trails_fold_all_but_the_deepest_folders() {
+        let mut short = vec!["a", "b", "c"];
+        assert!(fold_crumb_folders(&mut short).is_empty());
+        assert_eq!(short, ["a", "b", "c"]);
+        let mut deep = vec!["a", "b", "c", "d", "e"];
+        assert_eq!(fold_crumb_folders(&mut deep), ["a", "b", "c"]);
+        assert_eq!(deep, ["d", "e"]);
+    }
 
     #[gpui::test]
     fn devices_locations_folders_and_back_clear_stale_state(cx: &mut gpui::TestAppContext) {

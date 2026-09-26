@@ -38,6 +38,7 @@ fn harness() -> ClaudeHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        mcp: None,
         prompt: prompt.into(),
         harness: None,
         model: None,
@@ -335,6 +336,63 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
 }
 
 #[tokio::test]
+async fn ultrathink_preserves_selected_commands_on_initial_and_steered_sends() {
+    use zeron_proto::ReasoningLevel;
+    use zeron_proto::invocation::{Invocation, SkillCommand, harness_prompt};
+
+    let invocations = [
+        Invocation::Command {
+            name: "review".into(),
+        },
+        Invocation::Skill {
+            name: "review".into(),
+            path: "/repo/.claude/skills/review/SKILL.md".into(),
+            command: Some(SkillCommand {
+                name: "review".into(),
+                harness: HarnessId::ClaudeCode,
+            }),
+        },
+    ];
+    for invocation in invocations {
+        for prefix in ["", " ", "   ", "\n", "\r\n  "] {
+            let prompt = harness_prompt(
+                &format!("{prefix}{} scenario:command-echo", invocation.link()),
+                HarnessId::ClaudeCode,
+            );
+            let expected = format!("{prefix}/review scenario:command-echo");
+            let (initial_controls, _steer, _token) = controls("A");
+            let mut initial = request(&prompt);
+            initial.reasoning = Some(ReasoningLevel::Ultrathink);
+            let events = run_to_end(&harness(), initial, initial_controls).await;
+            assert!(
+                events.contains(&AgentEvent::TextDelta {
+                    text: expected.clone()
+                }),
+                "{events:?}"
+            );
+
+            let (steer_controls, steer, _token) = controls("A");
+            steer
+                .send(SteerMessage {
+                    prompt,
+                    message_id: None,
+                })
+                .await
+                .unwrap();
+            let mut initial = request("scenario:steer");
+            initial.reasoning = Some(ReasoningLevel::Ultrathink);
+            let events = run_to_end(&harness(), initial, steer_controls).await;
+            assert!(
+                events.contains(&AgentEvent::TextDelta {
+                    text: format!("steered:{expected}")
+                }),
+                "{events:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn steering_lines_are_written_to_stdin_mid_run() {
     let (controls, steer, _token) = controls("A");
     steer
@@ -359,6 +417,18 @@ async fn steering_lines_are_written_to_stdin_mid_run() {
             _ => None,
         })
         .expect("Steered emitted");
+    let boundary = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }))
+        .unwrap();
+    let continuation = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "-still-first"))
+        .unwrap();
+    assert!(
+        continuation < boundary,
+        "sending input must not split unconsumed response text"
+    );
     assert!(steered.0.is_some() && steered.1.is_some());
     assert_ne!(steered.0, steered.1);
 
@@ -693,4 +763,169 @@ async fn title_run_disables_tools_and_denies_unexpected_permissions() {
         )),
         "{events:?}"
     );
+}
+
+#[tokio::test]
+async fn command_discovery_tracks_project_changes() {
+    let h = harness();
+    for name in ["project-a", "project-b"] {
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join(".command-fixture"), name).unwrap();
+        let commands = h
+            .commands_for(&cwd.path().canonicalize().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, name);
+    }
+}
+
+#[tokio::test]
+async fn shared_skill_colliding_with_builtin_keeps_file_delivery() {
+    use zeron_proto::invocation::{Invocation, harness_prompt};
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cwd.path().join(".git")).unwrap();
+    let directory = cwd.path().join(".agents/skills/compact");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("SKILL.md");
+    std::fs::write(&path, "---\nname: compact\n---\nCompact JSON fixtures.").unwrap();
+
+    let harness = harness();
+    let commands = harness.commands_for(cwd.path()).await.unwrap();
+    assert!(commands.iter().any(|command| command.name == "compact"));
+    let skill = harness
+        .skills(cwd.path())
+        .await
+        .unwrap()
+        .unwrap()
+        .into_iter()
+        .find(|skill| skill.path == path.to_string_lossy())
+        .unwrap();
+    assert!(skill.command.is_none());
+    let invocation = Invocation::Skill {
+        name: skill.name,
+        path: skill.path,
+        command: skill.command,
+    };
+    assert_eq!(
+        harness_prompt(
+            &format!("{} data.json", invocation.link()),
+            HarnessId::ClaudeCode
+        ),
+        format!("Use the skill {} data.json", invocation.prompt_text())
+    );
+}
+
+#[tokio::test]
+async fn claude_skills_follow_native_availability_and_dollar_selection_keeps_arguments() {
+    use zeron_proto::{
+        HarnessId,
+        invocation::{Invocation, harness_prompt},
+    };
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::create_dir(cwd.path().join(".git")).unwrap();
+    for name in ["review", "disabled-plugin"] {
+        let directory = cwd.path().join(".claude/skills").join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Test\n---\nInstructions"),
+        )
+        .unwrap();
+    }
+    let skills = harness().skills(cwd.path()).await.unwrap().unwrap();
+    assert!(!skills.iter().any(|skill| skill.name == "disabled-plugin"));
+    let skill = skills
+        .into_iter()
+        .find(|skill| skill.name == "review")
+        .unwrap();
+    assert_eq!(
+        skill.command.as_ref().unwrap().harness,
+        HarnessId::ClaudeCode
+    );
+    let invocation = Invocation::Skill {
+        name: skill.name,
+        path: skill.path,
+        command: skill.command,
+    };
+    assert_eq!(
+        harness_prompt(&format!("{} 123", invocation.link()), HarnessId::ClaudeCode),
+        "/review 123"
+    );
+}
+
+/// Rapid `now` steers: the CLI replays only the last one. The replay must
+/// confirm every earlier steer too, and the run must still end.
+#[tokio::test]
+async fn a_replay_confirms_superseded_steers_and_the_turn_ends() {
+    let (controls, steer, _token) = controls("A");
+    for prompt in ["first steer", "second steer"] {
+        steer
+            .send(SteerMessage {
+                prompt: prompt.into(),
+                message_id: None,
+            })
+            .await
+            .expect("steer queued");
+    }
+    let events = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        run_to_end(&harness(), request("scenario:superseded-steers"), controls),
+    )
+    .await
+    .expect("run must end");
+    let steered = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Steered { .. }))
+        .count();
+    assert_eq!(steered, 2, "{events:?}");
+    let dones: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Done { .. }))
+        .collect();
+    assert_eq!(dones.len(), 1, "{events:?}");
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "answered-both".into()
+    }));
+    assert!(matches!(
+        events.last(),
+        Some(AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        })
+    ));
+}
+
+/// A steer the CLI never replays must not hold the turn end forever.
+#[tokio::test]
+async fn an_unreplayed_steer_releases_the_turn_end() {
+    let (controls, steer, _token) = controls("A");
+    steer
+        .send(SteerMessage {
+            prompt: "absorbed steer".into(),
+            message_id: None,
+        })
+        .await
+        .expect("steer queued");
+    let started = std::time::Instant::now();
+    let mut stream = harness()
+        .run(request("scenario:absorbed-steer"), controls)
+        .await
+        .expect("run starts");
+    let mut steered = 0;
+    let done = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while let Some(event) = stream.next().await {
+            match event.expect("event") {
+                AgentEvent::Steered { .. } => steered += 1,
+                AgentEvent::Done { status, .. } => return status,
+                _ => {}
+            }
+        }
+        panic!("stream ended without Done");
+    })
+    .await
+    .expect("turn end must be released");
+    assert_eq!(done, DoneStatus::Completed);
+    assert_eq!(steered, 1);
+    assert!(started.elapsed() >= std::time::Duration::from_secs(4));
 }

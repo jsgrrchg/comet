@@ -29,6 +29,7 @@ final class WorkspaceStore {
     private(set) var presence: [String: Int64] = [:]  // deviceId → last beat ms
     private(set) var changeRequestSnapshots: [ChangeRequestWatchKey: CheckoutChangeRequestStatus] = [:]
     private(set) var connected = false
+    private(set) var retryAt: Date?
     /// True once ANY transport delivered server state this session (socket
     /// state frame or HTTPS pull). Drives the "connecting" spinner: with the
     /// pull-first bootstrap this flips in ~1 round trip, while the socket
@@ -229,6 +230,7 @@ final class WorkspaceStore {
         case .connected:
             let reconnected = !connected
             connected = true
+            retryAt = nil
             registryJoinedAt = nowMs()
             if reconnected {
                 restartChangeRequestStreams(resetUnsupported: true)
@@ -252,8 +254,9 @@ final class WorkspaceStore {
         case .presence(let device, let at):
             presence[device] = at
             presenceReceivedAt[device] = nowMs()
-        case .disconnected:
+        case .disconnected(let retryAfterMs):
             connected = false
+            retryAt = Date().addingTimeInterval(TimeInterval(retryAfterMs) / 1_000)
             registryJoinedAt = nil
             doc.markDisconnected()
         }
@@ -380,7 +383,8 @@ final class WorkspaceStore {
                         createdAt: f["createdAt"]?.int64Value ?? 0,
                         spaceId: f["spaceId"]?.stringValue,
                         lastSeenAt: f["lastSeenAt"]?.int64Value,
-                        roomGen: f["roomGen"]?.int64Value.map(Int.init))
+                        roomGen: f["roomGen"]?.int64Value.map(Int.init),
+                        parentChatId: f["parentChatId"]?.stringValue)
         }
 
         var rows: [String: SessionRow] = [:]
@@ -412,7 +416,7 @@ final class WorkspaceStore {
     /// attention-sorted.
     var overviewChats: [Chat] {
         let liveSpaceIds = Set(spaces.map(\.id))
-        let live = chats.filter { !$0.archived && ($0.spaceId.map(liveSpaceIds.contains) ?? true) }
+        let live = chats.filter { !$0.archived && $0.parentChatId == nil && ($0.spaceId.map(liveSpaceIds.contains) ?? true) }
         return sortPinnedFirst(live, pinnedSessionIds: pinnedSessionIds)
     }
 
@@ -424,7 +428,7 @@ final class WorkspaceStore {
     /// Sessions section — so it follows that list's ordering instead.
     func chats(in spaceId: String) -> [Chat] {
         sortPinnedFirst(
-            chats.filter { !$0.archived && $0.spaceId == spaceId },
+            chats.filter { !$0.archived && $0.parentChatId == nil && $0.spaceId == spaceId },
             pinnedSessionIds: pinnedSessionIds
         )
     }
@@ -563,7 +567,7 @@ final class WorkspaceStore {
         do {
             return try await listFoldersDetailed(deviceId: deviceId, path: path)
         } catch {
-            lastRelayError = error.localizedDescription
+            lastRelayError = describeTransportError(error)
             return nil
         }
     }
@@ -655,7 +659,7 @@ final class WorkspaceStore {
                 .call(method: "SwitchRef", params: ["repoPath": repoPath, "refName": refName])
             return nil
         } catch {
-            return error.localizedDescription
+            return describeTransportError(error)
         }
     }
 

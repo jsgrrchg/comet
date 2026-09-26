@@ -80,14 +80,17 @@ impl Detector {
             if let Some(sound) = previous.and_then(|previous| {
                 status.sound_since(&previous, state.send_pending(&session.chat_id, now))
             }) {
+                // Child chats are surfaced inside their parent and should not
+                // generate separate notifications. Keep their detector baseline.
+                let chat = state.chats.iter().find(|chat| chat.id == session.chat_id);
+                if !chat.is_some_and(|chat| chat.parent_chat_id.is_none()) {
+                    continue;
+                }
                 let audio = settings.session_sound_enabled(sound)
                     && (sound != Sound::Attention || self.attention.should_play(instant));
                 notices.push(Notice {
                     chat_id: Some(session.chat_id.clone()),
-                    title: state
-                        .chats
-                        .iter()
-                        .find(|chat| chat.id == session.chat_id)
+                    title: chat
                         .and_then(|chat| chat.title.clone())
                         .unwrap_or_else(|| "New session".into()),
                     body: match sound {
@@ -187,6 +190,29 @@ mod tests {
         }
     }
 
+    fn chat(parent_chat_id: Option<&str>) -> zeron_proto::Chat {
+        zeron_proto::Chat {
+            id: "shared".into(),
+            device_id: "local".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+            parent_chat_id: parent_chat_id.map(str::to_owned),
+        }
+    }
+
     #[gpui::test]
     fn three_views_and_repeated_installation_emit_one_completion(cx: &mut gpui::TestAppContext) {
         let (owner, service, views) = cx.update(|cx| {
@@ -200,6 +226,7 @@ mod tests {
                 .collect::<Vec<_>>();
             owner.update(cx, |state, cx| {
                 state.connection = crate::state::ConnectionStatus::Ready;
+                state.chats = vec![chat(None)];
                 state.apply_sessions(vec![session()]);
                 cx.notify();
             });
@@ -230,6 +257,7 @@ mod tests {
     fn focus_preferences_and_profile_replacement_do_not_replay_alerts() {
         let mut state = AppState::new();
         state.connection = crate::state::ConnectionStatus::Ready;
+        state.chats = vec![chat(None)];
         state.sessions = vec![session()];
         let mut detector = Detector::default();
         let settings = UiSettings::default();
@@ -251,6 +279,35 @@ mod tests {
                 .is_empty()
         );
         state.runtime_epoch += 1;
+        assert!(
+            detector
+                .collect(&state, &settings, false, now, instant)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn child_chat_completion_does_not_emit_a_separate_notification() {
+        let mut state = AppState::new();
+        state.connection = crate::state::ConnectionStatus::Ready;
+        state.chats = vec![chat(Some("parent"))];
+        state.sessions = vec![session()];
+        let mut detector = Detector::default();
+        let settings = UiSettings::default();
+        let now = Utc::now();
+        let instant = Instant::now();
+        assert!(
+            detector
+                .collect(&state, &settings, false, now, instant)
+                .is_empty()
+        );
+        state.sessions[0].last_completed_turn = Some("turn-1".into());
+        assert!(
+            detector
+                .collect(&state, &settings, false, now, instant)
+                .is_empty()
+        );
+        state.chats[0].parent_chat_id = None;
         assert!(
             detector
                 .collect(&state, &settings, false, now, instant)

@@ -81,7 +81,7 @@ pub(crate) const QUEUE_COMPOSER_OVERLAP: f32 = 18.0;
 const NEW_THREAD_SELECTOR_ROW_HEIGHT: f32 = 20.0;
 // Accommodate the 24px usage indicator and PR badge without overflowing the
 // row's equal 8px top/bottom gutters.
-const SESSION_FOOTER_HEIGHT: f32 = 24.0;
+pub(crate) const SESSION_FOOTER_HEIGHT: f32 = 24.0;
 
 /// Route chrome dissolves around the middle of the shared-element move. The
 /// two ramps never overlap, which avoids duplicate picker ids/popovers while
@@ -5383,6 +5383,8 @@ pub struct Composer {
     /// The footer's rings: plan usage of the session harness's live
     /// account, and context occupancy — each opening a popover.
     account_usage: Entity<crate::account_usage::AccountUsage>,
+    /// A side chat's composer: its footer keeps only the context ring.
+    side_chat: bool,
     _picker_focus: Subscription,
     _input_events: Subscription,
 }
@@ -5595,6 +5597,7 @@ impl Composer {
             _observe: observe,
             _pickers_observe: pickers_observe,
             account_usage,
+            side_chat: false,
             _picker_focus: picker_focus,
             _input_events: input_events,
         };
@@ -5749,6 +5752,33 @@ impl Composer {
     }
 
     pub fn show_appshot_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.show_error(message, cx);
+    }
+
+    /// Mark this as a side chat's composer: below the input it shows only
+    /// the context ring (no checkout/ref footer, no plan usage).
+    pub(crate) fn set_side_chat(&mut self, cx: &mut Context<Self>) {
+        self.side_chat = true;
+        cx.notify();
+    }
+
+    /// Whether the draft holds anything a close would lose: text, staged
+    /// attachments or appshots, or staged review comments.
+    pub(crate) fn has_draft(&self, cx: &App) -> bool {
+        composer_has_content(
+            self.input.read(cx).text(),
+            self.staged().len() + self.staged_appshots().len(),
+            self.staged_comments(cx).len(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure(&self) -> Option<&SharedString> {
+        self.failure.as_ref()
+    }
+
+    /// Show a dismissable failure chip for the current draft's session.
+    pub(crate) fn show_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.failure = Some(message.into());
         self.failure_key = Some(self.current_key.clone());
         cx.notify();
@@ -8129,6 +8159,7 @@ impl Composer {
                     .is_some();
                 let command = SessionCommandPayload::Run {
                     request: RunRequest {
+                        mcp: None,
                         prompt: content.clone(),
                         harness: resolved.harness,
                         model: resolved.model.clone(),
@@ -9592,12 +9623,14 @@ impl Render for Composer {
             session_chrome
         };
         let container = if bottom_slot > 0.0 {
-            let footer = (session_chrome_opacity > 0.0).then(|| {
+            let footer = (session_chrome_opacity > 0.0 && !self.side_chat).then(|| {
                 self.pickers
                     .update(cx, |pickers, cx| pickers.render_footer(cx))
             });
             if session_chrome_opacity > 0.0 {
-                let harness = self.pickers.read(cx).resolved(cx).harness;
+                let harness = (!self.side_chat)
+                    .then(|| self.pickers.read(cx).resolved(cx).harness)
+                    .flatten();
                 let target = {
                     let state = self.state.read(cx);
                     state

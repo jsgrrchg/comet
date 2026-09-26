@@ -361,6 +361,9 @@ impl EngineHandle {
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let service_for_boot = assembled_service.clone();
+        // Agents only learn a port THIS window serves: a lost bind race must
+        // not point their injected MCP server at some other engine.
+        let served_ipc_port = ipc_task.as_ref().map(|_| engine_config.ipc_port);
         // The instance lock rides into the boot task and is consumed by
         // assembly — held through sign-in onboarding too, because this process
         // owns the data dir from the moment it decided to embed.
@@ -396,6 +399,9 @@ impl EngineHandle {
             match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
+                    if let Some(port) = served_ipc_port {
+                        engine_runtime.core().sessions.set_ipc_port(port);
+                    }
                     *runtime_for_boot.lock().await = Some(engine_runtime);
                     if service_for_boot.set(service).is_err() {
                         state_tx.send_replace(DeferredEngineState::Failed(
@@ -685,6 +691,8 @@ pub struct AppState {
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
+    /// Fork RPC may arrive ahead of its registry row on a remote device.
+    pending_side_chat: Option<Chat>,
     pub sessions: Vec<Session>,
     /// Synced user/org sidebar pin state. Local workspaces deliberately ignore
     /// this and continue reading their device-local settings entry.
@@ -819,6 +827,7 @@ impl AppState {
             connectivity_observed: false,
             spaces: Vec::new(),
             chats: Vec::new(),
+            pending_side_chat: None,
             sessions: Vec::new(),
             sidebar_preferences: SidebarPreferencesState::default(),
             session_presentation: None,
@@ -1220,6 +1229,13 @@ impl AppState {
     }
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
+        if let Some(pending) = &self.pending_side_chat {
+            if chats.iter().any(|chat| chat.id == pending.id) {
+                self.pending_side_chat = None;
+            } else {
+                chats.push(pending.clone());
+            }
+        }
         sort_chats(&mut chats);
         self.chats = chats;
         self.chats_synced = true;
@@ -1849,6 +1865,36 @@ impl AppState {
         }
     }
 
+    /// A send the host held for the next turn shows as its queue row, not
+    /// as an echo: drop echoes (and the pending-send overlay) for queued ids.
+    pub fn apply_queue(&mut self, items: Vec<zeron_doc::QueuedMessage>) {
+        if let Some(chat_id) = self.selected_chat.as_deref() {
+            let mut changed = false;
+            if let Some(echoes) = self.echoes.borrow_mut().get_mut(chat_id) {
+                let before = echoes.len();
+                echoes.retain(|echo| !items.iter().any(|q| q.id == echo.id));
+                if echoes.len() != before {
+                    self.transcript_revision = self.transcript_revision.wrapping_add(1);
+                    changed = true;
+                }
+            }
+            let queued_pending = self
+                .pending_sends
+                .borrow()
+                .get(chat_id)
+                .is_some_and(|p| items.iter().any(|q| q.id == p.message_id));
+            if queued_pending {
+                self.pending_sends.borrow_mut().remove(chat_id);
+                changed = true;
+            }
+            if changed {
+                self.optimistic_revision
+                    .set(self.optimistic_revision.get().wrapping_add(1));
+            }
+        }
+        self.queue = items;
+    }
+
     /// Shared optimistic rows; the short borrow never crosses an await.
     pub fn pending_echoes(&self) -> Ref<'_, [SessionMessageEntry]> {
         Ref::map(self.echoes.borrow(), |echoes| {
@@ -2114,6 +2160,7 @@ impl AppState {
         self.session_presence_presentation.clear();
         self.spaces.clear();
         self.chats.clear();
+        self.pending_side_chat = None;
         self.sessions.clear();
         self.sidebar_preferences = SidebarPreferencesState::default();
         self.session_presentation = None;
@@ -2138,6 +2185,31 @@ impl AppState {
         self.local_device_id = None;
         self.update = None;
         cx.notify();
+    }
+
+    /// Independent selection and transcript subscriptions over the same engine.
+    pub(crate) fn side_chat_state(
+        parent: &Entity<Self>,
+        chat: Chat,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let source = parent.read(cx);
+        let engine = source.engine.clone();
+        let mut state = Self::new();
+        state.chats = source.chats.clone();
+        if !state.chats.iter().any(|c| c.id == chat.id) {
+            state.chats.push(chat.clone());
+        }
+        state.spaces = source.spaces.clone();
+        state.devices = source.devices.clone();
+        state.data_dir = source.data_dir.clone();
+        state.auto_selected = true;
+        state.pending_side_chat = Some(chat.clone());
+        if let Some(engine) = engine {
+            state.attach_engine(engine, cx);
+        }
+        state.select_chat(Some(chat.id), cx);
+        state
     }
 
     // ---- gpui glue ----
@@ -3026,7 +3098,7 @@ fn spawn_queue_watch(
                 let alive = this.update(cx, |state, cx| {
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                        state.queue = frame.items;
+                        state.apply_queue(frame.items);
                         cx.notify();
                     }
                 });
@@ -4572,6 +4644,42 @@ mod tests {
     }
 
     #[test]
+    fn side_chats_remain_addressable_but_do_not_appear_in_sidebar() {
+        let mut state = AppState::new();
+        let main = chat("main", 0, None);
+        let mut side = chat("side", 1, Some(2));
+        side.parent_chat_id = Some(main.id.clone());
+        state.apply_chats(vec![main, side]);
+        assert_eq!(
+            state
+                .visible_chats()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["main"]
+        );
+        state.selected_chat = Some("side".into());
+        assert_eq!(
+            state.selected_chat_row().unwrap().parent_chat_id.as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn remote_fork_waits_for_registry_then_observes_deletion() {
+        let mut state = AppState::new();
+        let mut side = chat("side", 1, None);
+        side.parent_chat_id = Some("main".into());
+        state.selected_chat = Some(side.id.clone());
+        state.pending_side_chat = Some(side.clone());
+        state.apply_chats(vec![]);
+        assert_eq!(state.selected_chat.as_deref(), Some("side"));
+        state.apply_chats(vec![side]);
+        assert!(state.pending_side_chat.is_none());
+        state.apply_chats(vec![]);
+        assert_eq!(state.selected_chat, None);
+    }
+
+    #[test]
     fn jump_slots_count_the_rows_the_sidebar_draws() {
         let now = Utc::now();
         let mut state = AppState::new();
@@ -4620,6 +4728,44 @@ mod tests {
         // An already archived chat stays put — the shortcut never unarchives.
         state.selected_chat = Some("a".into());
         assert_eq!(state.archivable_selected_chat(), None);
+    }
+
+    #[test]
+    fn a_send_held_in_the_queue_drops_its_echo_and_pending_overlay() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        let echo = |id: &str| SessionMessageEntry {
+            id: id.into(),
+            role: zeron_doc::MessageRole::User,
+            parts: vec![],
+            created_at: 0,
+            device_id: "local".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let row = |id: &str| zeron_doc::QueuedMessage {
+            id: id.into(),
+            text: "held".into(),
+            attachments: vec![],
+            hold_for_turn_end: false,
+            issued_by: "local".into(),
+            issued_at: 0,
+            edited_at: None,
+            delivery_gate: None,
+        };
+        state.push_echo("c1", echo("held"));
+        state.push_echo("c1", echo("sent"));
+        state.begin_pending_send("c1", "held", Utc::now());
+        state.apply_queue(vec![row("held")]);
+        let ids: Vec<_> = state
+            .pending_echoes()
+            .iter()
+            .map(|e| e.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["sent"]);
+        assert!(!state.pending_sends.borrow().contains_key("c1"));
+        assert_eq!(state.queue.len(), 1);
     }
 
     #[test]

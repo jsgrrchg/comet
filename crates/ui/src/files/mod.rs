@@ -32,6 +32,7 @@ pub mod mutations;
 pub mod preview;
 mod rename;
 pub mod search;
+mod sections;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tree;
@@ -171,7 +172,7 @@ pub(crate) fn workspace_path_drag_ghost(
     cx.new(|_| WorkspacePathDragGhost { payload })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum FilesEvent {
     AddToChat {
         path: String,
@@ -195,6 +196,22 @@ pub enum FilesEvent {
     ShowAllFilesChanged(bool),
     CloseReady,
     CloseCancelled,
+    /// A footer row: open this subagent's transcript in the right pane.
+    OpenSubagent {
+        doc_id: String,
+        title: String,
+        frozen: bool,
+    },
+    /// A footer row: open this side chat (by id) in the right pane.
+    OpenChildChat(String),
+    ChildChatContextMenu {
+        chat_id: String,
+        position: Point<Pixels>,
+    },
+    /// The Chats header's "+": start a fresh side chat of the active chat.
+    NewChildChat,
+    /// The Chats header's fork: fork the active chat into a side chat.
+    ForkChat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,6 +287,8 @@ pub struct FilesSurface {
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
     started: bool,
+    /// The Subagents / Chats footer under the tree.
+    sections: sections::ExplorerSections,
     _observe: Subscription,
     _search_events: Subscription,
 }
@@ -298,6 +317,9 @@ impl Render for FilesSurface {
             self.render_explorer(&theme, cx).into_any_element()
         };
         let editor_context_menu = self.render_editor_context_menu(&theme, cx);
+        // The explorer docks its Subagents / Chats sections under the tree;
+        // an editor surface has no footer.
+        let sections = (!is_editor).then(|| self.render_sections(&theme, cx));
         div()
             .id(SharedString::from(format!(
                 "files-surface-{}",
@@ -317,6 +339,7 @@ impl Render for FilesSurface {
                     .as_ref()
                     .map(|message| crate::popover::error_row(&theme, message).into_any_element()),
             )
+            .children(sections)
             .children(editor_context_menu)
             .children(self.render_tree_context_menu(&theme, cx))
             .children(self.render_tree_delete(&theme, window, cx))
@@ -329,6 +352,19 @@ impl FilesSurface {
         theme: &crate::theme::Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let projectless_root = {
+            let state = self.state.read(cx);
+            state
+                .chats
+                .iter()
+                .find(|chat| chat.id == self.chat_id && chat.space_id.is_none())
+                .map(|chat| {
+                    let device = state
+                        .device_name(&chat.device_id)
+                        .unwrap_or(&chat.device_id);
+                    format!("Files in {} · {device}", chat.cwd.as_deref().unwrap_or("~"))
+                })
+        };
         let phase = self.tree.node("").map(|root| root.load.clone());
         let content = if !self.search_state.query.is_empty() {
             self.render_search_results(cx)
@@ -383,6 +419,19 @@ impl FilesSurface {
             .min_w_0()
             .flex()
             .flex_col()
+            .when_some(projectless_root, |element, label| {
+                element.child(
+                    div()
+                        .id("files-projectless-root")
+                        .flex_none()
+                        .px(px(10.0))
+                        .py(px(5.0))
+                        .text_size(px(10.0))
+                        .text_color(theme.text_faint)
+                        .truncate()
+                        .child(SharedString::from(label)),
+                )
+            })
             .when_some(self.git_status_notice(cx), |element, notice| {
                 element.child(
                     div()
@@ -558,6 +607,9 @@ impl FilesSurface {
                 this.ensure_loaded(cx);
             }
             this.sync_active_markdown_comments(cx);
+            if !this.presentation.is_editor() {
+                this.refresh_sections(cx);
+            }
         });
         // The list state exposes no scroll handle, so the floating rail
         // bridges scroll activity through the scroll handler (the
@@ -620,6 +672,7 @@ impl FilesSurface {
             loads: HashMap::new(),
             error: None,
             started: false,
+            sections: sections::ExplorerSections::default(),
             _observe: observe,
             _search_events: search_events,
         };
@@ -784,7 +837,18 @@ impl FilesSurface {
         if self.request_context.is_none() {
             return;
         }
-        self.ensure_watch(cx);
+        // A projectless explorer may not have a resolvable home on its host.
+        // Start its watcher only after the root listing succeeds.
+        let projectless_explorer = !self.presentation.is_editor()
+            && self
+                .state
+                .read(cx)
+                .chats
+                .iter()
+                .any(|chat| chat.id == self.chat_id && chat.space_id.is_none());
+        if !projectless_explorer {
+            self.ensure_watch(cx);
+        }
         if self.presentation.is_editor()
             && !self.preview.has_active()
             && let Some(path) = self.editor_path.clone()
@@ -966,6 +1030,9 @@ impl FilesSurface {
                         surface.mutation_capabilities = page.mutation_capabilities;
                         surface.error = None;
                         surface.tree.apply_page(page, generation);
+                        if directory.is_empty() {
+                            surface.ensure_watch(cx);
+                        }
                     }
                     Err(error) => {
                         let message = error.to_string();

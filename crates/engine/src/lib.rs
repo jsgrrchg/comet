@@ -48,8 +48,8 @@ pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use change_requests::{ChangeRequestCacheKey, CheckoutChangeRequests};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
-    capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
-    read_diff_file_text, snapshot_tree, working_diff_base,
+    capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff,
+    discard_working_tree, merge_base, read_diff_file_text, snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
@@ -434,12 +434,11 @@ impl EngineCore {
             zeron_rpc::HostRelayConfig::new(edge_url, self.device_id.clone(), Arc::new(auth));
         let doc_host = self.doc_host.clone();
         let on_nudge: zeron_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
-            // Opening the doc joins its room + syncs; drain fires on the change
-            // subscription — the command executes with no standing per-chat socket.
-            match doc_host.open(&chat_id) {
-                Ok(_) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
+            match doc_host.enqueue_wakeup(&chat_id) {
+                Ok(()) => true,
                 Err(err) => {
-                    tracing::warn!(chat = %chat_id, error = %err, "nudge: open failed")
+                    tracing::warn!(chat = %chat_id, %err, "nudge: durable admission failed; withholding ACK");
+                    false
                 }
             }
         });
@@ -895,6 +894,9 @@ impl Engine {
             stop_tx,
         });
         let server = serve_ipc(config.ipc_port, service).await?;
+        // Only a port this process actually serves goes to agents: the
+        // injected MCP server must dial back into THIS engine.
+        runtime.core().sessions.set_ipc_port(config.ipc_port);
 
         tokio::select! {
             result = shutdown_signal() => result?,

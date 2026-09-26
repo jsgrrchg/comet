@@ -19,10 +19,11 @@ impl Render for ModalSelectionHarness {
         let styled = StyledText::new(text.clone());
         let layout = styled.layout().clone();
         let underlay = canvas(
-            |_, _, _| (),
-            move |_, _, window, _| {
+            |bounds, window, _| window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal),
+            move |_, hitbox, window, _| {
                 render::paint_text_selection(
                     window,
+                    hitbox,
                     &BACKGROUND_KEY.into(),
                     &text,
                     &layout,

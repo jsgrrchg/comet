@@ -107,6 +107,17 @@ impl Shell {
         }
     }
 
+    fn dispatch_right_tab_close_this(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(menu) = self.right_tab_menu.as_open().cloned() else {
+            return;
+        };
+        let valid = self.right_tab_menu_is_valid(&menu, cx);
+        self.close_right_tab_menu(cx);
+        if valid {
+            self.close_right_surface(menu.target, window, cx);
+        }
+    }
+
     fn right_tab_copy_path(&self, menu: &RightTabMenuState, cx: &App) -> Option<String> {
         if !self.right_tab_menu_is_valid(menu, cx) {
             return None;
@@ -149,6 +160,17 @@ impl Shell {
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_right_tab_menu(cx)))
             .flex()
             .flex_col();
+        card = card.child(
+            popover::menu_row(&theme, false, "right-tab-close-this")
+                .id("right-tab-close-this")
+                .role(gpui::Role::MenuItem)
+                .aria_label("Close Tab")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.dispatch_right_tab_close_this(window, cx);
+                }))
+                .child("Close Tab"),
+        );
         for (mode, id, label) in [
             (
                 RightTabCloseMode::Left,
@@ -228,13 +250,13 @@ impl Shell {
             .collect()
     }
 
-    fn can_start_right_tab_close(&self) -> bool {
+    pub(super) fn can_start_right_tab_close(&self) -> bool {
         self.right_tab_close_batch.is_none()
             && self.pending_file_closes.is_empty()
             && self.pending_exit.is_none()
     }
 
-    fn start_right_tab_close(
+    pub(super) fn start_right_tab_close(
         &mut self,
         panel_key: &str,
         target: RightSurface,
@@ -375,7 +397,7 @@ mod tests {
                 let file = shell.file_surfaces[&shell.file_surface_seq].downgrade();
                 let target = add_subagent(shell, "keep", cx);
                 let removed = add_subagent(shell, "remove", cx);
-                shell.add_diff_surface(cx);
+                shell.add_diff_surface(window, cx);
                 shell.add_browser_surface(None, window, cx);
                 // A real tab entity without an engine/PTY process in this fixture.
                 let terminal = shell.right_terminal_panel(cx);

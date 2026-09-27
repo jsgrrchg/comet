@@ -3458,6 +3458,28 @@ impl Shell {
         outcome
     }
 
+    fn sync_browser_profile(&mut self, cx: &mut Context<Self>) {
+        let browser_profile = {
+            let state = self.state.read(cx);
+            crate::browser::profile::BrowserProfile::for_workspace(
+                &self.data_dir,
+                state.workspace_scope,
+                state.auth.as_ref(),
+                state.local_device_id.as_deref(),
+            )
+        };
+        if browser_profile != self.browser_profile {
+            for browser in self.browsers.values() {
+                browser.update(cx, |browser, cx| browser.close(cx));
+            }
+            self.browsers.clear();
+            self.browser_subs.clear();
+            self.browser_context = browser_profile.clone()
+                .map(crate::browser::BrowserContext::for_profile).unwrap_or_default();
+            self.browser_profile = browser_profile;
+        }
+    }
+
     /// Browser tabs are independent instances owned by the current session.
     fn add_browser_surface(
         &mut self,
@@ -3468,6 +3490,7 @@ impl Shell {
         if self.active_chat.is_empty() {
             return;
         }
+        self.sync_browser_profile(cx);
         let key = self.panel_key(cx);
         let remote = {
             let state = self.state.read(cx);
@@ -12254,24 +12277,7 @@ impl Render for Shell {
             .clone()
             .unwrap_or_else(|| self.state.read(cx).gate());
 
-        let browser_profile = {
-            let state = self.state.read(cx);
-            crate::browser::profile::BrowserProfile::for_workspace(
-                &self.data_dir,
-                state.workspace_scope,
-                state.auth.as_ref(),
-                state.local_device_id.as_deref(),
-            )
-        };
-        if browser_profile.is_some() && browser_profile != self.browser_profile {
-            for browser in self.browsers.values() {
-                browser.update(cx, |browser, cx| browser.close(cx));
-            }
-            self.browsers.clear();
-            self.browser_subs.clear();
-            self.browser_context = crate::browser::BrowserContext::for_profile(browser_profile.clone().unwrap());
-            self.browser_profile = browser_profile;
-        }
+        self.sync_browser_profile(cx);
         let browser_active = matches!(gate, GatePhase::Ready)
             && !restart_required
             && matches!(self.route, Route::Chat)

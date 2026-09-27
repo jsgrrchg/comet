@@ -1,10 +1,13 @@
 //! Application-wide alert detection. Window creation and navigation never
 //! install another detector or replay a conversation's previous completion.
 
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 
 use chrono::{DateTime, Utc};
-use gpui::{App, AppContext, Entity, Global, Subscription};
+use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task};
 
 use crate::{
     settings::UiSettings,
@@ -17,12 +20,110 @@ impl Global for Service {}
 
 pub(crate) struct NotificationService {
     detector: Detector,
+    harness_updates: HarnessUpdateDetector,
+    harness_update_task: Option<Task<()>>,
     _subscription: Subscription,
     // A send must be acknowledged even if its last viewing window closes.
     // These leases end as soon as the engine transcript confirms the message.
     pending: HashMap<String, Entity<AppState>>,
     #[cfg(test)]
     emitted: Vec<Notice>,
+    #[cfg(test)]
+    emitted_harness_updates: Vec<(usize, bool)>,
+}
+
+#[derive(Default)]
+struct HarnessUpdateDetector {
+    seen: HashSet<String>,
+}
+
+impl HarnessUpdateDetector {
+    fn versionless_key(device: &str, harness: zeron_proto::HarnessId) -> String {
+        format!("{device}:{harness:?}:versionless")
+    }
+
+    fn key(device: &str, status: &zeron_proto::HarnessUpdateStatus) -> Option<String> {
+        if status.phase != zeron_proto::HarnessUpdatePhase::Available {
+            return None;
+        }
+        Some(match status.latest_version.as_deref() {
+            Some(version) => format!("{device}:{:?}:{version}", status.harness),
+            None => Self::versionless_key(device, status.harness),
+        })
+    }
+
+    fn has_unseen(&mut self, state: &AppState) -> bool {
+        let device = state.local_device_id.as_deref().unwrap_or("local");
+        for status in &state.harness_updates {
+            if matches!(
+                status.phase,
+                zeron_proto::HarnessUpdatePhase::Current | zeron_proto::HarnessUpdatePhase::Updated
+            ) {
+                self.seen
+                    .remove(&Self::versionless_key(device, status.harness));
+            }
+        }
+        state
+            .harness_updates
+            .iter()
+            .any(|status| Self::key(device, status).is_some_and(|key| !self.seen.contains(&key)))
+    }
+
+    fn take_unseen(&mut self, state: &AppState) -> usize {
+        let device = state.local_device_id.as_deref().unwrap_or("local");
+        let new: HashSet<_> = state
+            .harness_updates
+            .iter()
+            .filter_map(|status| Self::key(device, status))
+            .filter(|key| !self.seen.contains(key))
+            .collect();
+        let count = new.len();
+        self.seen.extend(new);
+        count
+    }
+}
+
+impl NotificationService {
+    fn queue_harness_update_notice(&mut self, owner: &Entity<AppState>, cx: &mut Context<Self>) {
+        let has_unseen = self.harness_updates.has_unseen(owner.read(cx));
+        if self.harness_update_task.is_some() || !has_unseen {
+            return;
+        }
+        let owner = owner.clone();
+        self.harness_update_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            this.update(cx, |this, cx| {
+                this.harness_update_task = None;
+                let count = this.harness_updates.take_unseen(owner.read(cx));
+                if count == 0 {
+                    return;
+                }
+                let settings = crate::settings::current(cx);
+                let banner = settings.notifications_enabled
+                    && settings.agent_update_notifications
+                    && !(settings.notifications_background_only && cx.active_window().is_some());
+                #[cfg(not(test))]
+                if banner {
+                    let body = if count == 1 {
+                        "A coding agent update is ready"
+                    } else {
+                        "Coding agent updates are ready"
+                    };
+                    crate::notify::post(
+                        &format!(
+                            "{count} agent update{} available",
+                            if count == 1 { "" } else { "s" }
+                        ),
+                        body,
+                        Some(crate::notify::AGENT_UPDATES_TARGET),
+                    );
+                }
+                #[cfg(test)]
+                this.emitted_harness_updates.push((count, banner));
+            })
+            .ok();
+        }));
+    }
 }
 
 #[derive(Default)]
@@ -132,10 +233,15 @@ pub(crate) fn init(owner: Entity<AppState>, cx: &mut App) -> Entity<Notification
     }
     let service = cx.new(|cx| NotificationService {
         detector: Default::default(),
+        harness_updates: Default::default(),
+        harness_update_task: None,
         pending: Default::default(),
         #[cfg(test)]
         emitted: Vec::new(),
+        #[cfg(test)]
+        emitted_harness_updates: Vec::new(),
         _subscription: cx.observe(&owner, |this: &mut NotificationService, owner, cx| {
+            this.queue_harness_update_notice(&owner, cx);
             let (ids, engine) = {
                 let state = owner.read(cx);
                 (state.pending_chat_ids(), state.engine().cloned())
@@ -313,5 +419,77 @@ mod tests {
                 .collect(&state, &settings, false, now, instant)
                 .is_empty()
         );
+    }
+
+    #[gpui::test]
+    fn agent_update_banner_is_debounced_once_across_windows(cx: &mut gpui::TestAppContext) {
+        let (owner, service, views) = cx.update(|cx| {
+            let owner = cx.new(|_| AppState::new());
+            let service = init(owner.clone(), cx);
+            let views = (0..3)
+                .map(|_| cx.new(|cx| AppState::for_window(owner.clone(), cx)))
+                .collect::<Vec<_>>();
+            owner.update(cx, |state, cx| {
+                state.connection = crate::state::ConnectionStatus::Ready;
+                state.local_device_id = Some("local".into());
+                state.harness_updates = vec![
+                    serde_json::from_value(serde_json::json!({
+                        "harness": "codex", "phase": "available", "latestVersion": "2.0.0",
+                        "policy": "notify", "source": "unknown", "canApply": true
+                    }))
+                    .unwrap(),
+                    serde_json::from_value(serde_json::json!({
+                        "harness": "hermes", "phase": "available",
+                        "policy": "notify", "source": "unknown", "canApply": true
+                    }))
+                    .unwrap(),
+                ];
+                cx.notify();
+            });
+            (owner, service, views)
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                views
+                    .iter()
+                    .all(|view| view.read(cx).harness_updates.len() == 2)
+            );
+        });
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(service.read(cx).emitted_harness_updates.len(), 1);
+            assert_eq!(service.read(cx).emitted_harness_updates[0].0, 2);
+            assert_eq!(service.read(cx).harness_updates.seen.len(), 2);
+        });
+        // A versionless release can notify again only after Current or Updated.
+        for phase in [
+            zeron_proto::HarnessUpdatePhase::Checking,
+            zeron_proto::HarnessUpdatePhase::Available,
+        ] {
+            owner.update(cx, |state, cx| {
+                state.harness_updates[1].phase = phase;
+                cx.notify();
+            });
+        }
+        cx.run_until_parked();
+        cx.update(|cx| assert!(service.read(cx).harness_update_task.is_none()));
+        owner.update(cx, |state, cx| {
+            state.harness_updates[1].phase = zeron_proto::HarnessUpdatePhase::Current;
+            cx.notify();
+        });
+        cx.update(|cx| assert_eq!(service.read(cx).harness_updates.seen.len(), 1));
+        owner.update(cx, |state, cx| {
+            state.harness_updates[1].phase = zeron_proto::HarnessUpdatePhase::Available;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(service.read(cx).emitted_harness_updates.len(), 2);
+            assert_eq!(service.read(cx).emitted_harness_updates[1].0, 1);
+        });
     }
 }

@@ -214,15 +214,15 @@ fn run_application(
             }
         })
         .detach();
-        // Banner clicks land on the notified chat. The AppKit delegate fires
+        // Banner clicks land on the notified chat or settings page. The AppKit delegate fires
         // mid-event, so hop through a channel rather than updating inline.
         let (click_tx, mut click_rx) = futures::channel::mpsc::unbounded::<String>();
         notify::on_click(move |chat_id| {
             let _ = click_tx.unbounded_send(chat_id);
         });
         cx.spawn(async move |cx| {
-            while let Some(chat_id) = click_rx.next().await {
-                let _ = cx.update(|cx| window_manager::notified_chat(chat_id, cx));
+            while let Some(target) = click_rx.next().await {
+                let _ = cx.update(|cx| window_manager::notified_target(target, cx));
             }
         })
         .detach();

@@ -155,6 +155,19 @@ pub(crate) fn notified_chat(chat: String, cx: &mut App) {
     }
 }
 
+pub(crate) fn notified_target(target: String, cx: &mut App) {
+    if target != crate::notify::AGENT_UPDATES_TARGET {
+        notified_chat(target, cx);
+        return;
+    }
+    if let Some(window) = activate(cx) {
+        let _ = window.update(cx, |shell, window, cx| {
+            window.activate_window();
+            shell.open_settings(crate::shell::SettingsSection::Harnesses, cx);
+        });
+    }
+}
+
 pub(crate) fn deep_link(url: String, cx: &mut App) {
     let existing = crate::links::parse_zeron_conversation_link(&url)
         .ok()

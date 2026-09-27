@@ -62,6 +62,7 @@ use crate::workspace_links::resolve_workspace_file_link;
 mod actions_ui;
 mod command_palette;
 mod files_panel;
+mod harness_updates;
 mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
@@ -996,6 +997,9 @@ pub(crate) fn sidebar_faded_label(
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 24.0;
 
+/// Target of the sidebar's "Star on GitHub" banner (same as the landing page).
+const GITHUB_REPO_URL: &str = "https://github.com/zeronsh/comet";
+
 /// New-thread controls float over the tail of a top-anchored image hero. The
 /// hero reaches below the composer, giving its lower mask room to dissolve
 /// gradually into the otherwise empty lower canvas.
@@ -1895,6 +1899,12 @@ pub struct Shell {
     sidebar_pin_write_notice: Option<SharedString>,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
+    /// Independent watches retain device identity across selection changes.
+    harness_update_devices: std::collections::BTreeMap<String, harness_updates::DeviceUpdates>,
+    harness_update_expanded: bool,
+    harness_update_transition: Option<WidthTween>,
+    harness_update_geometry: [Option<WidthTween>; 2],
+    harness_update_scroll: settings::widgets::PageScroll,
     user_menu: popover::Popup<()>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
@@ -2337,6 +2347,11 @@ impl Shell {
             sidebar_pin_write_generation: 0,
             sidebar_pin_write_notice: None,
             space_boot_applied: false,
+            harness_update_devices: Default::default(),
+            harness_update_expanded: false,
+            harness_update_transition: None,
+            harness_update_geometry: [None; 2],
+            harness_update_scroll: settings::widgets::PageScroll::default(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
@@ -2508,6 +2523,7 @@ impl Shell {
                 .update(cx, |composer, cx| composer.reset_for_runtime(cx));
         }
         self.prune_file_explorers(cx);
+        self.refresh_harness_update_watch(cx);
         if state.read(cx).engine().is_none() {
             self.side_chats.clear();
             self.side_chat_creating = false;
@@ -4446,7 +4462,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+    pub(crate) fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         let section = section.canonical();
         self.command_palette = None;
         // Recreate per visit: the page's ListHarnesses load re-probes which
@@ -4691,6 +4707,7 @@ impl Shell {
                             self.settings.sound_attention_enabled,
                             self.settings.notifications_enabled,
                             self.settings.notifications_background_only,
+                            self.settings.agent_update_notifications,
                             cx,
                         )
                     });
@@ -4705,6 +4722,7 @@ impl Shell {
                                 attention_sound,
                                 desktop,
                                 background_only,
+                                agent_updates,
                             } = *event;
                             this.settings.sound_enabled = sound;
                             this.settings.sound_completion_enabled = completion_sound;
@@ -4712,6 +4730,7 @@ impl Shell {
                             this.settings.sound_attention_enabled = attention_sound;
                             this.settings.notifications_enabled = desktop;
                             this.settings.notifications_background_only = background_only;
+                            this.settings.agent_update_notifications = agent_updates;
                             this.schedule_save(cx);
                             cx.notify();
                         },
@@ -7946,6 +7965,11 @@ impl Shell {
         )
         .fade_overflow_y(&self.sidebar_scroll);
 
+        let update_strip = self.render_update_strip(theme, cx);
+        // Stacked above the update strip, the banner needs its own gap; alone
+        // it leans on the user-menu block's padding like the strip does.
+        let github_star_banner = self.render_github_star_banner(update_strip.is_some(), theme, cx);
+
         div()
             .w(px(self.settings.sidebar_width))
             .h_full()
@@ -7961,10 +7985,10 @@ impl Shell {
             .when_some(self.render_connection_pill(theme, cx), |el, pill| {
                 el.child(pill)
             })
-            // Update strip (above the user menu; below the lists).
-            .when_some(self.render_update_strip(theme, cx), |el, strip| {
-                el.child(strip)
-            })
+            // "Star on GitHub" banner until dismissed (persisted), then the
+            // update strip — both above the user menu, below the lists.
+            .when_some(github_star_banner, |el, banner| el.child(banner))
+            .when_some(update_strip, |el, strip| el.child(strip))
             // Inline mutation-failure notice.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
                 el.child(
@@ -7994,6 +8018,82 @@ impl Shell {
                     .child(self.render_sidebar_footer(theme, cx)),
             )
             .into_any_element()
+    }
+
+    /// "Star on GitHub" banner, styled like the update strip. Clicking it
+    /// opens the repository; either that or the close button dismisses it for
+    /// good — the choice is persisted so it never returns on the next launch.
+    fn render_github_star_banner(
+        &self,
+        above_update_strip: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.settings.github_star_banner_dismissed {
+            return None;
+        }
+        let tone = theme.accent;
+        let chip_bg_hover = theme.accent.opacity(0.16);
+        let close_bg_hover = theme.accent.opacity(0.22);
+        Some(
+            div()
+                .id("github-star-banner")
+                .mx(px(Theme::SPACE_SM))
+                .when(above_update_strip, |el| el.mb(px(Theme::SPACE_XS)))
+                .pl(px(Theme::SPACE_SM))
+                .pr(px(Theme::SPACE_XS))
+                .py(px(4.0))
+                .rounded(px(Theme::CONTROL_RADIUS))
+                .bg(theme.accent_wash)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .text_size(crate::typography::ui_rems(11.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(tone)
+                .cursor_pointer()
+                .hover(move |s| s.bg(chip_bg_hover))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.open_url(GITHUB_REPO_URL);
+                    this.dismiss_github_star_banner(cx);
+                }))
+                // Glyphs sit below the line box's optical center: nudge the
+                // star half a pixel down so it centers on the cap height.
+                .child(
+                    icon(icons::STAR_BOLD)
+                        .flex_none()
+                        .relative()
+                        .top(px(0.5))
+                        .size(px(12.0))
+                        .text_color(tone),
+                )
+                .child(div().flex_1().min_w_0().truncate().child("Star on GitHub"))
+                .child(
+                    div()
+                        .id("github-star-banner-dismiss")
+                        .flex_none()
+                        .size(px(18.0))
+                        .rounded(px(4.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(close_bg_hover))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.dismiss_github_star_banner(cx);
+                        }))
+                        .child(icon(icons::CLOSE).size(px(10.0)).text_color(tone)),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn dismiss_github_star_banner(&mut self, cx: &mut Context<Self>) {
+        self.settings.github_star_banner_dismissed = true;
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     /// Update strip: shown above the user menu whenever the engine's
@@ -8836,6 +8936,10 @@ impl Shell {
         {
             return true;
         }
+        if self.harness_update_expanded {
+            self.set_harness_updates_expanded(false, cx);
+            return true;
+        }
         if self.rename_dialog.is_some() {
             self.rename_dialog = None;
             cx.notify();
@@ -9674,6 +9778,22 @@ impl Shell {
             Empty.into_any_element()
         };
 
+        // Share the dock's choreography: release the bottom chip early on
+        // departure, reveal it with the Home selectors on return. Absolute
+        // mounting keeps it out of composer measurements and centering.
+        let chip_opacity = if has_selection {
+            1.0 - crate::composer_dock::stage(dock_frame.dissolve(), 0.0, 0.22)
+        } else {
+            dock_frame.selectors()
+        } * self.composer_dock.borrow().opacity();
+        if has_selection {
+            self.set_harness_updates_expanded(false, cx);
+        }
+        let harness_update_card = if chip_opacity > 0.001 && (!has_selection || dock_frame.active) {
+            self.render_harness_update_card(window, main_content_width, cx)
+        } else {
+            None
+        };
         let status = self.render_status_strip(composer_width, cx);
         // Attachment dropzone over the ENTIRE conversation column (transcript
         // + composer, not just the pill). OS images keep using the upload
@@ -9823,6 +9943,22 @@ impl Shell {
                         ))
                     })
                     .child(self.render_terminal_container(window, cx))
+            })
+            .when_some(harness_update_card, |column, chip| {
+                column.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom(px(24.0 - 8.0 * (1.0 - chip_opacity)))
+                        .opacity(chip_opacity)
+                        .flex()
+                        .justify_center()
+                        .child(chip)
+                        .when(has_selection, |el| {
+                            el.child(div().absolute().inset_0().occlude())
+                        }),
+                )
             })
             .child(
                 div()

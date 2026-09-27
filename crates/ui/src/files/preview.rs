@@ -3716,6 +3716,10 @@ impl FilesSurface {
             .clone()
     }
 
+    pub(crate) fn test_workspace_watch_ready(&self) -> bool {
+        self.watch_sequence.is_some()
+    }
+
     pub(crate) fn test_document_phase(&self, path: &str) -> Option<String> {
         Some(format!("{:?}", self.preview.documents.get(path)?.phase))
     }

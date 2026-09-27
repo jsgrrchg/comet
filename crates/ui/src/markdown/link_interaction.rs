@@ -608,6 +608,7 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn escape_dismisses_focused_destination() {
+        let _selection = super::super::selection::test_state_lock();
         test_application().run(|cx| {
             cx.set_global(Theme::dark());
             let window = cx
@@ -663,6 +664,7 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn focused_destination_does_not_block_other_controls() {
+        let _selection = super::super::selection::test_state_lock();
         test_application().run(|cx| {
             cx.set_global(Theme::dark());
             let clicks = Rc::new(Cell::new(0));
@@ -762,6 +764,7 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn context_menu_cancels_visible_and_pending_hover_tooltips() {
+        let _selection = super::super::selection::test_state_lock();
         let dir = tempfile::tempdir().unwrap();
         test_application().run(move |cx| {
             cx.set_global(Theme::dark());
@@ -879,6 +882,7 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn keyboard_visits_each_range_and_opens_the_link_menu() {
+        let _selection = super::super::selection::test_state_lock();
         test_application().run(|cx| {
             cx.set_global(Theme::dark());
             let activated = Rc::new(RefCell::new(Vec::new()));
@@ -957,6 +961,7 @@ mod rendered_tests {
         ignore = "requires a native desktop; run with --ignored --test-threads=1"
     )]
     fn rendered_truncation_resizes_and_selects_the_original_url() {
+        let _selection = super::super::selection::test_state_lock();
         test_application().run(|cx| {
             cx.set_global(Theme::dark());
             let url = format!("https://example.com/{}", "long-segment-🙂/".repeat(20));

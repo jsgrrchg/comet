@@ -115,6 +115,8 @@ pub struct BrowserSurface {
     _input_sub: Subscription,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     native: Option<native::NativePage>,
+    #[cfg(target_os = "linux")]
+    native_startup: Option<gpui::Task<()>>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     native_tx: tokio::sync::mpsc::Sender<native::NativeEvent>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -193,6 +195,8 @@ impl BrowserSurface {
             _input_sub: input_sub,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             native: None,
+            #[cfg(target_os = "linux")]
+            native_startup: None,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             native_tx,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -359,12 +363,19 @@ impl BrowserSurface {
             let result = if let Some(native) = &self.native {
                 native.load(&url)
             } else {
-                native::NativePage::new(window, &self.context.data, self.native_tx.clone())
-                    .map(|mut native| {
-                        native.present(self.presentation);
-                        self.native = Some(native);
-                    })
-                    .and_then(|_| self.native.as_ref().unwrap().load(&url))
+                #[cfg(target_os = "macos")]
+                {
+                    native::NativePage::new(window, &self.context.data, self.native_tx.clone())
+                        .map(|mut native| {
+                            native.present(self.presentation);
+                            self.native = Some(native);
+                        })
+                        .and_then(|_| self.native.as_ref().unwrap().load(&url))
+                }
+                #[cfg(target_os = "linux")]
+                {
+                    self.start_linux_page(window, cx)
+                }
             };
             self.page.loading = result.is_ok();
             if let Err(error) = result {
@@ -433,6 +444,12 @@ impl BrowserSurface {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.set_presentation(Presentation::Hidden, cx);
         self.clear_favicon(cx);
+        #[cfg(target_os = "linux")]
+        {
+            // Cancels delivery; any helper still starting finishes/cleans up on
+            // its startup thread and cannot reattach to this closed tab.
+            self.native_startup = None;
+        }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
             if let Some(native) = &mut self.native {

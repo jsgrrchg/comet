@@ -685,7 +685,7 @@ pub struct UiSettings {
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
-    /// The sidebar's "Star on GitHub!" banner was dismissed (its close button
+    /// The sidebar's "Star on GitHub" banner was dismissed (its close button
     /// or following the link). Device-local; never shown again once set.
     pub github_star_banner_dismissed: bool,
     /// The last selected space — restored on boot when the row still exists;

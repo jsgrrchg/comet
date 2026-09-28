@@ -14,6 +14,7 @@
 
 mod account_usage;
 pub mod app_menus;
+pub mod app_update;
 mod app_runtime;
 pub mod appearance;
 pub mod appshots;
@@ -186,6 +187,7 @@ fn run_application(
         appshots::set_enabled(ui_settings.appshots_enabled);
         terminal::panel::init(cx);
         app_menus::init(cx);
+        app_update::AppUpdate::init(config.boot().edge_url, data_dir.clone(), cx);
         if on_start.is_none() {
             cx.register_url_scheme("zeron").detach();
         }

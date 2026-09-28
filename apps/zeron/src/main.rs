@@ -128,6 +128,8 @@ fn main() -> anyhow::Result<()> {
     #[cfg(windows)]
     if let Some(pid) = cli.wait_for_exit {
         zeron_update::windows::wait_for_exit(pid)?;
+    } else if matches!(&cli.command, None | Some(Command::Headless)) {
+        zeron_update::windows::cleanup_previous_image();
     }
     let gui = if cli.command.is_none() {
         let request = if cli.new_window {

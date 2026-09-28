@@ -29,6 +29,7 @@ pub(crate) fn init(boot: EngineBootConfig, cx: &mut App) -> Entity<AppState> {
     let owner = state.clone();
     cx.on_app_quit(move |cx| {
         crate::settings::flush(cx);
+        crate::app_update::install_on_quit(cx);
         let shutdown = owner
             .read(cx)
             .engine()

@@ -3,12 +3,11 @@
 
 use gpui::{App, Entity, EntityId, Global, SharedString};
 
-use crate::shell::{Shell, SyncFlow, UpdateFlow};
+use crate::shell::{Shell, SyncFlow};
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct Progress {
     pub sync: SyncFlow,
-    pub update: UpdateFlow,
     pub error: Option<SharedString>,
     pub current: Option<SharedString>,
     pub busy: bool,

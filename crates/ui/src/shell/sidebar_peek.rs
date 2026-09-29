@@ -6,6 +6,8 @@ const LEAVE_SLOP: f32 = 12.0;
 const OPEN_DELAY: Duration = Duration::from_millis(120);
 const CLOSE_DELAY: Duration = Duration::from_millis(300);
 const PEEK_MOTION: motion::MotionSpec = motion::MotionSpec::new(120, motion::EASE_OUT);
+/// Gap between the floating card and the window's left and bottom edges.
+const INSET: f32 = 8.0;
 
 #[derive(Default)]
 pub(super) struct SidebarPeek {
@@ -60,6 +62,16 @@ impl Shell {
         )
     }
 
+    /// The card's border box: the sidebar keeps its pinned content width.
+    fn sidebar_peek_card_width(&self) -> f32 {
+        self.settings.sidebar_width + 2.0
+    }
+
+    /// Where the card's right edge is painted at the current progress.
+    fn sidebar_peek_right_edge(&self) -> f32 {
+        (INSET + self.sidebar_peek_card_width()) * self.sidebar_peek_progress()
+    }
+
     pub(super) fn sidebar_peek_mounted(&self) -> bool {
         self.sidebar_peek.handoff
             || (self.settings.sidebar_collapsed && self.sidebar_peek_progress() > 0.0)
@@ -102,7 +114,7 @@ impl Shell {
             panel: hovered
                 && in_height
                 && x >= 0.0
-                && x <= self.settings.sidebar_width * self.sidebar_peek_progress() + LEAVE_SLOP,
+                && x <= self.sidebar_peek_right_edge() + LEAVE_SLOP,
             held: self.sidebar_peek_menu_open()
                 || (self.sidebar_peek_focus.contains_focused(window, cx)
                     && (self.sidebar_peek.keyboard_focus
@@ -254,48 +266,30 @@ impl Shell {
     }
 
     pub(super) fn render_sidebar_peek(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let progress = self.sidebar_peek_progress();
         let theme = Theme::of(cx);
-        let width = self.settings.sidebar_width;
-        let shadow_alpha = progress
-            * if theme.appearance.is_dark() {
-                0.18
-            } else {
-                0.10
-            };
-        // The same tint/blur as contextual menus, extending behind the native
-        // traffic lights. Only the content is inset below the titlebar; the
-        // surface itself is flush with all three window edges.
+        let card_width = self.sidebar_peek_card_width();
+        let right_edge = self.sidebar_peek_right_edge();
+        // A floating card in the contextual-menu surface: same tint, blur,
+        // hairline border, radius and elevation, held clear of the window
+        // edges and below the titlebar so the traffic lights stay visible.
+        // Like menus and Cmd+K, glass carries no drop shadow: it would show
+        // through the translucent tint as a dark plate.
         let panel = div()
             .id("sidebar-peek-panel")
             .debug_selector(|| "sidebar-peek-panel".into())
             .absolute()
             .top_0()
-            .bottom_0()
-            .left(px(-width * (1.0 - progress)))
-            .w(px(width))
+            .bottom(px(INSET))
+            .left(px(right_edge - card_width))
+            .w(px(card_width))
             .occlude()
-            .border_r_1()
+            .overflow_hidden()
+            .rounded(px(popover::CARD_RADIUS))
+            .border_1()
             .border_color(theme.border)
+            .when(!theme.is_frost(), |el| el.shadow_lg())
             .bg(popover::surface_bg(theme))
-            .child(
-                div()
-                    .size_full()
-                    .pt(px(Theme::TITLEBAR_HEIGHT))
-                    .child(self.sidebar_content()),
-            )
-            .child(
-                self.titlebar_drag_region(
-                    "sidebar-peek-titlebar",
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .h(px(Theme::TITLEBAR_HEIGHT)),
-                    cx,
-                ),
-            );
+            .child(self.sidebar_content());
         // Priority zero is above native browser content and below menus (1)
         // and dialogs (2). Mount this native input overlay only during peek;
         // idle controls must stay in the base scene so the page keeps input.
@@ -303,26 +297,14 @@ impl Shell {
             div()
                 .absolute()
                 .left_0()
-                .top_0()
+                .top(px(Theme::TITLEBAR_HEIGHT))
                 .bottom_0()
-                .w(px(width))
-                .child(crate::frost::frosted(0.0, crate::frost::MENU_BLUR, panel))
-                // Keep the shadow outside the glass: a filled drop shadow
-                // behind the panel would darken its translucent surface.
-                // Follow the painted edge and fade with the reveal tween.
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(width * progress))
-                        .top_0()
-                        .bottom_0()
-                        .w(px(12.0))
-                        .bg(gpui::linear_gradient(
-                            90.0,
-                            gpui::linear_color_stop(gpui::black().opacity(shadow_alpha), 0.0),
-                            gpui::linear_color_stop(gpui::black().opacity(0.0), 1.0),
-                        )),
-                ),
+                .w(px(INSET + card_width))
+                .child(crate::frost::frosted(
+                    popover::CARD_RADIUS,
+                    crate::frost::MENU_BLUR,
+                    panel,
+                )),
         )
         .into_any_element()
     }

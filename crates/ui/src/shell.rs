@@ -12724,17 +12724,7 @@ impl Render for Shell {
                     .when(self.sidebar_peek_mounted(), |el| {
                         el.child(self.render_sidebar_peek(cx))
                     })
-                    // Elevate controls only while the peek covers the titlebar.
-                    // A permanent deferred cluster steals native browser input,
-                    // including when an otherwise passive tooltip is visible.
-                    .child({
-                        let cluster = self.render_titlebar_cluster(cx);
-                        if self.sidebar_peek_mounted() {
-                            gpui::deferred(cluster).into_any_element()
-                        } else {
-                            cluster
-                        }
-                    })
+                    .child(self.render_titlebar_cluster(cx))
                     .when(
                         (self.settings.sidebar_collapsed && settings::sidebar_hover_enabled(cx))
                             || self.sidebar_peek_mounted(),

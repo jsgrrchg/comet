@@ -654,6 +654,9 @@ impl Render for ChatActivity {
             .debug_selector(|| "chat-activity-trigger".into())
             .role(gpui::Role::Button)
             .aria_label(SharedString::from(label))
+            .tooltip(crate::settings::widgets::text_tooltip(
+                "Subagents and side chats",
+            ))
             .relative()
             .flex_none()
             .h(px(24.0))

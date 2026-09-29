@@ -2985,6 +2985,7 @@ impl FilesSurface {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.remove_editor_comment(&id, cx)
                             }))
+                            .tooltip(crate::settings::widgets::text_tooltip("Remove comment"))
                             .child(
                                 icon(icons::CLOSE_CIRCLE)
                                     .size(px(12.0))

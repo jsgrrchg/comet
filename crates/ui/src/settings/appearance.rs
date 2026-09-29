@@ -20,6 +20,7 @@ use zeron_theme::{
 use crate::appearance::{self, AppearanceMode};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons;
+use crate::motion::ReduceMotion;
 use crate::popover::{self, Popup};
 use crate::settings::widgets;
 use crate::theme::{Appearance, Theme};
@@ -224,6 +225,7 @@ pub struct AppearancePage {
     dark_theme_select: widgets::SelectState,
     surface_select: widgets::SelectState,
     background_effect_select: widgets::SelectState,
+    reduce_motion_select: widgets::SelectState,
     import_dialog: Option<ImportDialog>,
     review_entry: Option<String>,
     library_error: Option<SharedString>,
@@ -486,6 +488,7 @@ impl AppearancePage {
             dark_theme_select: widgets::SelectState::default(),
             surface_select: widgets::SelectState::default(),
             background_effect_select: widgets::SelectState::default(),
+            reduce_motion_select: widgets::SelectState::default(),
             import_dialog: None,
             review_entry: None,
             library_error: None,
@@ -1142,6 +1145,15 @@ fn surface_label(surface: SurfacePreference) -> &'static str {
         SurfacePreference::ThemeDefault => "Theme default",
         SurfacePreference::Frosted => "Frosted",
         SurfacePreference::Opaque => "Opaque",
+    }
+}
+
+fn reduce_motion_helper(preference: ReduceMotion, system: bool) -> &'static str {
+    match (preference, system) {
+        (ReduceMotion::System, true) => "Following the system, which currently reduces motion.",
+        (ReduceMotion::System, false) => "Following the system, which currently allows motion.",
+        (ReduceMotion::On, _) => "Animations skip straight to their final state.",
+        (ReduceMotion::Off, _) => "Animations play even if the system asks for less motion.",
     }
 }
 
@@ -2996,6 +3008,91 @@ impl Render for AppearancePage {
                     .into_any_element(),
             );
         }
+        let current_reduce_motion = crate::motion::preference(cx);
+        let reduce_motion_control = widgets::select(
+            "reduce-motion",
+            "Reduce motion",
+            &theme,
+            |page: &mut Self| &mut page.reduce_motion_select,
+        )
+        .options(
+            ReduceMotion::ALL
+                .into_iter()
+                .map(|preference| widgets::SelectOption::new(preference.label())),
+            ReduceMotion::ALL
+                .into_iter()
+                .position(|preference| preference == current_reduce_motion)
+                .unwrap_or_default(),
+        )
+        .width(128.0)
+        .on_select(|_, ix, _, cx| {
+            crate::motion::set_preference(ReduceMotion::ALL[ix], cx);
+            cx.notify();
+        })
+        .render(&self.reduce_motion_select, cx);
+        let pause_in_background = crate::motion::pause_in_background(cx);
+        let motion_rows = vec![
+            widgets::card_row(&theme, true)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.0))
+                        .child(widgets::row_title(&theme, "Reduce motion"))
+                        .child(widgets::meta_line(
+                            &theme,
+                            vec![
+                                div()
+                                    .child(reduce_motion_helper(
+                                        current_reduce_motion,
+                                        crate::motion::system_reduces_motion(cx),
+                                    ))
+                                    .into_any_element(),
+                            ],
+                        )),
+                )
+                .child(reduce_motion_control)
+                .into_any_element(),
+            widgets::card_row(&theme, false)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(widgets::row_title(&theme, "Pause animations in background"))
+                        .child(widgets::meta_line(
+                            &theme,
+                            vec![
+                                div()
+                                    .child(
+                                        "Hold animations still while Zeron isn't the focused window.",
+                                    )
+                                    .into_any_element(),
+                            ],
+                        )),
+                )
+                .child(
+                    widgets::toggle_switch(
+                        &theme,
+                        pause_in_background,
+                        "pause-animations-in-background",
+                    )
+                    .id("pause-animations-in-background-toggle")
+                    .tab_index(0)
+                    .role(gpui::Role::Switch)
+                    .aria_label("Pause animations in background")
+                    .focus_visible(|s| s.border_2().border_color(theme.accent))
+                    .cursor_pointer()
+                    .aria_toggled(if pause_in_background {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        crate::motion::set_pause_in_background(!pause_in_background, cx);
+                        cx.notify();
+                    })),
+                )
+                .into_any_element(),
+        ];
         let library_rows = self.render_theme_library_rows(&theme, cx);
         let library_warning = self
             .library_error
@@ -3154,6 +3251,11 @@ impl Render for AppearancePage {
                                     &theme,
                                     "Material and background",
                                     widgets::section_card(&theme).mt_0().children(settings_rows),
+                                ))
+                                .child(widgets::section(
+                                    &theme,
+                                    "Motion",
+                                    widgets::section_card(&theme).mt_0().children(motion_rows),
                                 ))
                                 .child(
                                     widgets::section_card(&theme)

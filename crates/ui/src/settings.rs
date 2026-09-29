@@ -895,6 +895,10 @@ pub struct UiSettings {
     pub wallpaper_color: Option<zeron_theme::Color>,
     /// Non-destructive treatment composited inside the artwork's fade mask.
     pub new_thread_background_effect: NewThreadBackgroundEffect,
+    /// Snap animations to rest. Defaults to following the OS.
+    pub reduce_motion: crate::motion::ReduceMotion,
+    /// Also snap animations while the main window is not focused.
+    pub pause_animations_in_background: bool,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -977,6 +981,8 @@ impl Default for UiSettings {
             wallpaper_theme_colors: false,
             wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
+            reduce_motion: crate::motion::ReduceMotion::System,
+            pause_animations_in_background: false,
             legacy_accent_color: None,
         }
     }
@@ -1787,6 +1793,8 @@ mod tests {
             loaded.new_thread_background_effect,
             NewThreadBackgroundEffect::None
         );
+        assert_eq!(loaded.reduce_motion, crate::motion::ReduceMotion::System);
+        assert!(!loaded.pause_animations_in_background);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled);
         for sound in [
@@ -2415,6 +2423,8 @@ mod tests {
             wallpaper_theme_colors: false,
             wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
+            reduce_motion: crate::motion::ReduceMotion::On,
+            pause_animations_in_background: true,
             legacy_accent_color: None,
         };
         settings.save(dir.path()).unwrap();
@@ -2424,6 +2434,8 @@ mod tests {
         assert!(json.contains(r#""codeFencesFitContent": true"#));
         assert!(json.contains(r#""openWebLinksInZeron": false"#));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
+        assert!(json.contains(r#""reduceMotion": "on""#));
+        assert!(json.contains(r#""pauseAnimationsInBackground": true"#));
         assert!(json.contains(r#""terminalFontFamily": "installed:Menlo""#));
         assert!(json.contains(r#""terminalFontSize": 15.0"#));
         assert!(json.contains(r#""codeFontFamily": "geist""#));

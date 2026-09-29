@@ -423,6 +423,41 @@ impl SessionsEngine {
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = crate::repos::expand_home(&request.cwd)
             .map_err(|error| EngineError::Other(error.to_string()))?;
+        // Native continuity comes exclusively from the host-owned document. This
+        // check precedes warm routing, queued sends, and cold provider startup.
+        let native_doc = self.doc_handle(chat_id)?;
+        if let Some(lineage) = native_doc.doc().native_fork_lineage()? {
+            if lineage.point.harness != harness_id
+                || lineage.child.cwd != request.cwd
+                || lineage.child.session_id.is_empty()
+                || request.worktree.is_some()
+            {
+                return Err(EngineError::Other(
+                    "Native fork must resume its saved provider session in the original checkout"
+                        .into(),
+                ));
+            }
+            if let Some(chat) = self
+                .inner
+                .workspace()
+                .and_then(|w| w.chat(chat_id).ok().flatten())
+                && (chat
+                    .config
+                    .as_ref()
+                    .is_some_and(|c| c.harness != harness_id)
+                    || chat
+                        .harness_session_id
+                        .as_deref()
+                        .is_some_and(|id| id != lineage.child.session_id))
+            {
+                return Err(EngineError::Other(
+                    "Native fork session configuration no longer matches its saved identity".into(),
+                ));
+            }
+            request.resume = Some(lineage.child.session_id);
+            request.resume_policy = zeron_proto::ResumePolicy::RequireExisting;
+            request.mcp = self.inner.zeron_mcp(chat_id);
+        }
         // Native-only catalog entries have no portable file fallback. Reject
         // cross-harness delivery before recording or routing the user turn.
         zeron_proto::invocation::validate_harness_invocations(&request.prompt, harness_id)
@@ -699,6 +734,19 @@ impl SessionsEngine {
         let Some((run_id, harness_id, steer_tx, ledger, history_sent)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
+        if let Some(lineage) = self.doc_handle(chat_id)?.doc().native_fork_lineage()? {
+            if lineage.point.harness != harness_id
+                || self
+                    .inner
+                    .resume_for(chat_id, &lineage.child.cwd)
+                    .as_deref()
+                    != Some(lineage.child.session_id.as_str())
+            {
+                return Err(EngineError::Other(
+                    "Native fork runtime no longer matches its saved session".into(),
+                ));
+            }
+        }
         zeron_proto::invocation::validate_harness_invocations(prompt, harness_id)
             .map_err(EngineError::Other)?;
         let user_id = message_id.unwrap_or_else(new_id);
@@ -1358,6 +1406,10 @@ impl Inner {
         current: Option<&str>,
         provider: ProviderSession<'_>,
     ) -> Option<String> {
+        if doc.native_fork_lineage().is_err() || doc.native_fork_lineage().ok().flatten().is_some()
+        {
+            return None;
+        }
         if native_command(prompt, harness_id)
             || !self
                 .workspace()
@@ -1813,7 +1865,11 @@ async fn drive_run(
     // Kept whole for the startup-crash retry (same user entry; dispatch
     // re-injects the stored resume id). Option so the retry branch (inside
     // the event loop) can take ownership.
-    let mut retry_request = Some(RunRequest {
+    let required_session = (request.resume_policy == zeron_proto::ResumePolicy::RequireExisting)
+        .then(|| request.resume.clone())
+        .flatten();
+    let native_interrupt = controls.interrupt.clone();
+    let mut retry_request = required_session.is_none().then(|| RunRequest {
         resume: None,
         ..request.clone()
     });
@@ -2681,6 +2737,22 @@ async fn drive_run(
             continue;
         }
 
+        if let Some(expected) = &required_session {
+            let actual = match &event {
+                AgentEvent::SessionStarted { session_id, .. } => Some(session_id),
+                AgentEvent::Done { session_id, .. } => session_id.as_ref(),
+                _ => None,
+            };
+            if actual.is_some_and(|id| id != expected) {
+                native_interrupt.cancel();
+                event = AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    result: None,
+                    error: Some("Provider returned an unexpected native session identity".into()),
+                    session_id: None,
+                };
+            }
+        }
         // Explicit lifecycle IDs bind adapter replies to storage entries. Never infer
         // this relationship from text, time, or transcript position.
         match &event {

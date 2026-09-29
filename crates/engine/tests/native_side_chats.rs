@@ -326,3 +326,85 @@ async fn native_fork_provider_created_recovery_reuses_the_durable_native_id() {
     assert_eq!(value["phase"], "Published");
     restarted.shutdown().await;
 }
+
+fn send_request(prompt: &str) -> RunRequest {
+    serde_json::from_value(serde_json::json!({
+        "prompt": prompt, "cwd": "/tmp", "sandbox": "workspace-write", "autoApprove": true,
+        "resume": "untrusted-parent", "mcp": {"name":"zeron", "command":"parent", "env":{"ZERON_CHAT_ID":"main"}}
+    })).unwrap()
+}
+
+async fn send_native(core: &EngineCore, harness: &NativeStore, prompt: &str) {
+    let before = harness.requests.lock().unwrap().len();
+    core.sessions
+        .dispatch("child", HarnessId::Mock, send_request(prompt), None)
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while harness.requests.lock().unwrap().len() == before
+            || core
+                .sessions
+                .session_status("child")
+                .is_some_and(|s| s.status != SessionStatus::Idle)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let captured = harness.requests.lock().unwrap()[before].clone();
+    assert_eq!(captured.resume.as_deref(), Some("native-child-1"));
+    assert_eq!(captured.resume_policy, ResumePolicy::RequireExisting);
+    assert_eq!(captured.prompt, prompt);
+    assert_eq!(captured.mcp.unwrap().env["ZERON_CHAT_ID"], "child");
+}
+
+#[tokio::test]
+async fn native_fork_resume_survives_restart_and_never_wraps_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(NativeStore::default());
+    let core = setup(dir.path(), harness.clone());
+    core.native_forks.create(request(&core)).await.unwrap();
+    core.shutdown().await;
+    drop(core);
+    for prompts in [["/review", "What do you remember?"], ["Continue", "Again"]] {
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(harness.clone());
+        let core = EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None).unwrap();
+        core.sessions.set_ipc_port(27699);
+        for prompt in prompts {
+            send_native(&core, &harness, prompt).await;
+        }
+        let mut changed = send_request("wrong checkout");
+        changed.cwd = "/".into();
+        assert!(
+            core.sessions
+                .dispatch("child", HarnessId::Mock, changed, None)
+                .await
+                .is_err()
+        );
+        assert!(
+            core.sessions
+                .dispatch(
+                    "child",
+                    HarnessId::Codex,
+                    send_request("wrong harness"),
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            core.doc_host
+                .open("child")
+                .unwrap()
+                .doc()
+                .native_fork_lineage()
+                .unwrap()
+                .is_some()
+        );
+        core.shutdown().await;
+    }
+    assert_eq!(harness.requests.lock().unwrap().len(), 4);
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+}

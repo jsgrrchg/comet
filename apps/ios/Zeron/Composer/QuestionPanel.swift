@@ -101,7 +101,8 @@ final class QuestionPanel: UIView, UITextFieldDelegate, UITextViewDelegate {
         page = 0
         submitted = false
         picks = [:]
-        custom = Dictionary(uniqueKeysWithValues: questions.map { ($0.id, $0.prefill ?? "") })
+        // Question ids arrive from agents and synced docs: never trap on a duplicate.
+        custom = Dictionary(questions.map { ($0.id, $0.prefill ?? "") }, uniquingKeysWith: { first, _ in first })
         render()
     }
 

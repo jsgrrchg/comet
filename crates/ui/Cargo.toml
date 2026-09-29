@@ -62,6 +62,7 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 pulldown-cmark.workspace = true
+zeron-markdown.workspace = true
 alacritty_terminal.workspace = true
 base64 = "0.22"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
@@ -99,7 +100,7 @@ block = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"
-ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts", "screenshot"] }
+ashpd = { version = "0.13.13", default-features = false, features = ["async-io", "global_shortcuts", "screenshot", "settings"] }
 atspi = { version = "0.30.0", features = ["zbus"] }
 async-io = "2"
 url = "2"
@@ -112,4 +113,4 @@ mimalloc.workspace = true
 tracing-subscriber.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }

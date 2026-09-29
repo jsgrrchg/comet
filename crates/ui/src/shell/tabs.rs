@@ -44,6 +44,10 @@ struct PanelTitlebarWidths {
     files_controls: f32,
 }
 
+/// The session header's "+" and fork buttons (28px each, 2px gap) plus the
+/// row gap they cost the project-actions control.
+const SESSION_CONTROLS_WIDTH: f32 = 28.0 * 2.0 + 2.0 + 8.0;
+
 /// The two fixed right-edge anchors: the explorer toggle and the pane toggle
 /// (28px each) with the same 4px gap the surface strip keeps between its
 /// controls, so the two never render as one fused block.
@@ -68,6 +72,85 @@ fn panel_titlebar_widths(
 }
 
 impl Shell {
+    /// The same binding navigates the focused pane. Keep the persisted action
+    /// IDs so existing user keymaps and the native browser bridge still work.
+    pub(super) fn cycle_navigation(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.navigation_overlay_open(cx) {
+            return;
+        }
+        if matches!(self.route, Route::Chat)
+            && self.right_pane_open(cx)
+            && self.navigation_focus.in_right(window, cx)
+        {
+            let rows = self.right_surface_rows(cx);
+            if rows.len() <= 1 {
+                return;
+            }
+            let active = self.resolved_right_active(cx);
+            let at = rows.iter().position(|(surface, ..)| *surface == active);
+            let next = match (at, forward) {
+                (Some(at), true) => (at + 1) % rows.len(),
+                (Some(at), false) => (at + rows.len() - 1) % rows.len(),
+                (None, true) => 0,
+                (None, false) => rows.len() - 1,
+            };
+            self.activate_right_surface(rows[next].0, window, cx);
+        } else {
+            self.cycle_session(forward, cx);
+        }
+    }
+
+    fn navigation_overlay_open(&self, cx: &App) -> bool {
+        self.overlay_owns_keyboard(cx)
+            || self.sync_flow.has_visible_overlay()
+            || self.delete_confirm.is_some()
+            || self.delete_space_confirm.is_some()
+            || self.rename_dialog.is_some()
+            || self.rename_space_dialog.is_some()
+            || self.discard_working_tree.is_some()
+            || self.chat_menu.get().is_some()
+            || self.space_menu.get().is_some()
+            || self.user_menu.get().is_some()
+            || self.spaces_menu.get().is_some()
+            || self.right_plus.get().is_some()
+            || !self.pending_file_closes.is_empty()
+            || self.pending_exit.is_some()
+    }
+
+    pub(super) fn activate_right_surface(
+        &mut self,
+        surface: RightSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.navigation_focus.right_was_focused = true;
+        self.composer
+            .update(cx, |composer, _| composer.focus_pending = false);
+        // Establish a stable target before detaching the old editor. Read-only
+        // surfaces keep it; editable surfaces claim their own focus below/on mount.
+        window.focus(&self.navigation_focus.right, cx);
+        self.set_right_active(surface, cx);
+        self.focus_right_file_editor(surface, window, cx);
+    }
+
+    pub(super) fn restore_right_focus_after_close(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.right_pane_open(cx) {
+            self.activate_right_surface(self.resolved_right_active(cx), window, cx);
+        } else {
+            self.navigation_focus.right_was_focused = false;
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
+    }
+
     /// Navigation requests focus once the destination composer renders.
     pub(super) fn focus_composer(&mut self, cx: &mut Context<Self>) {
         self.composer.update(cx, |composer, cx| {
@@ -80,14 +163,13 @@ impl Shell {
     /// the order it is drawn. Selection is immediate (no MRU overlay held open
     /// on the modifier) — one press, one session.
     ///
-    /// Chat-scoped chrome, like the panel toggles: gpui dispatches a matched
-    /// binding before any `on_key_down`, so an unscoped cycle would fire
-    /// underneath Settings (yanking the user off the page mid-record, since
-    /// these are the very keys the shortcuts table invites them to press) or
-    /// underneath the add-space palette, stranding the overlay over a session
-    /// they never picked.
+    /// Works from Settings too, landing back in chat like a jump; the
+    /// shortcut recorder intercepts these keys while it records. Quiet under
+    /// a keyboard-owning overlay: gpui dispatches a matched binding before any
+    /// `on_key_down`, so a cycle under the add-space palette would strand the
+    /// overlay over a session the user never picked.
     pub(super) fn cycle_session(&mut self, forward: bool, cx: &mut Context<Self>) {
-        if !matches!(self.route, Route::Chat) || self.overlay_owns_keyboard(cx) {
+        if self.overlay_owns_keyboard(cx) {
             return;
         }
         // The same list `render_active_rows` draws and the jump shortcuts
@@ -323,7 +405,11 @@ impl Shell {
                 .h_full()
                 .flex()
                 .flex_row()
-                .items_center();
+                .items_center()
+                // The transcript extends under this band (it fades beneath
+                // the tab strip); a wheel over the tabs must scroll the
+                // strip, never the surface behind it.
+                .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
             if right_pane_open {
                 // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
                 // options that used to live here moved into the pane's own
@@ -359,11 +445,21 @@ impl Shell {
                         .child(header_icon_button(
                             "expand-changes",
                             right_pane_expand_icon(self.right_pane_expanded),
+                            if self.right_pane_expanded {
+                                "Collapse panel"
+                            } else {
+                                "Expand panel"
+                            },
                             &theme,
                             cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                         )),
                 );
             }
+            let files_panel_label = if self.files_panel_open(cx) {
+                "Hide files panel"
+            } else {
+                "Show files panel"
+            };
             // The explorer slot sits over the explorer column and carries the
             // two fixed right-edge anchors — the explorer toggle and,
             // outermost, the pane toggle — which stay mounted at one position
@@ -390,17 +486,14 @@ impl Shell {
                                 header_icon_button(
                                     "toggle-files-panel",
                                     icons::FILE_TREE,
+                                    files_panel_label,
                                     &theme,
                                     cx.listener(|this, _, window, cx| {
                                         this.toggle_files_panel(window, cx)
                                     }),
                                 )
                                 .role(gpui::Role::Button)
-                                .aria_label(if self.files_panel_open(cx) {
-                                    "Hide files panel"
-                                } else {
-                                    "Show files panel"
-                                })
+                                .aria_label(files_panel_label)
                                 .when(self.files_panel_open(cx), |button| {
                                     button.bg(crate::theme::wash(0.09))
                                 }),
@@ -408,6 +501,7 @@ impl Shell {
                             .child(header_icon_button(
                                 "toggle-changes",
                                 icons::SIDEBAR_MINIMALISTIC,
+                                ShortcutId::ToggleChanges.label(),
                                 &theme,
                                 cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                             )),
@@ -416,6 +510,48 @@ impl Shell {
             )
         };
 
+        // The session's own side-chat controls: "+" mints a fresh side chat
+        // under this session, fork copies its history into one. Same pair
+        // the side-chat header carries, so a family reads the same from
+        // either end.
+        let session_controls = (!takeover && !on_canvas).then(|| {
+            let busy = self.side_chat_creating;
+            div()
+                .flex_none()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                .child(
+                    header_icon_button(
+                        "session-new-side-chat",
+                        icons::PLUS,
+                        "New side chat",
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.create_child_chat(None, cx)),
+                    )
+                    .role(gpui::Role::Button)
+                    .aria_label("New side chat")
+                    .when(busy, |el| el.opacity(0.4)),
+                )
+                .child(
+                    header_icon_button(
+                        "session-fork",
+                        icons::GIT_BRANCH,
+                        "Fork this session",
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.create_side_chat(cx)),
+                    )
+                    .role(gpui::Role::Button)
+                    .aria_label("Fork this session")
+                    .when(busy, |el| el.opacity(0.4)),
+                )
+        });
+        let available_titlebar_width = if session_controls.is_some() {
+            (available_titlebar_width - SESSION_CONTROLS_WIDTH).max(0.0)
+        } else {
+            available_titlebar_width
+        };
         let actions = (!takeover && !on_canvas)
             .then(|| {
                 self.render_project_actions_control(available_titlebar_width, viewport_height, cx)
@@ -478,6 +614,7 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(session_controls)
             .children(actions)
             .children(trailing);
 

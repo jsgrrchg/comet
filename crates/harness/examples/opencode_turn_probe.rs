@@ -42,6 +42,7 @@ async fn main() {
     let interrupt = CancellationToken::new();
     let (_steer_tx, steering) = mpsc::channel(8);
     let request = RunRequest {
+        mcp: None,
         prompt,
         harness: None,
         model,
@@ -62,6 +63,7 @@ async fn main() {
         .run(
             request,
             RunControls {
+                execution_lease: None,
                 request_input: Box::new(move |questions| {
                     assert!(
                         answer_yes,

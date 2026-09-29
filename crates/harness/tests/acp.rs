@@ -37,6 +37,7 @@ fn harness() -> AcpHarness {
 
 fn request(prompt: &str) -> RunRequest {
     RunRequest {
+        mcp: None,
         prompt: prompt.into(),
         harness: None,
         model: Some("grok-4.5".into()),
@@ -55,6 +56,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
+        execution_lease: None,
         request_input: Box::new(move |questions| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -501,7 +503,7 @@ fn descriptor_surface_matches_registry_expectations() {
     assert_eq!(harness.id(), HarnessId::Grok);
     assert_eq!(harness.display_name(), "Grok");
     assert!(harness.supports_steering());
-    assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(harness.steering_mode(), SteeringMode::StepBoundary);
     assert_eq!(
         harness.reasoning_levels(),
         &[
@@ -618,7 +620,7 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert_eq!(devin.id(), HarnessId::Devin);
     assert_eq!(devin.display_name(), "Devin");
     assert!(devin.supports_steering());
-    assert_eq!(devin.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(devin.steering_mode(), SteeringMode::StepBoundary);
     assert!(devin.reasoning_levels().is_empty());
 
     let hermes = AcpHarness::hermes();
@@ -632,7 +634,7 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
     assert_eq!(pi.id(), HarnessId::Pi);
     assert_eq!(pi.display_name(), "Pi");
     assert!(pi.supports_steering());
-    assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(pi.steering_mode(), SteeringMode::StepBoundary);
     assert_eq!(
         pi.reasoning_levels(),
         &[
@@ -795,6 +797,142 @@ async fn antigravity_run_without_sign_in_points_to_settings_instead_of_a_browser
     assert!(
         error.contains("Settings → Providers → Antigravity and connect an account"),
         "{error}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_auth_prompt_after_cancel_emits_one_interrupted_done() {
+    let mut req = request("auth-prompt-after-cancel");
+    req.model = None;
+    let (controls, _steer, token) = controls();
+    let harness = antigravity_harness();
+    let mut stream = harness.run(req, controls).await.expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.expect("stream event");
+            if matches!(&event, AgentEvent::TextDelta { text } if text == "Ready to cancel") {
+                token.cancel();
+            }
+            events.push(event);
+        }
+        events
+    })
+    .await
+    .expect("cancelled run finishes");
+    assert!(token.is_cancelled(), "{events:?}");
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Interrupted, None)],
+        "{events:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn antigravity_stale_login_stops_background_probes_and_runs() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let server = dir.path().join("stale-antigravity-acp");
+    let prompted = dir.path().join("prompted");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-antigravity-acp.sh");
+    std::fs::write(
+        &server,
+        format!(
+            "#!/bin/sh\nFAKE_AGY_STALE_LOGIN='{}' exec '{}' \"$@\"\n",
+            prompted.display(),
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let harness = AcpHarness::antigravity().with_executable(&server);
+
+    tokio::time::timeout(Duration::from_secs(10), harness.models())
+        .await
+        .expect("model probe waited for the sign-in timeout")
+        .expect("static model fallback");
+    // each retry would relaunch the server into another sign-in prompt
+    assert_eq!(std::fs::read_to_string(&prompted).unwrap(), "x");
+
+    let commands = tokio::time::timeout(Duration::from_secs(10), harness.commands())
+        .await
+        .expect("command probe waited for the sign-in timeout");
+    if let Err(error) = commands {
+        assert!(error.to_string().contains("isn't signed in"));
+    }
+
+    let mut req = request("hi");
+    req.model = None;
+    let (initial_controls, _, _) = controls();
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_to_end(&harness, req, initial_controls),
+    )
+    .await
+    .expect("run waited for the handshake timeout");
+    let done = dones(&events);
+    assert_eq!(done.len(), 1, "{events:?}");
+    assert_eq!(done[0].0, DoneStatus::Errored);
+    assert!(
+        done[0]
+            .1
+            .as_deref()
+            .unwrap_or_default()
+            .contains("isn't signed in"),
+        "{events:?}"
+    );
+
+    let stdout_server = dir.path().join("stdout-antigravity-acp");
+    std::fs::write(
+        &stdout_server,
+        format!(
+            "#!/bin/sh\nFAKE_AGY_STALE_LOGIN='{}' FAKE_AGY_STALE_LOGIN_STREAM='stdout' exec '{}' \"$@\"\n",
+            prompted.display(),
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stdout_server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let stdout_harness = AcpHarness::antigravity().with_executable(stdout_server);
+    tokio::time::timeout(Duration::from_secs(10), stdout_harness.models())
+        .await
+        .expect("stdout sign-in prompt waited for the discovery timeout")
+        .expect("static model fallback");
+
+    let turn_server = dir.path().join("turn-antigravity-acp");
+    std::fs::write(
+        &turn_server,
+        format!(
+            "#!/bin/sh\nFAKE_AGY_STALE_TURN='1' exec '{}' \"$@\"\n",
+            fixture.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&turn_server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let turn_harness = AcpHarness::antigravity().with_executable(turn_server);
+    let mut req = request("hi");
+    req.model = None;
+    let (turn_controls, _, _) = controls();
+    let events = tokio::time::timeout(
+        Duration::from_secs(10),
+        run_to_end(&turn_harness, req, turn_controls),
+    )
+    .await
+    .expect("turn waited for the sign-in timeout");
+    let done = dones(&events);
+    assert_eq!(done.len(), 1, "{events:?}");
+    assert_eq!(done[0].0, DoneStatus::Errored);
+    assert!(
+        done[0]
+            .1
+            .as_deref()
+            .unwrap_or_default()
+            .contains("isn't signed in"),
+        "{events:?}"
     );
 }
 
@@ -1893,7 +2031,6 @@ async fn pi_boundary_steer(scenario: &str, trigger_on_done: bool) {
     })
     .await
     .unwrap();
-    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None); 2]);
     assert_eq!(
         events
             .iter()
@@ -1901,15 +2038,28 @@ async fn pi_boundary_steer(scenario: &str, trigger_on_done: bool) {
             .count(),
         1
     );
-    let first_done = events
-        .iter()
-        .position(|e| matches!(e, AgentEvent::Done { .. }))
-        .unwrap();
     let second_text = events
         .iter()
         .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "second"))
         .unwrap();
-    assert!(first_done < second_text);
+    if trigger_on_done {
+        // Idle between turns: the steer is simply the next turn.
+        assert_eq!(dones(&events), vec![(DoneStatus::Completed, None); 2]);
+        let first_done = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Done { .. }))
+            .unwrap();
+        assert!(first_done < second_text);
+    } else {
+        // Mid-turn: the steer preempts (here the turn ended first anyway) and
+        // continues the run behind a Steered boundary — one run, one Done.
+        assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+        let steered = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::Steered { .. }))
+            .expect("steer boundary");
+        assert!(steered < second_text);
+    }
 }
 
 #[tokio::test]
@@ -1949,7 +2099,7 @@ fn antigravity_detection_and_missing_server_never_install() {
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         let adapters = dir.path().join("adapters");
         if scenario == "partial" {
-            let partial = adapters.join("antigravity-acp/1.1.1");
+            let partial = adapters.join("antigravity-acp/1.2.1");
             std::fs::create_dir_all(&partial).unwrap();
             std::fs::write(partial.join("agy_acp_server.par"), "incomplete").unwrap();
         }
@@ -1975,7 +2125,7 @@ fn antigravity_detection_and_missing_server_never_install() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!adapters.join(".tmp-antigravity-acp-1.1.1").exists());
+        assert!(!adapters.join(".tmp-antigravity-acp-1.2.1").exists());
     }
 }
 
@@ -2025,6 +2175,58 @@ async fn antigravity_detection_subprocess() {
                 .all(|entry| entry.file_name() == "antigravity-acp"))
             .unwrap_or(true)
     );
+}
+
+#[tokio::test]
+async fn mcp_injection_all_acp_harnesses_new_resume_and_fallback() {
+    for harness in [
+        AcpHarness::grok(),
+        AcpHarness::devin(),
+        AcpHarness::hermes(),
+        AcpHarness::pi(),
+        AcpHarness::antigravity(),
+    ] {
+        let harness = harness.with_executable(fixture_path());
+        for resume in [None, Some("mcp-loaded"), Some("load-fail")] {
+            let mut req = request("scenario:mcp");
+            req.model = None;
+            req.resume = resume.map(str::to_owned);
+            req.mcp = Some(zeron_proto::McpServer {
+                name: "zeron".into(),
+                command: "/path with spaces/zeron".into(),
+                args: vec!["mcp".into()],
+                env: [
+                    ("ZERON_CHAT_ID".into(), "origin-chat".into()),
+                    ("ZERON_IPC_PORT".into(), "27699".into()),
+                ]
+                .into(),
+            });
+            let (controls, _steer, _token) = controls();
+            let mut stream = harness.run(req, controls).await.unwrap();
+            let events = tokio::time::timeout(Duration::from_secs(10), async {
+                let mut events = Vec::new();
+                while let Some(event) = stream.next().await {
+                    let event = event.unwrap();
+                    let done = matches!(event, AgentEvent::Done { .. });
+                    events.push(event);
+                    if done {
+                        break;
+                    }
+                }
+                events
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{:?} {resume:?} timed out", harness.id()));
+
+            assert!(
+                events.contains(&AgentEvent::TextDelta {
+                    text: "mcp configured".into()
+                }),
+                "{:?} {resume:?}: {events:?}",
+                harness.id()
+            );
+        }
+    }
 }
 
 #[tokio::test]

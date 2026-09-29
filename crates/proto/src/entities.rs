@@ -225,9 +225,11 @@ pub struct Chat {
     /// dials the room the registry names. Per-chat and instantly revertible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room_gen: Option<u32>,
-    /// The chat whose agent created this one (via the Zeron MCP server):
-    /// a parent → child link for orchestration trees. Absent for chats a
-    /// human started; a dangling id (parent deleted) is tolerated.
+    /// The chat this one hangs off: the conversation a side chat was forked
+    /// from, or the chat whose agent spawned this one through the Zeron MCP
+    /// server. Children stay out of the main sidebar and list under their
+    /// parent instead. Absent for top-level chats; a dangling id (parent
+    /// deleted) is tolerated rather than cascaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_chat_id: Option<String>,
 }
@@ -612,6 +614,10 @@ pub enum WorkspaceReadOnlyReason {
     TooLarge,
     PermissionDenied,
     NotRegularFile,
+    /// A file read by absolute path beyond the chat's workspace root: reads
+    /// are allowed, writes never are. Older peers never see this variant —
+    /// only a new UI asks for an absolute path — so the wire stays additive.
+    OutsideWorkspace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1188,6 +1194,18 @@ pub struct ChatConnectivity {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn outside_workspace_reads_round_trip_without_breaking_older_reasons() {
+        let reason = WorkspaceReadOnlyReason::OutsideWorkspace;
+        assert_eq!(serde_json::to_value(reason).unwrap(), "outsideWorkspace");
+        assert_eq!(
+            serde_json::from_value::<WorkspaceReadOnlyReason>(serde_json::json!("symlink"))
+                .unwrap(),
+            WorkspaceReadOnlyReason::Symlink,
+            "older peers keep parsing every reason they knew"
+        );
+    }
 
     #[test]
     fn legacy_chat_connectivity_has_no_live_delivery_proof() {

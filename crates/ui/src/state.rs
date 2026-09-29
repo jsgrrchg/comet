@@ -359,6 +359,9 @@ impl EngineHandle {
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let service_for_boot = assembled_service.clone();
+        // Agents only learn a port THIS window serves: a lost bind race must
+        // not point their injected MCP server at some other engine.
+        let served_ipc_port = ipc_task.as_ref().map(|_| engine_config.ipc_port);
         // The instance lock rides into the boot task and is consumed by
         // assembly — held through sign-in onboarding too, because this process
         // owns the data dir from the moment it decided to embed.
@@ -394,6 +397,9 @@ impl EngineHandle {
             match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
+                    if let Some(port) = served_ipc_port {
+                        engine_runtime.core().sessions.set_ipc_port(port);
+                    }
                     *runtime_for_boot.lock().await = Some(engine_runtime);
                     if service_for_boot.set(service).is_err() {
                         state_tx.send_replace(DeferredEngineState::Failed(
@@ -683,6 +689,11 @@ pub struct AppState {
     pub spaces: Vec<Space>,
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
+    /// Fork RPC may arrive ahead of its registry row on a remote device.
+    pending_side_chat: Option<Chat>,
+    /// `pending_side_chat` was started by hand and nothing has minted it:
+    /// no registry row, no doc, until its first send.
+    unsaved_side_chat: bool,
     pub sessions: Vec<Session>,
     /// Synced user/org sidebar pin state. Local workspaces deliberately ignore
     /// this and continue reading their device-local settings entry.
@@ -729,6 +740,9 @@ pub struct AppState {
     /// Changes only when transcript/optimistic content changes. Presence,
     /// catalogs and other app-state notifications need no row derivation.
     pub(crate) transcript_revision: u64,
+    /// Changes whenever an input of [`Self::file_link_roots`] does — chat
+    /// rows, projects, this device's id — so views can memoize the roots.
+    pub(crate) link_roots_revision: u64,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
@@ -750,8 +764,9 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
-    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<zeron_update::UpdateStatus>,
+    /// Device-local agent CLI update lifecycle. Unlike `ListHarnesses`, this
+    /// standing stream may be backed by subprocess and network probes.
+    pub harness_updates: Vec<zeron_proto::HarnessUpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -806,6 +821,8 @@ impl AppState {
             connectivity_observed: false,
             spaces: Vec::new(),
             chats: Vec::new(),
+            pending_side_chat: None,
+            unsaved_side_chat: false,
             sessions: Vec::new(),
             sidebar_preferences: SidebarPreferencesState::default(),
             session_presentation: None,
@@ -821,6 +838,7 @@ impl AppState {
             transcript_cache: Default::default(),
             prepared_transcripts: HashMap::new(),
             transcript_revision: 0,
+            link_roots_revision: 0,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
             upload_progress: None,
@@ -828,7 +846,7 @@ impl AppState {
             review_comments: HashMap::new(),
             review_comment_flushes: HashMap::new(),
             local_device_id: None,
-            update: None,
+            harness_updates: Vec::new(),
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -1018,8 +1036,16 @@ impl AppState {
     }
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
+        if let Some(pending) = &self.pending_side_chat {
+            if chats.iter().any(|chat| chat.id == pending.id) {
+                self.pending_side_chat = None;
+            } else {
+                chats.push(pending.clone());
+            }
+        }
         sort_chats(&mut chats);
         self.chats = chats;
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
         self.chats_synced = true;
         self.transcript_cache
             .retain(|cached| self.chats.iter().any(|c| c.id == cached.chat_id));
@@ -1070,6 +1096,7 @@ impl AppState {
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
         sort_spaces(&mut spaces);
         self.spaces = spaces;
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
         self.spaces_synced = true;
         if self.no_project {
             self.selected_space = None;
@@ -1094,10 +1121,96 @@ impl AppState {
         }
     }
 
+    /// The ordered checkouts a file link from `chat_id` may resolve against:
+    /// the chat's own checkout, its parent chat's, then every project root on
+    /// the linking chat's device — an agent's paths name its own disk, so a
+    /// root on another device never owns them. Project roots have no owning
+    /// chat — a link that matches one opens by absolute path through the
+    /// linking chat. `local` marks roots whose files sit on this disk; a
+    /// remote chat's worktree still resolves links (reads go through its own
+    /// device) but cannot offer local file actions.
+    pub(crate) fn file_link_roots(
+        &self,
+        chat_id: &str,
+    ) -> Vec<crate::workspace_links::FileLinkRoot> {
+        use crate::workspace_links::FileLinkRoot;
+        // An unprobed device id means the chats on screen are the local
+        // engine's — everything shown counts as local until sync says else.
+        let on_this_device = |device: &str| {
+            self.local_device_id
+                .as_deref()
+                .is_none_or(|local| device == local)
+        };
+        let mut roots: Vec<FileLinkRoot> = Vec::new();
+        let mut push = |chat: Option<&Chat>, device: &str, root: Option<&str>| {
+            let Some(root) = root.filter(|root| !root.is_empty()) else {
+                return;
+            };
+            if roots.iter().any(|existing| existing.root == root) {
+                return;
+            }
+            roots.push(FileLinkRoot {
+                chat: chat.map(|chat| chat.id.clone()),
+                local: on_this_device(device),
+                root: root.to_owned(),
+            });
+        };
+        let chat_row = |id: &str| self.chats.iter().find(|chat| chat.id == id);
+        let linking = chat_row(chat_id);
+        // Roots on the linking chat's device; an unknown chat row falls back
+        // to this device's.
+        let on_link_device = |device: &str| match linking {
+            Some(chat) => chat.device_id == device,
+            None => on_this_device(device),
+        };
+        if let Some(chat) = linking {
+            push(Some(chat), &chat.device_id, chat.cwd.as_deref());
+        }
+        if let Some(parent) = linking
+            .and_then(|chat| chat.parent_chat_id.as_deref())
+            .and_then(chat_row)
+            .filter(|parent| on_link_device(&parent.device_id))
+        {
+            push(Some(parent), &parent.device_id, parent.cwd.as_deref());
+        }
+        for space in self
+            .spaces
+            .iter()
+            .filter(|space| on_link_device(&space.device_id))
+        {
+            push(None, &space.device_id, Some(space.path.as_str()));
+        }
+        roots
+    }
+
+    /// Whether `chat_id` lives on this device — an outside file link from it
+    /// resolves to this disk, so its menu may offer local file actions. An
+    /// unprobed device id (or an unknown chat row) counts as local, matching
+    /// `file_link_roots`.
+    pub(crate) fn chat_is_local(&self, chat_id: &str) -> bool {
+        self.chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .is_none_or(|chat| {
+                self.local_device_id
+                    .as_deref()
+                    .is_none_or(|local| chat.device_id == local)
+            })
+    }
+
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
     /// the chips update on click; the next chats watch frame carries the same
     /// value once the engine applies the LWW write.
     pub fn apply_chat_config(&mut self, chat_id: &str, config: zeron_proto::ChatConfig) {
+        // The pending side chat's copy is what `apply_chats` re-inserts and
+        // what an unsaved one is minted from.
+        if let Some(chat) = self
+            .pending_side_chat
+            .as_mut()
+            .filter(|chat| chat.id == chat_id)
+        {
+            chat.config = Some(config.clone());
+        }
         if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
             chat.config = Some(config);
         }
@@ -1252,8 +1365,8 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
-    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
-        self.update = Some(status);
+    pub fn apply_harness_updates(&mut self, statuses: Vec<zeron_proto::HarnessUpdateStatus>) {
+        self.harness_updates = statuses;
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -1616,6 +1729,28 @@ impl AppState {
         }
     }
 
+    /// A send the host held for the next turn shows as its queue row, not
+    /// as an echo: drop echoes (and the pending-send overlay) for queued ids.
+    pub fn apply_queue(&mut self, items: Vec<zeron_doc::QueuedMessage>) {
+        if let Some(chat_id) = self.selected_chat.as_deref() {
+            if let Some(echoes) = self.echoes.get_mut(chat_id) {
+                let before = echoes.len();
+                echoes.retain(|echo| !items.iter().any(|q| q.id == echo.id));
+                if echoes.len() != before {
+                    self.transcript_revision = self.transcript_revision.wrapping_add(1);
+                }
+            }
+            if self
+                .pending_sends
+                .get(chat_id)
+                .is_some_and(|p| items.iter().any(|q| q.id == p.message_id))
+            {
+                self.pending_sends.remove(chat_id);
+            }
+        }
+        self.queue = items;
+    }
+
     /// Unconfirmed echoes for the selected chat, in send order.
     pub fn pending_echoes(&self) -> &[SessionMessageEntry] {
         self.selected_chat
@@ -1871,6 +2006,8 @@ impl AppState {
         self.session_presence_presentation.clear();
         self.spaces.clear();
         self.chats.clear();
+        self.pending_side_chat = None;
+        self.unsaved_side_chat = false;
         self.sessions.clear();
         self.sidebar_preferences = SidebarPreferencesState::default();
         self.session_presentation = None;
@@ -1893,8 +2030,105 @@ impl AppState {
         self.upload_progress = None;
         self.transfers.clear();
         self.local_device_id = None;
-        self.update = None;
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
         cx.notify();
+    }
+
+    /// Independent selection and transcript subscriptions over the same engine.
+    /// An `unsaved` chat is a hand-started side chat nothing has written yet:
+    /// it opens no doc until its first send mints it (see
+    /// [`Self::unsaved_side_chat_create`]).
+    pub(crate) fn side_chat_state(
+        parent: &Entity<Self>,
+        chat: Chat,
+        unsaved: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let source = parent.read(cx);
+        let engine = source.engine.clone();
+        let mut state = Self::new();
+        state.chats = source.chats.clone();
+        if !state.chats.iter().any(|c| c.id == chat.id) {
+            state.chats.push(chat.clone());
+        }
+        state.spaces = source.spaces.clone();
+        state.devices = source.devices.clone();
+        state.data_dir = source.data_dir.clone();
+        state.auto_selected = true;
+        state.pending_side_chat = Some(chat.clone());
+        state.unsaved_side_chat = unsaved;
+        if let Some(engine) = engine {
+            state.attach_engine(engine, cx);
+        }
+        state.select_chat(Some(chat.id), cx);
+        state
+    }
+
+    /// This is a side chat's state whose chat its first send has yet to mint.
+    pub(crate) fn side_chat_unsaved(&self) -> bool {
+        self.unsaved_side_chat
+    }
+
+    /// The harness can change until the first send snapshots it.
+    /// Keep the harness fixed while createChat is in flight, including uploads.
+    pub(crate) fn side_chat_harness_editable(&self) -> bool {
+        self.unsaved_side_chat
+            && self
+                .selected_chat
+                .as_ref()
+                .is_some_and(|id| !self.pending_sends.contains_key(id))
+    }
+
+    fn is_unsaved_side_chat(&self, chat_id: &str) -> bool {
+        self.unsaved_side_chat
+            && self
+                .pending_side_chat
+                .as_ref()
+                .is_some_and(|chat| chat.id == chat_id)
+    }
+
+    /// The `Mutate createChat` params that mint the unsaved side chat
+    /// `chat_id` on its first send; `None` once it exists.
+    pub(crate) fn unsaved_side_chat_create(&self, chat_id: &str) -> Option<serde_json::Value> {
+        if !self.is_unsaved_side_chat(chat_id) {
+            return None;
+        }
+        let chat = self.pending_side_chat.as_ref()?;
+        Some(serde_json::json!({
+            "op": "createChat",
+            "chatId": chat.id,
+            "deviceId": chat.device_id,
+            "spaceId": chat.space_id,
+            "config": chat.config,
+            "branch": chat.branch,
+            "cwd": chat.cwd,
+            "parentChatId": chat.parent_chat_id,
+        }))
+    }
+
+    /// The unsaved side chat now exists: attach the doc watches it deferred.
+    pub(crate) fn side_chat_saved(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if !self.is_unsaved_side_chat(chat_id) {
+            return;
+        }
+        self.unsaved_side_chat = false;
+        if self.selected_chat.as_deref() == Some(chat_id) {
+            self.focus_chat_sync(chat_id, cx);
+            self.start_chat_watches(chat_id.to_owned(), cx);
+        }
+    }
+
+    fn start_chat_watches(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        self.transcript_task = Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
+        if handle
+            .engine_info()
+            .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
+        {
+            self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+        }
     }
 
     // ---- gpui glue ----
@@ -1941,8 +2175,14 @@ impl AppState {
         // baseline instead of comparing the new runtime with the old one.
         self.connectivity_observed = false;
         let engine_info = handle.engine_info();
+        let supports_harness_updates =
+            engine_info.supports(zeron_proto::capabilities::HARNESS_UPDATES_V1);
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
+        self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
+        if !supports_harness_updates {
+            self.harness_updates.clear();
+        }
         self.engine = Some(handle.clone());
         let mut watch_tasks = Vec::with_capacity(10);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
@@ -1995,17 +2235,19 @@ impl AppState {
                 state.apply_auth_value(value);
                 true
             }),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::UPDATE_STATUS,
-                |state, value| {
-                    state.apply_update(value);
-                    true
-                },
-            ),
             spawn_local_device_probe(cx, handle.clone()),
         ]);
+        if supports_harness_updates {
+            watch_tasks.push(spawn_watch(
+                cx,
+                handle.clone(),
+                methods::WATCH_HARNESS_UPDATES,
+                |state, value| {
+                    state.apply_harness_updates(value);
+                    true
+                },
+            ));
+        }
         self.watch_tasks = watch_tasks;
         self.reconcile_change_request_watches(cx);
         // EngineInfo is part of the attachment boundary: views must know which
@@ -2110,7 +2352,9 @@ impl AppState {
     /// watch server-side. Selecting a chat also lands in its space and marks it
     /// seen (a global-list click must switch the tab strip too).
     pub fn select_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
-        if let Some(id) = &chat_id {
+        if let Some(id) = &chat_id
+            && !self.is_unsaved_side_chat(id)
+        {
             self.focus_chat_sync(id, cx);
         }
         if self.selected_chat == chat_id {
@@ -2226,14 +2470,12 @@ impl AppState {
             }
             self.mark_chat_seen(id, cx);
         }
-        if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task =
-                Some(spawn_transcript_watch(cx, handle.clone(), chat_id.clone()));
-            if handle
-                .engine_info()
-                .supports(zeron_proto::capabilities::MESSAGE_QUEUE_V1)
-            {
-                self.queue_task = Some(spawn_queue_watch(cx, handle, chat_id));
+        if let Some(chat_id) = chat_id {
+            if self.is_unsaved_side_chat(&chat_id) {
+                // Nothing to watch yet, and opening its doc would start one.
+                self.transcript_replayed = true;
+            } else {
+                self.start_chat_watches(chat_id, cx);
             }
         }
         cx.notify();
@@ -2600,6 +2842,7 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
         if let Some(id) = id {
             this.update(cx, |state, cx| {
                 state.local_device_id = Some(id);
+                state.link_roots_revision = state.link_roots_revision.wrapping_add(1);
                 state.apply_pending_deep_link(cx);
                 // Watches opened before this probe conservatively route through
                 // targetDeviceId. Recreate them now that local routing is known.
@@ -2753,7 +2996,7 @@ fn spawn_queue_watch(
                 let alive = this.update(cx, |state, cx| {
                     // Guard against a stale pump racing a newer selection.
                     if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                        state.queue = frame.items;
+                        state.apply_queue(frame.items);
                         cx.notify();
                     }
                 });
@@ -4062,6 +4305,75 @@ mod tests {
     }
 
     #[test]
+    fn file_link_roots_order_chat_parent_then_projects() {
+        use crate::workspace_links::FileLinkRoot;
+        let mut state = AppState::new();
+        state.local_device_id = Some("dev".into());
+        let mut parent = chat("parent", 0, None);
+        parent.cwd = Some("/repo".into());
+        let mut fork = chat("fork", 1, None);
+        fork.cwd = Some("/fork/fork".into());
+        fork.parent_chat_id = Some("parent".into());
+        // A chat hosted on another device still contributes its checkout —
+        // reads go through it — but is flagged remote so system-level file
+        // actions stay hidden.
+        let mut remote = chat("remote", 2, None);
+        remote.device_id = "other".into();
+        remote.cwd = Some("/far/worktree".into());
+        remote.parent_chat_id = Some("fork".into());
+        state.apply_chats(vec![parent, fork, remote]);
+        state.apply_spaces(vec![
+            space("local", "dev", "/projects/zeron", 0),
+            space("remote", "other", "/remote/only", 1),
+        ]);
+        let root = |chat: Option<&str>, root: &str, local: bool| FileLinkRoot {
+            chat: chat.map(str::to_owned),
+            root: root.into(),
+            local,
+        };
+
+        let roots = state.file_link_roots("fork");
+        assert_eq!(
+            roots,
+            vec![
+                root(Some("fork"), "/fork/fork", true),
+                root(Some("parent"), "/repo", true),
+                root(None, "/projects/zeron", true),
+            ],
+            "own checkout, parent, then this device's projects"
+        );
+        assert!(state.chat_is_local("fork"));
+        assert!(!state.chat_is_local("remote"));
+        // A remote chat's paths name its own device: this device's projects
+        // and a parent hosted here never own them.
+        assert_eq!(
+            state.file_link_roots("remote"),
+            vec![
+                root(Some("remote"), "/far/worktree", false),
+                root(None, "/remote/only", false),
+            ]
+        );
+
+        // An absolute path outside every known root is still a file: it
+        // resolves as an outside link owned by the linking chat.
+        let root_refs: Vec<&str> = roots.iter().map(|root| root.root.as_str()).collect();
+        assert!(matches!(
+            crate::workspace_links::first_root_owning("/elsewhere/x.md", root_refs.clone()),
+            Some(crate::workspace_links::FileLinkResolution::Outside(link))
+                if link.path == "/elsewhere/x.md" && link.outside
+        ));
+        // A path under the parent's checkout resolves to that root.
+        assert_eq!(
+            match crate::workspace_links::first_root_owning("/repo/src/lib.rs", root_refs) {
+                Some(crate::workspace_links::FileLinkResolution::Owned { root, link }) =>
+                    Some((roots[root].chat.clone(), link.path)),
+                _ => None,
+            },
+            Some((Some("parent".into()), "src/lib.rs".into()))
+        );
+    }
+
+    #[test]
     fn canvas_terminal_uses_the_selected_project_folder() {
         let mut state = AppState::new();
         state.local_device_id = Some("local".into());
@@ -4299,6 +4611,42 @@ mod tests {
     }
 
     #[test]
+    fn side_chats_remain_addressable_but_do_not_appear_in_sidebar() {
+        let mut state = AppState::new();
+        let main = chat("main", 0, None);
+        let mut side = chat("side", 1, Some(2));
+        side.parent_chat_id = Some(main.id.clone());
+        state.apply_chats(vec![main, side]);
+        assert_eq!(
+            state
+                .visible_chats()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["main"]
+        );
+        state.selected_chat = Some("side".into());
+        assert_eq!(
+            state.selected_chat_row().unwrap().parent_chat_id.as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
+    fn remote_fork_waits_for_registry_then_observes_deletion() {
+        let mut state = AppState::new();
+        let mut side = chat("side", 1, None);
+        side.parent_chat_id = Some("main".into());
+        state.selected_chat = Some(side.id.clone());
+        state.pending_side_chat = Some(side.clone());
+        state.apply_chats(vec![]);
+        assert_eq!(state.selected_chat.as_deref(), Some("side"));
+        state.apply_chats(vec![side]);
+        assert!(state.pending_side_chat.is_none());
+        state.apply_chats(vec![]);
+        assert_eq!(state.selected_chat, None);
+    }
+
+    #[test]
     fn jump_slots_count_the_rows_the_sidebar_draws() {
         let now = Utc::now();
         let mut state = AppState::new();
@@ -4347,6 +4695,44 @@ mod tests {
         // An already archived chat stays put — the shortcut never unarchives.
         state.selected_chat = Some("a".into());
         assert_eq!(state.archivable_selected_chat(), None);
+    }
+
+    #[test]
+    fn a_send_held_in_the_queue_drops_its_echo_and_pending_overlay() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        let echo = |id: &str| SessionMessageEntry {
+            id: id.into(),
+            role: zeron_doc::MessageRole::User,
+            parts: vec![],
+            created_at: 0,
+            device_id: "local".into(),
+            status: None,
+            continuation_of: None,
+            duration_ms: None,
+        };
+        let row = |id: &str| zeron_doc::QueuedMessage {
+            id: id.into(),
+            text: "held".into(),
+            attachments: vec![],
+            hold_for_turn_end: false,
+            issued_by: "local".into(),
+            issued_at: 0,
+            edited_at: None,
+            delivery_gate: None,
+        };
+        state.push_echo("c1", echo("held"));
+        state.push_echo("c1", echo("sent"));
+        state.begin_pending_send("c1", "held", Utc::now());
+        state.apply_queue(vec![row("held")]);
+        let ids: Vec<_> = state
+            .pending_echoes()
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["sent"]);
+        assert!(!state.pending_sends.contains_key("c1"));
+        assert_eq!(state.queue.len(), 1);
     }
 
     #[test]

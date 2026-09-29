@@ -1566,6 +1566,7 @@ impl SubagentSink {
             status: Some(MessageStatus::Complete),
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         };
         if let Err(err) = self.doc.push_message(&entry) {
             tracing::warn!(doc = %self.doc_id, error = %err, "subagent steer write failed");
@@ -1935,6 +1936,7 @@ async fn drive_run(
         }
     }
     let mut prepared_events = std::collections::VecDeque::new();
+    let mut response_aliases = std::collections::HashMap::<String, String>::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
@@ -2048,7 +2050,7 @@ async fn drive_run(
 
     let mut final_completed_turn = None;
     let final_status = loop {
-        let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
+        let mut event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
             event
         } else {
             let raw_event = tokio::select! {
@@ -2651,6 +2653,10 @@ async fn drive_run(
             folded.clear();
             dirty = false;
             entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
+            response_aliases.clear();
+            if let Some(id) = next_assistant_message_id {
+                response_aliases.insert(id.clone(), entry_id.clone());
+            }
             segment_started = now_ms();
             // The elapsed timer is per user message, not per child process: a
             // steer boundary restarts it (matches the parked-resume path and
@@ -2672,6 +2678,51 @@ async fn drive_run(
             {
                 let _ = doc.set_fork_history_session(&session);
             }
+            continue;
+        }
+
+        // Explicit lifecycle IDs bind adapter replies to storage entries. Never infer
+        // this relationship from text, time, or transcript position.
+        match &event {
+            AgentEvent::SessionStarted {
+                assistant_message_id,
+                ..
+            }
+            | AgentEvent::AssistantMessageCompleted {
+                assistant_message_id,
+            } => {
+                response_aliases.insert(assistant_message_id.clone(), entry_id.clone());
+            }
+            _ => {}
+        }
+        if let AgentEvent::NativeForkReady {
+            assistant_message_id,
+            point,
+        } = &mut event
+        {
+            if response_aliases.get(assistant_message_id) != Some(&entry_id)
+                || point.harness != harness_id
+                || point.cwd != run_cwd
+                || point.validate().is_err()
+            {
+                continue;
+            }
+            point.source_device_id = device_id.clone();
+            *assistant_message_id = entry_id.clone();
+            let stored = sync_segment(
+                doc_ref,
+                &mut writer,
+                &entry_id,
+                &device_id,
+                segment_started,
+                &folded,
+            )
+            .and_then(|()| doc_ref.set_native_fork_point(&entry_id, point));
+            if let Err(err) = stored {
+                tracing::warn!(chat = %chat_id, error = %err, "native fork point persistence failed");
+                continue;
+            }
+            inner.publish(&chat_id, &event);
             continue;
         }
 
@@ -2931,6 +2982,7 @@ mod tests {
             status: None,
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         })
         .unwrap();
         let current = format!("Current {skill}\nKeep **Markdown**");
@@ -2972,6 +3024,7 @@ mod tests {
                 status: None,
                 continuation_of: None,
                 duration_ms: None,
+                native_fork_point: None,
             })
             .unwrap();
         }

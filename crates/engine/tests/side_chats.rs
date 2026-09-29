@@ -54,6 +54,7 @@ impl Harness for Capture {
 fn message(id: &str, role: MessageRole, text: &str, status: MessageStatus) -> SessionMessageEntry {
     SessionMessageEntry {
         duration_ms: None,
+        native_fork_point: None,
         id: id.into(),
         role,
         parts: vec![MessagePart::Text {
@@ -418,6 +419,7 @@ async fn side_turn(
                 sandbox: SandboxLevel::WorkspaceWrite,
                 auto_approve: true,
                 resume,
+                resume_policy: Default::default(),
                 attachments: vec![],
                 worktree: None,
             },

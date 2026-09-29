@@ -800,6 +800,7 @@ fn derive_pending(st: &mut CoreState, device_id: &str, degraded: bool, now: i64)
                             status: Some(MessageStatus::Complete),
                             continuation_of: None,
                             duration_ms: None,
+                            native_fork_point: None,
                         }),
                         echo: Some(LocalEcho {
                             state: pending.state,

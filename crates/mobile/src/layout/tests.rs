@@ -20,7 +20,11 @@ impl PlatformMeasurer for FixedFallback {
 }
 
 fn font(name: &str) -> Vec<u8> {
-    std::fs::read(format!("{}/../ui/assets/fonts/{name}.ttf", env!("CARGO_MANIFEST_DIR"))).unwrap()
+    std::fs::read(format!(
+        "{}/../ui/assets/fonts/{name}.ttf",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
 }
 
 pub(crate) fn text_system() -> Arc<TextSystem> {
@@ -34,14 +38,23 @@ pub(crate) fn text_system() -> Arc<TextSystem> {
         (FaceRole::Mono, "GeistMono"),
     ]
     .into_iter()
-    .map(|(role, name)| FaceData { role, bytes: font(name) })
+    .map(|(role, name)| FaceData {
+        role,
+        bytes: font(name),
+    })
     .collect();
     TextSystem::new(faces, Some(Arc::new(FixedFallback)))
 }
 
 fn worker(width: f32) -> Worker {
     let ts = text_system();
-    let mut w = Worker::new(&ts, Arc::new(Shared { frame: Mutex::new(Arc::new(LayoutFrame::empty())) }), Arc::new(Quiet));
+    let mut w = Worker::new(
+        &ts,
+        Arc::new(Shared {
+            frame: Mutex::new(Arc::new(LayoutFrame::empty())),
+        }),
+        Arc::new(Quiet),
+    );
     w.width = width;
     w
 }
@@ -85,9 +98,14 @@ fn paint_matches_measure_at_many_widths() {
             for run in &d.runs {
                 assert!(run.start + run.len <= units, "run slices the row text");
                 if run.scroller.is_none() {
-                    assert!(run.x >= 0.0 && run.x + run.width <= width + 0.5, "run inside width {width}: {run:?}");
+                    assert!(
+                        run.x >= 0.0 && run.x + run.width <= width + 0.5,
+                        "run inside width {width}: {run:?}"
+                    );
                 }
-                assert!(run.baseline > 0.0 && run.baseline <= d.height + 0.5 || run.scroller.is_some());
+                assert!(
+                    run.baseline > 0.0 && run.baseline <= d.height + 0.5 || run.scroller.is_some()
+                );
             }
         }
     }
@@ -102,13 +120,26 @@ fn streaming_converges_to_full_parse() {
     for chunk in chars.chunks(7) {
         shown.extend(chunk);
         w.input = debug_input(
-            vec![DebugEntry { id: "a".into(), user: false, text: shown.clone(), streaming: true }],
+            vec![DebugEntry {
+                id: "a".into(),
+                user: false,
+                text: shown.clone(),
+                streaming: true,
+            }],
             true,
         );
         last = Some(w.pass());
     }
     let _ = last;
-    w.input = debug_input(vec![DebugEntry { id: "a".into(), user: false, text: shown, streaming: false }], false);
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "a".into(),
+            user: false,
+            text: shown,
+            streaming: false,
+        }],
+        false,
+    );
     let streamed = w.pass();
     let mut fresh = worker(390.0);
     fresh.input = transcript_one(RICH);
@@ -117,34 +148,80 @@ fn streaming_converges_to_full_parse() {
     for i in 0..full.row_count() {
         let (a, b) = (streamed.placement(i).unwrap(), full.placement(i).unwrap());
         assert_eq!(a.key, b.key);
-        assert!((a.height - b.height).abs() < 0.01, "row {i}: {} vs {}", a.height, b.height);
+        assert!(
+            (a.height - b.height).abs() < 0.01,
+            "row {i}: {} vs {}",
+            a.height,
+            b.height
+        );
     }
 }
 
 fn transcript_one(text: &str) -> TranscriptInput {
-    debug_input(vec![DebugEntry { id: "a".into(), user: false, text: text.into(), streaming: false }], false)
+    debug_input(
+        vec![DebugEntry {
+            id: "a".into(),
+            user: false,
+            text: text.into(),
+            streaming: false,
+        }],
+        false,
+    )
 }
 
 #[test]
 fn stable_prefix_rows_are_reused_while_streaming() {
     let mut w = worker(390.0);
     let base = "# Title\n\nFirst paragraph.\n\nSecond paragraph that keeps growing";
-    w.input = debug_input(vec![DebugEntry { id: "a".into(), user: false, text: base.into(), streaming: true }], true);
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "a".into(),
+            user: false,
+            text: base.into(),
+            streaming: true,
+        }],
+        true,
+    );
     let f1 = w.pass();
-    w.input = debug_input(vec![DebugEntry { id: "a".into(), user: false, text: format!("{base} with more words"), streaming: true }], true);
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "a".into(),
+            user: false,
+            text: format!("{base} with more words"),
+            streaming: true,
+        }],
+        true,
+    );
     let f2 = w.pass();
     // Heading + first paragraph keep their versions; the tail changes.
     for i in 0..2 {
-        assert_eq!(f1.placement(i).unwrap().version, f2.placement(i).unwrap().version);
+        assert_eq!(
+            f1.placement(i).unwrap().version,
+            f2.placement(i).unwrap().version
+        );
     }
-    assert_ne!(f1.placement(2).unwrap().version, f2.placement(2).unwrap().version);
+    assert_ne!(
+        f1.placement(2).unwrap().version,
+        f2.placement(2).unwrap().version
+    );
 }
 
 #[test]
 fn toggles_expand_tool_groups_and_long_user_messages() {
     let mut w = worker(390.0);
-    let long = (0..40).map(|i| format!("line {i} of a long pasted prompt")).collect::<Vec<_>>().join("\n");
-    w.input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text: long, streaming: false }], false);
+    let long = (0..40)
+        .map(|i| format!("line {i} of a long pasted prompt"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "u".into(),
+            user: true,
+            text: long,
+            streaming: false,
+        }],
+        false,
+    );
     let folded = w.pass();
     let key = folded.placement(0).unwrap().key;
     w.builder.expanded.insert(key);
@@ -439,14 +516,24 @@ fn bench_layout_passes() {
         e.push(Arc::new(SessionMessageEntry {
             id: "live".into(),
             role: MessageRole::Assistant,
-            parts: vec![MessagePart::Text { id: "t0".into(), text: text.clone() }],
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.clone(),
+            }],
             created_at: 0,
             device_id: String::new(),
             status: Some(MessageStatus::Streaming),
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         }));
-        w.input = TranscriptInput { entries: e, pending: vec![], working: true, working_since_ms: None, streaming: true };
+        w.input = TranscriptInput {
+            entries: e,
+            pending: vec![],
+            working: true,
+            working_since_ms: None,
+            streaming: true,
+        };
         let t = Instant::now();
         w.pass();
         total += t.elapsed();
@@ -467,7 +554,15 @@ fn bench_layout_passes() {
 fn user_mentions_render_as_accent_chips() {
     let mut w = worker(390.0);
     let text = "Look at [mod.rs](zeron-file:crates/mobile/src/layout/mod.rs) please".to_owned();
-    w.input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text, streaming: false }], false);
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "u".into(),
+            user: true,
+            text,
+            streaming: false,
+        }],
+        false,
+    );
     let frame = w.pass();
     let d = frame.display(0).unwrap();
     assert!(d.text.contains("@mod.rs"), "{}", d.text);
@@ -479,7 +574,15 @@ fn user_mentions_render_as_accent_chips() {
 fn user_attachments_render_as_images_not_trailer_text() {
     let mut w = worker(390.0);
     let text = "Fix the header spacing\n\nAttached images (local files — open them to view):\n- /tmp/uploads/a/shot.png".to_owned();
-    w.input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text, streaming: false }], false);
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "u".into(),
+            user: true,
+            text,
+            streaming: false,
+        }],
+        false,
+    );
     let frame = w.pass();
     let d = frame.display(0).unwrap();
     assert!(!d.text.contains("Attached images"), "{}", d.text);
@@ -490,13 +593,33 @@ fn user_attachments_render_as_images_not_trailer_text() {
 #[test]
 fn folded_user_message_fades_its_last_line() {
     let mut w = worker(390.0);
-    let long = (0..40).map(|i| format!("line {i} of a long pasted prompt")).collect::<Vec<_>>().join("\n");
-    w.input = debug_input(vec![DebugEntry { id: "u".into(), user: true, text: long, streaming: false }], false);
+    let long = (0..40)
+        .map(|i| format!("line {i} of a long pasted prompt"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    w.input = debug_input(
+        vec![DebugEntry {
+            id: "u".into(),
+            user: true,
+            text: long,
+            streaming: false,
+        }],
+        false,
+    );
     let frame = w.pass();
     let d = frame.display(0).unwrap();
-    let fade = d.fades.iter().find(|f| f.edge == display::FadeEdge::Bottom).expect("bottom fade");
+    let fade = d
+        .fades
+        .iter()
+        .find(|f| f.edge == display::FadeEdge::Bottom)
+        .expect("bottom fade");
     // Exactly one shown line sits in the fade band (the "Show more" label is below it).
-    let in_band: Vec<f32> = d.runs.iter().map(|r| r.baseline).filter(|b| *b > fade.y && *b <= fade.y + fade.h).collect();
+    let in_band: Vec<f32> = d
+        .runs
+        .iter()
+        .map(|r| r.baseline)
+        .filter(|b| *b > fade.y && *b <= fade.y + fade.h)
+        .collect();
     assert!(!in_band.is_empty(), "fade covers the last shown line");
     assert!(in_band.iter().all(|b| (b - in_band[0]).abs() < 0.5));
 }
@@ -507,7 +630,10 @@ fn running_subagent_shows_a_spinner_after_its_spawn_resolves() {
     use zeron_doc::schema::{MessageRole, SessionMessageEntry};
     let spawn = |status: SubagentStatus| MessagePart::Tool {
         id: "k1".into(),
-        call: zeron_proto::ToolCall::Unknown { name: "Agent: scan the repo".into(), input: None },
+        call: zeron_proto::ToolCall::Unknown {
+            name: "Agent: scan the repo".into(),
+            input: None,
+        },
         is_error: false,
         // Eager-done: the spawn call resolved while the subagent still runs.
         resolved: true,
@@ -533,16 +659,40 @@ fn running_subagent_shows_a_spinner_after_its_spawn_resolves() {
                 status: Some(MessageStatus::Complete),
                 continuation_of: None,
                 duration_ms: None,
+                native_fork_point: None,
             })],
             ..Default::default()
         };
         w.pass()
     };
-    let spinners = |f: &LayoutFrame| f.display(0).unwrap().widgets.iter().filter(|w| matches!(w.kind, display::WidgetKind::Spinner)).count();
-    assert_eq!(spinners(&frame_for(SubagentStatus::Running)), 1, "running subagent spins");
-    assert_eq!(spinners(&frame_for(SubagentStatus::Done)), 0, "finished subagent is quiet");
+    let spinners = |f: &LayoutFrame| {
+        f.display(0)
+            .unwrap()
+            .widgets
+            .iter()
+            .filter(|w| matches!(w.kind, display::WidgetKind::Spinner))
+            .count()
+    };
+    assert_eq!(
+        spinners(&frame_for(SubagentStatus::Running)),
+        1,
+        "running subagent spins"
+    );
+    assert_eq!(
+        spinners(&frame_for(SubagentStatus::Done)),
+        0,
+        "finished subagent is quiet"
+    );
     let failed = frame_for(SubagentStatus::Failed);
-    assert!(failed.display(0).unwrap().runs.iter().any(|r| r.color == display::ColorRole::Danger), "failed subagent is tinted danger");
+    assert!(
+        failed
+            .display(0)
+            .unwrap()
+            .runs
+            .iter()
+            .any(|r| r.color == display::ColorRole::Danger),
+        "failed subagent is tinted danger"
+    );
 }
 
 #[test]
@@ -557,7 +707,9 @@ fn links_get_hit_regions() {
         w.input = transcript_one(md);
         w.pass();
         let frame = w.shared.frame.lock().unwrap().clone();
-        let links: Vec<_> = (0..frame.row_count()).flat_map(|i| frame.display(i).unwrap().links).collect();
+        let links: Vec<_> = (0..frame.row_count())
+            .flat_map(|i| frame.display(i).unwrap().links)
+            .collect();
         assert!(!links.is_empty(), "no link hits for {md:?}");
     }
 }

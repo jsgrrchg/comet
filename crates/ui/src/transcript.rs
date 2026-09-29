@@ -1670,6 +1670,7 @@ pub fn rows_for_entry(
                 let work_entry = SessionMessageEntry {
                     parts: work_parts,
                     duration_ms: None,
+                    native_fork_point: None,
                     continuation_of: None,
                     ..entry.clone()
                 };
@@ -8773,6 +8774,9 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
     });
     acc.push(pending as u8);
     acc.extend_from_slice(&entry.duration_ms.unwrap_or(0).to_le_bytes());
+    if let Some(point) = &entry.native_fork_point {
+        acc.extend_from_slice(&serde_json::to_vec(point).unwrap_or_default());
+    }
     for part in &entry.parts {
         acc.extend_from_slice(part.id().as_bytes());
         acc.extend_from_slice(&(part.byte_len() as u64).to_le_bytes());
@@ -10483,6 +10487,7 @@ mod tests {
             status: Some(status),
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         }
     }
 
@@ -13960,6 +13965,7 @@ mod tests {
             status: None,
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         };
         let rows = rows_for_entry(&user, true, false, &mut parse);
         assert_eq!(rows.len(), 1);

@@ -514,6 +514,13 @@ pub enum AgentEvent {
     AssistantMessageCompleted {
         assistant_message_id: String,
     },
+    /// Authoritative boundary, emitted before Done. The host stamps device provenance
+    /// and resolves the explicitly bound adapter message ID before journaling.
+    #[serde(rename_all = "camelCase")]
+    NativeForkReady {
+        assistant_message_id: String,
+        point: crate::NativeForkPoint,
+    },
     ToolCall {
         id: String,
         call: ToolCall,

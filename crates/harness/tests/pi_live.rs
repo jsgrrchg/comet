@@ -93,6 +93,7 @@ async fn real_pi_mock_lifecycle() {
             resume: session.clone(),
             attachments: vec![],
             worktree: None,
+            resume_policy: Default::default(),
             mcp: None,
         };
         let previous_session = session.clone();
@@ -187,6 +188,7 @@ async fn real_pi_mock_lifecycle() {
         cwd: cwd.display().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        resume_policy: Default::default(),
         resume: session.clone(),
         attachments: vec![],
         worktree: None,
@@ -258,6 +260,7 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
         cwd: cwd.display().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
+        resume_policy: Default::default(),
         resume: None,
         attachments: vec![],
         worktree: None,

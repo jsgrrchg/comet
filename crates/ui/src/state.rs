@@ -1241,8 +1241,7 @@ impl AppState {
         if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
             return false;
         }
-        if self.connectivity.state == S::Offline
-            || !self.device_online(&chat.device_id, Utc::now())
+        if self.connectivity.state == S::Offline || !self.device_online(&chat.device_id, Utc::now())
         {
             return true;
         }
@@ -2574,7 +2573,10 @@ impl AppState {
         cx.spawn(async move |_, _| {
             if let Err(error) = handle
                 .client()
-                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
+                .call(
+                    methods::FOCUS_CHAT,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
                 .await
             {
                 tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");
@@ -3695,6 +3697,7 @@ mod tests {
             status: None,
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         }
     }
 
@@ -4710,6 +4713,7 @@ mod tests {
             status: None,
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         };
         let row = |id: &str| zeron_doc::QueuedMessage {
             id: id.into(),
@@ -4748,6 +4752,7 @@ mod tests {
             status: None,
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         };
         state.push_echo("c1", echo.clone());
         // Duplicate pushes dedupe.

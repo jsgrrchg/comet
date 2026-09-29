@@ -53,7 +53,7 @@ async fn check_node(
         _ = stopped => Err(NativeForkError::Rejected("Node version check cancelled".into())),
     };
     // Even read-only probes must exit before releasing the provider lease.
-    let _ = child.kill().await;
+    let _ = child.start_kill();
     let _ = child.wait().await;
     result
 }
@@ -174,7 +174,7 @@ pub(super) async fn helper(
         result = tokio::time::timeout_at(deadline, operation) => result.unwrap_or_else(|_| Err(NativeForkError::Indeterminate("Claude fork timed out".into()))),
         _ = controls.interrupt.cancelled() => Err(NativeForkError::Indeterminate("Claude fork cancelled".into())),
     };
-    let _ = child.kill().await;
+    let _ = child.start_kill();
     let _ = child.wait().await;
     drop(controls.execution_lease);
     result

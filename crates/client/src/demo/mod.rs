@@ -526,7 +526,6 @@ impl DemoHost {
         user: Option<(String, String, String)>,
         steps: Vec<Step>,
         resume: Option<(usize, Vec<MessagePart>)>,
-        resume_policy: Default::default(),
     ) {
         let root = self.cancel_token();
         if root.is_cancelled() {
@@ -576,7 +575,6 @@ impl DemoHost {
         user: Option<(String, String, String)>,
         steps: Vec<Step>,
         resume: Option<(usize, Vec<MessagePart>)>,
-        resume_policy: Default::default(),
         token: CancellationToken,
     ) {
         let Ok(client) = self.client() else { return };

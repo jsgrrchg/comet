@@ -27,7 +27,7 @@ impl CodexHarness {
                 .kill_on_drop(true);
             let mut child = cmd.spawn().map_err(|e| e.to_string())?;
             let result = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
-            let _ = child.kill().await;
+            let _ = child.start_kill();
             let _ = child.wait().await;
             let success = result
                 .ok()

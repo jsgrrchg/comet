@@ -97,6 +97,37 @@ async fn terminal_contract_handles_normal_errors_retries_compaction_and_consumed
 }
 
 #[tokio::test]
+async fn nested_agent_environment_is_not_inherited() {
+    if std::env::var_os("CLAUDECODE").is_none() {
+        // Re-run in a private environment; never mutate this process's env.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "nested_agent_environment_is_not_inherited",
+                "--nocapture",
+            ])
+            .env("CLAUDECODE", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
+    let text: String = collect("env")
+        .await
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text, "reply:env:false");
+}
+
+#[tokio::test]
 async fn resumes_the_same_session_after_process_shutdown() {
     let dir = tempfile::tempdir().unwrap();
     let h = harness().with_session_store(dir.path().join("index"));

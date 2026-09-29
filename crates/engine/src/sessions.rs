@@ -568,7 +568,8 @@ impl SessionsEngine {
                 let engine_tx = engine_tx.clone();
                 tokio::spawn(async move {
                     tokio::select! {
-                        answer = answer_rx => { let _ = tx.send(answer.unwrap_or_default()); }
+                        // A dropped resolver stays an error for the harness, as before.
+                        answer = answer_rx => if let Ok(answer) = answer { let _ = tx.send(answer); },
                         _ = tx.closed() => {
                             lock(&pending).remove(&request_id);
                             let _ = engine_tx.send(AgentEvent::InputResolved { request_id });

@@ -101,7 +101,10 @@ fn main() {
                 json!({"commands":[{"name":"noop","description":"handled","source":"extension"},{"name":"skill:probe","description":"skill","source":"skill"}]}),
             ),
             "prompt" => {
-                let text = v["message"].as_str().unwrap_or("").to_owned();
+                let mut text = v["message"].as_str().unwrap_or("").to_owned();
+                if text == "env" {
+                    text = format!("env:{}", std::env::var_os("CLAUDECODE").is_some());
+                }
                 if text == "reject" {
                     emit(
                         json!({"type":"response","id":v["id"],"command":"prompt","success":false,"error":"preflight rejected"}),

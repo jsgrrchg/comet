@@ -121,6 +121,8 @@ impl PiHarness {
             }
         }
         let mut cmd = Command::new(&exe);
+        // Process group plus the same env scrubbing the ACP launch applied.
+        crate::process::owned::configure(&mut cmd);
         crate::compose_child_path(&mut cmd, &exe);
         cmd.args(["--mode", "rpc", "--no-themes"])
             .args(args)
@@ -129,8 +131,6 @@ impl PiHarness {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        #[cfg(unix)]
-        cmd.process_group(0);
         let scratch = mcp
             .map(|config| self::mcp::configure(&mut cmd, config))
             .transpose()?;

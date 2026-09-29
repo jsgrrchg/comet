@@ -204,12 +204,16 @@ async fn real_pi_mock_lifecycle() {
     .await
     .expect("native Pi run must settle");
     assert!(
-        events.iter().any(|e| matches!(e, AgentEvent::Error { message }
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Error { message }
             if message.contains("without the previous context"))),
         "{events:?}"
     );
     assert!(
-        events.iter().any(|e| matches!(e, AgentEvent::Done { status, session_id, .. }
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { status, session_id, .. }
             if *status == DoneStatus::Completed && session_id.is_some() && *session_id != session)),
         "{events:?}"
     );

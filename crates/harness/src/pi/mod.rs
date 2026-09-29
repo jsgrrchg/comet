@@ -3,6 +3,7 @@ mod catalog;
 mod normalize;
 mod rpc;
 mod sessions;
+mod ui;
 
 use crate::{
     Harness, HarnessError, RunControls,
@@ -143,6 +144,7 @@ impl PiHarness {
             transport,
             tail,
             stderr_task,
+            dialogs: Default::default(),
         })
     }
 }
@@ -151,6 +153,7 @@ struct Process {
     transport: rpc::Transport,
     tail: crate::StderrTail,
     stderr_task: tokio::task::JoinHandle<()>,
+    dialogs: ui::Dialogs,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -169,7 +172,11 @@ impl Process {
             if frame["type"] == "response" && frame["id"] == id {
                 return response_data(frame);
             }
-            backlog.push(frame);
+            if frame["type"] == "extension_ui_request" {
+                self.dialogs.request(self.transport.client.clone(), &frame);
+            } else {
+                backlog.push(frame);
+            }
         }
         Err(HarnessError::Protocol("Pi disconnected".into()))
     }
@@ -316,10 +323,11 @@ impl Harness for PiHarness {
             // The lease lives through shutdown even if the consumer drops its stream.
             let RunControls {
                 execution_lease: _lease,
-                request_input: _,
+                request_input,
                 mut steering,
                 interrupt,
             } = controls;
+            runner.process.dialogs.input = Some(std::sync::Arc::from(request_input));
             let consumer = runner.tx.clone();
             let result = tokio::select! {
                 result=runner.run(&mut steering)=>result,
@@ -390,6 +398,7 @@ impl Runner {
             return Ok(());
         }
         self.active = false;
+        self.process.dialogs.cancel();
         self.emit(AgentEvent::Done {
             status: if self.interrupted {
                 zeron_proto::DoneStatus::Interrupted
@@ -613,6 +622,7 @@ impl Runner {
     }
     async fn interrupt(&mut self, grace: Duration) {
         self.interrupted = true;
+        self.process.dialogs.cancel();
         self.queued.clear();
         self.delivery = None;
         if !self.active {
@@ -644,6 +654,23 @@ impl Runner {
         .await;
     }
     async fn frame(&mut self, frame: Value) -> Result<(), HarnessError> {
+        if frame["type"] == "extension_ui_request" {
+            self.process
+                .dialogs
+                .request(self.process.transport.client.clone(), &frame);
+            if frame["method"] == "notify" {
+                self.emit(AgentEvent::TextDelta {
+                    text: format!(
+                        "
+{}
+",
+                        string(&frame, "message")
+                    ),
+                })
+                .await?;
+            }
+            return Ok(());
+        }
         if frame["type"] == "response" {
             let Some(pending) = self.pending.remove(string(&frame, "id")) else {
                 return Ok(());

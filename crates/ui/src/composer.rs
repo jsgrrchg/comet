@@ -686,12 +686,16 @@ pub struct Wizard {
 impl Wizard {
     pub fn new(request_id: String, questions: Vec<UserInputQuestion>) -> Self {
         let n = questions.len();
+        let typed = questions
+            .iter()
+            .map(|q| q.prefill.clone().unwrap_or_default())
+            .collect();
         Self {
             request_id,
             questions,
             page: 0,
             picked: vec![Vec::new(); n],
-            typed: vec![String::new(); n],
+            typed,
         }
     }
 
@@ -780,8 +784,12 @@ impl Wizard {
             .iter()
             .enumerate()
             .map(|(ix, q)| {
-                let typed = self.typed.get(ix).map(|s| s.trim()).unwrap_or("");
-                let labels = if !typed.is_empty() {
+                let typed = self
+                    .typed
+                    .get(ix)
+                    .map(|s| if q.multiline { s.as_str() } else { s.trim() })
+                    .unwrap_or("");
+                let labels = if !typed.is_empty() || q.multiline {
                     vec![typed.to_string()]
                 } else {
                     self.picked
@@ -7365,7 +7373,13 @@ impl Composer {
                     .is_some_and(|w| w.request_id == request_id);
                 if !same {
                     self.reset_mention(None, cx);
+                    let prefill = questions
+                        .first()
+                        .and_then(|q| q.prefill.clone())
+                        .unwrap_or_default();
                     self.wizard = Some(Wizard::new(request_id, questions));
+                    self.input
+                        .update(cx, |input, cx| input.set_text(prefill, cx));
                     self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
                     self.input.update(cx, |input, cx| {
@@ -7492,7 +7506,7 @@ impl Composer {
         }
         if self.wizard.is_some() {
             // Enter inside the panel's free-text input submits the page.
-            let typed = self.input.read(cx).text().trim().to_string();
+            let typed = self.input.read(cx).text().to_string();
             if let Some(w) = self.wizard.as_mut() {
                 w.set_typed(typed);
             }
@@ -8429,22 +8443,28 @@ impl Composer {
     }
 
     fn wizard_advance(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text().to_string();
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
+        wizard.set_typed(text);
         match wizard.advance() {
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             _ => {
-                // Moving on: clear the shared free-text input for the next page.
-                self.input.update(cx, |input, cx| input.set_text("", cx));
+                let text = wizard.typed.get(wizard.page).cloned().unwrap_or_default();
+                self.input.update(cx, |input, cx| input.set_text(text, cx));
                 cx.notify();
             }
         }
     }
 
     fn wizard_back(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text().to_string();
         if let Some(wizard) = self.wizard.as_mut() {
+            wizard.set_typed(text);
             wizard.back();
+            let text = wizard.typed.get(wizard.page).cloned().unwrap_or_default();
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
             cx.notify();
         }
     }
@@ -8564,7 +8584,7 @@ impl Composer {
         let page = wizard.page;
         let last = page + 1 >= wizard.questions.len();
         let typed_empty = self.input.read(cx).is_empty();
-        let can_advance = wizard.page_has_pick() || !typed_empty;
+        let can_advance = wizard.page_has_pick() || !typed_empty || question.multiline;
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
@@ -12935,6 +12955,8 @@ mod tests {
             header: "Header".into(),
             question: format!("Question {id}"),
             options: options.iter().map(|s| s.to_string()).collect(),
+            prefill: None,
+            multiline: false,
             multi_select: multi,
         }
     }
@@ -13703,6 +13725,17 @@ mod tests {
             panic!()
         };
         assert_eq!(answers[0].labels, vec!["c"]);
+    }
+
+    #[test]
+    fn wizard_editor_preserves_prefill_whitespace_and_empty_edits() {
+        let mut q = question("editor", &[], false);
+        q.multiline = true;
+        q.prefill = Some("  first\nsecond\n".into());
+        let mut w = Wizard::new("req".into(), vec![q]);
+        assert_eq!(w.answers()[0].labels, vec!["  first\nsecond\n"]);
+        w.set_typed(String::new());
+        assert_eq!(w.answers()[0].labels, vec![""]);
     }
 
     #[test]

@@ -252,3 +252,86 @@ async fn rpc_control_commands_finish_without_waiting_for_agent_settled() {
         );
     }
 }
+
+#[tokio::test]
+async fn extension_dialogs_roundtrip_without_autoaccepting_and_preserve_editor_text() {
+    for (method, label, key, expected) in [
+        (
+            "select",
+            Some("second"),
+            "value",
+            serde_json::json!("second"),
+        ),
+        ("select", None, "cancelled", serde_json::json!(true)),
+        ("confirm", Some("No"), "confirmed", serde_json::json!(false)),
+        (
+            "input",
+            Some("custom"),
+            "value",
+            serde_json::json!("custom"),
+        ),
+        (
+            "editor",
+            Some("  first\nsecond\n"),
+            "value",
+            serde_json::json!("  first\nsecond\n"),
+        ),
+        ("editor", Some(""), "value", serde_json::json!("")),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut c, tx, _) = controls();
+        drop(tx);
+        c.request_input = Box::new(move |questions| {
+            assert_eq!(questions.len(), 1);
+            assert_eq!(questions[0].multiline, method == "editor");
+            assert_eq!(questions[0].prefill.as_deref(), Some("initial\nvalue"));
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(
+                label
+                    .map(|l| {
+                        vec![zeron_proto::UserInputAnswer {
+                            question_id: questions[0].id.clone(),
+                            labels: vec![l.into()],
+                        }]
+                    })
+                    .unwrap_or_default(),
+            );
+            rx
+        });
+        let events: Vec<_> = tokio::time::timeout(
+            Duration::from_secs(5),
+            harness()
+                .with_session_store(dir.path().join("index"))
+                .run(request(dir.path(), &format!("/dialog {method}")), c)
+                .await
+                .unwrap()
+                .map(Result::unwrap)
+                .collect(),
+        )
+        .await
+        .unwrap();
+        let reply = events
+            .iter()
+            .find_map(|e| match e {
+                AgentEvent::TextDelta { text } => {
+                    serde_json::from_str::<serde_json::Value>(text.trim()).ok()
+                }
+                _ => None,
+            })
+            .expect("dialog reply notification");
+        assert_eq!(reply[key], expected, "{events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        ..
+                    }
+                ))
+                .count(),
+            1
+        );
+    }
+}

@@ -3155,6 +3155,8 @@ fn handle_server_request_live(
             .unwrap_or("The agent needs your input.")
             .to_owned(),
         options: names.clone(),
+        prefill: None,
+        multiline: false,
         multi_select: false,
     };
     let client = client.clone();

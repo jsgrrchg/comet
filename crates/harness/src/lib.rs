@@ -184,6 +184,7 @@ pub(crate) mod jsonrpc;
 pub mod mock;
 mod model_context;
 pub mod opencode;
+pub mod pi;
 pub mod process;
 mod scratch;
 pub mod shell_env;

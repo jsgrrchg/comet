@@ -31,9 +31,10 @@ process; model switches do not persist global defaults. Commands and skills
 are discovered in the workspace. Pi controls project-extension trust.
 
 Steering queues at a model step boundary and starts immediately when idle.
-Zeron selects Pi's `all` steering mode when starting a session, so messages
+When no steering mode is configured, Zeron selects Pi's `all` mode, so messages
 queued before the next model call enter that call together. Pi persists this
-mode in its settings; `/steering one-at-a-time` can change it during the session.
+mode in its global settings. A mode already set in Pi's global or project
+settings (including one chosen with `/steering`) is never overwritten.
 Each input is sent as soon as the preceding preflight and ordered state query
 finish, without waiting for earlier queued inputs to be consumed or adding a
 batching delay. Inputs arriving after a model call starts belong to a later step.

@@ -13,15 +13,32 @@ pub(super) struct Store {
     agent: PathBuf,
     legacy: PathBuf,
 }
+/// Pi's settings directory: an explicit override, else `PI_CODING_AGENT_DIR`,
+/// else `~/.pi/agent`.
+pub(super) fn agent_dir(explicit: Option<PathBuf>) -> PathBuf {
+    explicit.unwrap_or_else(|| {
+        crate::model_context::root(
+            "PI_CODING_AGENT_DIR",
+            crate::executable::home_or_current_dir().join(".pi/agent"),
+        )
+    })
+}
 impl Store {
-    pub fn new(root: Option<PathBuf>) -> Self {
+    pub fn new(root: Option<PathBuf>, agent: Option<PathBuf>) -> Self {
         let home = crate::executable::home_or_current_dir();
-        let agent = crate::model_context::root("PI_CODING_AGENT_DIR", home.join(".pi/agent"));
+        let agent = agent_dir(agent);
         Self {
             root: root.unwrap_or_else(|| agent.join("zeron-sessions")),
             agent,
             legacy: home.join(".pi/pi-acp/session-map.json"),
         }
+    }
+    /// Whether a steering mode is already set in the settings Pi loads for
+    /// `cwd` (global, then project).
+    pub fn steering_mode_configured(&self, cwd: &Path) -> bool {
+        [self.agent.join("settings.json"), cwd.join(".pi/settings.json")]
+            .iter()
+            .any(|settings| json_file(settings).get("steeringMode").is_some())
     }
     fn key(&self, id: &str) -> PathBuf {
         self.root
@@ -197,7 +214,7 @@ mod tests {
     #[test]
     fn only_proven_empty_local_sessions_can_be_recreated_and_submission_revokes_it() {
         let dir = tempfile::tempdir().unwrap();
-        let mut store = Store::new(Some(dir.path().join("index")));
+        let mut store = Store::new(Some(dir.path().join("index")), None);
         store.agent = dir.path().join("agent");
         store.legacy = dir.path().join("legacy.json");
         let file = dir.path().join("session.jsonl");
@@ -237,13 +254,35 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_steering_mode_in_either_settings_file_is_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(cwd.join(".pi")).unwrap();
+        let store = Store::new(Some(dir.path().join("index")), Some(agent.clone()));
+        assert!(!store.steering_mode_configured(&cwd));
+        std::fs::write(agent.join("settings.json"), r#"{"retry":{"enabled":false}}"#).unwrap();
+        assert!(!store.steering_mode_configured(&cwd));
+        std::fs::write(
+            cwd.join(".pi/settings.json"),
+            r#"{"steeringMode":"one-at-a-time"}"#,
+        )
+        .unwrap();
+        assert!(store.steering_mode_configured(&cwd));
+        std::fs::remove_file(cwd.join(".pi/settings.json")).unwrap();
+        std::fs::write(agent.join("settings.json"), r#"{"steeringMode":"all"}"#).unwrap();
+        assert!(store.steering_mode_configured(&cwd));
+    }
+
+    #[test]
     fn resolves_legacy_and_native_files_and_rejects_wrong_identity() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session with spaces.jsonl");
         std::fs::write(&path, "{\"type\":\"session\",\"id\":\"old-id\"}\n").unwrap();
         // Windows expands short names and adds a verbatim prefix on canonicalization.
         let expected = path.canonicalize().unwrap();
-        let mut store = Store::new(Some(dir.path().join("index")));
+        let mut store = Store::new(Some(dir.path().join("index")), None);
         store.agent = dir.path().join("agent");
         store.legacy = dir.path().join("legacy.json");
         std::fs::write(

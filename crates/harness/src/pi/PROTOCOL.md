@@ -22,8 +22,9 @@ Independent work started later by an extension is a new run (`agent_start`).
 Discovery/startup timeouts diagnose startup only; no active model run is timed
 out for lack of output. Interruption clears queues before aborting.
 
-Steering uses `prompt` with `streamingBehavior: "steer"` and starts with Pi's
-native `all` mode (the `set_steering_mode` command persists that preference).
+Steering uses `prompt` with `streamingBehavior: "steer"`. `set_steering_mode`
+persists globally, so Pi's native `all` mode is selected only while neither
+global nor project settings configure a mode.
 Preflight/state barriers remain serialized, but consumption does not gate the
 next submission after `queue_update` confirms an appended steering entry.
 Keep one FIFO delivery record per original input, including duplicate text.

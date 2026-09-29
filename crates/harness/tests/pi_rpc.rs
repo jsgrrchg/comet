@@ -7,6 +7,8 @@ use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
 fn harness() -> PiHarness {
     PiHarness::new()
         .with_executable(env!("CARGO_BIN_EXE_harness-pi-fixture"))
+        // Never consult the developer's own Pi settings.
+        .with_agent_dir(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("pi-rpc-agent"))
         .with_graces(Duration::from_millis(100), Duration::from_millis(100))
 }
 fn request(cwd: &std::path::Path, prompt: &str) -> RunRequest {
@@ -233,6 +235,46 @@ async fn idle_mailbox_starts_another_turn_without_restarting_process() {
     .unwrap();
     assert_eq!(done, 2);
     assert_eq!(confirmed, 1);
+}
+
+#[tokio::test]
+async fn steering_mode_is_selected_only_while_unconfigured() {
+    for configured in [None, Some("one-at-a-time"), Some("all")] {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        if let Some(mode) = configured {
+            std::fs::write(
+                agent.join("settings.json"),
+                serde_json::json!({ "steeringMode": mode }).to_string(),
+            )
+            .unwrap();
+        }
+        let (c, tx, _) = controls();
+        drop(tx);
+        let stream = harness()
+            .with_agent_dir(&agent)
+            .with_session_store(dir.path().join("index"))
+            .run(request(dir.path(), "hello"), c)
+            .await
+            .unwrap();
+        let events: Vec<_> =
+            tokio::time::timeout(Duration::from_secs(5), stream.map(Result::unwrap).collect())
+                .await
+                .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Done { status, .. } if *status == DoneStatus::Completed)),
+            "{events:?}"
+        );
+        // Pi persists set_steering_mode globally: an explicit choice must survive.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("steering-mode")).ok(),
+            configured.is_none().then(|| "all".to_string()),
+            "{configured:?}"
+        );
+    }
 }
 
 #[tokio::test]

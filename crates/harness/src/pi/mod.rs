@@ -29,6 +29,7 @@ pub struct PiHarness {
     models_cache: crate::catalog::Catalog,
     workspace_commands: crate::skills::CommandDiscovery,
     session_store: Option<PathBuf>,
+    agent_dir: Option<PathBuf>,
     executable: Option<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
@@ -38,6 +39,7 @@ impl Default for PiHarness {
         Self {
             executable: None,
             session_store: None,
+            agent_dir: None,
             models_cache: Default::default(),
             workspace_commands: Default::default(),
             interrupt_grace: Duration::from_secs(2),
@@ -55,6 +57,12 @@ impl PiHarness {
     }
     pub fn with_session_store(mut self, path: impl Into<PathBuf>) -> Self {
         self.session_store = Some(path.into());
+        self
+    }
+    /// Pi's settings/credentials directory (`PI_CODING_AGENT_DIR`) for the
+    /// child and for Zeron's own reads of it; defaults to the inherited one.
+    pub fn with_agent_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.agent_dir = Some(path.into());
         self
     }
     pub fn with_graces(mut self, interrupt: Duration, kill: Duration) -> Self {
@@ -124,6 +132,9 @@ impl PiHarness {
         // Process group plus the same env scrubbing the ACP launch applied.
         crate::process::owned::configure(&mut cmd);
         crate::compose_child_path(&mut cmd, &exe);
+        if let Some(dir) = &self.agent_dir {
+            cmd.env("PI_CODING_AGENT_DIR", dir);
+        }
         cmd.args(["--mode", "rpc", "--no-themes"])
             .args(args)
             .current_dir(cwd)
@@ -258,10 +269,7 @@ impl Harness for PiHarness {
         Ok(self.model_catalog(false).await?.models)
     }
     fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
-        let root = crate::model_context::root(
-            "PI_CODING_AGENT_DIR",
-            crate::executable::home_or_current_dir().join(".pi/agent"),
-        );
+        let root = sessions::agent_dir(self.agent_dir.clone());
         crate::model_context::context(
             HarnessId::Pi,
             &self.resolve_executable()?,
@@ -318,7 +326,7 @@ impl Harness for PiHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let store = sessions::Store::new(self.session_store.clone());
+        let store = sessions::Store::new(self.session_store.clone(), self.agent_dir.clone());
         let args = if let Some(id) = &request.resume {
             store.resume_args(id, Path::new(&request.cwd))?
         } else {
@@ -483,10 +491,17 @@ impl Runner {
     }
     async fn bootstrap(&mut self, backlog: &mut Vec<Value>) -> Result<Value, HarnessError> {
         // Pi defaults to one-at-a-time. Zeron's pending steers belong together
-        // at the next model step. This is Pi's native, persisted queue setting.
-        self.process
-            .query(json!({"type":"set_steering_mode","mode":"all"}), backlog)
-            .await?;
+        // at the next model step. Pi persists this in its global settings, so
+        // select it only while no mode is configured: an explicit choice (the
+        // user's, or `/steering` in a chat) is never overwritten.
+        if !self
+            .store
+            .steering_mode_configured(Path::new(&self.request.cwd))
+        {
+            self.process
+                .query(json!({"type":"set_steering_mode","mode":"all"}), backlog)
+                .await?;
+        }
         if let Some(model) = self.request.model.as_deref().filter(|s| *s != "default") {
             let models = self
                 .process

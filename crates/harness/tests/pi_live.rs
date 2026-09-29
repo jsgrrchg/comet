@@ -41,6 +41,7 @@ fn isolated_pi() -> (tempfile::TempDir, PiHarness) {
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
     let harness = PiHarness::new()
         .with_executable(wrapper)
+        .with_agent_dir(&agent)
         .with_session_store(cwd.join("index"));
     (dir, harness)
 }

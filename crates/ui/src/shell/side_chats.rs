@@ -8,6 +8,130 @@ pub(super) struct SideChatTab {
 }
 
 impl Shell {
+    pub(super) fn fork_message(
+        &mut self,
+        transcript: Entity<Transcript>,
+        source_id: String,
+        message_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|c| c.id == source_id)
+            .cloned()
+        else {
+            transcript.update(cx, |t, cx| {
+                t.native_fork_finished(
+                    &source_id,
+                    &message_id,
+                    Some("Source chat is unavailable".into()),
+                    cx,
+                )
+            });
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            transcript.update(cx, |t, cx| {
+                t.native_fork_finished(
+                    &source_id,
+                    &message_id,
+                    Some("Chat host is disconnected".into()),
+                    cx,
+                )
+            });
+            return;
+        };
+        // Capture the emitting surface's panel, including side-chat transcripts.
+        let side = self
+            .side_chats
+            .iter()
+            .find(|(_, tab)| tab.transcript == transcript)
+            .map(|(id, _)| *id);
+        let key = side
+            .and_then(|id| {
+                self.right_tabs
+                    .iter()
+                    .find(|(_, tabs)| tabs.contains(&RightSurface::SideChat(id)))
+                    .map(|(key, _)| key.clone())
+            })
+            .unwrap_or_else(|| self.panel_key(cx));
+        let origin_panel = self.panels.get(&key);
+        let request = self
+            .native_fork_operations
+            .entry((source_id.clone(), message_id.clone()))
+            .or_insert_with(|| zeron_proto::ForkMessageSideChatRequest {
+                request_id: uuid::Uuid::new_v4().to_string(),
+                chat_id: uuid::Uuid::new_v4().to_string(),
+                source_chat_id: source.id.clone(),
+                source_message_id: message_id.clone(),
+                parent_chat_id: Some(source.parent_chat_id.clone().unwrap_or(source.id.clone())),
+                target_device_id: source.device_id.clone(),
+            })
+            .clone();
+        if !self.native_fork_pending.insert(request.request_id.clone()) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call_as::<zeron_proto::Chat>(
+                    methods::FORK_MESSAGE_SIDE_CHAT,
+                    serde_json::to_value(&request).unwrap(),
+                )
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.native_fork_pending.remove(&request.request_id);
+                let error = result.as_ref().err().map(ToString::to_string);
+                transcript.update(cx, |t, cx| {
+                    t.native_fork_finished(&source_id, &message_id, error.clone(), cx)
+                });
+                match result {
+                    Ok(chat) => {
+                        let current_panel = this.panels.get(&key);
+                        let unchanged = current_panel.right_active == origin_panel.right_active
+                            && current_panel.changes_open == origin_panel.changes_open;
+                        let focus = key == this.panel_key(cx) && unchanged;
+                        let child_id = chat.id.clone();
+                        this.open_side_chat(chat, key.clone(), cx);
+                        if !unchanged {
+                            this.panels.update(&key, |p| {
+                                p.right_active = current_panel.right_active;
+                                p.changes_open = current_panel.changes_open;
+                            });
+                        }
+                        if focus
+                            && let Some(tab) = this.side_chats.values().find(|tab| {
+                                tab.state.read(cx).selected_chat.as_deref()
+                                    == Some(child_id.as_str())
+                            })
+                        {
+                            tab.composer.update(cx, |composer, cx| {
+                                composer.focus_pending = true;
+                                cx.notify();
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(tab) = side.and_then(|id| this.side_chats.get(&id)) {
+                            tab.composer.update(cx, |composer, cx| {
+                                composer.show_error(error.to_string(), cx)
+                            });
+                        } else if this.state.read(cx).selected_chat.as_deref()
+                            == Some(source_id.as_str())
+                        {
+                            this.show_side_chat_error(error.to_string(), cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn close_empty_right_pane(&mut self, key: &str, cx: &mut Context<Self>) {
         let empty = if key == self.panel_key(cx) {
             self.right_surface_rows(cx).is_empty()

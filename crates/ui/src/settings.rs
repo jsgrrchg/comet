@@ -26,6 +26,8 @@ pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
 pub mod thread_naming;
+pub mod wallpaper;
+pub mod wallpaper_colors;
 pub mod widgets;
 pub mod windows;
 
@@ -321,13 +323,50 @@ pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Re
     let staged = crate::attachments::stage_file(source)?;
     // Do not persist the candidate or retire the old managed file until the
     // renderer's decoder has accepted the exact bytes we are about to save.
-    crate::new_thread_background_image::decode(staged.bytes()).map_err(|_| {
+    let image = crate::new_thread_background_image::decode(staged.bytes()).map_err(|_| {
         "This background image is unsupported or damaged. Choose a valid image such as PNG or JPEG.".to_string()
     })?;
+    let proxy = image.thumbnail(64, 64).to_rgba8();
+    let color = wallpaper_colors::extract(proxy.pixels().map(|pixel| pixel.0));
+    install_staged_background(source, staged, color, cx)
+}
+
+fn install_staged_background(
+    source: &Path,
+    staged: crate::attachments::StagedAttachment,
+    color: Option<zeron_theme::Color>,
+    cx: &mut App,
+) -> Result<(), String> {
     let data_dir = cx
         .try_global::<SettingsStore>()
         .map(|store| store.data_dir.clone())
         .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
+    let prepared = prepare_background_file(staged, &data_dir)?;
+    commit_background(source, prepared, color, cx)
+}
+
+/// Owns a prewritten managed file until it is committed; dropped queue entries
+/// and failed commits clean up their files without touching the active image.
+pub(super) struct PreparedBackgroundFile(Option<NewThreadComposerBackground>);
+
+impl PreparedBackgroundFile {
+    fn path(&self) -> &Path {
+        Path::new(&self.0.as_ref().unwrap().path)
+    }
+}
+
+impl Drop for PreparedBackgroundFile {
+    fn drop(&mut self) {
+        if let Some(background) = &self.0 {
+            let _ = std::fs::remove_file(&background.path);
+        }
+    }
+}
+
+fn prepare_background_file(
+    staged: crate::attachments::StagedAttachment,
+    data_dir: &Path,
+) -> Result<PreparedBackgroundFile, String> {
     let backgrounds_dir = data_dir.join(NEW_THREAD_BACKGROUND_DIR);
     std::fs::create_dir_all(&backgrounds_dir).map_err(|_| {
         "Unable to save the image. Check folder permissions and try again.".to_string()
@@ -357,7 +396,28 @@ pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Re
         path: destination.to_string_lossy().into_owned(),
         name: staged.name,
     };
+    Ok(PreparedBackgroundFile(Some(replacement)))
+}
+
+fn commit_background(
+    source: &Path,
+    mut prepared: PreparedBackgroundFile,
+    color: Option<zeron_theme::Color>,
+    cx: &mut App,
+) -> Result<(), String> {
+    let data_dir = cx
+        .try_global::<SettingsStore>()
+        .map(|store| store.data_dir.clone())
+        .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
+    let backgrounds_dir = data_dir.join(NEW_THREAD_BACKGROUND_DIR);
+    let replacement = prepared.0.as_ref().unwrap().clone();
     let mut next = current(cx);
+    if let Some(previous) = &next.wallpaper_source {
+        wallpaper::remember(&mut next.wallpaper_history, previous);
+    }
+    wallpaper::remember(&mut next.wallpaper_history, source);
+    next.wallpaper_source = Some(source.to_path_buf());
+    next.wallpaper_color = color;
     let previous = next
         .new_thread_composer_background
         .replace(replacement.clone());
@@ -365,13 +425,16 @@ pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Re
     // updates memory first and only logs an I/O failure; for a file-backed
     // setting that order can leave disk pointing at an image we just deleted.
     if next.save(&data_dir).is_err() {
-        let _ = std::fs::remove_file(&destination);
         return Err(
             "Unable to save the image. Check folder permissions and try again.".to_string(),
         );
     }
+    prepared.0.take();
     replace(next, SavePolicy::Immediate, cx);
     remove_managed_new_thread_background(previous.as_ref(), &backgrounds_dir);
+    if current(cx).wallpaper_theme_colors {
+        crate::appearance::apply(cx);
+    }
     cx.refresh_windows();
     Ok(())
 }
@@ -383,6 +446,8 @@ pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String>
         .ok_or_else(|| "Unable to remove the image. Restart Zeron and try again.".to_string())?;
     let mut next = current(cx);
     let previous = next.new_thread_composer_background.take();
+    next.wallpaper_source = None;
+    next.wallpaper_color = None;
     if previous.is_none() {
         return Ok(());
     }
@@ -396,6 +461,9 @@ pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String>
         previous.as_ref(),
         &data_dir.join(NEW_THREAD_BACKGROUND_DIR),
     );
+    if current(cx).wallpaper_theme_colors {
+        crate::appearance::apply(cx);
+    }
     cx.refresh_windows();
     Ok(())
 }
@@ -825,6 +893,13 @@ pub struct UiSettings {
     /// Optional device-local artwork behind the blank new-thread composer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_thread_composer_background: Option<NewThreadComposerBackground>,
+    /// Device-local folder used by the random wallpaper shortcut.
+    pub wallpaper_folder: Option<PathBuf>,
+    pub wallpaper_source: Option<PathBuf>,
+    /// Most recently displayed sources first; bounded by the shuffle cooldown.
+    pub wallpaper_history: Vec<PathBuf>,
+    pub wallpaper_theme_colors: bool,
+    pub wallpaper_color: Option<zeron_theme::Color>,
     /// Non-destructive treatment composited inside the artwork's fade mask.
     pub new_thread_background_effect: NewThreadBackgroundEffect,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
@@ -904,6 +979,11 @@ impl Default for UiSettings {
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
             new_thread_composer_background: None,
+            wallpaper_folder: None,
+            wallpaper_source: None,
+            wallpaper_history: Vec::new(),
+            wallpaper_theme_colors: false,
+            wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             legacy_accent_color: None,
         }
@@ -940,6 +1020,7 @@ const JUMP_LABELS: [&str; JUMP_SLOTS] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
     CaptureAppshot,
+    RandomWallpaper,
     SaveFile,
     BrowserReload,
     ToggleSidebar,
@@ -957,8 +1038,9 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 14 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 15 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
+        ShortcutId::RandomWallpaper,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
         ShortcutId::ToggleSidebar,
@@ -990,6 +1072,7 @@ impl ShortcutId {
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
+            ShortcutId::RandomWallpaper => "Random wallpaper",
             ShortcutId::CaptureAppshot => "Capture Appshot",
             ShortcutId::SaveFile => "Save file",
             ShortcutId::BrowserReload => "Reload browser page",
@@ -1017,6 +1100,7 @@ impl ShortcutId {
     /// this guards against only exists off macOS).
     pub fn default_combo_on(self, mac: bool) -> &'static str {
         match self {
+            ShortcutId::RandomWallpaper => "mod-u",
             ShortcutId::CaptureAppshot if mac => "ctrl-alt-space",
             ShortcutId::CaptureAppshot => "mod-alt-space",
             ShortcutId::SaveFile => "mod-s",
@@ -1067,6 +1151,7 @@ impl ShortcutId {
 pub struct KeymapConfig {
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
     pub capture_appshot: String,
+    pub random_wallpaper: String,
     pub save_file: String,
     pub browser_reload: String,
     pub toggle_sidebar: String,
@@ -1132,6 +1217,7 @@ impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
             capture_appshot: ShortcutId::CaptureAppshot.default_combo().into(),
+            random_wallpaper: ShortcutId::RandomWallpaper.default_combo().into(),
             save_file: ShortcutId::SaveFile.default_combo().into(),
             browser_reload: ShortcutId::BrowserReload.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
@@ -1177,6 +1263,7 @@ impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
             ShortcutId::CaptureAppshot => &self.capture_appshot,
+            ShortcutId::RandomWallpaper => &self.random_wallpaper,
             ShortcutId::SaveFile => &self.save_file,
             ShortcutId::BrowserReload => &self.browser_reload,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
@@ -1201,6 +1288,7 @@ impl KeymapConfig {
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
             ShortcutId::CaptureAppshot => self.capture_appshot = combo,
+            ShortcutId::RandomWallpaper => self.random_wallpaper = combo,
             ShortcutId::SaveFile => self.save_file = combo,
             ShortcutId::BrowserReload => self.browser_reload = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
@@ -2366,6 +2454,11 @@ mod tests {
                 path: "/tmp/zeron/new-thread-background.png".into(),
                 name: "background.png".into(),
             }),
+            wallpaper_folder: Some("/tmp/wallpapers".into()),
+            wallpaper_source: Some("/tmp/wallpapers/background.png".into()),
+            wallpaper_history: vec!["/tmp/wallpapers/background.png".into()],
+            wallpaper_theme_colors: false,
+            wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
             legacy_accent_color: None,
         };

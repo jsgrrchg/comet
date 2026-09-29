@@ -1333,6 +1333,8 @@ fn forward_deadline(method: &str) -> std::time::Duration {
         // queueing, verification, and the relayed response itself.
         methods::APPLY_HARNESS_UPDATE => Duration::from_secs(20 * 60),
         methods::CREATE_WORKTREE => Duration::from_secs(120),
+        methods::FORK_MESSAGE_SIDE_CHAT => Duration::from_secs(200),
+        methods::GET_NATIVE_FORK_AVAILABILITY => Duration::from_secs(100),
         // Allow the adapter discovery budget plus relay and shutdown overhead.
         methods::LIST_MODELS | methods::LIST_COMMANDS => Duration::from_secs(100),
         _ => Duration::from_secs(30),
@@ -3843,6 +3845,12 @@ mod tests {
             MutateParams::ChangeSidebarPin { change: zeron_proto::SidebarPinChange::Move { session_id, before, .. } }
                 if session_id == "chat-b" && before.as_deref() == Some("chat-a")
         ));
+    }
+
+    #[test]
+    fn native_fork_rpcs_route_to_the_execution_host() {
+        assert!(forwardable(methods::FORK_MESSAGE_SIDE_CHAT));
+        assert!(forwardable(methods::GET_NATIVE_FORK_AVAILABILITY));
     }
 
     #[test]

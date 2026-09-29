@@ -75,7 +75,12 @@ impl Server {
                 .request(reqwest::Method::GET, &path)
                 .timeout(CALL_TIMEOUT);
             if v2 {
-                req = req.query(&[("order", "asc"), ("limit", "100")]);
+                req = req.query(&[("limit", "100")]);
+                // V2 cursors carry their ordering; combining order with cursor
+                // is rejected even on the final (empty) page.
+                if cursor.is_none() {
+                    req = req.query(&[("order", "asc")]);
+                }
             }
             if let Some(cursor) = &cursor {
                 req = req.query(&[("cursor", cursor)]);
@@ -87,9 +92,10 @@ impl Server {
                 .await
                 .map_err(|e| HarnessError::Protocol(e.to_string()))?;
             if !response.status().is_success() {
-                return Err(HarnessError::Protocol(
-                    "Native transcript is unavailable".into(),
-                ));
+                return Err(HarnessError::Protocol(format!(
+                    "Native transcript is unavailable (HTTP {})",
+                    response.status()
+                )));
             }
             let page: Value = response
                 .json()
@@ -186,7 +192,18 @@ impl Server {
             },
             point.source_session_id
         );
-        let body = next.map_or_else(|| json!({}), |id| json!({"messageID":id}));
+        // The verified 2.0.11 executable's /openapi.json names this exclusive
+        // boundary `before`; v1 calls it messageID. Unknown versions are gated.
+        let body = next.map_or_else(
+            || json!({}),
+            |id| {
+                if self.protocol.get() == Some(&Protocol::V2) {
+                    json!({"before":id})
+                } else {
+                    json!({"messageID":id})
+                }
+            },
+        );
         let result = self
             .post_json(&path, Some(&point.cwd), &body)
             .await
@@ -208,9 +225,29 @@ impl Server {
                 .zip(&source)
                 .any(|(a, b)| canonical(a) != canonical(b))
         {
-            return Err(NativeForkError::Indeterminate(
-                "Provider did not preserve the selected native prefix".into(),
-            ));
+            let mismatch = child
+                .iter()
+                .zip(&source)
+                .position(|(a, b)| canonical(a) != canonical(b));
+            let fields = mismatch
+                .map(|index| {
+                    let a = canonical(&source[index]);
+                    let b = canonical(&child[index]);
+                    a.as_object()
+                        .into_iter()
+                        .flat_map(|m| m.keys())
+                        .filter(|key| a.get(*key) != b.get(*key))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            return Err(NativeForkError::Indeterminate(format!(
+                "Provider did not preserve the selected native prefix (expected {} messages, received {}; mismatch {:?}, fields {:?})",
+                index + 1,
+                child.len(),
+                mismatch,
+                fields
+            )));
         }
         Ok(NativeForkResult {
             session_id: id.into(),
@@ -251,6 +288,18 @@ impl OpencodeHarness {
             .server(Some(&point.cwd), None)
             .await
             .map_err(|e| NativeForkError::Rejected(e.to_string()))?;
+        let _ = server.protocol().await;
+        if !server
+            .version
+            .get()
+            .and_then(|v| v.number)
+            .is_some_and(|v| matches!(v, (1, 18, 33) | (2, 0, 11)))
+        {
+            server.shutdown(self.kill_grace).await;
+            return Err(NativeForkError::Rejected(
+                "This OpenCode version has no verified native fork contract".into(),
+            ));
+        }
         let result = tokio::select! {
             result = tokio::time::timeout(controls.timeout, server.fork_verified(point, controls.source_idle)) => result.unwrap_or_else(|_| Err(NativeForkError::Indeterminate("OpenCode fork timed out".into()))),
             _ = controls.interrupt.cancelled() => Err(NativeForkError::Indeterminate("OpenCode fork cancelled".into())),
@@ -268,7 +317,7 @@ mod tests {
     async fn native_fork_verifies_exclusive_boundary_on_both_wires() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         for v2 in [false, true] {
-            for overcopy in [false, true] {
+            for (overcopy, tail) in [(false, false), (true, false), (false, true)] {
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let base = format!("http://{}", listener.local_addr().unwrap());
                 let traffic = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -288,15 +337,29 @@ mod tests {
                                 json!({"info":{"id":id,"role":role,"time":{"created":1,"completed":2}},"parts":[{"id":format!("p{id}"),"messageID":id,"type":"text","text":text}]})
                             }
                         };
-                        let source = vec![
+                        let mut source = vec![
                             message("u1", "user", "initial"),
                             message("a1", "assistant", "answer"),
                             message("u2", "user", "later secret"),
                         ];
+                        if tail {
+                            source.pop();
+                        }
                         let response = if request.starts_with("POST") {
                             assert!(path.split('?').next().unwrap().ends_with("/fork"));
-                            assert!(request.contains("\"messageID\":\"u2\""));
+                            assert_eq!(
+                                request.contains(if v2 {
+                                    "\"before\":\"u2\""
+                                } else {
+                                    "\"messageID\":\"u2\""
+                                }),
+                                !tail
+                            );
                             json!({"id":"child"})
+                        } else if path.split('?').next().unwrap().ends_with("/status")
+                            || path.split('?').next().unwrap().ends_with("/active")
+                        {
+                            json!({})
                         } else if path.contains("/source/message") {
                             json!(source)
                         } else if path.contains("/child/message") {
@@ -314,8 +377,15 @@ mod tests {
                         } else {
                             panic!("unexpected request {path}")
                         };
+                        let paged = v2 && path.contains("/message");
+                        let response = if paged && path.contains("cursor=") {
+                            assert!(!path.contains("order="));
+                            json!([])
+                        } else {
+                            response
+                        };
                         let body = if v2 {
-                            json!({"data":response,"cursor":{"next":null}})
+                            json!({"data":response,"cursor":{"next":if paged && !path.contains("cursor=") { Some("next-page") } else { None }}})
                         } else {
                             response
                         }
@@ -338,9 +408,48 @@ mod tests {
                         assistant_message_id: "a1".into(),
                     },
                 };
-                let result = client.fork_verified(&point, false).await;
+                let result = client.fork_verified(&point, tail).await;
                 assert_eq!(result.is_ok(), !overcopy, "{result:?}");
-                assert_eq!(traffic.lock().unwrap().len(), 3);
+                assert_eq!(
+                    traffic.lock().unwrap().len(),
+                    3 + usize::from(tail) + if v2 { 2 } else { 0 }
+                );
+                let before = traffic
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.starts_with("POST"))
+                    .count();
+                let mut invalid = point.clone();
+                invalid.boundary = NativeForkBoundary::OpenCodeReply {
+                    assistant_message_id: "missing".into(),
+                };
+                assert!(matches!(
+                    client.fork_verified(&invalid, true).await,
+                    Err(NativeForkError::Rejected(_))
+                ));
+                if tail {
+                    assert!(matches!(
+                        client.fork_verified(&point, false).await,
+                        Err(NativeForkError::Rejected(_))
+                    ));
+                    let admission = admission(&client, Some(&point.cwd), &point.source_session_id);
+                    admission.active.store(true, Ordering::Release);
+                    assert!(matches!(
+                        client.fork_verified(&point, true).await,
+                        Err(NativeForkError::Rejected(_))
+                    ));
+                    admission.active.store(false, Ordering::Release);
+                }
+                assert_eq!(
+                    traffic
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r.starts_with("POST"))
+                        .count(),
+                    before
+                );
                 server.abort();
             }
         }

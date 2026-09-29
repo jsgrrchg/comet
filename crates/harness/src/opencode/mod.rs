@@ -2861,7 +2861,7 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 return BusOutcome::Continue;
             };
             if session == session_id {
-                if role == "assistant" {
+                if role == "assistant" && info["_zeronSyntheticUsage"] != true {
                     main_feed.last_native_reply = Some(message.to_owned());
                 }
                 main_feed
@@ -3955,6 +3955,7 @@ fn normalize_v2_frame_with_session_models(
             let mut info = json!({
                 "sessionID": session(),
                 "id": "usage",
+                "_zeronSyntheticUsage": true,
                 "role": "assistant",
                 "tokens": tokens,
             });

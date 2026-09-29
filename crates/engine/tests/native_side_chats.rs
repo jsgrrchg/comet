@@ -16,6 +16,11 @@ struct NativeStore {
     sessions: Mutex<std::collections::HashMap<String, Vec<String>>>,
     requests: Mutex<Vec<RunRequest>>,
     ambiguous: bool,
+    reject_once: bool,
+    reject_resume: bool,
+    unexpected_identity: bool,
+    fork_started: Option<Arc<tokio::sync::Notify>>,
+    fork_release: Option<Arc<tokio::sync::Notify>>,
 }
 #[async_trait]
 impl Harness for NativeStore {
@@ -45,9 +50,18 @@ impl Harness for NativeStore {
         point: &NativeForkPoint,
         _: NativeForkControls,
     ) -> Result<NativeForkResult, NativeForkError> {
-        self.forks.fetch_add(1, Ordering::SeqCst);
+        let attempt = self.forks.fetch_add(1, Ordering::SeqCst);
+        if self.reject_once && attempt == 0 {
+            return Err(NativeForkError::Rejected("Helper could not start".into()));
+        }
         if self.ambiguous {
             return Err(NativeForkError::Indeterminate("lost provider reply".into()));
+        }
+        if let Some(started) = &self.fork_started {
+            started.notify_one();
+        }
+        if let Some(release) = &self.fork_release {
+            release.notified().await;
         }
         assert_eq!(point.source_session_id, "canonical");
         let NativeForkBoundary::AppServerTurn { turn_id } = &point.boundary else {
@@ -69,8 +83,17 @@ impl Harness for NativeStore {
         request: RunRequest,
         _: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let session_id = request.resume.clone();
+        let session_id = if self.unexpected_identity {
+            Some("wrong-native-session".into())
+        } else {
+            request.resume.clone()
+        };
         self.requests.lock().unwrap().push(request);
+        if self.reject_resume {
+            return Err(HarnessError::Protocol(
+                "Saved native session disappeared".into(),
+            ));
+        }
         Ok(futures::stream::iter(vec![
             Ok(AgentEvent::TextDelta {
                 text: "child answer".into(),
@@ -285,6 +308,9 @@ async fn native_fork_provider_created_recovery_reuses_the_durable_native_id() {
     let core = setup(dir.path(), harness.clone());
     let request = request(&core);
     let child = core.native_forks.create(request.clone()).await.unwrap();
+    // Simulate the workspace row not surviving publication; the durable provider
+    // result and child snapshot must be sufficient to repair it at startup.
+    core.workspace.delete_chat("child").unwrap();
     core.shutdown().await;
     drop(core);
     fn records(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
@@ -407,4 +433,194 @@ async fn native_fork_resume_survives_restart_and_never_wraps_history() {
     }
     assert_eq!(harness.requests.lock().unwrap().len(), 4);
     assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn native_fork_resume_failure_cannot_retry_fresh_or_replace_identity() {
+    for unexpected_identity in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = Arc::new(NativeStore {
+            reject_resume: !unexpected_identity,
+            unexpected_identity,
+            ..Default::default()
+        });
+        let core = setup(dir.path(), harness.clone());
+        core.native_forks.create(request(&core)).await.unwrap();
+        core.sessions
+            .dispatch("child", HarnessId::Mock, send_request("Continue"), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if core
+                    .sessions
+                    .session_status("child")
+                    .is_some_and(|s| s.status == SessionStatus::Errored)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(harness.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            core.workspace
+                .chat("child")
+                .unwrap()
+                .unwrap()
+                .harness_session_id
+                .as_deref(),
+            Some("native-child-1")
+        );
+        assert!(
+            core.doc_host
+                .open("child")
+                .unwrap()
+                .doc()
+                .native_fork_lineage()
+                .unwrap()
+                .is_some()
+        );
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn native_fork_update_blocks_creation_and_keeps_availability_honest() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(NativeStore::default());
+    let core = setup(dir.path(), harness.clone());
+    core.registry.begin_update(HarnessId::Mock);
+    let availability = core
+        .native_forks
+        .availability(NativeForkAvailabilityRequest {
+            source_chat_id: "main".into(),
+            message_ids: vec!["a1".into()],
+            target_device_id: core.device_id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(!availability["a1"].available);
+    assert!(
+        core.native_forks
+            .create(request(&core))
+            .await
+            .unwrap_err()
+            .contains("update")
+    );
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 0);
+    core.registry.end_update(HarnessId::Mock);
+    core.native_forks.create(request(&core)).await.unwrap();
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_fork_prepared_restart_is_indeterminate_and_never_recreates() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(NativeStore::default());
+    let core = setup(dir.path(), harness.clone());
+    let request = request(&core);
+    core.native_forks.create(request.clone()).await.unwrap();
+    core.workspace.delete_chat("child").unwrap();
+    core.shutdown().await;
+    drop(core);
+    fn rewrite(dir: &std::path::Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rewrite(&path);
+            } else if path.parent().unwrap().file_name().unwrap() == "native-forks"
+                && path.extension().is_some_and(|s| s == "json")
+            {
+                let mut record: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                record["phase"] = serde_json::json!("Prepared");
+                record["child"] = serde_json::Value::Null;
+                std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+        }
+    }
+    rewrite(dir.path());
+    let registry = Arc::new(HarnessRegistry::new());
+    registry.register(harness.clone());
+    let core = EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None).unwrap();
+    assert!(
+        core.native_forks
+            .create(request)
+            .await
+            .unwrap_err()
+            .contains("will not be retried")
+    );
+    assert!(core.workspace.chat("child").unwrap().is_none());
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_fork_definite_rejection_can_retry_the_same_operation() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(NativeStore {
+        reject_once: true,
+        ..Default::default()
+    });
+    let core = setup(dir.path(), harness.clone());
+    let request = request(&core);
+    assert!(core.native_forks.create(request.clone()).await.is_err());
+    assert!(core.workspace.chat("child").unwrap().is_none());
+    let child = core.native_forks.create(request.clone()).await.unwrap();
+    assert_eq!(core.native_forks.create(request).await.unwrap(), child);
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 2);
+    assert_eq!(harness.sessions.lock().unwrap().len(), 1);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_fork_never_overwrites_a_destination_created_during_provider_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let harness = Arc::new(NativeStore {
+        fork_started: Some(started.clone()),
+        fork_release: Some(release.clone()),
+        ..Default::default()
+    });
+    let core = setup(dir.path(), harness.clone());
+    let request = request(&core);
+    let task = tokio::spawn({
+        let forks = core.native_forks.clone();
+        let request = request.clone();
+        async move { forks.create(request).await }
+    });
+    started.notified().await;
+    core.workspace
+        .create_chat(
+            "child",
+            None,
+            Some(&core.device_id),
+            None,
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    core.workspace
+        .rename_chat("child", "Created by another action")
+        .unwrap();
+    let foreign = core.workspace.chat("child").unwrap().unwrap();
+    release.notify_one();
+    assert!(task.await.unwrap().unwrap_err().contains("occupied"));
+    assert!(core.native_forks.create(request).await.is_err());
+    assert_eq!(core.workspace.chat("child").unwrap().unwrap(), foreign);
+    assert!(
+        core.doc_host
+            .open("child")
+            .unwrap()
+            .doc()
+            .native_fork_lineage()
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+    core.shutdown().await;
 }

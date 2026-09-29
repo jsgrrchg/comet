@@ -14087,6 +14087,23 @@ mod tests {
         });
         cx.simulate_event(gpui::KeyUpEvent { keystroke });
         assert_eq!(events.borrow().len(), 2);
+        transcript.update(cx, |t, cx| {
+            t.native_fork_finished("side-source", "answer", None, cx);
+            t.native_forks.insert(
+                "answer".into(),
+                zeron_proto::NativeForkAvailability::unavailable(
+                    "Update the chat host to fork this message",
+                ),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.simulate_click(point(px(10.0), px(10.0)), gpui::Modifiers::default());
+        assert_eq!(
+            events.borrow().len(),
+            2,
+            "Unavailable actions must not emit requests"
+        );
     }
 
     #[test]
@@ -14344,6 +14361,18 @@ mod tests {
 impl Transcript {
     pub fn fixture_appshots_start(&mut self, cx: &mut Context<Self>) {
         self.list.scroll_to(gpui::ListOffset::default());
+        cx.notify();
+    }
+}
+
+#[cfg(feature = "native-forks-fixture")]
+impl Transcript {
+    pub fn fixture_native_fork_reveal(&mut self, entry: &str, cx: &mut Context<Self>) {
+        self.hovered_entry = self
+            .rows
+            .iter()
+            .find(|r| r.entry_id.as_ref() == entry && r.timestamp.is_some())
+            .map(|r| (r.id.clone(), r.entry_id.clone()));
         cx.notify();
     }
 }

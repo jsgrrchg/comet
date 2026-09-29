@@ -5276,3 +5276,10 @@ impl AppState {
         self.change_requests.store(key, snapshot);
     }
 }
+
+#[cfg(feature = "native-forks-fixture")]
+impl AppState {
+    pub fn fixture_native_fork_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        self.attach_engine(handle, cx);
+    }
+}

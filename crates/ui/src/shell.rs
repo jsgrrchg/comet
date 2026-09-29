@@ -16573,3 +16573,19 @@ mod settings_modal_regressions {
         });
     }
 }
+
+#[cfg(feature = "native-forks-fixture")]
+impl Shell {
+    pub fn fixture_native_fork_reveal(&self, entry: &str, cx: &mut Context<Self>) {
+        self.transcript
+            .update(cx, |t, cx| t.fixture_native_fork_reveal(entry, cx));
+    }
+    pub fn fixture_native_fork_create(&mut self, cx: &mut Context<Self>) {
+        self.fork_message(
+            self.transcript.clone(),
+            "native-fixture".into(),
+            "a1".into(),
+            cx,
+        );
+    }
+}

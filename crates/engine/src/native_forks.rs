@@ -177,7 +177,9 @@ impl NativeForks {
                 .config
                 .as_ref()
                 .is_some_and(|c| c.harness != point.harness)
-            || source.cwd.as_deref().is_some_and(|cwd| cwd != point.cwd)
+            || source.cwd.as_deref().is_some_and(|cwd| {
+                crate::repos::expand_home(cwd).ok().as_deref() != Some(point.cwd.as_str())
+            })
         {
             return Err("Native fork provenance does not match this chat".into());
         }
@@ -270,6 +272,14 @@ impl NativeForks {
                     self.publish(&mut op)?;
                     Ok(op.chat)
                 }
+                Phase::Failed => {
+                    // Only a definite pre-creation rejection is safe to retry.
+                    // Keep the original frozen prefix and destination identity.
+                    op.error = None;
+                    op.phase = Phase::Prepared;
+                    self.save(&op)?;
+                    self.create_provider(op).await
+                }
                 _ => Err(op.error.unwrap_or_else(|| {
                     "Native fork outcome is indeterminate; creation will not be repeated".into()
                 })),
@@ -345,7 +355,7 @@ impl NativeForks {
         chat.room_gen = Some(2);
         chat.harness_session_id = None;
         chat.harness_session_cwd = None;
-        let mut op = Operation {
+        let op = Operation {
             request,
             phase: Phase::Prepared,
             chat,
@@ -355,12 +365,15 @@ impl NativeForks {
             error: None,
         };
         self.save(&op)?;
+        self.create_provider(op).await
+    }
+    async fn create_provider(&self, mut op: Operation) -> Result<Chat, String> {
         let lease = tokio::select! { lease = self.0.registry.execution_lease(op.point.harness) => lease, _ = self.0.cancel.cancelled() => return Err("Engine is shutting down".into()) };
         let harness = self.0.registry.resolve(op.point.harness).map_err(err)?;
         let idle = self
             .0
             .sessions
-            .session_status(&source.id)
+            .session_status(&op.request.source_chat_id)
             .is_none_or(|s| matches!(s.status, SessionStatus::Idle | SessionStatus::Errored));
         match harness
             .fork_native(
@@ -405,12 +418,43 @@ impl NativeForks {
     fn publish(&self, op: &mut Operation) -> Result<(), String> {
         let child = op.child.clone().ok_or("Native child identity is missing")?;
         let target = self.0.docs.open(&op.chat.id).map_err(err)?;
-        if let Some(lineage) = target.doc().native_fork_lineage().map_err(err)?
-            && lineage.request_id != op.request.request_id
-        {
+        let lineage = target.doc().native_fork_lineage().map_err(err)?;
+        if lineage.as_ref().is_some_and(|lineage| {
+            lineage.request_id != op.request.request_id || lineage.child != child
+        }) {
             return Err("Destination belongs to another operation".into());
         }
+        if let Some(row) = self.0.workspace.chat(&op.chat.id).map_err(err)? {
+            if lineage.is_none()
+                || row.harness_session_id.as_deref() != Some(child.session_id.as_str())
+            {
+                return Err(
+                    "Destination was occupied while the provider fork was being created".into(),
+                );
+            }
+            // A published row proves the child snapshot was persisted. Preserve
+            // any edits or new turns made after publication but before receipt.
+            op.chat = row;
+            op.phase = Phase::Published;
+            return self.save(op);
+        }
         let existing = target.doc().read_entries().map_err(err)?;
+        if lineage.is_none() && !existing.is_empty() {
+            return Err("Destination document belongs to another operation".into());
+        }
+        // Claim the empty document before copying any rows, so interrupted
+        // materialization is identifiable without comparing message text.
+        target
+            .doc()
+            .set_native_fork_lineage(&NativeForkLineage {
+                strategy: HistoryStrategy::NativeFork,
+                request_id: op.request.request_id.clone(),
+                source_chat_id: op.request.source_chat_id.clone(),
+                source_message_id: op.request.source_message_id.clone(),
+                point: op.point.clone(),
+                child: child.clone(),
+            })
+            .map_err(err)?;
         for entry in &op.prefix {
             if existing.iter().any(|e| e.id == entry.id) {
                 continue;
@@ -456,17 +500,6 @@ impl NativeForks {
                 })
                 .map_err(err)?;
         }
-        target
-            .doc()
-            .set_native_fork_lineage(&NativeForkLineage {
-                strategy: HistoryStrategy::NativeFork,
-                request_id: op.request.request_id.clone(),
-                source_chat_id: op.request.source_chat_id.clone(),
-                source_message_id: op.request.source_message_id.clone(),
-                point: op.point.clone(),
-                child: child.clone(),
-            })
-            .map_err(err)?;
         self.0.docs.persist_fork(&target).map_err(err)?;
         op.chat.harness_session_id = Some(child.session_id);
         op.chat.harness_session_cwd = Some(child.cwd);

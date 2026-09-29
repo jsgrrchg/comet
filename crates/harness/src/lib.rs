@@ -70,7 +70,7 @@ pub struct NativeForkControls {
     pub execution_lease: Option<std::sync::Arc<tokio::sync::OwnedRwLockReadGuard<()>>>,
     pub interrupt: CancellationToken,
     pub timeout: std::time::Duration,
-    /// The host holds the session admission guard until this operation returns.
+    /// Host idle snapshot; adapters must also serialize native prompt admission.
     pub source_idle: bool,
 }
 

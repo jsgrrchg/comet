@@ -320,13 +320,7 @@ impl Harness for PiHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let store = sessions::Store::new(self.session_store.clone());
         let args = if let Some(id) = &request.resume {
-            vec![
-                "--session".into(),
-                store
-                    .resolve(id, Path::new(&request.cwd))?
-                    .display()
-                    .to_string(),
-            ]
+            store.resume_args(id, Path::new(&request.cwd))?
         } else {
             vec![]
         };
@@ -384,11 +378,13 @@ impl Harness for PiHarness {
         )
     }
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum Pending {
     Prompt(u64),
     Barrier(u64),
     Command(u64),
+    EmptyEntries(u64, String),
+    EmptyState(u64, String, bool),
 }
 struct Runner {
     extension_commands: HashSet<String>,
@@ -458,6 +454,7 @@ impl Runner {
         }
     }
     fn submit(&mut self, text: String, images: Value, steer: bool) -> Result<(), HarnessError> {
+        self.store.mark_submitted(&self.session)?;
         let control = self.control_command(&text);
         let command=control.clone().unwrap_or_else(||json!({"type":"prompt","message":text,"images":images,"streamingBehavior":if steer {"steer"}else{"followUp"}}));
         let id = self.process.transport.client.request(command)?;
@@ -608,10 +605,15 @@ impl Runner {
         loop {
             if self.delivery.is_none()
                 && !self.initial_pending
-                && !self
-                    .pending
-                    .values()
-                    .any(|p| matches!(p, Pending::Prompt(_) | Pending::Command(_)))
+                && !self.pending.values().any(|p| {
+                    matches!(
+                        p,
+                        Pending::Prompt(_)
+                            | Pending::Command(_)
+                            | Pending::EmptyEntries(..)
+                            | Pending::EmptyState(..)
+                    )
+                })
             {
                 if !self
                     .queued
@@ -684,6 +686,67 @@ impl Runner {
         })
         .await;
     }
+    async fn state(&mut self, data: Value, empty_proof: Option<bool>) -> Result<(), HarnessError> {
+        let session = data["sessionId"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| HarnessError::Protocol("Pi get_state omitted sessionId".into()))?;
+        let changed = self.session != session;
+        self.session = session.into();
+        let file = data["sessionFile"].as_str().map(Path::new);
+        if let Some(file) = file {
+            self.store.remember(&self.session, file)?;
+        }
+        if changed {
+            self.started(data["model"]["id"].as_str().unwrap_or("default").into())
+                .await?;
+        }
+        self.auto_compaction = data["autoCompactionEnabled"]
+            .as_bool()
+            .unwrap_or(self.auto_compaction);
+        self.norm.window = data["model"]["contextWindow"].as_u64().or(self.norm.window);
+        if data["isStreaming"] != false
+            || data["isCompacting"] != false
+            || self.pending.values().any(|p| {
+                matches!(
+                    p,
+                    Pending::Prompt(_)
+                        | Pending::Command(_)
+                        | Pending::EmptyEntries(..)
+                        | Pending::EmptyState(..)
+                )
+            })
+        {
+            return Ok(());
+        }
+        if file.is_some_and(|p| {
+            p.metadata()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+        }) && data["messageCount"] == 0
+            && !self.interrupted
+        {
+            if let Some(clean) = empty_proof {
+                if clean {
+                    self.store
+                        .remember_empty(&data, Path::new(&self.request.cwd))?;
+                }
+            } else {
+                let id = self
+                    .process
+                    .transport
+                    .client
+                    .request(json!({"type":"get_entries"}))?;
+                self.pending
+                    .insert(id, Pending::EmptyEntries(self.epoch, self.session.clone()));
+                return Ok(());
+            }
+        }
+        self.initial_pending = false;
+        if !self.interrupted {
+            self.confirm_delivery().await?;
+        }
+        self.finish().await
+    }
     async fn frame(&mut self, frame: Value) -> Result<(), HarnessError> {
         if frame["type"] == "extension_ui_request" {
             if !self.active {
@@ -738,27 +801,37 @@ impl Runner {
                     self.pending.insert(id, Pending::Barrier(epoch));
                 }
                 Pending::Barrier(epoch) if epoch == self.epoch && self.active => {
-                    self.auto_compaction = data["autoCompactionEnabled"]
-                        .as_bool()
-                        .unwrap_or(self.auto_compaction);
-                    self.norm.window = data["model"]["contextWindow"].as_u64().or(self.norm.window);
-                    if data["isStreaming"] == false
-                        && data["isCompacting"] == false
-                        && !self
-                            .pending
-                            .values()
-                            .any(|p| matches!(p, Pending::Prompt(_) | Pending::Command(_)))
-                    {
-                        self.initial_pending = false;
-                        if !self.interrupted {
-                            self.confirm_delivery().await?;
-                        }
-                        self.finish().await?;
-                    }
+                    self.state(data, None).await?;
+                }
+                Pending::EmptyEntries(epoch, session) if epoch == self.epoch && self.active => {
+                    let clean = data["entries"].as_array().is_some_and(|entries| {
+                        entries.iter().all(|entry| {
+                            matches!(
+                                entry["type"].as_str(),
+                                Some("model_change" | "thinking_level_change")
+                            )
+                        })
+                    });
+                    let id = self
+                        .process
+                        .transport
+                        .client
+                        .request(json!({"type":"get_state"}))?;
+                    self.pending
+                        .insert(id, Pending::EmptyState(epoch, session, clean));
+                }
+                Pending::EmptyState(epoch, session, clean)
+                    if epoch == self.epoch && self.active =>
+                {
+                    let proof = (data["sessionId"] == session).then_some(clean);
+                    self.state(data, proof).await?;
                 }
                 _ => {}
             }
             return Ok(());
+        }
+        if frame["type"] == "agent_start" {
+            self.store.mark_submitted(&self.session)?;
         }
         if frame["type"] == "agent_start" && !self.active {
             self.epoch += 1;

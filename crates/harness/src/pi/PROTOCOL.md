@@ -24,3 +24,11 @@ out for lack of output. Interruption clears queues before aborting.
 
 Sources inspected: Pi dist/core/agent-session.js and dist/modes/rpc/rpc-mode.js
 0.85.1, and upstream commit f07218c4d4bbc12bef056a7058c3dd49dfe41abe.
+
+Session identity is refreshed from every accepted state barrier, including
+extension-driven new/switch/fork operations. Pi defers file creation until an
+assistant message. Only a host-owned empty-session record, checked with
+get_entries (model/thinking changes only) and a second idle get_state, permits
+recreation using --session-id in the same cwd. Any submitted input revokes that
+proof before the write to stdin. Missing history/custom entries never authorize
+fresh-session fallback.

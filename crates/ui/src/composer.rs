@@ -7310,11 +7310,15 @@ impl Composer {
                 self.launching_new_chat && self.current_key.is_empty() && !key.is_empty();
             let returning_to_new_thread = !self.current_key.is_empty() && key.is_empty();
             self.launching_new_chat = false;
-            let old_text = self.input.read(cx).text().to_string();
-            if old_text.is_empty() {
-                self.drafts.remove(&self.current_key);
-            } else {
-                self.drafts.insert(self.current_key.clone(), old_text);
+            // A question temporarily borrows the editor. Its answer must never
+            // replace the ordinary chat draft saved when the panel opened.
+            if self.wizard.is_none() {
+                let old_text = self.input.read(cx).text().to_string();
+                if old_text.is_empty() {
+                    self.drafts.remove(&self.current_key);
+                } else {
+                    self.drafts.insert(self.current_key.clone(), old_text);
+                }
             }
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
@@ -7372,6 +7376,12 @@ impl Composer {
                     .as_ref()
                     .is_some_and(|w| w.request_id == request_id);
                 if !same {
+                    if self.wizard.is_none() {
+                        self.drafts.insert(
+                            self.current_key.clone(),
+                            self.input.read(cx).text().to_string(),
+                        );
+                    }
                     self.reset_mention(None, cx);
                     let prefill = questions
                         .first()
@@ -7405,8 +7415,15 @@ impl Composer {
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
-                        self.input
-                            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+                        let draft = self
+                            .drafts
+                            .get(&self.current_key)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.input.update(cx, |input, cx| {
+                            input.set_text(draft, cx);
+                            input.set_placeholder("Do anything…", cx);
+                        });
                     }
                 }
             }
@@ -8476,8 +8493,13 @@ impl Composer {
         };
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
+        let draft = self
+            .drafts
+            .get(&self.current_key)
+            .cloned()
+            .unwrap_or_default();
         self.input.update(cx, |input, cx| {
-            input.set_text("", cx);
+            input.set_text(draft, cx);
             // The panel borrowed the composer input; hand back its identity.
             input.set_placeholder("Do anything…", cx);
             input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
@@ -13836,6 +13858,78 @@ mod tests {
             input.undo(&Undo, window, cx);
             assert_eq!(input.text(), committed);
             assert_ranges(input);
+        });
+    }
+
+    #[gpui::test]
+    fn wizard_restores_displaced_draft_after_submit_navigation_and_timeout(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let transcript = |id: &str, resolved: bool| {
+            let mut q = question("editor", &[], false);
+            q.prefill = Some("  initial\ntext\n".into());
+            q.multiline = true;
+            vec![SessionMessageEntry {
+                id: "assistant".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Input {
+                    id: "input".into(),
+                    request_id: id.into(),
+                    questions: vec![q],
+                    resolved,
+                }],
+                created_at: 0,
+                device_id: "device".into(),
+                status: Some(zeron_doc::MessageStatus::Streaming),
+                continuation_of: None,
+                duration_ms: None,
+            }]
+        };
+        state.update(cx, |s, _| s.selected_chat = Some("a".into()));
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            c.input
+                .update(cx, |i, cx| i.set_text("ordinary draft a", cx));
+        });
+        state.update(cx, |s, _| s.transcript = transcript("submit", false));
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            assert_eq!(c.input.read(cx).text(), "  initial\ntext\n");
+            c.input.update(cx, |i, cx| i.set_text("answer", cx));
+            c.wizard_advance(cx);
+            assert_eq!(c.input.read(cx).text(), "ordinary draft a");
+        });
+        state.update(cx, |s, _| s.transcript = transcript("expires", false));
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            c.input.update(cx, |i, cx| i.set_text("partial answer", cx));
+        });
+        state.update(cx, |s, _| {
+            s.selected_chat = Some("b".into());
+            s.transcript.clear();
+        });
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            assert!(c.input.read(cx).text().is_empty());
+            c.input
+                .update(cx, |i, cx| i.set_text("ordinary draft b", cx));
+        });
+        state.update(cx, |s, _| {
+            s.selected_chat = Some("a".into());
+            s.transcript = transcript("expires", false);
+        });
+        composer.update(cx, |c, cx| c.on_state_changed(cx));
+        state.update(cx, |s, _| s.transcript = transcript("expires", true));
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            assert!(c.wizard.is_none());
+            assert_eq!(c.input.read(cx).text(), "ordinary draft a");
+            assert_eq!(
+                c.drafts.get("b").map(String::as_str),
+                Some("ordinary draft b")
+            );
         });
     }
 

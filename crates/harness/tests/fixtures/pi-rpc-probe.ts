@@ -1,5 +1,7 @@
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 export default function(pi) {
+  pi.registerCommand('probe-new', {description:'New native session', handler: async (_args, ctx) => { await ctx.newSession(); }});
+  pi.registerCommand('probe-metadata', {description:'Native extension state', handler: async () => { pi.appendEntry('probe-state', {saved: true}); }});
   pi.registerCommand('probe-noop', {description:'No model run', handler: async () => {}});
   pi.registerCommand('probe-input', {description:'Input dialog', handler: async (_args, ctx) => { const value = await ctx.ui.input('Probe input'); ctx.ui.notify(`answer:${value}`, 'info'); }});
   pi.registerProvider('zeron-probe', {

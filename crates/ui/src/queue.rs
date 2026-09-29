@@ -218,6 +218,29 @@ fn queue_visible_text(text: &str, attachments: &[String]) -> String {
     }
 }
 
+/// Presentation-only metadata. Never expose the observed accessibility payload.
+/// Rows show thumbnails only; these names surface as tooltips and labels.
+fn queue_attachment_labels(text: &str, paths: &[String]) -> Vec<String> {
+    let presentations = crate::appshots::presentations(text);
+    paths
+        .iter()
+        .map(|path| match presentations.get(path) {
+            Some(appshot) => format!("{} Appshot", appshot.app_name),
+            None => std::path::Path::new(path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Image")
+                .to_owned(),
+        })
+        .collect()
+}
+
+/// Names the attachments folded into the "+N" chip, so they stay discoverable.
+fn queue_hidden_attachments_label(labels: &[String], shown: usize) -> Option<String> {
+    let hidden = labels.get(shown..).filter(|hidden| !hidden.is_empty())?;
+    Some(format!("{} more: {}", hidden.len(), hidden.join(" · ")))
+}
+
 fn queue_panel_surface(theme: &Theme) -> gpui::Div {
     div()
         .occlude()
@@ -555,15 +578,22 @@ impl Composer {
                     .line_height(px(16.0))
                     .text_color(theme.text.opacity(0.9))
                     .child(text);
+                let labels = queue_attachment_labels(&item.text, &item.attachments);
+                let limit = self.queue_preview_limit();
+                let hidden = queue_hidden_attachments_label(&labels, limit);
                 el.children(
                     item.attachments
                         .iter()
-                        .take(self.queue_preview_limit())
+                        .zip(&labels)
+                        .take(limit)
                         .enumerate()
-                        .map(|(index, path)| self.queue_thumbnail(&key, index, path, cx)),
+                        .map(|(index, (path, label))| {
+                            self.queue_thumbnail(&key, index, path, label.into(), cx)
+                        }),
                 )
-                .when(item.attachments.len() > self.queue_preview_limit(), |el| {
-                    let remaining = item.attachments.len() - self.queue_preview_limit();
+                .when_some(hidden, |el, hidden| {
+                    let remaining = item.attachments.len() - limit;
+                    let hidden: SharedString = hidden.into();
                     el.child(
                         div()
                             .id(SharedString::from(format!("{key}-more-attachments")))
@@ -577,9 +607,14 @@ impl Composer {
                             .bg(crate::theme::ink(0.06))
                             .text_size(px(11.0))
                             .text_color(theme.text_muted)
-                            .aria_label(format!(
-                                "{remaining} more attachments; edit message to view all"
-                            ))
+                            .aria_label(format!("{hidden}; edit message to view all"))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| QueueActionTooltip {
+                                    label: hidden.clone(),
+                                })
+                                .into()
+                            })
+                            .tooltip_show_delay(std::time::Duration::from_millis(350))
                             .child(format!("+{remaining}")),
                     )
                 })
@@ -804,6 +839,7 @@ impl Composer {
         key: &SharedString,
         index: usize,
         path: &str,
+        label: SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments;
@@ -831,10 +867,19 @@ impl Composer {
             .border_1()
             .border_color(crate::theme::hairline(0.1))
             .bg(crate::theme::ink(0.035))
-            .overflow_hidden();
+            .overflow_hidden()
+            .tooltip({
+                let label = label.clone();
+                move |_, cx| {
+                    cx.new(|_| QueueActionTooltip {
+                        label: label.clone(),
+                    })
+                    .into()
+                }
+            })
+            .tooltip_show_delay(std::time::Duration::from_millis(350));
         match snapshot {
             Some(image) => {
-                let label = image.name.clone();
                 let path = path.to_owned();
                 let accent = Theme::of(cx).accent;
                 frame
@@ -863,7 +908,7 @@ impl Composer {
                     let accent = Theme::of(cx).accent;
                     frame
                         .role(gpui::Role::Button)
-                        .aria_label("Open attachment preview")
+                        .aria_label(format!("Preview {label}"))
                         .tab_index(0)
                         .focus_visible(move |style| style.border_color(accent))
                         .cursor_pointer()
@@ -1936,6 +1981,51 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn attachment_labels_decode_app_names_and_preserve_ordinary_images() {
+        let shot = crate::appshots::tests::shot();
+        let paths = vec![
+            "/tmp/shot & detail.png".to_owned(),
+            "/tmp/reference.png".to_owned(),
+        ];
+        let mut shot = shot;
+        shot.app_name = "Notes & Ideas".into();
+        let body = crate::appshots::with_appshots(
+            "look",
+            &[shot.clone()],
+            &[(shot.screenshot.id.clone(), paths[0].clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(
+            super::queue_attachment_labels(&body, &paths),
+            vec!["Notes & Ideas Appshot", "reference.png"]
+        );
+        assert_eq!(
+            super::queue_attachment_labels(&body, &["/tmp/other.png".into()]),
+            vec!["other.png"]
+        );
+        let malformed = format!("\n\n{}\n<appshot", crate::appshots::CONTEXT_MARKER);
+        assert_eq!(
+            super::queue_attachment_labels(&malformed, &paths),
+            vec!["shot & detail.png", "reference.png"]
+        );
+    }
+
+    /// Filenames are no longer printed in the row, so every attachment folded
+    /// into the "+N" chip must still be named by its tooltip.
+    #[test]
+    fn overflow_chip_names_every_hidden_attachment() {
+        let labels = ["a.png", "Notes Appshot", "c.png"].map(String::from);
+        assert_eq!(
+            super::queue_hidden_attachments_label(&labels, 1).as_deref(),
+            Some("2 more: Notes Appshot · c.png")
+        );
+        assert_eq!(super::queue_hidden_attachments_label(&labels, 3), None);
+        assert_eq!(super::queue_hidden_attachments_label(&labels, 5), None);
+        assert_eq!(super::queue_hidden_attachments_label(&[], 2), None);
     }
 
     #[test]

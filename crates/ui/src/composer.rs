@@ -8213,6 +8213,7 @@ impl Composer {
                         sandbox: SandboxLevel::WorkspaceWrite,
                         auto_approve: false,
                         resume: None,
+                        resume_policy: Default::default(),
                         attachments: attachment_paths,
                         worktree: run_worktree,
                     },

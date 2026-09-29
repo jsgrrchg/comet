@@ -5678,6 +5678,7 @@ impl DocHost {
             auto_approve: false,
             attachments: Vec::new(),
             resume: None,
+            resume_policy: Default::default(),
             worktree: None,
         })
     }

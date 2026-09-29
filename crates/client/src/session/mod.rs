@@ -1053,6 +1053,7 @@ impl SessionHandle {
                     sandbox: config.map_or(SandboxLevel::WorkspaceWrite, |c| c.sandbox),
                     auto_approve: true,
                     resume: None,
+                    resume_policy: Default::default(),
                     attachments: refs.clone(),
                     worktree: request.worktree.clone(),
                     mcp: None,

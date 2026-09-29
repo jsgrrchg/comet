@@ -927,6 +927,7 @@ impl SessionsEngine {
                             auto_approve: false,
                             attachments: Vec::new(),
                             resume: None,
+                            resume_policy: Default::default(),
                             worktree: None,
                         })
                     });
@@ -3075,6 +3076,7 @@ mod tests {
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
             resume: None,
+            resume_policy: Default::default(),
             attachments: Vec::new(),
             worktree: None,
         }

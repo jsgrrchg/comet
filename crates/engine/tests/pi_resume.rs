@@ -34,6 +34,7 @@ async fn pi_idle_crash_next_dispatch_loads_stored_session() {
             attachments: Vec::new(),
             worktree: None,
             resume: None,
+            resume_policy: Default::default(),
         };
         core.sessions
             .dispatch(chat, HarnessId::Pi, req, None)

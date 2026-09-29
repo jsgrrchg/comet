@@ -229,6 +229,8 @@ pub struct RunRequest {
     pub auto_approve: bool,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
+    #[serde(default, skip_serializing_if = "crate::ResumePolicy::is_default")]
+    pub resume_policy: crate::ResumePolicy,
     /// Absolute paths of image attachments already staged on the run device
     /// (composer uploads: UploadChunk/UploadCommit → durable path). The same
     /// paths also ride the prompt text as `Attached images (local files …)`

@@ -491,6 +491,14 @@ fn exit_progress(since: std::time::Instant) -> f32 {
 /// primitive ignores `element_opacity`, so without this the glass slab would
 /// hold full strength through the fade and pop off at unmount.
 fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
+    frosted_menu_with_radius(exit, content, CARD_RADIUS)
+}
+
+fn frosted_menu_with_radius(
+    exit: Option<f32>,
+    content: AnyElement,
+    corner_radius: f32,
+) -> AnyElement {
     let blur = crate::frost::MENU_BLUR * (1.0 - exit.unwrap_or(0.0));
     // Outside-dismiss listeners run during capture. Consume that same press
     // during bubble, after dismissal, so content behind the menu cannot act
@@ -508,7 +516,7 @@ fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
     .absolute()
     .inset_0();
     crate::frost::frosted(
-        CARD_RADIUS,
+        corner_radius,
         blur,
         div()
             .relative()
@@ -785,8 +793,18 @@ pub fn anchored_menu_above_end(
     content: AnyElement,
     closing: Option<std::time::Instant>,
 ) -> AnyElement {
+    anchored_menu_above_end_with_radius(id, content, closing, CARD_RADIUS)
+}
+
+/// Match the frost mask to a card that overrides the standard menu radius.
+pub(crate) fn anchored_menu_above_end_with_radius(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+    corner_radius: f32,
+) -> AnyElement {
     let exit = closing.map(exit_progress);
-    let content = frosted_menu(exit, content);
+    let content = frosted_menu_with_radius(exit, content, corner_radius);
     div()
         .absolute()
         .top_0()

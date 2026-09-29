@@ -9244,6 +9244,11 @@ impl Render for Composer {
         };
         let text_pt = morph_text_pad(layout_morph_t);
         let surface_radius = COMPOSER_RADIUS - 4.0 * dock_amount;
+        if let Some(activity) = &self.chat_activity {
+            activity.update(cx, |activity, cx| {
+                activity.set_corner_radius(surface_radius, cx);
+            });
+        }
         let route_to_single_line =
             self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded;
         let textarea_height = (pill_height

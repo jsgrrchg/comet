@@ -105,6 +105,7 @@ pub(crate) struct ChatActivity {
     scroll: UniformListScrollHandle,
     scrollbar: popover::MenuScrollbarState,
     menu: popover::Popup<()>,
+    corner_radius: f32,
     focus: FocusHandle,
     composer_focus: FocusHandle,
     focus_pending: bool,
@@ -165,6 +166,7 @@ impl ChatActivity {
             scroll: UniformListScrollHandle::new(),
             scrollbar: Default::default(),
             menu: Default::default(),
+            corner_radius: crate::composer::COMPOSER_RADIUS,
             focus: cx.focus_handle(),
             composer_focus,
             focus_pending: false,
@@ -176,6 +178,12 @@ impl ChatActivity {
 
     pub(crate) fn is_open(&self) -> bool {
         self.menu.is_open()
+    }
+    pub(crate) fn set_corner_radius(&mut self, radius: f32, cx: &mut Context<Self>) {
+        if self.corner_radius != radius {
+            self.corner_radius = radius;
+            cx.notify();
+        }
     }
     pub(crate) fn set_child_overlay_open(&mut self, open: bool, cx: &mut Context<Self>) {
         if self.child_overlay_open != open {
@@ -707,6 +715,7 @@ impl Render for ChatActivity {
             let theme = theme.for_popup();
             let viewport = window.viewport_size();
             let card = popover::popover_card_flush(&theme)
+                .rounded(px(self.corner_radius))
                 // macOS leaves the backdrop visible without a fill; Linux
                 // uses the shared popover tint and translucency unchanged.
                 .when(cfg!(target_os = "macos"), |card| {
@@ -729,10 +738,11 @@ impl Render for ChatActivity {
                     }
                 }))
                 .child(self.render_menu(f32::from(viewport.height), &theme, cx));
-            trigger = trigger.child(popover::anchored_menu_above_end(
+            trigger = trigger.child(popover::anchored_menu_above_end_with_radius(
                 "chat-activity-popover",
                 card.into_any_element(),
                 self.menu.closing_since(),
+                self.corner_radius,
             ));
         }
         trigger.into_any_element()

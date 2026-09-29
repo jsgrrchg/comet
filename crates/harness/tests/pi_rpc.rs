@@ -203,3 +203,52 @@ async fn idle_mailbox_starts_another_turn_without_restarting_process() {
     assert_eq!(done, 2);
     assert_eq!(confirmed, 1);
 }
+
+#[tokio::test]
+async fn discovers_model_specific_thinking_and_extension_commands() {
+    let h = harness();
+    let models = h.models().await.unwrap();
+    assert_eq!(models[0].id, "mock/mock");
+    assert_eq!(
+        models[0].reasoning_levels,
+        vec![
+            zeron_proto::ReasoningLevel::Low,
+            zeron_proto::ReasoningLevel::Medium,
+            zeron_proto::ReasoningLevel::High
+        ]
+    );
+    assert_eq!(models[0].options[0].id, "pi_thinking");
+    let dir = tempfile::tempdir().unwrap();
+    let commands = h.commands_for(dir.path()).await.unwrap();
+    for expected in ["noop", "skill:probe", "compact", "session"] {
+        assert!(commands.iter().any(|c| c.name == expected));
+    }
+    let skills = h.skills(dir.path()).await.unwrap().unwrap();
+    assert!(skills.iter().any(|s| s.name == "probe"));
+}
+#[tokio::test]
+async fn rpc_control_commands_finish_without_waiting_for_agent_settled() {
+    for command in [
+        "/compact",
+        "/session",
+        "/name Test",
+        "/autocompact off",
+        "/steering all",
+    ] {
+        let events = collect(command).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        ..
+                    }
+                ))
+                .count(),
+            1,
+            "{command}: {events:?}"
+        );
+    }
+}

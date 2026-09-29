@@ -1,4 +1,5 @@
 //! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
+mod catalog;
 mod normalize;
 mod rpc;
 mod sessions;
@@ -12,7 +13,7 @@ use futures::{StreamExt, stream::BoxStream};
 use normalize::{Normalizer, string};
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -23,6 +24,8 @@ use tokio::{
 use zeron_proto::{AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode};
 
 pub struct PiHarness {
+    models_cache: crate::catalog::Catalog,
+    workspace_commands: crate::skills::CommandDiscovery,
     session_store: Option<PathBuf>,
     executable: Option<PathBuf>,
     interrupt_grace: Duration,
@@ -33,6 +36,8 @@ impl Default for PiHarness {
         Self {
             executable: None,
             session_store: None,
+            models_cache: Default::default(),
+            workspace_commands: Default::default(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
         }
@@ -78,6 +83,24 @@ impl PiHarness {
                 "Pi CLI: install Pi or set PI_EXECUTABLE (the pi-acp adapter is not used)".into(),
             )
         })
+    }
+    async fn probe(&self, cwd: &Path, models: bool) -> Result<Value, HarnessError> {
+        let mut process = self.spawn(cwd, &["--no-session".into()])?;
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
+        let grace = self.kill_grace;
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                result=tokio::time::timeout(Duration::from_secs(60),async {
+                    if models {Ok(serde_json::to_value(catalog::models(&mut process).await?).unwrap())}
+                    else {process.query(json!({"type":"get_commands"}),&mut vec![]).await}
+                })=>result.unwrap_or_else(|_|Err(HarnessError::Protocol("Pi discovery timed out".into()))),
+                _=tx.closed()=>Err(HarnessError::Protocol("Pi discovery cancelled".into())),
+            };
+            process.shutdown(grace).await;
+            let _ = tx.send(result);
+        });
+        rx.await
+            .map_err(|_| HarnessError::Protocol("Pi discovery task failed".into()))?
     }
     fn spawn(&self, cwd: &Path, args: &[String]) -> Result<Process, HarnessError> {
         let exe = self.resolve_executable()?;
@@ -180,14 +203,7 @@ impl Harness for PiHarness {
         SteeringMode::StepBoundary
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[
-            ReasoningLevel::Minimal,
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ]
+        &[]
     }
     fn installed(&self) -> bool {
         self.resolve_executable().is_ok()
@@ -199,7 +215,54 @@ impl Harness for PiHarness {
         true
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        Ok(self.fallback_models())
+        Ok(self.model_catalog(false).await?.models)
+    }
+    fn model_context(&self) -> Result<Option<crate::ModelContext>, HarnessError> {
+        let root = crate::model_context::root(
+            "PI_CODING_AGENT_DIR",
+            crate::executable::home_or_current_dir().join(".pi/agent"),
+        );
+        crate::model_context::context(
+            HarnessId::Pi,
+            &self.resolve_executable()?,
+            &[root.join("models.json"), root.join("settings.json")],
+        )
+        .map(Some)
+    }
+    async fn model_catalog(&self, force: bool) -> Result<crate::ModelCatalog, HarnessError> {
+        self.models_cache
+            .get_with_timeout(
+                force,
+                Duration::from_secs(65),
+                || Ok(self.model_context()?.expect("Pi model context").key()),
+                || async {
+                    let value = self.probe(&std::env::current_dir()?, true).await?;
+                    serde_json::from_value(value).map_err(|e| HarnessError::Protocol(e.to_string()))
+                },
+            )
+            .await
+    }
+    async fn commands(&self) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
+        self.commands_for(&std::env::current_dir()?).await
+    }
+    async fn commands_for(
+        &self,
+        cwd: &Path,
+    ) -> Result<Vec<zeron_proto::SlashCommand>, HarnessError> {
+        self.workspace_commands
+            .get(cwd, async {
+                Ok(catalog::commands(&self.probe(cwd, false).await?))
+            })
+            .await
+    }
+    async fn skills(
+        &self,
+        cwd: &Path,
+    ) -> Result<Option<Vec<zeron_proto::invocation::Skill>>, HarnessError> {
+        let mut skills = crate::skills::discover(HarnessId::Pi, cwd).await?;
+        let commands = self.commands_for(cwd).await?;
+        crate::skills::attach_advertised_commands(HarnessId::Pi, &mut skills, &commands);
+        Ok(Some(skills))
     }
     fn fallback_models(&self) -> Vec<Model> {
         vec![Model {
@@ -235,6 +298,8 @@ impl Harness for PiHarness {
             let mut runner = Runner {
                 store,
                 interrupted: false,
+                extension_commands: HashSet::new(),
+                auto_compaction: true,
                 initial_pending: true,
                 delivery: None,
                 queued: VecDeque::new(),
@@ -282,8 +347,11 @@ impl Harness for PiHarness {
 enum Pending {
     Prompt(u64),
     Barrier(u64),
+    Command(u64),
 }
 struct Runner {
+    extension_commands: HashSet<String>,
+    auto_compaction: bool,
     interrupted: bool,
     initial_pending: bool,
     delivery: Option<crate::SteerMessage>,
@@ -334,30 +402,138 @@ impl Runner {
         })
         .await
     }
+    fn control_command(&self, text: &str) -> Option<Value> {
+        let name = text
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_start_matches('/');
+        if self.extension_commands.contains(name) {
+            None
+        } else {
+            catalog::builtin(text, self.auto_compaction)
+        }
+    }
+    fn submit(&mut self, text: String, images: Value, steer: bool) -> Result<(), HarnessError> {
+        let control = self.control_command(&text);
+        let command=control.clone().unwrap_or_else(||json!({"type":"prompt","message":text,"images":images,"streamingBehavior":if steer {"steer"}else{"followUp"}}));
+        let id = self.process.transport.client.request(command)?;
+        self.pending.insert(
+            id,
+            if control.is_some() {
+                Pending::Command(self.epoch)
+            } else {
+                Pending::Prompt(self.epoch)
+            },
+        );
+        Ok(())
+    }
     fn prompt(&mut self, text: String, images: Value) -> Result<(), HarnessError> {
         self.epoch += 1;
         self.active = true;
         self.norm.reset();
-        let id = self
+        self.submit(text, images, false)
+    }
+    async fn bootstrap(&mut self, backlog: &mut Vec<Value>) -> Result<Value, HarnessError> {
+        if let Some(model) = self.request.model.as_deref().filter(|s| *s != "default") {
+            let models = self
+                .process
+                .query(json!({"type":"get_available_models"}), backlog)
+                .await?;
+            let options = models["models"]
+                .as_array()
+                .ok_or_else(|| HarnessError::Protocol("Pi returned no models".into()))?;
+            let found = options
+                .iter()
+                .find(|m| format!("{}/{}", string(m, "provider"), string(m, "id")) == model)
+                .or_else(|| {
+                    let mut matches = options.iter().filter(|m| string(m, "id") == model);
+                    let first = matches.next()?;
+                    matches.next().is_none().then_some(first)
+                })
+                .ok_or_else(|| {
+                    HarnessError::Protocol(format!("Pi model is not available: {model}"))
+                })?;
+            self.process
+                .query(
+                    json!({"type":"set_model","provider":found["provider"],"modelId":found["id"]}),
+                    backlog,
+                )
+                .await?;
+        }
+        if self.request.reasoning.is_some()
+            || self
+                .request
+                .model_options
+                .get("pi_thinking")
+                .is_some_and(|v| v == "off")
+        {
+            let supported = self
+                .process
+                .query(json!({"type":"get_available_thinking_levels"}), backlog)
+                .await?;
+            let levels = supported["levels"].as_array().cloned().unwrap_or_default();
+            let desired = if self
+                .request
+                .model_options
+                .get("pi_thinking")
+                .is_some_and(|v| v == "off")
+            {
+                "off".to_string()
+            } else {
+                serde_json::to_value(self.request.reasoning)
+                    .unwrap()
+                    .as_str()
+                    .unwrap_or("medium")
+                    .to_owned()
+            };
+            let order = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+            let rank = order
+                .iter()
+                .position(|s| *s == desired)
+                .unwrap_or(order.len() - 1);
+            let effective = order[..=rank]
+                .iter()
+                .rev()
+                .find(|s| levels.iter().any(|v| v == **s))
+                .ok_or_else(|| {
+                    HarnessError::Protocol("Pi returned no supported thinking level".into())
+                })?;
+            self.process
+                .query(
+                    json!({"type":"set_thinking_level","level":effective}),
+                    backlog,
+                )
+                .await?;
+        }
+        let commands = self
             .process
-            .transport
-            .client
-            .request(json!({"type":"prompt","message":text,"images":images}))?;
-        self.pending.insert(id, Pending::Prompt(self.epoch));
-        Ok(())
+            .query(json!({"type":"get_commands"}), backlog)
+            .await?;
+        self.extension_commands = commands["commands"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["source"] == "extension")
+            .map(|c| string(c, "name").to_owned())
+            .collect();
+        self.emit(AgentEvent::AvailableCommands {
+            commands: catalog::commands(&commands),
+        })
+        .await?;
+        self.process
+            .query(json!({"type":"get_state"}), backlog)
+            .await
     }
     async fn run(
         &mut self,
         steering: &mut mpsc::Receiver<crate::SteerMessage>,
     ) -> Result<(), HarnessError> {
         let mut backlog = vec![];
-        let state = tokio::time::timeout(
-            Duration::from_secs(60),
-            self.process
-                .query(json!({"type":"get_state"}), &mut backlog),
-        )
-        .await
-        .map_err(|_| HarnessError::Protocol("Pi startup timed out".into()))??;
+        let state = tokio::time::timeout(Duration::from_secs(60), self.bootstrap(&mut backlog))
+            .await
+            .map_err(|_| HarnessError::Protocol("Pi startup timed out".into()))??;
         self.session = string(&state, "sessionId").into();
         if self.session.is_empty() {
             return Err(HarnessError::Protocol(
@@ -377,6 +553,7 @@ impl Runner {
         if let Some(file) = state["sessionFile"].as_str() {
             self.store.remember(&self.session, Path::new(file))?;
         }
+        self.auto_compaction = state["autoCompactionEnabled"].as_bool().unwrap_or(true);
         self.norm.window = state["model"]["contextWindow"].as_u64();
         self.started(state["model"]["id"].as_str().unwrap_or("default").into())
             .await?;
@@ -392,21 +569,24 @@ impl Runner {
                 && !self
                     .pending
                     .values()
-                    .any(|p| matches!(p, Pending::Prompt(_)))
+                    .any(|p| matches!(p, Pending::Prompt(_) | Pending::Command(_)))
             {
-                if let Some(steer) = self.queued.pop_front() {
-                    if !self.active {
-                        self.norm.reset();
+                if !self
+                    .queued
+                    .front()
+                    .is_some_and(|s| self.active && self.control_command(&s.prompt).is_some())
+                {
+                    if let Some(steer) = self.queued.pop_front() {
+                        if !self.active {
+                            self.norm.reset();
+                        }
+                        self.epoch += 1;
+                        self.active = true;
+                        // Atomic Pi operation: queue at a step boundary if busy, start if idle.
+                        // A separate get_state + steer pair would strand an input on the idle race.
+                        self.submit(steer.prompt.clone(), json!([]), true)?;
+                        self.delivery = Some(steer);
                     }
-                    self.epoch += 1;
-                    self.active = true;
-                    // Atomic Pi operation: queue at a step boundary if busy, start if idle.
-                    // A separate get_state + steer pair would strand an input on the idle race.
-                    let id = self.process.transport.client.request(
-                        json!({"type":"prompt","message":steer.prompt,"streamingBehavior":"steer"}),
-                    )?;
-                    self.pending.insert(id, Pending::Prompt(self.epoch));
-                    self.delivery = Some(steer);
                 }
             }
             if !self.active && !open && self.queued.is_empty() {
@@ -469,6 +649,25 @@ impl Runner {
                 return Ok(());
             };
             let data = response_data(frame)?;
+            if let Pending::Command(epoch) = pending {
+                if epoch == self.epoch {
+                    self.initial_pending = false;
+                    self.confirm_delivery().await?;
+                    let text = if data.is_null() {
+                        "Pi command completed.".into()
+                    } else {
+                        serde_json::to_string_pretty(&data).unwrap()
+                    };
+                    self.emit(AgentEvent::TextDelta { text }).await?;
+                    let id = self
+                        .process
+                        .transport
+                        .client
+                        .request(json!({"type":"get_state"}))?;
+                    self.pending.insert(id, Pending::Barrier(epoch));
+                }
+                return Ok(());
+            }
             match pending {
                 Pending::Prompt(epoch) if epoch == self.epoch && self.active => {
                     let id = self
@@ -479,12 +678,16 @@ impl Runner {
                     self.pending.insert(id, Pending::Barrier(epoch));
                 }
                 Pending::Barrier(epoch) if epoch == self.epoch && self.active => {
+                    self.auto_compaction = data["autoCompactionEnabled"]
+                        .as_bool()
+                        .unwrap_or(self.auto_compaction);
+                    self.norm.window = data["model"]["contextWindow"].as_u64().or(self.norm.window);
                     if data["isStreaming"] == false
                         && data["isCompacting"] == false
                         && !self
                             .pending
                             .values()
-                            .any(|p| matches!(p, Pending::Prompt(_)))
+                            .any(|p| matches!(p, Pending::Prompt(_) | Pending::Command(_)))
                     {
                         self.initial_pending = false;
                         if !self.interrupted {

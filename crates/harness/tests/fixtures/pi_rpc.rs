@@ -47,7 +47,7 @@ fn main() {
         .and_then(|s| serde_json::from_str::<Value>(s.lines().next()?).ok())
         .and_then(|v| v["id"].as_str().map(str::to_owned))
         .unwrap_or_else(|| "pi-fixture-session".into());
-    if !std::path::Path::new(&file).exists() {
+    if !args.iter().any(|a| a == "--no-session") && !std::path::Path::new(&file).exists() {
         std::fs::write(
             &file,
             format!(

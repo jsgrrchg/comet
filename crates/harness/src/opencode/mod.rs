@@ -52,6 +52,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod fork;
+
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
@@ -436,11 +438,31 @@ impl Harness for OpencodeHarness {
         result
     }
 
+    async fn native_fork_support(
+        &self,
+        cwd: &std::path::Path,
+    ) -> zeron_proto::NativeForkAvailability {
+        self.fork_support(cwd).await
+    }
+    async fn fork_native(
+        &self,
+        point: &zeron_proto::NativeForkPoint,
+        controls: crate::NativeForkControls,
+    ) -> Result<zeron_proto::NativeForkResult, crate::NativeForkError> {
+        self.fork_at(point, controls).await
+    }
     async fn run(
         &self,
         mut request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        if request.resume_policy == zeron_proto::ResumePolicy::RequireExisting
+            && request.resume.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(HarnessError::Protocol(
+                "Native fork requires its existing OpenCode session".into(),
+            ));
+        }
         // The engine intentionally leaves OpenCode's canonical invocation
         // intact. Capture the selected identity before converting it to the
         // provider's `/command arguments` text.
@@ -1359,6 +1381,7 @@ struct PartState {
 struct SessionFeed {
     /// messageID → is-assistant (user prompt echoes must not render).
     assistant_messages: HashMap<String, bool>,
+    last_native_reply: Option<String>,
     /// Parts whose message ROLE isn't known yet, replayed when it lands.
     pending_parts: Vec<Value>,
     parts: HashMap<String, PartState>,
@@ -1507,6 +1530,13 @@ async fn run_session(session: Session) {
                             .and_then(Value::as_str)
                             .unwrap_or(resume)
                             .to_owned();
+                        if request.resume_policy == zeron_proto::ResumePolicy::RequireExisting
+                            && &id != resume
+                        {
+                            return Err(HarnessError::Protocol(
+                                "OpenCode resumed an unexpected session".into(),
+                            ));
+                        }
                         if server.protocol().await == Protocol::V2
                             && let Some(agent) = agent
                         {
@@ -1521,6 +1551,9 @@ async fn run_session(session: Session) {
                         id
                     }
                     Err(e) => {
+                        if request.resume_policy == zeron_proto::ResumePolicy::RequireExisting {
+                            return Err(e);
+                        }
                         tracing::debug!(
                             target: "zeron_harness::opencode",
                             "session resume failed (starting fresh): {e}"
@@ -1605,6 +1638,7 @@ async fn run_session(session: Session) {
         .collect();
     drop(providers);
 
+    let session_admission = fork::admission(&server, dir, &session_id);
     let mut assistant_message_id = new_message_id();
     if !send(
         &event_tx,
@@ -1746,6 +1780,7 @@ async fn run_session(session: Session) {
                 continue $label;
             }
             turn.active = false;
+            session_admission.active.store(false, std::sync::atomic::Ordering::Release);
             if let Some(usage) = pending_usage.take()
                 && !interrupt_requested
                 && !send(&event_tx, usage).await
@@ -1823,12 +1858,17 @@ async fn run_session(session: Session) {
             }
             let (prev, _next) = rotate(&mut assistant_message_id);
             if !send(&event_tx, AgentEvent::AssistantMessageCompleted {
-                assistant_message_id: prev,
+                assistant_message_id: prev.clone(),
             }).await {
                 break $label;
             }
             let errored = turn.aborted_for_retry
                 || (turn.error.is_some() && !turn.saw_content);
+            if !errored && let Some(id) = main_feed.last_native_reply.take() {
+                let _ = send(&event_tx, AgentEvent::NativeForkReady { assistant_message_id: prev, point: zeron_proto::NativeForkPoint {
+                    format_version: 1, harness: HarnessId::Opencode, source_device_id: "host".into(), source_session_id: session_id.clone(), cwd: request.cwd.clone(), boundary: zeron_proto::NativeForkBoundary::OpenCodeReply { assistant_message_id: id },
+                }}).await;
+            }
             let _ = send(&event_tx, AgentEvent::Done {
                 status: if errored {
                     DoneStatus::Errored
@@ -2433,6 +2473,10 @@ async fn post_prompt(
         attachments,
     } = spec;
     let protocol = server.protocol().await;
+    let admission = fork::admission(server, dir, session_id);
+    admission
+        .active
+        .store(true, std::sync::atomic::Ordering::Release);
     if let Some((name, arguments)) =
         native_command_request(prompt, commands, native_command_selected)?
     {
@@ -2460,6 +2504,10 @@ async fn post_prompt(
         let protocol = server.protocol.clone();
         let command_failure_tx = command_failure_tx.clone();
         tokio::spawn(async move {
+            let admission_guard = admission.gate.lock().await;
+            // active was set before this task queued. A fork holding the gate
+            // finishes before transmission; later forks see the active turn.
+            drop(admission_guard);
             let server = Server {
                 child: None,
                 base: server_base,
@@ -2523,6 +2571,10 @@ async fn post_prompt(
     // The bus owns turn completion. A stalled HTTP acknowledgement must not
     // prevent cancellation or event consumption; post_json bounds the request.
     tokio::spawn(async move {
+        let admission_guard = admission.gate.lock().await;
+        // active was set before this task queued. A fork holding the gate
+        // finishes before transmission; later forks see the active turn.
+        drop(admission_guard);
         if let Err(error) = server.post_json(&path, dir.as_deref(), &body).await {
             let _ = bus_tx.send(BusMsg::CommandFailed(error.to_string())).await;
         }
@@ -2809,6 +2861,9 @@ async fn handle_bus_event(ctx: BusCtx<'_>) -> BusOutcome {
                 return BusOutcome::Continue;
             };
             if session == session_id {
+                if role == "assistant" {
+                    main_feed.last_native_reply = Some(message.to_owned());
+                }
                 main_feed
                     .assistant_messages
                     .entry(message.to_owned())

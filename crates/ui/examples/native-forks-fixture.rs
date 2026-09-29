@@ -77,7 +77,7 @@ fn capture(
             let (connection, screen) = x11rb::connect(None)?;
             let root = connection.setup().roots[screen].root;
             // Run on an isolated Xvfb display; decode the sole application window.
-            let window = connection
+            let mut window = connection
                 .query_tree(root)?
                 .reply()?
                 .children
@@ -90,12 +90,33 @@ fn capture(
                         .is_some_and(|g| g.width > 300 && g.height > 300)
                 })
                 .ok_or_else(|| anyhow::anyhow!("No fixture window"))?;
+            // A window manager supplies real resize/focus events. Descend past
+            // its frame so captures contain only the application's pixels.
+            while let Some(child) = connection
+                .query_tree(window)?
+                .reply()?
+                .children
+                .into_iter()
+                .find(|id| {
+                    connection
+                        .get_geometry(*id)
+                        .ok()
+                        .and_then(|r| r.reply().ok())
+                        .is_some_and(|g| g.width > 300 && g.height > 300)
+                })
+            {
+                window = child;
+            }
             let geometry = connection.get_geometry(window)?.reply()?;
+            let position = connection
+                .translate_coordinates(window, root, 0, 0)?
+                .reply()?;
+            // Read the displayed pixels, including the Vulkan presentation surface.
             let (image, visual) = x11rb::image::Image::get(
                 &connection,
-                window,
-                0,
-                0,
+                root,
+                position.dst_x,
+                position.dst_y,
                 geometry.width,
                 geometry.height,
             )?;
@@ -289,18 +310,8 @@ fn main() -> anyhow::Result<()> {
                     pause(cx, 350).await;
                     capture(window.into(), cx, &output, "native-fork-light")?;
                     window.update(cx, |s, _, cx| s.fixture_native_fork_reveal("a2", cx))?;
-                    window.update(cx, |_, w, cx| {
-                        w.dispatch_event(
-                            gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
-                                position: gpui::point(px(477.), px(693.)),
-                                pressed_button: None,
-                                modifiers: Default::default(),
-                            }),
-                            cx,
-                        )
-                    })?;
-                    pause(cx, 800).await;
-                    capture(window.into(), cx, &output, "native-fork-unavailable")?;
+                    pause(cx, 350).await;
+                    capture(window.into(), cx, &output, "native-fork-no-native-point")?;
                     window.update(cx, |s, _, cx| s.fixture_native_fork_create(cx))?;
                     pause(cx, 1500).await;
                     capture(
@@ -309,7 +320,10 @@ fn main() -> anyhow::Result<()> {
                         &output,
                         "native-fork-historical-side-chat",
                     )?;
-                    window.update(cx, |_, w, _| w.resize(size(px(700.), px(850.))))?;
+                    window.update(cx, |_, w, cx| {
+                        w.dispatch_action(Box::new(shell::ToggleSidebar), cx);
+                        w.resize(size(px(900.), px(850.)));
+                    })?;
                     pause(cx, 500).await;
                     capture(window.into(), cx, &output, "native-fork-narrow")?;
                     Ok(())

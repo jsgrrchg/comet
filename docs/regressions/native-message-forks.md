@@ -75,8 +75,10 @@ Visual fixture, with a synthetic provider and an isolated engine (no inference):
 ```sh
 cargo build -p zeron-ui --example native-forks-fixture --features native-forks-fixture
 env -u WAYLAND_DISPLAY xvfb-run -a -s '-screen 0 1400x1000x24' \
-  target/debug/examples/native-forks-fixture /tmp/native-forks-visual
+  sh -c 'openbox >/tmp/native-forks-openbox.log 2>&1 & fixture_wm_pid=$!; trap "kill $fixture_wm_pid" EXIT; target/debug/examples/native-forks-fixture /tmp/native-forks-visual'
 ```
+
+Openbox supplies resize and focus events on Xvfb. Captures exclude its window decorations; the compact view hides the sidebar and uses a 900 px window.
 
 ## Validation notes
 
@@ -96,7 +98,9 @@ These captures use the real shell, transcript, composer, and fork RPC with an is
 
 ![The same action in the light theme](../screenshots/native-message-forks/native-fork-light.png)
 
-Replies without a recorded native point and hosts without the native message fork capability no longer render the action. The earlier `native-fork-unavailable.png` capture predates this visibility change. GPUI regression coverage verifies that the button stays hidden, stale availability replies cannot restore it, and it reappears when the point or host capability arrives.
+Replies without a recorded native point and hosts without the native message fork capability do not render the action. GPUI regression coverage verifies that the button stays hidden, stale availability replies cannot restore it, and it reappears when the point or host capability arrives.
+
+![A reply without a native point shows its timestamp and Copy, with no fork icon](../screenshots/native-message-forks/native-fork-no-native-point.png)
 
 ![Historical fork open in the right panel](../screenshots/native-message-forks/native-fork-historical-side-chat.png)
 

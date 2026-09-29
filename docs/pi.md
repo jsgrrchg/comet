@@ -15,13 +15,13 @@ absolute file mapping in `PI_CODING_AGENT_DIR/zeron-sessions` (normally
 `~/.pi/agent/zeron-sessions`). For older chats it also reads
 `~/.pi/pi-acp/session-map.json`, then searches native session directories,
 including configured `sessionDir` locations. It validates the session header
-before reopening the exact file. Missing sessions produce an explicit error;
-a new conversation is never silently substituted. A session that Pi has not yet
+before reopening the exact file. A session that cannot be found starts a new
+conversation with a visible notice, as other harnesses do. A session that Pi has not yet
 written can retain its UUID through `--session-id` only after ordered native
 queries prove it has no conversation or extension entries. The proof is revoked
 before another input is sent. Unsaved custom extension state cannot be recreated:
-Pi only materializes it after its first assistant response, so restart recovery
-fails explicitly if that file never existed. Session changes made by extensions
+Pi only materializes it after its first assistant response, so if that file
+never existed the chat continues in a new session with the same notice. Session changes made by extensions
 refresh the UUID and file mapping before turn completion.
 
 Models and supported thinking levels come from native RPC discovery. The

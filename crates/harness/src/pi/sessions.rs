@@ -187,7 +187,7 @@ impl Store {
             }
         }
         Err(HarnessError::Protocol(format!(
-            "Cannot restore Pi session {id}: native session file was not found; previous context has not been replaced"
+            "native session file for {id} was not found"
         )))
     }
 }

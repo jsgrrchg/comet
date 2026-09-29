@@ -43,4 +43,5 @@ assistant message. Only a host-owned empty-session record, checked with
 get_entries (model/thinking changes only) and a second idle get_state, permits
 recreation using --session-id in the same cwd. Any submitted input revokes that
 proof before the write to stdin. Missing history/custom entries never authorize
-fresh-session fallback.
+recreating the same UUID; an unrestorable session starts a new one with a
+visible "without the previous context" notice, like the other harnesses.

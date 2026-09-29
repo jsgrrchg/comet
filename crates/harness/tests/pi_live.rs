@@ -168,8 +168,9 @@ async fn real_pi_mock_lifecycle() {
             assert_eq!(text, format!("MOCK:{prompt}"));
         }
     }
-    // Unsaved extension entries are not equivalent to an empty conversation.
-    // Pi has no public RPC to restore them; refuse instead of losing them.
+    // Unsaved extension entries are not equivalent to an empty conversation, so
+    // the UUID is not recreated. Pi has no public RPC to restore them; the chat
+    // continues in a new session and says so instead of failing every message.
     let (_, steering) = mpsc::channel(1);
     let controls = RunControls {
         execution_lease: None,
@@ -178,7 +179,7 @@ async fn real_pi_mock_lifecycle() {
         request_input: Box::new(|_| oneshot::channel().1),
     };
     let request = RunRequest {
-        prompt: "must not run".into(),
+        prompt: "after loss".into(),
         harness: None,
         model: Some("zeron-probe/mock".into()),
         reasoning: None,
@@ -186,14 +187,31 @@ async fn real_pi_mock_lifecycle() {
         cwd: cwd.display().to_string(),
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
-        resume: session,
+        resume: session.clone(),
         attachments: vec![],
         worktree: None,
         mcp: None,
     };
+    let events: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(20),
+        harness
+            .run(request, controls)
+            .await
+            .unwrap()
+            .map(Result::unwrap)
+            .collect(),
+    )
+    .await
+    .expect("native Pi run must settle");
     assert!(
-        harness.run(request, controls).await.is_err(),
-        "unpersisted extension state must not silently disappear"
+        events.iter().any(|e| matches!(e, AgentEvent::Error { message }
+            if message.contains("without the previous context"))),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, AgentEvent::Done { status, session_id, .. }
+            if *status == DoneStatus::Completed && session_id.is_some() && *session_id != session)),
+        "{events:?}"
     );
 }
 

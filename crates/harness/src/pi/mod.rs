@@ -326,12 +326,27 @@ impl Harness for PiHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let mut request = request;
         let store = sessions::Store::new(self.session_store.clone(), self.agent_dir.clone());
-        let args = if let Some(id) = &request.resume {
-            store.resume_args(id, Path::new(&request.cwd))?
-        } else {
-            vec![]
+        let mut lost_context = None;
+        let args = match &request.resume {
+            Some(id) => match store.resume_args(id, Path::new(&request.cwd)) {
+                Ok(args) => args,
+                // Like every other harness, a session that can no longer be
+                // reopened starts fresh with a visible notice. Failing instead
+                // would strand the chat: the engine resumes the same id forever.
+                Err(error) => {
+                    lost_context = Some(format!(
+                        "Pi could not restore session {id}; starting a new session without the previous context: {error}"
+                    ));
+                    vec![]
+                }
+            },
+            None => vec![],
         };
+        if lost_context.is_some() {
+            request.resume = None;
+        }
         let process = self.spawn(Path::new(&request.cwd), &args, request.mcp.as_ref())?;
         let (tx, rx) = mpsc::channel(256);
         let kill_grace = self.kill_grace;
@@ -355,6 +370,7 @@ impl Harness for PiHarness {
                 pending: HashMap::new(),
                 session: String::new(),
                 assistant: uuid::Uuid::new_v4().to_string(),
+                lost_context,
             };
             // The lease lives through shutdown even if the consumer drops its stream.
             let RunControls {
@@ -418,6 +434,7 @@ struct Runner {
     pending: HashMap<String, Pending>,
     session: String,
     assistant: String,
+    lost_context: Option<String>,
 }
 impl Runner {
     async fn emit(&self, event: AgentEvent) -> Result<(), HarnessError> {
@@ -623,6 +640,9 @@ impl Runner {
         self.norm.window = state["model"]["contextWindow"].as_u64();
         self.started(state["model"]["id"].as_str().unwrap_or("default").into())
             .await?;
+        if let Some(message) = self.lost_context.take() {
+            self.emit(AgentEvent::Error { message }).await?;
+        }
         for frame in backlog {
             self.frame(frame).await?;
         }

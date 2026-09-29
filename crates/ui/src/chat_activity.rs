@@ -298,8 +298,8 @@ impl ChatActivity {
     ) -> AnyElement {
         let state = self.state.read(cx);
         let counts = [
-            subagent_rows(state, &self.chat_id).len(),
             child_chat_rows(state, &self.chat_id, Utc::now()).len(),
+            subagent_rows(state, &self.chat_id).len(),
         ];
         let mut tabs = div()
             .flex_none()
@@ -310,7 +310,7 @@ impl ChatActivity {
             .flex()
             .items_center()
             .gap(px(2.0));
-        for (tab, count) in [ActivityTab::Subagents, ActivityTab::Chats]
+        for (tab, count) in [ActivityTab::Chats, ActivityTab::Subagents]
             .into_iter()
             .zip(counts)
         {

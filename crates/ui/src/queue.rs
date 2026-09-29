@@ -217,22 +217,6 @@ fn queue_visible_text(text: &str, attachments: &[String]) -> String {
     }
 }
 
-/// Presentation-only metadata. Never expose the observed accessibility payload.
-fn queue_attachment_labels(text: &str, paths: &[String]) -> Vec<String> {
-    let presentations = crate::appshots::presentations(text);
-    paths
-        .iter()
-        .map(|path| match presentations.get(path) {
-            Some(appshot) => format!("{} Appshot", appshot.app_name),
-            None => std::path::Path::new(path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("Image")
-                .to_owned(),
-        })
-        .collect()
-}
-
 fn queue_panel_surface(theme: &Theme) -> gpui::Div {
     div()
         .occlude()
@@ -560,42 +544,14 @@ impl Composer {
             // from the editing state.
             .when(being_edited, |el| el.child(div().w(px(14.0)).flex_none()))
             .when(!being_edited, |el| {
-                let labels = queue_attachment_labels(&item.text, &item.attachments);
-                let summary = if labels.len() > 1 {
-                    format!("{} attachments · {}", labels.len(), labels.join(" · "))
-                } else {
-                    labels.join(" · ")
-                };
-                let only_images = text.as_ref() == crate::attachments::ATTACHMENT_ONLY_TEXT;
-                let title = if only_images {
-                    summary.clone().into()
-                } else {
-                    text
-                };
-                let mut content = div()
+                let content = div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(QUEUE_TEXT_SIZE))
-                            .line_height(px(16.0))
-                            .text_color(theme.text.opacity(0.9))
-                            .child(title),
-                    );
-                if !labels.is_empty() && !only_images {
-                    content = content.child(
-                        div()
-                            .truncate()
-                            .text_size(px(11.0))
-                            .line_height(px(13.0))
-                            .text_color(theme.text_muted)
-                            .child(summary),
-                    );
-                }
+                    .truncate()
+                    .text_size(px(QUEUE_TEXT_SIZE))
+                    .line_height(px(16.0))
+                    .text_color(theme.text.opacity(0.9))
+                    .child(text);
                 el.children(
                     item.attachments
                         .iter()
@@ -1977,37 +1933,6 @@ mod tests {
                 expected
             );
         }
-    }
-
-    #[test]
-    fn attachment_labels_decode_app_names_and_preserve_ordinary_images() {
-        let shot = crate::appshots::tests::shot();
-        let paths = vec![
-            "/tmp/shot & detail.png".to_owned(),
-            "/tmp/reference.png".to_owned(),
-        ];
-        let mut shot = shot;
-        shot.app_name = "Notes & Ideas".into();
-        let body = crate::appshots::with_appshots(
-            "look",
-            &[shot.clone()],
-            &[(shot.screenshot.id.clone(), paths[0].clone())]
-                .into_iter()
-                .collect(),
-        );
-        assert_eq!(
-            super::queue_attachment_labels(&body, &paths),
-            vec!["Notes & Ideas Appshot", "reference.png"]
-        );
-        assert_eq!(
-            super::queue_attachment_labels(&body, &["/tmp/other.png".into()]),
-            vec!["other.png"]
-        );
-        let malformed = format!("\n\n{}\n<appshot", crate::appshots::CONTEXT_MARKER);
-        assert_eq!(
-            super::queue_attachment_labels(&malformed, &paths),
-            vec!["shot & detail.png", "reference.png"]
-        );
     }
 
     #[test]

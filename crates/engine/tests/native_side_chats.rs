@@ -166,6 +166,7 @@ fn setup(dir: &std::path::Path, harness: Arc<NativeStore>) -> EngineCore {
 }
 fn request(core: &EngineCore) -> ForkMessageSideChatRequest {
     ForkMessageSideChatRequest {
+        destination: NativeForkDestination::SideChat,
         request_id: "op-one".into(),
         chat_id: "child".into(),
         source_chat_id: "main".into(),
@@ -260,6 +261,116 @@ async fn native_fork_rpc_freezes_exact_prefix_dedupes_and_preserves_canonical_li
     assert_eq!(harness.forks.load(Ordering::SeqCst), 2);
     restarted.shutdown().await;
 }
+#[tokio::test]
+async fn native_fork_main_conversation_survives_restart_and_resumes_native_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(NativeStore::default());
+    let core = setup(dir.path(), harness.clone());
+    // A reply from a side chat can also become a root conversation.
+    let side = core.native_forks.create(request(&core)).await.unwrap();
+    let mut fork = request(&core);
+    fork.request_id = "op-main".into();
+    fork.chat_id = "new-main".into();
+    fork.source_chat_id = side.id.clone();
+    fork.parent_chat_id = None;
+    fork.destination = NativeForkDestination::MainConversation;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let params = serde_json::to_value(&fork).unwrap();
+    let child = client
+        .call_as::<Chat>(methods::FORK_MESSAGE_SIDE_CHAT, params.clone())
+        .await
+        .unwrap();
+    assert_eq!(child.parent_chat_id, None);
+    assert_eq!(child.device_id, side.device_id);
+    assert_eq!(child.cwd, side.cwd);
+    assert!(harness.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        core.doc_host
+            .open("new-main")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap()
+            .iter()
+            .map(|e| e.id.as_str())
+            .collect::<Vec<_>>(),
+        ["u1", "a1", "fork:new-main"]
+    );
+    // Reusing an operation ID with another destination is not a retry.
+    let mut changed = fork.clone();
+    changed.destination = NativeForkDestination::SideChat;
+    assert!(core.native_forks.create(changed).await.is_err());
+    let mut invalid = fork.clone();
+    invalid.request_id = "invalid-parent".into();
+    invalid.chat_id = "invalid-child".into();
+    invalid.parent_chat_id = Some("main".into());
+    assert!(
+        core.native_forks
+            .create(invalid)
+            .await
+            .unwrap_err()
+            .contains("visual parent")
+    );
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 2);
+    core.shutdown().await;
+    drop(client);
+    drop(core);
+    let registry = Arc::new(HarnessRegistry::new());
+    registry.register(harness.clone());
+    let restarted = EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None).unwrap();
+    let replay = zeron_rpc::memory_client(restarted.rpc_service())
+        .call_as::<Chat>(methods::FORK_MESSAGE_SIDE_CHAT, params)
+        .await
+        .unwrap();
+    assert_eq!(replay, child);
+    assert_eq!(
+        restarted
+            .workspace
+            .chat("new-main")
+            .unwrap()
+            .unwrap()
+            .parent_chat_id,
+        None
+    );
+    restarted
+        .sessions
+        .dispatch(
+            "new-main",
+            HarnessId::Mock,
+            send_request("Continue here"),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if !harness.requests.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let requests = harness.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].resume, child.harness_session_id);
+    assert_eq!(requests[0].resume_policy, ResumePolicy::RequireExisting);
+    assert_eq!(requests[0].prompt, "Continue here");
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        restarted
+            .workspace
+            .chat("main")
+            .unwrap()
+            .unwrap()
+            .harness_session_id
+            .as_deref(),
+        Some("canonical")
+    );
+    restarted.shutdown().await;
+}
+
 #[tokio::test]
 async fn native_fork_indeterminate_never_retries_or_publishes() {
     let dir = tempfile::tempdir().unwrap();

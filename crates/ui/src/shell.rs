@@ -1823,8 +1823,10 @@ pub struct Shell {
     side_chats: std::collections::HashMap<u64, SideChatTab>,
     side_chat_seq: u64,
     side_chat_creating: bool,
-    native_fork_operations:
-        std::collections::HashMap<(String, String), zeron_proto::ForkMessageSideChatRequest>,
+    native_fork_operations: std::collections::HashMap<
+        (String, String, zeron_proto::NativeForkDestination),
+        zeron_proto::ForkMessageSideChatRequest,
+    >,
     native_fork_pending: std::collections::HashSet<String>,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
@@ -3861,8 +3863,15 @@ impl Shell {
             TranscriptEvent::ForkMessage {
                 chat_id,
                 message_id,
+                destination,
             } => {
-                self.fork_message(transcript, chat_id.clone(), message_id.clone(), cx);
+                self.fork_message(
+                    transcript,
+                    chat_id.clone(),
+                    message_id.clone(),
+                    *destination,
+                    cx,
+                );
             }
             TranscriptEvent::OpenSubagent {
                 chat_id,
@@ -16585,6 +16594,7 @@ impl Shell {
             self.transcript.clone(),
             "native-fixture".into(),
             "a1".into(),
+            zeron_proto::NativeForkDestination::SideChat,
             cx,
         );
     }

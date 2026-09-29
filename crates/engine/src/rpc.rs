@@ -653,7 +653,10 @@ impl EngineRpc {
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
             capabilities: zeron_proto::capabilities::current()
                 .into_iter()
-                .filter(|c| c != zeron_proto::capabilities::NATIVE_MESSAGE_FORK_V1)
+                .filter(|c| {
+                    c != zeron_proto::capabilities::NATIVE_MESSAGE_FORK_V1
+                        && c != zeron_proto::capabilities::NATIVE_MESSAGE_FORK_MAIN_V1
+                })
                 .collect(),
         };
         Self {
@@ -685,6 +688,9 @@ impl EngineRpc {
         self.engine_info
             .capabilities
             .push(zeron_proto::capabilities::NATIVE_MESSAGE_FORK_V1.into());
+        self.engine_info
+            .capabilities
+            .push(zeron_proto::capabilities::NATIVE_MESSAGE_FORK_MAIN_V1.into());
         self
     }
 

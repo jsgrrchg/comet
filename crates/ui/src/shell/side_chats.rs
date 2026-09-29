@@ -13,6 +13,7 @@ impl Shell {
         transcript: Entity<Transcript>,
         source_id: String,
         message_id: String,
+        destination: zeron_proto::NativeForkDestination,
         cx: &mut Context<Self>,
     ) {
         let Some(source) = self
@@ -61,13 +62,15 @@ impl Shell {
         let origin_panel = self.panels.get(&key);
         let request = self
             .native_fork_operations
-            .entry((source_id.clone(), message_id.clone()))
+            .entry((source_id.clone(), message_id.clone(), destination))
             .or_insert_with(|| zeron_proto::ForkMessageSideChatRequest {
                 request_id: uuid::Uuid::new_v4().to_string(),
                 chat_id: uuid::Uuid::new_v4().to_string(),
                 source_chat_id: source.id.clone(),
                 source_message_id: message_id.clone(),
-                parent_chat_id: Some(source.parent_chat_id.clone().unwrap_or(source.id.clone())),
+                destination,
+                parent_chat_id: (destination == zeron_proto::NativeForkDestination::SideChat)
+                    .then(|| source.parent_chat_id.clone().unwrap_or(source.id.clone())),
                 target_device_id: source.device_id.clone(),
             })
             .clone();
@@ -92,8 +95,32 @@ impl Shell {
                     Ok(chat) => {
                         // Retries share an identity until confirmation. A later
                         // click on this reply must create an independent child.
-                        this.native_fork_operations
-                            .remove(&(source_id.clone(), message_id.clone()));
+                        this.native_fork_operations.remove(&(
+                            source_id.clone(),
+                            message_id.clone(),
+                            destination,
+                        ));
+                        if destination == zeron_proto::NativeForkDestination::MainConversation {
+                            // Publication is already durable; expose the returned row
+                            // immediately, even if the workspace update is in flight.
+                            this.state.update(cx, |state, cx| {
+                                let mut chats = state.chats.clone();
+                                if !chats.iter().any(|row| row.id == chat.id) {
+                                    chats.push(chat.clone());
+                                }
+                                state.apply_chats(chats);
+                                cx.notify();
+                            });
+                            // A completed background fork must not steal navigation.
+                            let current = this.panels.get(&key);
+                            if key == this.panel_key(cx)
+                                && current.right_active == origin_panel.right_active
+                                && current.changes_open == origin_panel.changes_open
+                            {
+                                this.open_chat(chat.id, cx);
+                            }
+                            return;
+                        }
                         let current_panel = this.panels.get(&key);
                         let unchanged = current_panel.right_active == origin_panel.right_active
                             && current_panel.changes_open == origin_panel.changes_open;
@@ -608,7 +635,12 @@ mod tests {
         let mut sent = Vec::<zeron_proto::ForkMessageSideChatRequest>::new();
         // A lost result is retried with the same identity. Once confirmed,
         // another click forks the same reply into a different saved side chat.
-        for attempt in 0..3 {
+        for attempt in 0..4 {
+            let destination = if attempt == 3 {
+                zeron_proto::NativeForkDestination::MainConversation
+            } else {
+                zeron_proto::NativeForkDestination::SideChat
+            };
             window
                 .update(cx, |shell, _, cx| {
                     for _ in 0..2 {
@@ -616,6 +648,7 @@ mod tests {
                             shell.transcript.clone(),
                             "main".into(),
                             "a1".into(),
+                            destination,
                             cx,
                         );
                     }
@@ -635,6 +668,11 @@ mod tests {
                 serde_json::from_value(frame.params).unwrap();
             assert_eq!(request.source_chat_id, "main");
             assert_eq!(request.source_message_id, "a1");
+            assert_eq!(request.destination, destination);
+            assert_eq!(
+                request.parent_chat_id.as_deref(),
+                if attempt == 3 { None } else { Some("main") }
+            );
             if attempt == 1 {
                 assert_eq!(request, sent[0], "An unconfirmed retry keeps its identity");
             } else if attempt == 2 {
@@ -651,7 +689,7 @@ mod tests {
                 zeron_rpc::ServerFrame {
                     id: frame.id,
                     ok: Some(serde_json::json!({
-                        "id": request.chat_id, "parentChatId": "main", "deviceId": "host",
+                        "id": request.chat_id, "parentChatId": request.parent_chat_id, "deviceId": "host",
                         "archived": false, "createdAt": Utc::now(),
                     })),
                     ..Default::default()
@@ -666,6 +704,18 @@ mod tests {
         }
         window
             .update(cx, |shell, _, cx| {
+                assert_eq!(
+                    shell.state.read(cx).selected_chat.as_deref(),
+                    Some(sent[3].chat_id.as_str())
+                );
+                assert!(
+                    shell
+                        .state
+                        .read(cx)
+                        .chats
+                        .iter()
+                        .any(|chat| chat.id == sent[3].chat_id && chat.parent_chat_id.is_none())
+                );
                 let children: std::collections::HashSet<_> = shell
                     .side_chats
                     .values()

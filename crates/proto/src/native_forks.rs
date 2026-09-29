@@ -124,6 +124,21 @@ impl NativeForkAvailability {
     }
 }
 
+/// Visual destination only; both modes preserve the same native fork contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeForkDestination {
+    #[default]
+    SideChat,
+    MainConversation,
+}
+
+impl NativeForkDestination {
+    fn is_side_chat(&self) -> bool {
+        *self == Self::SideChat
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ForkMessageSideChatRequest {
@@ -131,6 +146,8 @@ pub struct ForkMessageSideChatRequest {
     pub chat_id: String,
     pub source_chat_id: String,
     pub source_message_id: String,
+    #[serde(default, skip_serializing_if = "NativeForkDestination::is_side_chat")]
+    pub destination: NativeForkDestination,
     #[serde(default)]
     pub parent_chat_id: Option<String>,
     pub target_device_id: String,
@@ -205,6 +222,30 @@ mod tests {
                 .get("resumePolicy")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn native_fork_destination_preserves_old_side_chat_requests() {
+        let value = serde_json::json!({"requestId":"r", "chatId":"c", "sourceChatId":"s", "sourceMessageId":"m", "targetDeviceId":"d"});
+        let mut request: ForkMessageSideChatRequest =
+            serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.destination, NativeForkDestination::SideChat);
+        assert!(
+            serde_json::to_value(&request)
+                .unwrap()
+                .get("destination")
+                .is_none()
+        );
+        request.destination = NativeForkDestination::MainConversation;
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["destination"], "mainConversation");
+        assert_eq!(
+            serde_json::from_value::<ForkMessageSideChatRequest>(wire).unwrap(),
+            request
+        );
+        let mut invalid = value;
+        invalid["destination"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<ForkMessageSideChatRequest>(invalid).is_err());
     }
 
     #[test]

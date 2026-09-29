@@ -320,6 +320,11 @@ impl NativeForks {
             .parent_chat_id
             .clone()
             .unwrap_or_else(|| source.id.clone());
+        if request.destination == NativeForkDestination::MainConversation
+            && request.parent_chat_id.is_some()
+        {
+            return Err("Main conversation forks cannot have a visual parent".into());
+        }
         if request
             .parent_chat_id
             .as_ref()
@@ -345,7 +350,10 @@ impl NativeForks {
             .ok_or("Source boundary disappeared")?;
         let mut chat = source.clone();
         chat.id = request.chat_id.clone();
-        chat.parent_chat_id = Some(parent);
+        chat.parent_chat_id = match request.destination {
+            NativeForkDestination::SideChat => Some(parent),
+            NativeForkDestination::MainConversation => None,
+        };
         chat.title = None;
         chat.archived = false;
         chat.created_at = chrono::Utc::now();

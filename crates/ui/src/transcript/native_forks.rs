@@ -1,5 +1,12 @@
 use super::*;
-use zeron_proto::{HarnessId, NativeForkAvailability};
+use zeron_proto::{HarnessId, NativeForkAvailability, NativeForkDestination};
+
+pub(super) struct ForkMenu {
+    chat: String,
+    message: String,
+    active: usize,
+    return_focus: Option<gpui::FocusHandle>,
+}
 
 pub(super) fn eligible(entry: &SessionMessageEntry, harness: HarnessId, subagent: bool) -> bool {
     !subagent
@@ -74,6 +81,10 @@ impl Transcript {
             &chat.device_id,
             harness,
             supported,
+            state.device_supports(
+                &chat.device_id,
+                zeron_proto::capabilities::NATIVE_MESSAGE_FORK_MAIN_V1,
+            ),
             format!("{:?}", state.connection),
             remote_health,
             points,
@@ -84,6 +95,7 @@ impl Transcript {
             return;
         }
         self.native_fork_key = key.clone();
+        self.native_fork_menu = Default::default();
         // Dropping the previous task cancels stale requests and retry timers,
         // including when navigation returns to a previously used cache key.
         self.native_fork_availability_task = None;
@@ -162,6 +174,157 @@ impl Transcript {
         cx.notify();
     }
 
+    fn close_native_fork_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let return_focus = self
+            .native_fork_menu
+            .as_open()
+            .and_then(|menu| menu.return_focus.clone());
+        if let Some(focus) = return_focus {
+            window.focus(&focus, cx);
+        }
+        if self.native_fork_menu.begin_close() {
+            crate::popover::reap_popup(cx, |this| &mut this.native_fork_menu);
+        }
+        cx.notify();
+    }
+
+    fn choose_native_fork(
+        &mut self,
+        destination: NativeForkDestination,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.native_fork_menu.as_open() else {
+            return;
+        };
+        let chat = menu.chat.clone();
+        let message = menu.message.clone();
+        if self.chat_id.as_deref() != Some(&chat)
+            || !self.native_forks.get(&message).is_some_and(|a| a.available)
+            || (destination == NativeForkDestination::MainConversation
+                && !self.main_fork_supported(cx))
+        {
+            self.close_native_fork_menu(window, cx);
+            return;
+        }
+        let identity = (chat.clone(), message.clone());
+        if !self.native_fork_pending.insert(identity.clone()) {
+            return;
+        }
+        self.native_fork_errors.remove(&identity);
+        self.close_native_fork_menu(window, cx);
+        cx.emit(TranscriptEvent::ForkMessage {
+            chat_id: chat,
+            message_id: message,
+            destination,
+        });
+    }
+
+    fn main_fork_supported(&self, cx: &Context<Self>) -> bool {
+        let state = self.state.read(cx);
+        state.selected_chat_row().is_some_and(|chat| {
+            state.device_supports(
+                &chat.device_id,
+                zeron_proto::capabilities::NATIVE_MESSAGE_FORK_MAIN_V1,
+            )
+        })
+    }
+
+    fn native_fork_menu(
+        &self,
+        entry: &SharedString,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let menu = self.native_fork_menu.get()?;
+        if menu.message != entry.as_ref() || self.chat_id.as_deref() != Some(&menu.chat) {
+            return None;
+        }
+        let active = menu.active;
+        let main_supported = self.main_fork_supported(cx);
+        let theme = theme.for_popup();
+        let mut card = crate::popover::popover_card(&theme)
+            .w(px(220.0))
+            .track_focus(&self.native_fork_menu_focus)
+            .on_mouse_down_out(
+                cx.listener(|this, _, window, cx| this.close_native_fork_menu(window, cx)),
+            )
+            .on_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    use crate::popover::MenuKey;
+                    match crate::popover::classify_key(
+                        &event.keystroke.key,
+                        event.keystroke.modifiers.platform,
+                        event.keystroke.modifiers.control,
+                    ) {
+                        MenuKey::Escape => this.close_native_fork_menu(window, cx),
+                        MenuKey::Up | MenuKey::Down => {
+                            if let Some(menu) = this.native_fork_menu.open_mut() {
+                                menu.active = if main_supported { 1 - menu.active } else { 0 };
+                            }
+                            cx.notify();
+                        }
+                        MenuKey::Enter | MenuKey::ModEnter => {
+                            if let Some(menu) = this.native_fork_menu.as_open() {
+                                let destination = if menu.active == 0 {
+                                    NativeForkDestination::SideChat
+                                } else {
+                                    NativeForkDestination::MainConversation
+                                };
+                                this.choose_native_fork(destination, window, cx);
+                            }
+                        }
+                        _ => return,
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            .flex()
+            .flex_col();
+        for (index, id, label, destination) in [
+            (
+                0,
+                "native-fork-side-chat",
+                "Fork in side chat",
+                NativeForkDestination::SideChat,
+            ),
+            (
+                1,
+                "native-fork-main-conversation",
+                "Fork as main conversation",
+                NativeForkDestination::MainConversation,
+            ),
+        ] {
+            let enabled = index == 0 || main_supported;
+            card = card.child(
+                crate::popover::menu_row_nav(&theme, false, active == index, id)
+                    .id(id)
+                    .debug_selector(move || id.into())
+                    .role(gpui::Role::MenuItem)
+                    .aria_label(label)
+                    .when(!enabled, |row| {
+                        row.opacity(0.4).cursor_default().tooltip(
+                            crate::settings::widgets::text_tooltip(
+                                "Update the chat host to fork as a main conversation",
+                            ),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        if enabled {
+                            this.choose_native_fork(destination, window, cx);
+                        }
+                    }))
+                    .child(label),
+            );
+        }
+        Some(crate::popover::anchored_menu_right(
+            "native-fork-destination-menu",
+            card.into_any_element(),
+            self.native_fork_menu.closing_since(),
+        ))
+    }
+
     pub(super) fn native_fork_button(
         &self,
         entry: &SharedString,
@@ -175,9 +338,9 @@ impl Transcript {
         let busy = self.native_fork_pending.contains(&identity);
         let enabled = availability.available && !busy;
         let label = if busy {
-            "Creating side chat…"
+            "Creating conversation…"
         } else {
-            "Fork in side chat"
+            "Fork conversation"
         };
         let tooltip = if busy {
             label.to_owned()
@@ -188,6 +351,8 @@ impl Transcript {
                 .or_else(|| availability.reason.clone())
                 .unwrap_or_else(|| label.to_owned())
         };
+        let menu = self.native_fork_menu(entry, theme, cx);
+        let trigger_message = message.clone();
         Some(
             div()
                 .id(SharedString::from(format!("native-fork-{entry}")))
@@ -205,18 +370,31 @@ impl Transcript {
                     el.cursor_pointer().hover(|s| s.bg(crate::theme::ink(0.08)))
                 })
                 .tooltip(crate::settings::widgets::text_tooltip(tooltip))
-                .on_click(cx.listener(move |this, _, _, cx| {
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, _| {
+                        this.native_fork_menu
+                            .note_trigger_press_matching(|menu| menu.message == trigger_message);
+                    }),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
                     if !enabled || this.native_fork_pending.contains(&identity) {
                         return;
                     }
-                    this.native_fork_pending.insert(identity.clone());
-                    this.native_fork_errors.remove(&identity);
-                    cx.emit(TranscriptEvent::ForkMessage {
-                        chat_id: chat.clone(),
-                        message_id: message.clone(),
+                    if this.native_fork_menu.take_press_was_open() {
+                        this.close_native_fork_menu(window, cx);
+                        return;
+                    }
+                    this.native_fork_menu.open(ForkMenu {
+                        chat: chat.clone(),
+                        message: message.clone(),
+                        active: 0,
+                        return_focus: window.focused(cx),
                     });
+                    window.focus(&this.native_fork_menu_focus, cx);
                     cx.notify();
                 }))
+                .children(menu)
                 .child(
                     crate::icons::icon(crate::icons::GIT_BRANCH)
                         .size(px(14.0))

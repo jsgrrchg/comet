@@ -3053,6 +3053,8 @@ impl SavedViewportCache {
 pub struct Transcript {
     state: Entity<AppState>,
     native_forks: HashMap<String, zeron_proto::NativeForkAvailability>,
+    native_fork_menu: crate::popover::Popup<native_forks::ForkMenu>,
+    native_fork_menu_focus: gpui::FocusHandle,
     native_fork_key: String,
     native_fork_availability_task: Option<Task<()>>,
     native_fork_pending: HashSet<(String, String)>,
@@ -3296,6 +3298,7 @@ pub enum TranscriptEvent {
     ForkMessage {
         chat_id: String,
         message_id: String,
+        destination: zeron_proto::NativeForkDestination,
     },
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
@@ -3465,6 +3468,8 @@ impl Transcript {
         let pinned = follow;
         let mut this = Self {
             native_forks: HashMap::new(),
+            native_fork_menu: Default::default(),
+            native_fork_menu_focus: cx.focus_handle(),
             native_fork_key: String::new(),
             native_fork_availability_task: None,
             native_fork_pending: HashSet::new(),
@@ -14089,12 +14094,19 @@ mod tests {
             ForkFixture(transcript.clone())
         });
         cx.run_until_parked();
+        cx.simulate_click(point(px(10.0), px(10.0)), gpui::Modifiers::default());
+        assert!(
+            events.borrow().is_empty(),
+            "Opening the menu must not create a fork"
+        );
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
         for _ in 0..2 {
             cx.simulate_click(point(px(10.0), px(10.0)), gpui::Modifiers::default());
         }
         assert_eq!(events.borrow().len(), 1);
         assert!(
-            matches!(&events.borrow()[0], TranscriptEvent::ForkMessage {chat_id,message_id} if chat_id == "side-source" && message_id == "answer")
+            matches!(&events.borrow()[0], TranscriptEvent::ForkMessage {chat_id,message_id,destination: zeron_proto::NativeForkDestination::SideChat} if chat_id == "side-source" && message_id == "answer")
         );
         transcript.update(cx, |t, cx| {
             t.native_fork_finished("side-source", "answer", None, cx)
@@ -14109,6 +14121,10 @@ mod tests {
             prefer_character_input: false,
         });
         cx.simulate_event(gpui::KeyUpEvent { keystroke });
+        // Keyboard activation opens the menu; a second Enter chooses a destination.
+        cx.run_until_parked();
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
         assert_eq!(events.borrow().len(), 2);
         transcript.update(cx, |t, cx| {
             t.native_fork_finished("side-source", "answer", None, cx);
@@ -14127,6 +14143,134 @@ mod tests {
             2,
             "Unavailable actions must not emit requests"
         );
+    }
+
+    #[gpui::test]
+    fn native_fork_menu_selects_main_and_dismisses_without_creating(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let transcript = cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            crate::settings::init(Default::default(), dir.path(), cx);
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("source".into());
+                state.chats = vec![serde_json::from_value(serde_json::json!({
+                    "id":"source", "deviceId":"host", "createdAt":chrono::Utc::now(), "archived":false
+                })).unwrap()];
+                state.devices = vec![serde_json::from_value(serde_json::json!({
+                    "id":"host", "name":"Host", "platform":"linux",
+                    "capabilities":[zeron_proto::capabilities::NATIVE_MESSAGE_FORK_MAIN_V1]
+                })).unwrap()];
+                state
+            });
+            cx.new(|cx| {
+                let mut view = Transcript::new(state, cx);
+                view.chat_id = Some("source".into());
+                view.native_forks.insert("answer".into(), zeron_proto::NativeForkAvailability::available());
+                view
+            })
+        });
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let captured = events.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&transcript, move |_, event: &TranscriptEvent, _| {
+                captured.borrow_mut().push(event.clone());
+            })
+        });
+        struct MenuFixture(Entity<Transcript>);
+        impl Render for MenuFixture {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let theme = Theme::of(cx).clone();
+                self.0.update(cx, |view, cx| {
+                    view.native_fork_button(&"answer".into(), &theme, cx)
+                        .unwrap()
+                })
+            }
+        }
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            cx.observe(&transcript, |_, _, cx| cx.notify()).detach();
+            MenuFixture(transcript.clone())
+        });
+        cx.run_until_parked();
+        cx.simulate_click(point(px(10.0), px(10.0)), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert!(events.borrow().is_empty());
+        // Popup exit animations use a wall-clock Instant alongside the
+        // executor timer; let both clocks reach the end before another click.
+        std::thread::sleep(
+            crate::motion::MENU_OUT
+                .total()
+                .mul_f32(crate::motion::speed_scale()),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.simulate_click(point(px(10.0), px(10.0)), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let main_row = cx.debug_bounds("native-fork-main-conversation").unwrap();
+        cx.simulate_click(main_row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(events.borrow().len(), 1);
+        assert!(matches!(&events.borrow()[0], TranscriptEvent::ForkMessage {
+            chat_id, message_id, destination: zeron_proto::NativeForkDestination::MainConversation,
+        } if chat_id == "source" && message_id == "answer"));
+        transcript.update(cx, |view, cx| {
+            view.native_fork_finished("source", "answer", None, cx)
+        });
+        // Popup exit animations use a wall-clock Instant alongside the
+        // executor timer; let both clocks reach the end before another click.
+        std::thread::sleep(
+            crate::motion::MENU_OUT
+                .total()
+                .mul_f32(crate::motion::speed_scale()),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.simulate_click(point(px(10.0), px(10.0)), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(events.borrow().len(), 2);
+        assert!(matches!(
+            &events.borrow()[1],
+            TranscriptEvent::ForkMessage {
+                destination: zeron_proto::NativeForkDestination::MainConversation,
+                ..
+            }
+        ));
+        // A host that only supports side-chat forks must not receive a main fork.
+        transcript.update(cx, |view, cx| {
+            view.native_fork_finished("source", "answer", None, cx);
+            view.state
+                .update(cx, |state, _| state.devices[0].capabilities.clear());
+        });
+        // Popup exit animations use a wall-clock Instant alongside the
+        // executor timer; let both clocks reach the end before another click.
+        std::thread::sleep(
+            crate::motion::MENU_OUT
+                .total()
+                .mul_f32(crate::motion::speed_scale()),
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        cx.simulate_click(point(px(10.0), px(10.0)), gpui::Modifiers::default());
+        cx.run_until_parked();
+        let main_row = cx.debug_bounds("native-fork-main-conversation").unwrap();
+        cx.simulate_click(main_row.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(events.borrow().len(), 2);
+        cx.simulate_keystrokes("down enter");
+        cx.run_until_parked();
+        assert_eq!(events.borrow().len(), 3);
+        assert!(matches!(
+            &events.borrow()[2],
+            TranscriptEvent::ForkMessage {
+                destination: zeron_proto::NativeForkDestination::SideChat,
+                ..
+            }
+        ));
     }
 
     #[test]

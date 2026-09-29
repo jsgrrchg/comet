@@ -66,3 +66,16 @@ The iOS app adds no Install action. `HarnessDescriptor.can_install` already has
 `#[serde(default)]` (`crates/engine/src/registry.rs`); iOS's `WireHarness: Decodable`
 in `apps/ios/Zeron/Sync/WorkspaceStore.swift` ignores unrecognized keys, including
 `canInstall`. `HarnessCatalog` continues consuming the existing mapped fields.
+
+### Native Claude message forks
+
+Message forks use the official `forkSession` storage API from
+`@anthropic-ai/claude-agent-sdk@0.3.284`. The small `claude/fork.mjs` helper is
+embedded in the Rust binary and materialized through the existing managed SDK
+installer; no global SDK or `npx latest` is used. Node >=18 and npm are required
+for preparation. The helper inherits `CLAUDE_CONFIG_DIR` and runs in the source
+project directory. Creation performs no inference and does not restore files.
+
+Offline helper tests: `node --test crates/harness/src/claude/fork.test.mjs`.
+The storage test additionally accepts `CLAUDE_FORK_TEST_SDK=/absolute/path/to/sdk.mjs`
+with the pinned package and runs `node --test crates/harness/src/claude/fork.storage.test.mjs`.

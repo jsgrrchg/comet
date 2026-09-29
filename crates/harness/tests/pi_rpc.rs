@@ -263,9 +263,9 @@ async fn steering_mode_is_selected_only_while_unconfigured() {
                 .await
                 .unwrap();
         assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, AgentEvent::Done { status, .. } if *status == DoneStatus::Completed)),
+            events.iter().any(
+                |e| matches!(e, AgentEvent::Done { status, .. } if *status == DoneStatus::Completed)
+            ),
             "{events:?}"
         );
         // Pi persists set_steering_mode globally: an explicit choice must survive.

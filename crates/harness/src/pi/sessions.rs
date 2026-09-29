@@ -36,9 +36,12 @@ impl Store {
     /// Whether a steering mode is already set in the settings Pi loads for
     /// `cwd` (global, then project).
     pub fn steering_mode_configured(&self, cwd: &Path) -> bool {
-        [self.agent.join("settings.json"), cwd.join(".pi/settings.json")]
-            .iter()
-            .any(|settings| json_file(settings).get("steeringMode").is_some())
+        [
+            self.agent.join("settings.json"),
+            cwd.join(".pi/settings.json"),
+        ]
+        .iter()
+        .any(|settings| json_file(settings).get("steeringMode").is_some())
     }
     fn key(&self, id: &str) -> PathBuf {
         self.root
@@ -262,7 +265,11 @@ mod tests {
         std::fs::create_dir_all(cwd.join(".pi")).unwrap();
         let store = Store::new(Some(dir.path().join("index")), Some(agent.clone()));
         assert!(!store.steering_mode_configured(&cwd));
-        std::fs::write(agent.join("settings.json"), r#"{"retry":{"enabled":false}}"#).unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            r#"{"retry":{"enabled":false}}"#,
+        )
+        .unwrap();
         assert!(!store.steering_mode_configured(&cwd));
         std::fs::write(
             cwd.join(".pi/settings.json"),

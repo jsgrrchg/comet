@@ -12,7 +12,7 @@ use futures::{StreamExt, stream::BoxStream};
 use normalize::{Normalizer, string};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -230,9 +230,14 @@ impl Harness for PiHarness {
         let process = self.spawn(Path::new(&request.cwd), &args)?;
         let (tx, rx) = mpsc::channel(256);
         let kill_grace = self.kill_grace;
+        let interrupt_grace = self.interrupt_grace;
         tokio::spawn(async move {
             let mut runner = Runner {
                 store,
+                interrupted: false,
+                initial_pending: true,
+                delivery: None,
+                queued: VecDeque::new(),
                 process,
                 tx,
                 request,
@@ -253,7 +258,7 @@ impl Harness for PiHarness {
             let consumer = runner.tx.clone();
             let result = tokio::select! {
                 result=runner.run(&mut steering)=>result,
-                _=interrupt.cancelled()=>{ runner.norm.aborted=true; Ok(()) },
+                _=interrupt.cancelled()=>{ runner.interrupt(interrupt_grace).await; Ok(()) },
                 _=consumer.closed()=>Ok(()),
             };
             if let Err(error) = result {
@@ -279,6 +284,10 @@ enum Pending {
     Barrier(u64),
 }
 struct Runner {
+    interrupted: bool,
+    initial_pending: bool,
+    delivery: Option<crate::SteerMessage>,
+    queued: VecDeque<crate::SteerMessage>,
     store: sessions::Store,
     process: Process,
     tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
@@ -314,7 +323,11 @@ impl Runner {
         }
         self.active = false;
         self.emit(AgentEvent::Done {
-            status: self.norm.status(),
+            status: if self.interrupted {
+                zeron_proto::DoneStatus::Interrupted
+            } else {
+                self.norm.status()
+            },
             result: None,
             error: self.norm.error.clone(),
             session_id: (!self.session.is_empty()).then(|| self.session.clone()),
@@ -374,20 +387,81 @@ impl Runner {
         self.prompt(self.request.prompt.clone(), images)?;
         let mut open = true;
         loop {
-            if !self.active && !open {
+            if self.delivery.is_none()
+                && !self.initial_pending
+                && !self
+                    .pending
+                    .values()
+                    .any(|p| matches!(p, Pending::Prompt(_)))
+            {
+                if let Some(steer) = self.queued.pop_front() {
+                    if !self.active {
+                        self.norm.reset();
+                    }
+                    self.epoch += 1;
+                    self.active = true;
+                    // Atomic Pi operation: queue at a step boundary if busy, start if idle.
+                    // A separate get_state + steer pair would strand an input on the idle race.
+                    let id = self.process.transport.client.request(
+                        json!({"type":"prompt","message":steer.prompt,"streamingBehavior":"steer"}),
+                    )?;
+                    self.pending.insert(id, Pending::Prompt(self.epoch));
+                    self.delivery = Some(steer);
+                }
+            }
+            if !self.active && !open && self.queued.is_empty() {
                 return Ok(());
             }
             tokio::select! {
                 incoming=self.process.transport.incoming.recv()=>{
                     match incoming {Some(frame)=>self.frame(frame?).await?,None=>return Err(HarnessError::Protocol("Pi disconnected".into()))}
                 }
-                steer=steering.recv(),if open=>match steer {
-                    Some(steer) if !self.active=>{self.assistant=steer.message_id.unwrap_or_else(||uuid::Uuid::new_v4().to_string());self.prompt(steer.prompt,json!([]))?;}
-                    Some(_)=>return Err(HarnessError::Protocol("Native Pi steering is not configured yet".into())),
-                    None=>open=false,
-                }
+                steer=steering.recv(),if open=>match steer {Some(steer)=>self.queued.push_back(steer),None=>open=false}
             }
         }
+    }
+    async fn confirm_delivery(&mut self) -> Result<(), HarnessError> {
+        if self.delivery.take().is_some() {
+            let old = std::mem::replace(&mut self.assistant, uuid::Uuid::new_v4().to_string());
+            self.emit(AgentEvent::Steered {
+                assistant_message_id: Some(old),
+                next_assistant_message_id: Some(self.assistant.clone()),
+            })
+            .await?;
+        }
+        Ok(())
+    }
+    async fn interrupt(&mut self, grace: Duration) {
+        self.interrupted = true;
+        self.queued.clear();
+        self.delivery = None;
+        if !self.active {
+            return;
+        }
+        let _ = self
+            .process
+            .transport
+            .client
+            .request(json!({"type":"clear_queue"}));
+        let Ok(abort) = self
+            .process
+            .transport
+            .client
+            .request(json!({"type":"abort"}))
+        else {
+            return;
+        };
+        let _ = tokio::time::timeout(grace, async {
+            while let Some(Ok(frame)) = self.process.transport.incoming.recv().await {
+                if frame["id"] == abort && frame["success"] == true {
+                    break;
+                }
+                if self.frame(frame).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .await;
     }
     async fn frame(&mut self, frame: Value) -> Result<(), HarnessError> {
         if frame["type"] == "response" {
@@ -405,7 +479,17 @@ impl Runner {
                     self.pending.insert(id, Pending::Barrier(epoch));
                 }
                 Pending::Barrier(epoch) if epoch == self.epoch && self.active => {
-                    if data["isStreaming"] == false && data["isCompacting"] == false {
+                    if data["isStreaming"] == false
+                        && data["isCompacting"] == false
+                        && !self
+                            .pending
+                            .values()
+                            .any(|p| matches!(p, Pending::Prompt(_)))
+                    {
+                        self.initial_pending = false;
+                        if !self.interrupted {
+                            self.confirm_delivery().await?;
+                        }
                         self.finish().await?;
                     }
                 }
@@ -426,11 +510,23 @@ impl Runner {
             )
             .await?;
         }
+        if frame["type"] == "message_start" && frame["message"]["role"] == "user" {
+            if self.initial_pending {
+                self.initial_pending = false;
+            } else {
+                self.confirm_delivery().await?;
+            }
+        }
         for event in self.norm.map(&frame) {
             self.emit(event).await?;
         }
         if frame["type"] == "agent_settled" {
-            self.finish().await?;
+            let id = self
+                .process
+                .transport
+                .client
+                .request(json!({"type":"get_state"}))?;
+            self.pending.insert(id, Pending::Barrier(self.epoch));
         }
         Ok(())
     }

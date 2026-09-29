@@ -127,3 +127,79 @@ async fn resumes_the_same_session_after_process_shutdown() {
     }
     assert!(id.is_some());
 }
+
+#[tokio::test]
+async fn steers_confirm_on_consumption_and_interrupt_is_terminal_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, token) = controls();
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "slow"), c)
+        .await
+        .unwrap();
+    tx.send(SteerMessage {
+        prompt: "redirect".into(),
+        message_id: Some("user-id".into()),
+    })
+    .await
+    .unwrap();
+    let mut confirmed = 0;
+    let mut done = vec![];
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::Steered {
+                    next_assistant_message_id,
+                    ..
+                } => {
+                    assert_ne!(next_assistant_message_id.as_deref(), Some("user-id"));
+                    confirmed += 1;
+                    token.cancel();
+                }
+                AgentEvent::Done { status, .. } => done.push(status),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(confirmed, 1);
+    assert_eq!(done, vec![DoneStatus::Interrupted]);
+}
+#[tokio::test]
+async fn idle_mailbox_starts_another_turn_without_restarting_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "first"), c)
+        .await
+        .unwrap();
+    let mut sender = Some(tx);
+    let mut done = 0;
+    let mut confirmed = 0;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::Done { status, .. } => {
+                    assert_eq!(status, DoneStatus::Completed);
+                    done += 1;
+                    if let Some(tx) = sender.take() {
+                        tx.send(SteerMessage {
+                            prompt: "second".into(),
+                            message_id: None,
+                        })
+                        .await
+                        .unwrap();
+                    }
+                }
+                AgentEvent::Steered { .. } => confirmed += 1,
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(done, 2);
+    assert_eq!(confirmed, 1);
+}

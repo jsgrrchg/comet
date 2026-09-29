@@ -970,6 +970,10 @@ const SIDEBAR_LIST_PAD_TOP: f32 = 4.0;
 
 /// Active and archived sessions share harness/title geometry.
 const SIDEBAR_ACTIVE_HARNESS_ICON_SIZE: f32 = 13.0;
+/// Compact-row time slot while a text jump hint ("Ctrl+9") stands in for the
+/// time: wide enough for the widest of them at 11px on one line. In
+/// default-size pixels; scaled with the UI font via `ui_rems`.
+const COMPACT_JUMP_HINT_WIDTH: f32 = 42.0;
 const SIDEBAR_ACTIVE_HARNESS_TITLE_GAP: f32 = Theme::SPACE_SM;
 /// The sidebar footer's profile and settings buttons share one hit target.
 const SIDEBAR_FOOTER_BUTTON_SIZE: f32 = 28.0;
@@ -4404,6 +4408,8 @@ impl Shell {
         self.settings.transcript_width = current.transcript_width;
         self.settings.skill_completion_by_harness = current.skill_completion_by_harness;
         self.settings.skills_in_slash_menu = current.skills_in_slash_menu;
+        self.settings.reduce_motion = current.reduce_motion;
+        self.settings.pause_animations_in_background = current.pause_animations_in_background;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -6250,6 +6256,7 @@ impl Shell {
             .child(window_control_button(
                 "toggle-sidebar",
                 icons::SIDEBAR_MINIMALISTIC_LEFT,
+                ShortcutId::ToggleSidebar.label(),
                 &theme,
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
             ))
@@ -6263,6 +6270,7 @@ impl Shell {
                     .child(nav_history_button(
                         "nav-back",
                         icons::ARROW_LEFT,
+                        "Back",
                         can_back,
                         &theme,
                         cx.listener(|this, _, _, cx| this.navigate_back(cx)),
@@ -6270,6 +6278,7 @@ impl Shell {
                     .child(nav_history_button(
                         "nav-forward",
                         icons::ARROW_RIGHT,
+                        "Forward",
                         can_forward,
                         &theme,
                         cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
@@ -6283,6 +6292,7 @@ impl Shell {
                     .child(window_control_button(
                         "titlebar-new-session",
                         icons::PLUS,
+                        ShortcutId::NewSession.label(),
                         &theme,
                         cx.listener(|this, _, _, cx| this.open_new_session(cx)),
                     ))
@@ -7075,6 +7085,7 @@ impl Shell {
                     .px(px(4.0))
                     .rounded(px(4.0))
                     .bg(tone.opacity(0.08))
+                    .whitespace_nowrap()
                     .text_size(crate::typography::ui_rems(10.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(tone.opacity(0.85))
@@ -7471,14 +7482,30 @@ impl Shell {
                         }))
                     })
                     .when(compact, |el| {
+                        // The time slot is 30px, which holds "17m" but not
+                        // "Ctrl+2": unwrapped, the hint broke after the `+`
+                        // and stacked two lines. A text-length hint keeps one
+                        // line in a wider slot — a floor, not content sized,
+                        // so "Ctrl+1" (a narrower glyph) doesn't nudge its
+                        // row's badge off the others'. The floor scales with
+                        // the UI font like the text does, and a longer
+                        // rebound combo grows the slot instead of spilling
+                        // over the title.
+                        let text_hint = compact_jump_label
+                            .as_ref()
+                            .is_some_and(|label| label.chars().count() > 3);
                         el.child(
                             div()
                                 .debug_selector({
                                     let id = id.clone();
                                     move || format!("chat-time-{id}")
                                 })
-                                .w(px(30.0))
+                                .when(text_hint, |el| {
+                                    el.min_w(crate::typography::ui_rems(COMPACT_JUMP_HINT_WIDTH))
+                                })
+                                .when(!text_hint, |el| el.w(px(30.0)))
                                 .flex_none()
+                                .whitespace_nowrap()
                                 .text_right()
                                 .text_size(crate::typography::ui_rems(11.0))
                                 .text_color(subline)
@@ -8207,6 +8234,7 @@ impl Shell {
                             cx.stop_propagation();
                             this.dismiss_github_star_banner(cx);
                         }))
+                        .tooltip(crate::settings::widgets::text_tooltip("Dismiss"))
                         .child(icon(icons::CLOSE).size(px(10.0)).text_color(tone)),
                 )
                 .into_any_element(),
@@ -11278,6 +11306,7 @@ impl Shell {
                     cx.notify();
                 }
             }))
+            .tooltip(crate::settings::widgets::text_tooltip("New tab"))
             .child(
                 icon(icons::PLUS)
                     .size(px(13.0))
@@ -11900,6 +11929,7 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
 fn window_control_button(
     id: &'static str,
     icon_path: &'static str,
+    label: &'static str,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -11939,6 +11969,7 @@ fn window_control_button(
             cx.stop_propagation();
             on_click(event, window, cx)
         })
+        .tooltip(crate::settings::widgets::text_tooltip(label))
         .child(icon(icon_path).size(px(16.0)).text_color(muted))
 }
 
@@ -12054,6 +12085,7 @@ fn linux_caption_button(
 fn nav_history_button(
     id: &'static str,
     icon_path: &'static str,
+    label: &'static str,
     enabled: bool,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -12075,7 +12107,7 @@ fn nav_history_button(
             )
             .into_any_element();
     }
-    window_control_button(id, icon_path, theme, on_click).into_any_element()
+    window_control_button(id, icon_path, label, theme, on_click).into_any_element()
 }
 
 /// A size-7 icon button for the main-panel header (zeron __root.tsx:
@@ -12083,6 +12115,7 @@ fn nav_history_button(
 fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
+    label: &'static str,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
@@ -12113,6 +12146,7 @@ fn header_icon_button(
             cx.stop_propagation();
             on_click(event, window, cx)
         })
+        .tooltip(crate::settings::widgets::text_tooltip(label))
         .child(icon(icon_path).size(px(16.0)).text_color(muted))
 }
 
@@ -12351,6 +12385,16 @@ impl Render for Shell {
             self.activation_sub = Some(cx.observe_window_activation(
                 window,
                 |this: &mut Shell, window, cx| {
+                    // Window focus notifications can arrive in either order
+                    // when switching between Zeron windows. Read all windows
+                    // after the current callback releases its window borrow.
+                    cx.defer(|cx| {
+                        let active = cx.windows().into_iter().any(|handle| {
+                            cx.update_window(handle, |_, window, _| window.is_window_active())
+                                .unwrap_or(false)
+                        });
+                        motion::window_activation_changed(active, cx);
+                    });
                     if window.is_window_active() {
                         crate::window_manager::activated(window.window_handle().window_id(), cx);
                         // Coming back to the app (often after sleep) checks
@@ -14675,6 +14719,56 @@ mod exit_regressions {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn shell_saves_keep_motion_settings_chosen_in_appearance(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                // The Appearance page writes these straight to the store,
+                // outside the shell's working copy.
+                settings::update(SavePolicy::Immediate, cx, |settings| {
+                    settings.reduce_motion = crate::motion::ReduceMotion::On;
+                    settings.pause_animations_in_background = true;
+                });
+                // Any shell-owned change (sidebar width, panels) republishes
+                // the working copy; it must not revert the motion choices.
+                shell.schedule_save(cx);
+                let saved = settings::current(cx);
+                assert_eq!(saved.reduce_motion, crate::motion::ReduceMotion::On);
+                assert!(saved.pause_animations_in_background);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

@@ -183,6 +183,11 @@ fn run_application(
             ui_settings.git_history_author_display,
             cx,
         );
+        motion::init(
+            ui_settings.reduce_motion,
+            ui_settings.pause_animations_in_background,
+            cx,
+        );
         composer::init(cx, ui_settings.composer_send_behavior);
         appshots::set_enabled(ui_settings.appshots_enabled);
         terminal::panel::init(cx);

@@ -241,6 +241,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session with spaces.jsonl");
         std::fs::write(&path, "{\"type\":\"session\",\"id\":\"old-id\"}\n").unwrap();
+        // Windows expands short names and adds a verbatim prefix on canonicalization.
+        let expected = path.canonicalize().unwrap();
         let mut store = Store::new(Some(dir.path().join("index")));
         store.agent = dir.path().join("agent");
         store.legacy = dir.path().join("legacy.json");
@@ -249,10 +251,10 @@ mod tests {
             json!({"version":1,"sessions":{"old-id":{"sessionFile":path}}}).to_string(),
         )
         .unwrap();
-        assert_eq!(store.resolve("old-id", dir.path()).unwrap(), path);
+        assert_eq!(store.resolve("old-id", dir.path()).unwrap(), expected);
         store.remember("old-id", &path).unwrap();
         std::fs::remove_file(&store.legacy).unwrap();
-        assert_eq!(store.resolve("old-id", dir.path()).unwrap(), path);
+        assert_eq!(store.resolve("old-id", dir.path()).unwrap(), expected);
         store.remember("wrong-id", &path).unwrap();
         assert!(store.resolve("wrong-id", dir.path()).is_err());
     }

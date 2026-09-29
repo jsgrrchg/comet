@@ -123,17 +123,36 @@ async fn delayed_turn(scenario: &str) {
     let (controls, steer, token) = controls();
     let mut stream = harness.run(request(scenario), controls).await.unwrap();
     let mut early = Vec::new();
-    if scenario == "open-tool" {
-        // Steer only once the tool is visibly running.
-        while let Some(event) = stream.next().await {
-            let event = event.expect("stream event");
-            let open = matches!(&event, AgentEvent::ToolCall { id, .. } if id == "3");
+    // Observe the scenario before steering. Grok re-sends a prompt cancelled
+    // before any progress, so queuing immediately after run() races that path
+    // instead of exercising the intended text/tool/usage/reasoning state.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let event = stream
+                .next()
+                .await
+                .expect("scenario event")
+                .expect("stream event");
+            let ready = match scenario {
+                "open-tool" => matches!(&event, AgentEvent::ToolCall { id, .. } if id == "3"),
+                "tools" => matches!(&event, AgentEvent::ToolResult { id, .. } if id == "3"),
+                "usage" => matches!(&event, AgentEvent::ContextUsage { .. }),
+                "reasoning" => matches!(&event, AgentEvent::ReasoningDelta { .. }),
+                "text" => matches!(&event, AgentEvent::TextDelta { text } if text == "working"),
+                _ => panic!("unknown scenario: {scenario}"),
+            };
+            assert!(
+                !matches!(event, AgentEvent::Done { .. }),
+                "premature Done: {event:?}"
+            );
             early.push(event);
-            if open {
+            if ready {
                 break;
             }
         }
-    }
+    })
+    .await
+    .expect("scenario must start before steering");
     // Queue multiple follow-ups while the first prompt remains outstanding.
     steer
         .send(SteerMessage {

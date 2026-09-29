@@ -614,7 +614,8 @@ impl Runner {
         steering: &mut mpsc::Receiver<crate::SteerMessage>,
     ) -> Result<(), HarnessError> {
         let mut backlog = vec![];
-        let state = tokio::time::timeout(Duration::from_secs(60), self.bootstrap(&mut backlog))
+        // Same budget the ACP handshake gave Pi: extensions can start cold.
+        let state = tokio::time::timeout(Duration::from_secs(120), self.bootstrap(&mut backlog))
             .await
             .map_err(|_| HarnessError::Protocol("Pi startup timed out".into()))??;
         self.session = string(&state, "sessionId").into();
@@ -646,7 +647,7 @@ impl Runner {
         for frame in backlog {
             self.frame(frame).await?;
         }
-        let images = load_images(&self.request.attachments).await?;
+        let images = load_images(&self.request.attachments).await;
         self.prompt(self.request.prompt.clone(), images)?;
         let mut open = true;
         loop {
@@ -952,17 +953,31 @@ impl Runner {
         Ok(())
     }
 }
-async fn load_images(paths: &[String]) -> Result<Value, HarnessError> {
+/// Inline attachments as native image blocks, best-effort like the Claude
+/// driver: the path refs already ride the prompt text, so an unreadable,
+/// oversized or non-inlinable file (SVG, HEIC, TIFF, ...) must not fail the turn.
+async fn load_images(paths: &[String]) -> Value {
     use base64::Engine;
     let mut images = vec![];
     for path in paths {
-        let meta = tokio::fs::metadata(path).await?;
-        if meta.len() > 20 * 1024 * 1024 {
-            return Err(HarnessError::Protocol(format!(
-                "Pi image exceeds 20 MiB: {path}"
-            )));
+        match tokio::fs::metadata(path).await {
+            Ok(meta) if meta.len() <= 20 * 1024 * 1024 => {}
+            Ok(_) => {
+                tracing::debug!(%path, "Pi attachment over inline cap; path ref only");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(%path, %error, "Pi attachment unreadable; path ref only");
+                continue;
+            }
         }
-        let bytes = tokio::fs::read(path).await?;
+        let bytes = match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%path, %error, "Pi attachment unreadable; path ref only");
+                continue;
+            }
+        };
         let mime = if bytes.starts_with(b"\x89PNG") {
             "image/png"
         } else if bytes.starts_with(b"\xff\xd8\xff") {
@@ -972,11 +987,34 @@ async fn load_images(paths: &[String]) -> Result<Value, HarnessError> {
         } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
             "image/webp"
         } else {
-            return Err(HarnessError::Protocol(format!(
-                "Unsupported Pi image: {path}"
-            )));
+            tracing::debug!(%path, "Pi attachment is not an inlinable image; path ref only");
+            continue;
         };
         images.push(json!({"type":"image","data":base64::engine::general_purpose::STANDARD.encode(bytes),"mimeType":mime}));
     }
-    Ok(Value::Array(images))
+    Value::Array(images)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_images;
+
+    #[tokio::test]
+    async fn unsupported_or_missing_attachments_do_not_fail_the_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = dir.path().join("a.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\nrest").unwrap();
+        let svg = dir.path().join("b.svg");
+        std::fs::write(&svg, b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>").unwrap();
+        let missing = dir.path().join("gone.jpg");
+        let images = load_images(&[
+            svg.display().to_string(),
+            missing.display().to_string(),
+            png.display().to_string(),
+        ])
+        .await;
+        let images = images.as_array().unwrap();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0]["mimeType"], "image/png");
+    }
 }

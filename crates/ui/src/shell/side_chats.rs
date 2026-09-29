@@ -90,6 +90,10 @@ impl Shell {
                 });
                 match result {
                     Ok(chat) => {
+                        // Retries share an identity until confirmation. A later
+                        // click on this reply must create an independent child.
+                        this.native_fork_operations
+                            .remove(&(source_id.clone(), message_id.clone()));
                         let current_panel = this.panels.get(&key);
                         let unchanged = current_panel.right_active == origin_panel.right_active
                             && current_panel.changes_open == origin_panel.changes_open;
@@ -570,6 +574,112 @@ mod tests {
                 cx,
             )
         })
+    }
+
+    #[gpui::test]
+    fn native_fork_same_reply_creates_new_children_after_confirmation(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let dir = tempfile::tempdir().unwrap();
+        let window = shell_window(dir.path(), cx);
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.active_chat = "main".into();
+                shell.state.update(cx, |state, _| {
+                    state.chats = vec![
+                        serde_json::from_value(serde_json::json!({
+                            "id": "main", "deviceId": "host", "archived": false,
+                            "createdAt": Utc::now(),
+                        }))
+                        .unwrap(),
+                    ];
+                    state.selected_chat = Some("main".into());
+                    state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                        zeron_rpc::RpcClient::new(out, inbound),
+                    ));
+                });
+            })
+            .unwrap();
+        let mut sent = Vec::<zeron_proto::ForkMessageSideChatRequest>::new();
+        // A lost result is retried with the same identity. Once confirmed,
+        // another click forks the same reply into a different saved side chat.
+        for attempt in 0..3 {
+            window
+                .update(cx, |shell, _, cx| {
+                    for _ in 0..2 {
+                        shell.fork_message(
+                            shell.transcript.clone(),
+                            "main".into(),
+                            "a1".into(),
+                            cx,
+                        );
+                    }
+                })
+                .unwrap();
+            cx.run_until_parked();
+            let mut forks = Vec::new();
+            while let Ok(frame) = requests.try_recv() {
+                let frame: zeron_rpc::ClientFrame = serde_json::from_str(&frame).unwrap();
+                if frame.method.as_deref() == Some(methods::FORK_MESSAGE_SIDE_CHAT) {
+                    forks.push(frame);
+                }
+            }
+            assert_eq!(forks.len(), 1, "Pending double clicks must share one RPC");
+            let frame = forks.pop().unwrap();
+            let request: zeron_proto::ForkMessageSideChatRequest =
+                serde_json::from_value(frame.params).unwrap();
+            assert_eq!(request.source_chat_id, "main");
+            assert_eq!(request.source_message_id, "a1");
+            if attempt == 1 {
+                assert_eq!(request, sent[0], "An unconfirmed retry keeps its identity");
+            } else if attempt == 2 {
+                assert_ne!(request.request_id, sent[1].request_id);
+                assert_ne!(request.chat_id, sent[1].chat_id);
+            }
+            let response = if attempt == 0 {
+                zeron_rpc::ServerFrame {
+                    id: frame.id,
+                    err: Some("Provider result was not received".into()),
+                    ..Default::default()
+                }
+            } else {
+                zeron_rpc::ServerFrame {
+                    id: frame.id,
+                    ok: Some(serde_json::json!({
+                        "id": request.chat_id, "parentChatId": "main", "deviceId": "host",
+                        "archived": false, "createdAt": Utc::now(),
+                    })),
+                    ..Default::default()
+                }
+            };
+            sent.push(request);
+            replies
+                .try_send(serde_json::to_string(&response).unwrap())
+                .unwrap();
+            runtime.block_on(async { tokio::task::yield_now().await });
+            cx.run_until_parked();
+        }
+        window
+            .update(cx, |shell, _, cx| {
+                let children: std::collections::HashSet<_> = shell
+                    .side_chats
+                    .values()
+                    .filter_map(|tab| tab.state.read(cx).selected_chat.clone())
+                    .collect();
+                assert_eq!(
+                    children,
+                    std::collections::HashSet::from([
+                        sent[1].chat_id.clone(),
+                        sent[2].chat_id.clone(),
+                    ])
+                );
+            })
+            .unwrap();
     }
 
     #[gpui::test]

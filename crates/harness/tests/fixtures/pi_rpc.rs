@@ -21,6 +21,9 @@ fn message(text: &str, stop: &str) {
         json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":text}],"stopReason":stop,"errorMessage":"mock provider failure","usage":{"input":12,"output":3}}}),
     );
 }
+fn queue_update(queue: &std::collections::VecDeque<String>) {
+    emit(json!({"type":"queue_update","steering":queue,"followUp":[]}));
+}
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
@@ -63,6 +66,7 @@ fn main() {
     let queue = Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
     let active = Arc::new(AtomicBool::new(false));
     let abort = Arc::new(AtomicBool::new(false));
+    let steering_all = Arc::new(AtomicBool::new(false));
     let mut dialog = None;
     let mut model = "mock".to_string();
     let mut thinking = "medium".to_string();
@@ -86,6 +90,10 @@ fn main() {
             }
             "set_thinking_level" => {
                 thinking = v["level"].as_str().unwrap().into();
+                response(&v, json!({}));
+            }
+            "set_steering_mode" => {
+                steering_all.store(v["mode"] == "all", Ordering::SeqCst);
                 response(&v, json!({}));
             }
             "get_commands" => response(
@@ -130,7 +138,10 @@ fn main() {
                 let mut queued = queue.lock().unwrap();
                 if active.load(Ordering::SeqCst) {
                     queued.push_back(text);
+                    queue_update(&queued);
                     response(&v, json!({}));
+                    std::fs::write("pending-steers.json", serde_json::to_vec(&*queued).unwrap())
+                        .unwrap();
                     continue;
                 }
                 active.store(true, Ordering::SeqCst);
@@ -144,9 +155,21 @@ fn main() {
                 let active = active.clone();
                 let abort = abort.clone();
                 let queue = queue.clone();
+                let steering_all = steering_all.clone();
                 std::thread::spawn(move || {
                     let mut text = text;
                     loop {
+                        if text == "burst-start" {
+                            emit(json!({"type":"message_start","message":{"role":"assistant"}}));
+                            emit(
+                                json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"waiting"}}),
+                            );
+                            while !std::path::Path::new("release-burst").exists()
+                                && !abort.load(Ordering::SeqCst)
+                            {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        }
                         if text == "tree" {
                             emit(
                                 json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"tree ready"}}),
@@ -187,13 +210,22 @@ fn main() {
                         }
                         emit(json!({"type":"agent_end"}));
                         let mut queued = queue.lock().unwrap();
-                        if !abort.load(Ordering::SeqCst)
-                            && let Some(next) = queued.pop_front()
-                        {
-                            text = next;
-                            emit(
-                                json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":text}]}}),
-                            );
+                        if !abort.load(Ordering::SeqCst) && !queued.is_empty() {
+                            let count = if steering_all.load(Ordering::SeqCst) {
+                                queued.len()
+                            } else {
+                                1
+                            };
+                            let mut batch = Vec::new();
+                            for _ in 0..count {
+                                let next = queued.pop_front().unwrap();
+                                queue_update(&queued);
+                                emit(
+                                    json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":next}]}}),
+                                );
+                                batch.push(next);
+                            }
+                            text = batch.join("\n");
                             continue;
                         }
                         active.store(false, Ordering::SeqCst);

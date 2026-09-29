@@ -22,6 +22,17 @@ Independent work started later by an extension is a new run (`agent_start`).
 Discovery/startup timeouts diagnose startup only; no active model run is timed
 out for lack of output. Interruption clears queues before aborting.
 
+Steering uses `prompt` with `streamingBehavior: "steer"` and starts with Pi's
+native `all` mode (the `set_steering_mode` command persists that preference).
+Preflight/state barriers remain serialized, but consumption does not gate the
+next submission after `queue_update` confirms an appended steering entry.
+Keep one FIFO delivery record per original input, including duplicate text.
+`message_start` for each consumed user input emits its own `Steered`; neither
+the prompt ACK nor `queue_update` is a consumption receipt. Extension commands
+wait for earlier deliveries, and unqueued/handled inputs block pipelining until
+consumed or settled. An idle barrier must not confirm queued inputs that never
+produced their consumption events.
+
 Sources inspected: Pi dist/core/agent-session.js and dist/modes/rpc/rpc-mode.js
 0.85.1, and upstream commit f07218c4d4bbc12bef056a7058c3dd49dfe41abe.
 

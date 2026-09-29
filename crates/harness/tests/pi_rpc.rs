@@ -336,48 +336,187 @@ async fn extension_dialogs_roundtrip_without_autoaccepting_and_preserve_editor_t
     }
 }
 
-#[tokio::test]
-async fn multiple_steers_are_confirmed_in_order_before_completion() {
-    let dir = tempfile::tempdir().unwrap();
-    let (c, tx, _) = controls();
-    let mut stream = harness()
-        .with_session_store(dir.path().join("index"))
-        .run(request(dir.path(), "slow"), c)
-        .await
-        .unwrap();
-    for prompt in ["redirect one", "redirect two"] {
-        tx.send(SteerMessage {
-            prompt: prompt.into(),
-            message_id: None,
-        })
-        .await
-        .unwrap();
-    }
-    drop(tx);
-    let mut confirms = 0;
-    let mut done = 0;
-    let mut text = String::new();
+async fn wait_for_queued_steers(dir: &std::path::Path, expected: &[String]) {
     tokio::time::timeout(Duration::from_secs(5), async {
-        while let Some(event) = stream.next().await {
-            match event.unwrap() {
-                AgentEvent::Steered { .. } => confirms += 1,
-                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
-                AgentEvent::Done { status, .. } => {
-                    assert_eq!(status, DoneStatus::Completed);
-                    done += 1;
-                }
-                _ => {}
+        loop {
+            let queued = std::fs::read(dir.join("pending-steers.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Vec<String>>(&bytes).ok());
+            if queued.as_deref() == Some(expected) {
+                break;
             }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .unwrap();
-    assert_eq!(confirms, 2);
-    assert!(done >= 1);
-    assert!(
-        text.contains("reply:redirect one") && text.contains("reply:redirect two"),
-        "{text}"
-    );
+    .expect("the entire burst must reach Pi before the blocked model step finishes");
+}
+
+#[tokio::test]
+async fn steering_burst_reaches_one_model_step_and_confirms_each_message_on_consumption() {
+    for cancel in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, tx, token) = controls();
+        let mut stream = harness()
+            .with_session_store(dir.path().join("index"))
+            .run(request(dir.path(), "burst-start"), c)
+            .await
+            .unwrap();
+        let mut assistant = None;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    AgentEvent::SessionStarted {
+                        assistant_message_id,
+                        ..
+                    } => assistant = Some(assistant_message_id),
+                    AgentEvent::TextDelta { text } if text == "waiting" => return,
+                    AgentEvent::Done { .. } => panic!("model step ended before release"),
+                    _ => {}
+                }
+            }
+            panic!("fixture did not start the blocked model step");
+        })
+        .await
+        .unwrap();
+        // Exceed the engine mailbox size and include duplicate text. Delivery
+        // receipts must still be one per original message, in the original order.
+        let prompts: Vec<_> = (0..40)
+            .map(|i| {
+                if i == 20 {
+                    // A command name without '/' is still ordinary user text.
+                    "noop".into()
+                } else {
+                    format!("redirect {}", i / 2)
+                }
+            })
+            .collect();
+        for (i, prompt) in prompts.iter().enumerate() {
+            tx.send(SteerMessage {
+                prompt: prompt.clone(),
+                message_id: Some(format!("user-{i}")),
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        wait_for_queued_steers(dir.path(), &prompts).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), stream.next())
+                .await
+                .is_err(),
+            "queue acceptance must not confirm consumption or finish the turn"
+        );
+        if cancel {
+            token.cancel();
+        } else {
+            std::fs::write(dir.path().join("release-burst"), "").unwrap();
+        }
+        let mut confirms = 0;
+        let mut done = vec![];
+        let mut text = String::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    AgentEvent::Steered {
+                        assistant_message_id,
+                        next_assistant_message_id,
+                    } => {
+                        assert_eq!(assistant_message_id, assistant);
+                        assert!(next_assistant_message_id.is_some());
+                        assistant = next_assistant_message_id;
+                        confirms += 1;
+                    }
+                    AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                    AgentEvent::Done { status, .. } => done.push(status),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if cancel {
+            assert_eq!(confirms, 0);
+            assert_eq!(done, vec![DoneStatus::Interrupted]);
+            assert!(!text.contains("redirect"), "{text}");
+        } else {
+            assert_eq!(confirms, prompts.len());
+            assert_eq!(done, vec![DoneStatus::Completed]);
+            assert_eq!(
+                text,
+                format!("reply:burst-startreply:{}", prompts.join("\n"))
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn handled_input_between_steers_keeps_its_own_delivery_receipt() {
+    for handled in ["handled", "/noop"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, tx, _) = controls();
+        let mut stream = harness()
+            .with_session_store(dir.path().join("index"))
+            .run(request(dir.path(), "burst-start"), c)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                if matches!(event.unwrap(), AgentEvent::TextDelta { text } if text == "waiting") {
+                    return;
+                }
+            }
+            panic!("fixture did not reach the blocked model step");
+        })
+        .await
+        .unwrap();
+        for prompt in ["redirect first", handled, "redirect last"] {
+            tx.send(SteerMessage {
+                prompt: prompt.into(),
+                message_id: None,
+            })
+            .await
+            .unwrap();
+        }
+        drop(tx);
+        wait_for_queued_steers(dir.path(), &["redirect first".into()]).await;
+        std::fs::write(dir.path().join("release-burst"), "").unwrap();
+        let mut receipts = 0;
+        let mut text = String::new();
+        let mut completions = 0;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    AgentEvent::Steered { .. } => receipts += 1,
+                    AgentEvent::TextDelta { text: delta } => {
+                        if delta.contains("redirect first") {
+                            assert_eq!(
+                                receipts, 1,
+                                "handled input must not consume another message's receipt"
+                            );
+                        }
+                        if delta.contains("redirect last") {
+                            assert_eq!(receipts, 3);
+                        }
+                        text.push_str(&delta);
+                    }
+                    AgentEvent::Done { status, .. } => {
+                        assert_eq!(status, DoneStatus::Completed);
+                        completions += 1;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(receipts, 3);
+        assert!(completions >= 1);
+        assert_eq!(
+            text,
+            "reply:burst-startreply:redirect firstreply:redirect last"
+        );
+    }
 }
 
 #[cfg(target_os = "linux")]

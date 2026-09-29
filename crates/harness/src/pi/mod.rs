@@ -335,7 +335,8 @@ impl Harness for PiHarness {
                 extension_commands: HashSet::new(),
                 auto_compaction: true,
                 initial_pending: true,
-                delivery: None,
+                deliveries: VecDeque::new(),
+                native_queue: Vec::new(),
                 queued: VecDeque::new(),
                 process,
                 tx,
@@ -386,12 +387,18 @@ enum Pending {
     EmptyEntries(u64, String),
     EmptyState(u64, String, bool),
 }
+struct Delivery {
+    epoch: u64,
+    // Queue acceptance permits sending the next steer, but is not consumption.
+    queued: bool,
+}
 struct Runner {
     extension_commands: HashSet<String>,
     auto_compaction: bool,
     interrupted: bool,
     initial_pending: bool,
-    delivery: Option<crate::SteerMessage>,
+    deliveries: VecDeque<Delivery>,
+    native_queue: Vec<String>,
     queued: VecDeque<crate::SteerMessage>,
     store: sessions::Store,
     process: Process,
@@ -475,6 +482,11 @@ impl Runner {
         self.submit(text, images, false)
     }
     async fn bootstrap(&mut self, backlog: &mut Vec<Value>) -> Result<Value, HarnessError> {
+        // Pi defaults to one-at-a-time. Zeron's pending steers belong together
+        // at the next model step. This is Pi's native, persisted queue setting.
+        self.process
+            .query(json!({"type":"set_steering_mode","mode":"all"}), backlog)
+            .await?;
         if let Some(model) = self.request.model.as_deref().filter(|s| *s != "default") {
             let models = self
                 .process
@@ -603,23 +615,27 @@ impl Runner {
         self.prompt(self.request.prompt.clone(), images)?;
         let mut open = true;
         loop {
-            if self.delivery.is_none()
+            if self.deliveries.iter().all(|delivery| delivery.queued)
                 && !self.initial_pending
                 && !self.pending.values().any(|p| {
                     matches!(
                         p,
                         Pending::Prompt(_)
+                            | Pending::Barrier(_)
                             | Pending::Command(_)
                             | Pending::EmptyEntries(..)
                             | Pending::EmptyState(..)
                     )
                 })
             {
-                if !self
-                    .queued
-                    .front()
-                    .is_some_and(|s| self.active && self.control_command(&s.prompt).is_some())
-                {
+                if !self.queued.front().is_some_and(|s| {
+                    (self.active && self.control_command(&s.prompt).is_some())
+                        || (!self.deliveries.is_empty()
+                            && s.prompt.strip_prefix('/').is_some_and(|command| {
+                                self.extension_commands
+                                    .contains(command.split_whitespace().next().unwrap_or(""))
+                            }))
+                }) {
                     if let Some(steer) = self.queued.pop_front() {
                         if !self.active {
                             self.norm.reset();
@@ -629,7 +645,10 @@ impl Runner {
                         // Atomic Pi operation: queue at a step boundary if busy, start if idle.
                         // A separate get_state + steer pair would strand an input on the idle race.
                         self.submit(steer.prompt.clone(), json!([]), true)?;
-                        self.delivery = Some(steer);
+                        self.deliveries.push_back(Delivery {
+                            epoch: self.epoch,
+                            queued: false,
+                        });
                     }
                 }
             }
@@ -643,7 +662,7 @@ impl Runner {
         }
     }
     async fn confirm_delivery(&mut self) -> Result<(), HarnessError> {
-        if self.delivery.take().is_some() {
+        if self.deliveries.pop_front().is_some() {
             let old = std::mem::replace(&mut self.assistant, uuid::Uuid::new_v4().to_string());
             self.emit(AgentEvent::Steered {
                 assistant_message_id: Some(old),
@@ -657,7 +676,7 @@ impl Runner {
         self.interrupted = true;
         self.process.dialogs.cancel();
         self.queued.clear();
-        self.delivery = None;
+        self.deliveries.clear();
         if !self.active {
             return;
         }
@@ -743,11 +762,42 @@ impl Runner {
         }
         self.initial_pending = false;
         if !self.interrupted {
-            self.confirm_delivery().await?;
+            // Only an unqueued input may have been handled without a model run.
+            // Never turn an accepted-but-unconsumed queued steer into a receipt.
+            if self.deliveries.iter().any(|delivery| delivery.queued) {
+                return Err(HarnessError::Protocol(
+                    "Pi settled with unconsumed steering messages".into(),
+                ));
+            }
+            while !self.deliveries.is_empty() {
+                self.confirm_delivery().await?;
+            }
         }
         self.finish().await
     }
     async fn frame(&mut self, frame: Value) -> Result<(), HarnessError> {
+        if frame["type"] == "queue_update" {
+            let queue: Vec<String> = frame["steering"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|text| text.as_str().map(str::to_owned))
+                .collect();
+            // Preflight requests stay serialized through their ordered state
+            // barrier. An appended queue entry therefore belongs to the one
+            // submission in flight, including Pi's input/template expansions.
+            if queue.len() > self.native_queue.len()
+                && queue.starts_with(&self.native_queue)
+                && let Some(delivery) = self.deliveries.back_mut()
+                && self.pending.values().any(
+                    |pending| matches!(pending, Pending::Prompt(epoch) if *epoch == delivery.epoch),
+                )
+            {
+                delivery.queued = true;
+            }
+            self.native_queue = queue;
+            return Ok(());
+        }
         if frame["type"] == "extension_ui_request" {
             if !self.active {
                 // A background notification must not reopen a completed engine turn.

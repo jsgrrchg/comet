@@ -31,7 +31,15 @@ process; model switches do not persist global defaults. Commands and skills
 are discovered in the workspace. Pi controls project-extension trust.
 
 Steering queues at a model step boundary and starts immediately when idle.
-Zeron confirms it when Pi consumes the input. Interrupt clears queues, aborts
+Zeron selects Pi's `all` steering mode when starting a session, so messages
+queued before the next model call enter that call together. Pi persists this
+mode in its settings; `/steering one-at-a-time` can change it during the session.
+Each input is sent as soon as the preceding preflight and ordered state query
+finish, without waiting for earlier queued inputs to be consumed or adding a
+batching delay. Inputs arriving after a model call starts belong to a later step.
+Zeron confirms each original message only when Pi consumes it. Extension commands
+and inputs handled without a model run retain serialized delivery.
+Interrupt clears queues, aborts
 the run and terminates the owned process tree after a grace period. A completed
 model iteration (`agent_end`) alone does not close the turn: retries,
 compaction and handled extension commands follow the native lifecycle.

@@ -6,9 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeron_harness::{CancellationToken, Harness, PiHarness, RunControls, SteerMessage};
 use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel, UserInputAnswer};
 
-#[tokio::test]
-#[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
-async fn real_pi_mock_lifecycle() {
+fn isolated_pi() -> (tempfile::TempDir, PiHarness) {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path();
     let agent = cwd.join("agent");
@@ -44,6 +42,14 @@ async fn real_pi_mock_lifecycle() {
     let harness = PiHarness::new()
         .with_executable(wrapper)
         .with_session_store(cwd.join("index"));
+    (dir, harness)
+}
+
+#[tokio::test]
+#[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
+async fn real_pi_mock_lifecycle() {
+    let (dir, harness) = isolated_pi();
+    let cwd = dir.path();
     let mut session = None;
     for (prompt, expected) in [
         ("/probe-noop", DoneStatus::Completed),
@@ -188,4 +194,123 @@ async fn real_pi_mock_lifecycle() {
         harness.run(request, controls).await.is_err(),
         "unpersisted extension state must not silently disappear"
     );
+}
+
+async fn wait_probe_lines(path: &std::path::Path, count: usize) -> Vec<serde_json::Value> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let lines: Vec<_> = std::fs::read_to_string(path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect();
+            if lines.len() >= count {
+                return lines;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Pi probe must reach the expected barrier")
+}
+
+#[tokio::test]
+#[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
+async fn real_pi_steering_bursts_share_the_next_model_call() {
+    let (dir, harness) = isolated_pi();
+    let cwd = dir.path();
+    let (tx, steering) = mpsc::channel(8);
+    let controls = RunControls {
+        execution_lease: None,
+        steering,
+        interrupt: CancellationToken::new(),
+        request_input: Box::new(|_| oneshot::channel().1),
+    };
+    let request = RunRequest {
+        prompt: "burst hold".into(),
+        harness: None,
+        model: Some("zeron-probe/mock".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: cwd.display().to_string(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        resume: None,
+        attachments: vec![],
+        worktree: None,
+        mcp: None,
+    };
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let calls = cwd.join("probe-model-calls.jsonl");
+    let inputs = cwd.join("probe-inputs.jsonl");
+    assert_eq!(
+        wait_probe_lines(&calls, 1).await[0],
+        serde_json::json!(["burst hold"])
+    );
+    let burst: Vec<_> = (0..40).map(|i| format!("burst-{}", i / 2)).collect();
+    for (i, prompt) in burst.iter().enumerate() {
+        tx.send(SteerMessage {
+            prompt: prompt.clone(),
+            message_id: Some(format!("burst-user-{i}")),
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        wait_probe_lines(&inputs, burst.len()).await,
+        burst
+            .iter()
+            .map(|s| serde_json::json!(s))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(wait_probe_lines(&calls, 1).await.len(), 1);
+    std::fs::write(cwd.join("probe-release-initial"), "").unwrap();
+    let snapshot = wait_probe_lines(&calls, 2).await;
+    assert_eq!(snapshot.len(), 2);
+    assert_eq!(snapshot[1], serde_json::json!(burst));
+    // Anything arriving after the next call began belongs to the following
+    // step, rather than being claimed as part of the already-running call.
+    let late = vec!["late-1", "late-2", "late-3"];
+    for prompt in &late {
+        tx.send(SteerMessage {
+            prompt: (*prompt).into(),
+            message_id: None,
+        })
+        .await
+        .unwrap();
+    }
+    drop(tx);
+    wait_probe_lines(&inputs, burst.len() + late.len()).await;
+    assert_eq!(wait_probe_lines(&calls, 2).await.len(), 2);
+    std::fs::write(cwd.join("probe-release-burst"), "").unwrap();
+    let snapshot = wait_probe_lines(&calls, 3).await;
+    assert_eq!(snapshot.len(), 3);
+    assert_eq!(snapshot[2], serde_json::json!(late));
+    std::fs::write(cwd.join("probe-release-late"), "").unwrap();
+    let mut confirmed = 0;
+    let mut done = vec![];
+    let mut text = String::new();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::Steered { .. } => confirmed += 1,
+                AgentEvent::Done { status, .. } => done.push(status),
+                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(confirmed, burst.len() + late.len());
+    assert_eq!(done, vec![DoneStatus::Completed]);
+    assert_eq!(
+        text,
+        format!(
+            "MOCK:burst holdMOCK:{}MOCK:{}",
+            burst.join("|"),
+            late.join("|")
+        )
+    );
+    assert_eq!(wait_probe_lines(&calls, 3).await.len(), 3);
 }

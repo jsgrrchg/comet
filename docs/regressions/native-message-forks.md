@@ -96,7 +96,7 @@ These captures use the real shell, transcript, composer, and fork RPC with an is
 
 ![The same action in the light theme](../screenshots/native-message-forks/native-fork-light.png)
 
-![A completed reply without a native point explains why the action is disabled](../screenshots/native-message-forks/native-fork-unavailable.png)
+Replies without a recorded native point and hosts without the native message fork capability no longer render the action. The earlier `native-fork-unavailable.png` capture predates this visibility change. GPUI regression coverage verifies that the button stays hidden, stale availability replies cannot restore it, and it reappears when the point or host capability arrives.
 
 ![Historical fork open in the right panel](../screenshots/native-message-forks/native-fork-historical-side-chat.png)
 

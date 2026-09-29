@@ -90,17 +90,13 @@ impl Transcript {
         self.native_forks.clear();
         let mut ids = Vec::new();
         for entry in entries {
-            let reason = if !supported {
-                "Update the chat host to fork this message"
-            } else if entry.native_fork_point.is_none() {
-                "Native fork point unavailable for this message"
-            } else {
-                ids.push(entry.id.clone());
-                "Checking native fork availability…"
-            };
+            if !supported || entry.native_fork_point.is_none() {
+                continue;
+            }
+            ids.push(entry.id.clone());
             self.native_forks.insert(
                 entry.id.clone(),
-                NativeForkAvailability::unavailable(reason),
+                NativeForkAvailability::unavailable("Checking native fork availability…"),
             );
         }
         let engine = state.engine().cloned();
@@ -362,6 +358,67 @@ mod tests {
         fn available(&self, cx: &TestAppContext) -> bool {
             self.view
                 .read_with(cx, |view, _| view.native_forks["a1"].available)
+        }
+
+        fn button_visible(&self, cx: &mut TestAppContext) -> bool {
+            self.view.update(cx, |view, cx| {
+                view.native_fork_button(&"a1".into(), &Theme::of(cx).clone(), cx)
+                    .is_some()
+            })
+        }
+    }
+
+    #[gpui::test]
+    fn native_fork_hides_missing_points_and_unsupported_hosts(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        for missing_point in [true, false] {
+            let mut fixture = Fixture::new(cx, true);
+            let first = fixture.query(cx);
+            assert!(fixture.button_visible(cx));
+            let (point, capabilities) = fixture.state.update(cx, |state, cx| {
+                let original = (
+                    state.transcript[0].native_fork_point.clone(),
+                    state.devices[0].capabilities.clone(),
+                );
+                if missing_point {
+                    state.transcript[0].native_fork_point = None;
+                } else {
+                    state.devices[0].capabilities.clear();
+                }
+                cx.notify();
+                original
+            });
+            assert!(fixture.queries(cx).is_empty());
+            assert!(!fixture.button_visible(cx));
+            // An answer to the previous query must not restore a hidden action.
+            fixture.reply(
+                &first,
+                Ok(NativeForkAvailability::available()),
+                &runtime,
+                cx,
+            );
+            assert!(!fixture.button_visible(cx));
+            cx.executor().advance_clock(Duration::from_secs(30));
+            assert!(fixture.queries(cx).is_empty());
+
+            fixture.state.update(cx, |state, cx| {
+                state.transcript[0].native_fork_point = point;
+                state.devices[0].capabilities = capabilities;
+                cx.notify();
+            });
+            let recovered = fixture.query(cx);
+            fixture.reply(
+                &recovered,
+                Ok(NativeForkAvailability::available()),
+                &runtime,
+                cx,
+            );
+            assert!(fixture.button_visible(cx));
+            assert!(fixture.available(cx));
         }
     }
 

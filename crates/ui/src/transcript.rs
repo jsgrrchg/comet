@@ -14094,7 +14094,7 @@ mod tests {
             t.native_forks.insert(
                 "answer".into(),
                 zeron_proto::NativeForkAvailability::unavailable(
-                    "Update the chat host to fork this message",
+                    "Provider fork contract has not been verified",
                 ),
             );
             cx.notify();

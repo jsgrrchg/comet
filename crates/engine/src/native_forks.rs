@@ -432,9 +432,10 @@ impl NativeForks {
                     "Destination was occupied while the provider fork was being created".into(),
                 );
             }
-            // A published row proves the child snapshot was persisted. Preserve
-            // any edits or new turns made after publication but before receipt.
+            // The row may exist only in memory after a failed flush. Preserve
+            // subsequent edits, but confirm persistence before acknowledging it.
             op.chat = row;
+            self.0.workspace.flush().map_err(err)?;
             op.phase = Phase::Published;
             return self.save(op);
         }
@@ -504,7 +505,7 @@ impl NativeForks {
         op.chat.harness_session_id = Some(child.session_id);
         op.chat.harness_session_cwd = Some(child.cwd);
         self.0.workspace.import_chat_row(&op.chat).map_err(err)?;
-        self.0.workspace.flush();
+        self.0.workspace.flush().map_err(err)?;
         op.phase = Phase::Published;
         self.save(op)
     }

@@ -353,6 +353,126 @@ async fn native_fork_provider_created_recovery_reuses_the_durable_native_id() {
     restarted.shutdown().await;
 }
 
+async fn registry_write_failure_recovers(restart_before_retry: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(NativeStore::default());
+    let mut core = setup(dir.path(), harness.clone());
+    let request = request(&core);
+    core.workspace.flush().unwrap();
+    let store_root = core.uploads.dir().parent().unwrap().to_path_buf();
+    let database = rusqlite::Connection::open(store_root.join("docs.sqlite3")).unwrap();
+    // Fail only registry writes: the provider result and child document can
+    // still become durable, reproducing a failure at the publication boundary.
+    database
+        .execute_batch(&format!(
+            "CREATE TRIGGER fail_native_fork_registry BEFORE INSERT ON snapshots
+         WHEN NEW.doc_id = '{REGISTRY_DOC_ID}'
+         BEGIN SELECT RAISE(FAIL, 'injected registry write failure'); END;"
+        ))
+        .unwrap();
+    let device_id = core.device_id.clone();
+    let persisted_chats = || {
+        let bytes: Vec<u8> = database
+            .query_row(
+                "SELECT bytes FROM snapshots WHERE doc_id = ?1",
+                [REGISTRY_DOC_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        RegistryDoc::from_bytes(&bytes, &device_id)
+            .unwrap()
+            .read_chats()
+            .unwrap()
+    };
+    let error = core.native_forks.create(request.clone()).await.unwrap_err();
+    assert!(error.contains("injected registry write failure"), "{error}");
+    assert!(core.workspace.chat("child").unwrap().is_some());
+    assert!(!persisted_chats().iter().any(|chat| chat.id == "child"));
+    let record_path = std::fs::read_dir(store_root.join("native-forks"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|s| s == "json"))
+        .unwrap();
+    let record = || -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap()
+    };
+    assert_eq!(record()["phase"], "ProviderCreated");
+    assert_eq!(record()["child"]["sessionId"], "native-child-1");
+
+    // The existing in-memory row must not let a retry acknowledge the same
+    // failed disk write, or discard the recoverable provider result.
+    let error = core.native_forks.create(request.clone()).await.unwrap_err();
+    assert!(error.contains("injected registry write failure"), "{error}");
+    assert_eq!(record()["phase"], "ProviderCreated");
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+
+    let reopen = || {
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(harness.clone());
+        EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None).unwrap()
+    };
+    if restart_before_retry {
+        // Keep the fault through shutdown so no final flush can hide the loss.
+        core.shutdown().await;
+        drop(core);
+        assert!(!persisted_chats().iter().any(|chat| chat.id == "child"));
+        database
+            .execute_batch("DROP TRIGGER fail_native_fork_registry;")
+            .unwrap();
+        core = reopen();
+        assert!(
+            core.workspace.chat("child").unwrap().is_some(),
+            "Startup must finish publication"
+        );
+    } else {
+        database
+            .execute_batch("DROP TRIGGER fail_native_fork_registry;")
+            .unwrap();
+    }
+    let child = core.native_forks.create(request.clone()).await.unwrap();
+    assert_eq!(child.harness_session_id.as_deref(), Some("native-child-1"));
+    assert_eq!(record()["phase"], "Published");
+    let durable_child = persisted_chats()
+        .into_iter()
+        .find(|chat| chat.id == child.id)
+        .expect("The confirmed child must already be on disk");
+    assert_eq!(durable_child.harness_session_id, child.harness_session_id);
+    assert_eq!(durable_child.parent_chat_id, child.parent_chat_id);
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+    core.shutdown().await;
+    drop(core);
+
+    let restarted = reopen();
+    assert_eq!(
+        restarted.workspace.chat("child").unwrap(),
+        Some(durable_child)
+    );
+    assert_eq!(restarted.native_forks.create(request).await.unwrap(), child);
+    assert_eq!(
+        restarted
+            .doc_host
+            .open("child")
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap()
+            .len(),
+        3,
+    );
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_fork_registry_write_failure_retries_publication_in_memory() {
+    registry_write_failure_recovers(false).await;
+}
+
+#[tokio::test]
+async fn native_fork_registry_write_failure_recovers_after_restart() {
+    registry_write_failure_recovers(true).await;
+}
+
 fn send_request(prompt: &str) -> RunRequest {
     serde_json::from_value(serde_json::json!({
         "prompt": prompt, "cwd": "/tmp", "sandbox": "workspace-write", "autoApprove": true,

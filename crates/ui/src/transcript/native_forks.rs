@@ -19,6 +19,7 @@ impl Transcript {
         else {
             self.native_forks.clear();
             self.native_fork_key.clear();
+            self.native_fork_availability_task = None;
             return;
         };
         let harness = chat.config.as_ref().map(|c| c.harness).or_else(|| {
@@ -29,6 +30,8 @@ impl Transcript {
         });
         let Some(harness) = harness else {
             self.native_forks.clear();
+            self.native_fork_key.clear();
+            self.native_fork_availability_task = None;
             return;
         };
         let supported = state.device_supports(
@@ -50,12 +53,29 @@ impl Transcript {
             .filter(|s| s.harness == harness)
             .map(|s| (&s.installed_version, &s.phase))
             .collect();
+        // Remote delivery can recover while the viewer's local engine remains
+        // Ready. Track only this host/chat's health, not heartbeat timestamps,
+        // pending update counts, or connectivity changes in unrelated chats.
+        let remote_health = (state.local_device_id.as_deref() != Some(chat.device_id.as_str()))
+            .then(|| {
+                (
+                    state.connectivity.state,
+                    state.device_online(&chat.device_id, chrono::Utc::now()),
+                    state
+                        .connectivity
+                        .chats
+                        .iter()
+                        .find(|net| net.chat_id == chat.id)
+                        .map(|net| (net.sync_state, net.connected, net.delivery_live)),
+                )
+            });
         let key = serde_json::to_string(&(
             &chat.id,
             &chat.device_id,
             harness,
             supported,
             format!("{:?}", state.connection),
+            remote_health,
             points,
             versions,
         ))
@@ -64,6 +84,9 @@ impl Transcript {
             return;
         }
         self.native_fork_key = key.clone();
+        // Dropping the previous task cancels stale requests and retry timers,
+        // including when navigation returns to a previously used cache key.
+        self.native_fork_availability_task = None;
         self.native_forks.clear();
         let mut ids = Vec::new();
         for entry in entries {
@@ -88,24 +111,43 @@ impl Transcript {
         let Some(engine) = engine else {
             return;
         };
-        cx.spawn(async move |this, cx| {
-            for chunk in ids.chunks(512) {
-                let result = engine.client().call_as::<HashMap<String, NativeForkAvailability>>(
-                    zeron_rpc::methods::GET_NATIVE_FORK_AVAILABILITY,
-                    serde_json::json!({"sourceChatId":chat.id,"targetDeviceId":chat.device_id,"messageIds":chunk}),
-                ).await;
-                let _ = this.update(cx, |this, cx| {
-                    if this.native_fork_key != key { return; }
-                    match result {
-                        Ok(values) => this.native_forks.extend(values),
-                        Err(error) => for id in chunk {
-                            this.native_forks.insert(id.clone(), NativeForkAvailability::unavailable(error.to_string()));
-                        }
+        self.native_fork_availability_task = Some(cx.spawn(async move |this, cx| {
+            let mut delay = Duration::from_secs(1);
+            loop {
+                let mut retry = Vec::new();
+                for chunk in ids.chunks(512) {
+                    let result = engine.client().call_as::<HashMap<String, NativeForkAvailability>>(
+                        zeron_rpc::methods::GET_NATIVE_FORK_AVAILABILITY,
+                        serde_json::json!({"sourceChatId":chat.id,"targetDeviceId":chat.device_id,"messageIds":chunk}),
+                    ).await;
+                    if result.is_err() {
+                        retry.extend_from_slice(chunk);
                     }
-                    cx.notify();
-                });
+                    let current = this.update(cx, |this, cx| {
+                        if this.native_fork_key != key { return false; }
+                        match result {
+                            Ok(values) => this.native_forks.extend(values),
+                            Err(error) => for id in chunk {
+                                this.native_forks.insert(id.clone(), NativeForkAvailability::unavailable(error.to_string()));
+                            }
+                        }
+                        cx.notify();
+                        true
+                    });
+                    if !matches!(current, Ok(true)) {
+                        return;
+                    }
+                }
+                // Retry failed batches only. A successful availability reply,
+                // including an unsupported boundary, remains cached normally.
+                if retry.is_empty() {
+                    return;
+                }
+                cx.background_executor().timer(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(30));
+                ids = retry;
             }
-        }).detach();
+        }));
     }
 
     pub(crate) fn native_fork_finished(
@@ -186,5 +228,270 @@ impl Transcript {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use zeron_proto::view::ConnectionStatus;
+    use zeron_proto::{ChatConnectivity, ChatSyncState, ConnectivityState};
+    use zeron_rpc::{ClientFrame, ServerFrame, methods};
+
+    struct Fixture {
+        state: Entity<AppState>,
+        view: Entity<Transcript>,
+        requests: tokio::sync::mpsc::Receiver<String>,
+        replies: tokio::sync::mpsc::Sender<String>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Fixture {
+        fn new(cx: &mut TestAppContext, host_online: bool) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let (out, requests) = tokio::sync::mpsc::channel(64);
+            let (replies, inbound) = tokio::sync::mpsc::channel(64);
+            let (state, view) = cx.update(|cx| {
+                gpui_base::init(cx);
+                cx.set_global(Theme::dark());
+                crate::settings::init(Default::default(), dir.path(), cx);
+                let state =
+                    cx.new(|_| {
+                        let mut state = AppState::new();
+                        state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                            zeron_rpc::RpcClient::new(out, inbound),
+                        ));
+                        state.connection = ConnectionStatus::Ready;
+                        state.local_device_id = Some("viewer".into());
+                        state.selected_chat = Some("remote-chat".into());
+                        state.chats = vec![serde_json::from_value(serde_json::json!({
+                        "id":"remote-chat", "deviceId":"host", "createdAt":chrono::Utc::now(),
+                        "archived":false, "config":{"harness":"codex", "sandbox":"workspace-write"}
+                    })).unwrap()];
+                        state.devices =
+                            vec![serde_json::from_value(serde_json::json!({
+                        "id":"host", "name":"Remote host", "platform":"linux",
+                        "lastSeenAt":host_online.then(chrono::Utc::now),
+                        "capabilities":[zeron_proto::capabilities::NATIVE_MESSAGE_FORK_V1]
+                    })).unwrap()];
+                        state.connectivity.state = ConnectivityState::Connected;
+                        state.connectivity.chats = vec![ChatConnectivity {
+                            chat_id: "remote-chat".into(),
+                            sync_state: ChatSyncState::Waiting,
+                            connected: false,
+                            delivery_live: false,
+                            pending_pushes: 0,
+                        }];
+                        let mut entry: SessionMessageEntry =
+                            serde_json::from_value(serde_json::json!({
+                                "id":"a1", "role":"assistant", "status":"complete", "parts":[],
+                                "createdAt":1, "deviceId":"host"
+                            }))
+                            .unwrap();
+                        entry.native_fork_point = Some(zeron_proto::NativeForkPoint {
+                            format_version: 1,
+                            harness: HarnessId::Codex,
+                            source_device_id: "host".into(),
+                            source_session_id: "native-parent".into(),
+                            cwd: "/project".into(),
+                            boundary: zeron_proto::NativeForkBoundary::AppServerTurn {
+                                turn_id: "turn1".into(),
+                            },
+                        });
+                        state.transcript = vec![entry];
+                        state
+                    });
+                let view = cx.new(|cx| Transcript::new(state.clone(), cx));
+                (state, view)
+            });
+            Self {
+                state,
+                view,
+                requests,
+                replies,
+                _dir: dir,
+            }
+        }
+
+        fn queries(&mut self, cx: &mut TestAppContext) -> Vec<ClientFrame> {
+            cx.run_until_parked();
+            let mut queries = Vec::new();
+            while let Ok(frame) = self.requests.try_recv() {
+                let frame: ClientFrame = serde_json::from_str(&frame).unwrap();
+                if frame.method.as_deref() == Some(methods::GET_NATIVE_FORK_AVAILABILITY) {
+                    assert_eq!(frame.params["targetDeviceId"], "host");
+                    queries.push(frame);
+                }
+            }
+            queries
+        }
+
+        fn query(&mut self, cx: &mut TestAppContext) -> ClientFrame {
+            let mut queries = self.queries(cx);
+            assert_eq!(queries.len(), 1);
+            queries.pop().unwrap()
+        }
+
+        fn reply(
+            &self,
+            query: &ClientFrame,
+            value: Result<NativeForkAvailability, &str>,
+            runtime: &tokio::runtime::Runtime,
+            cx: &mut TestAppContext,
+        ) {
+            let frame = match value {
+                Ok(value) => ServerFrame {
+                    id: query.id,
+                    ok: Some(serde_json::json!({"a1":value})),
+                    ..Default::default()
+                },
+                Err(error) => ServerFrame {
+                    id: query.id,
+                    err: Some(error.into()),
+                    ..Default::default()
+                },
+            };
+            self.replies
+                .try_send(serde_json::to_string(&frame).unwrap())
+                .unwrap();
+            runtime.block_on(async { tokio::task::yield_now().await });
+            cx.run_until_parked();
+        }
+
+        fn available(&self, cx: &TestAppContext) -> bool {
+            self.view
+                .read_with(cx, |view, _| view.native_forks["a1"].available)
+        }
+    }
+
+    #[gpui::test]
+    fn native_fork_remote_recovery_refreshes_without_local_reconnect(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        for presence_recovers in [true, false] {
+            let mut fixture = Fixture::new(cx, !presence_recovers);
+            let first = fixture.query(cx);
+            fixture.reply(&first, Err("Host is offline"), &runtime, cx);
+            assert!(!fixture.available(cx));
+            fixture.state.update(cx, |state, cx| {
+                if presence_recovers {
+                    state.devices[0].last_seen_at = Some(chrono::Utc::now());
+                } else {
+                    state.connectivity.chats[0].delivery_live = true;
+                }
+                assert_eq!(state.connection, ConnectionStatus::Ready);
+                cx.notify();
+            });
+            let recovered = fixture.query(cx);
+            fixture.reply(
+                &recovered,
+                Ok(NativeForkAvailability::available()),
+                &runtime,
+                cx,
+            );
+            assert!(fixture.available(cx));
+            fixture.state.update(cx, |state, cx| {
+                state.devices[0].last_seen_at = Some(chrono::Utc::now());
+                state.connectivity.chats[0].pending_pushes += 1;
+                let mut other = state.connectivity.chats[0].clone();
+                other.chat_id = "unrelated".into();
+                state.connectivity.chats.push(other);
+                cx.notify();
+            });
+            cx.executor().advance_clock(Duration::from_secs(30));
+            assert!(
+                fixture.queries(cx).is_empty(),
+                "Health noise and old retry timers must not query again"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn native_fork_query_errors_retry_with_backoff_and_stop_on_answer(cx: &mut TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let mut fixture = Fixture::new(cx, true);
+        let first = fixture.query(cx);
+        fixture.reply(&first, Err("Temporary timeout"), &runtime, cx);
+        assert!(fixture.queries(cx).is_empty());
+        cx.executor().advance_clock(Duration::from_secs(1));
+        let retry = fixture.query(cx);
+        assert_eq!(retry.params, first.params);
+        fixture.reply(&retry, Err("Temporary timeout"), &runtime, cx);
+        cx.executor().advance_clock(Duration::from_secs(1));
+        assert!(
+            fixture.queries(cx).is_empty(),
+            "Repeated errors must back off"
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        let retry = fixture.query(cx);
+        fixture.reply(
+            &retry,
+            Ok(NativeForkAvailability::unavailable(
+                "Unsupported native boundary",
+            )),
+            &runtime,
+            cx,
+        );
+        assert!(!fixture.available(cx));
+        cx.executor().advance_clock(Duration::from_secs(60));
+        assert!(
+            fixture.queries(cx).is_empty(),
+            "Definitive availability is cached"
+        );
+    }
+
+    #[gpui::test]
+    fn native_fork_recovery_discards_stale_queries_and_navigation_cancels_retries(
+        cx: &mut TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let mut fixture = Fixture::new(cx, false);
+        let stale = fixture.query(cx);
+        fixture.state.update(cx, |state, cx| {
+            state.devices[0].last_seen_at = Some(chrono::Utc::now());
+            cx.notify();
+        });
+        let recovered = fixture.query(cx);
+        fixture.reply(
+            &recovered,
+            Ok(NativeForkAvailability::available()),
+            &runtime,
+            cx,
+        );
+        fixture.reply(&stale, Err("Old host connection failed"), &runtime, cx);
+        assert!(
+            fixture.available(cx),
+            "An old failure must not replace recovery"
+        );
+        cx.executor().advance_clock(Duration::from_secs(30));
+        assert!(fixture.queries(cx).is_empty());
+        fixture.state.update(cx, |state, cx| {
+            state.connectivity.chats[0].connected = true;
+            cx.notify();
+        });
+        let query = fixture.query(cx);
+        fixture.reply(&query, Err("Temporary failure"), &runtime, cx);
+        fixture.state.update(cx, |state, cx| {
+            state.selected_chat = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(30));
+        assert!(
+            fixture.queries(cx).is_empty(),
+            "Leaving the chat cancels retries"
+        );
     }
 }

@@ -3054,6 +3054,7 @@ pub struct Transcript {
     state: Entity<AppState>,
     native_forks: HashMap<String, zeron_proto::NativeForkAvailability>,
     native_fork_key: String,
+    native_fork_availability_task: Option<Task<()>>,
     native_fork_pending: HashSet<(String, String)>,
     native_fork_errors: HashMap<(String, String), String>,
     metadata_focus: HashMap<SharedString, (gpui::FocusHandle, Vec<Subscription>)>,
@@ -3465,6 +3466,7 @@ impl Transcript {
         let mut this = Self {
             native_forks: HashMap::new(),
             native_fork_key: String::new(),
+            native_fork_availability_task: None,
             native_fork_pending: HashSet::new(),
             native_fork_errors: HashMap::new(),
             metadata_focus: HashMap::new(),

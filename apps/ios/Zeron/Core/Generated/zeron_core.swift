@@ -7968,8 +7968,8 @@ public struct FfiConverterTypeUserInputQuestion: FfiConverterRustBuffer {
                 header: FfiConverterString.read(from: &buf), 
                 question: FfiConverterString.read(from: &buf), 
                 options: FfiConverterSequenceString.read(from: &buf), 
-                multiSelect: FfiConverterBool.read(from: &buf),
-                prefill: FfiConverterOptionString.read(from: &buf),
+                multiSelect: FfiConverterBool.read(from: &buf), 
+                prefill: FfiConverterOptionString.read(from: &buf), 
                 multiline: FfiConverterBool.read(from: &buf)
         )
     }

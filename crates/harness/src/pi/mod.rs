@@ -1,6 +1,7 @@
 //! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
 mod normalize;
 mod rpc;
+mod sessions;
 
 use crate::{
     Harness, HarnessError, RunControls,
@@ -22,6 +23,7 @@ use tokio::{
 use zeron_proto::{AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode};
 
 pub struct PiHarness {
+    session_store: Option<PathBuf>,
     executable: Option<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
@@ -30,6 +32,7 @@ impl Default for PiHarness {
     fn default() -> Self {
         Self {
             executable: None,
+            session_store: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
         }
@@ -41,6 +44,10 @@ impl PiHarness {
     }
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        self
+    }
+    pub fn with_session_store(mut self, path: impl Into<PathBuf>) -> Self {
+        self.session_store = Some(path.into());
         self
     }
     pub fn with_graces(mut self, interrupt: Duration, kill: Duration) -> Self {
@@ -208,11 +215,24 @@ impl Harness for PiHarness {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        let process = self.spawn(Path::new(&request.cwd), &[])?;
+        let store = sessions::Store::new(self.session_store.clone());
+        let args = if let Some(id) = &request.resume {
+            vec![
+                "--session".into(),
+                store
+                    .resolve(id, Path::new(&request.cwd))?
+                    .display()
+                    .to_string(),
+            ]
+        } else {
+            vec![]
+        };
+        let process = self.spawn(Path::new(&request.cwd), &args)?;
         let (tx, rx) = mpsc::channel(256);
         let kill_grace = self.kill_grace;
         tokio::spawn(async move {
             let mut runner = Runner {
+                store,
                 process,
                 tx,
                 request,
@@ -259,6 +279,7 @@ enum Pending {
     Barrier(u64),
 }
 struct Runner {
+    store: sessions::Store,
     process: Process,
     tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     request: RunRequest,
@@ -329,6 +350,19 @@ impl Runner {
             return Err(HarnessError::Protocol(
                 "Pi get_state omitted sessionId".into(),
             ));
+        }
+        if self
+            .request
+            .resume
+            .as_ref()
+            .is_some_and(|id| id != &self.session)
+        {
+            return Err(HarnessError::Protocol(
+                "Pi resumed a different session".into(),
+            ));
+        }
+        if let Some(file) = state["sessionFile"].as_str() {
+            self.store.remember(&self.session, Path::new(file))?;
         }
         self.norm.window = state["model"]["contextWindow"].as_u64();
         self.started(state["model"]["id"].as_str().unwrap_or("default").into())

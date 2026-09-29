@@ -47,7 +47,11 @@ async fn collect(prompt: &str) -> Vec<AgentEvent> {
     let dir = tempfile::tempdir().unwrap();
     let (c, tx, _) = controls();
     drop(tx);
-    let stream = harness().run(request(dir.path(), prompt), c).await.unwrap();
+    let stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), prompt), c)
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), stream.map(Result::unwrap).collect())
         .await
         .unwrap()
@@ -90,4 +94,36 @@ async fn terminal_contract_handles_normal_errors_retries_compaction_and_consumed
             assert_eq!(text, "reply:hello");
         }
     }
+}
+
+#[tokio::test]
+async fn resumes_the_same_session_after_process_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = harness().with_session_store(dir.path().join("index"));
+    let mut id = None;
+    for text in ["first", "second"] {
+        let (c, tx, _) = controls();
+        drop(tx);
+        let mut req = request(dir.path(), text);
+        req.resume = id.clone();
+        let events: Vec<_> = tokio::time::timeout(
+            Duration::from_secs(5),
+            h.run(req, c).await.unwrap().collect(),
+        )
+        .await
+        .unwrap();
+        for event in events {
+            if let AgentEvent::Done {
+                session_id, status, ..
+            } = event.unwrap()
+            {
+                assert_eq!(status, DoneStatus::Completed);
+                if id.is_some() {
+                    assert_eq!(id, session_id);
+                }
+                id = session_id;
+            }
+        }
+    }
+    assert!(id.is_some());
 }

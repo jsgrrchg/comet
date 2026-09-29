@@ -1833,10 +1833,10 @@ mod tests {
     use zeron_rpc::methods;
 
     use super::{
-        PANEL_PAD_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action,
-        latest_queued_message, one_line, queue_action_needs_host, queue_drag_offsets,
-        queue_drop_index, queue_latest_shortcut_visible, queue_mutation_acknowledged,
-        queue_visible_text, visible_queue_rows,
+        PANEL_PAD_TOP, PANEL_PAD_X, PANEL_RADIUS, QueuePrimaryAction, ROW_RADIUS, ROW_SLOT,
+        available_queue_primary_action, latest_queued_message, one_line, queue_action_needs_host,
+        queue_drag_offsets, queue_drop_index, queue_latest_shortcut_visible,
+        queue_mutation_acknowledged, queue_visible_text, visible_queue_rows,
     };
 
     #[test]
@@ -2012,6 +2012,20 @@ mod tests {
             super::queue_attachment_labels(&malformed, &paths),
             vec!["shot & detail.png", "reference.png"]
         );
+    }
+
+    /// GPUI clips the rows rectangularly, so a row's own rounded hover wash
+    /// must fit inside the tray's rounded top corners (within its 1px border).
+    #[test]
+    fn row_hover_corners_stay_inside_the_panel_curve() {
+        let border = 1.0_f32;
+        let row_corner_center = (
+            border + PANEL_PAD_X + ROW_RADIUS,
+            border + PANEL_PAD_TOP + ROW_RADIUS,
+        );
+        let reach = (PANEL_RADIUS - row_corner_center.0).hypot(PANEL_RADIUS - row_corner_center.1)
+            + ROW_RADIUS;
+        assert!(reach <= PANEL_RADIUS - border, "row corner reaches {reach}");
     }
 
     /// Filenames are no longer printed in the row, so every attachment folded

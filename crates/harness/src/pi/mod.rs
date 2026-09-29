@@ -1,5 +1,6 @@
 //! Native Pi JSONL RPC driver. See PROTOCOL.md for the legacy ACK barrier.
 mod catalog;
+mod mcp;
 mod normalize;
 mod rpc;
 mod sessions;
@@ -86,7 +87,7 @@ impl PiHarness {
         })
     }
     async fn probe(&self, cwd: &Path, models: bool) -> Result<Value, HarnessError> {
-        let mut process = self.spawn(cwd, &["--no-session".into()])?;
+        let mut process = self.spawn(cwd, &["--no-session".into()], None)?;
         let (mut tx, rx) = tokio::sync::oneshot::channel();
         let grace = self.kill_grace;
         tokio::spawn(async move {
@@ -103,7 +104,12 @@ impl PiHarness {
         rx.await
             .map_err(|_| HarnessError::Protocol("Pi discovery task failed".into()))?
     }
-    fn spawn(&self, cwd: &Path, args: &[String]) -> Result<Process, HarnessError> {
+    fn spawn(
+        &self,
+        cwd: &Path,
+        args: &[String],
+        mcp: Option<&zeron_proto::McpServer>,
+    ) -> Result<Process, HarnessError> {
         let exe = self.resolve_executable()?;
         if self.executable.is_none() {
             if let Some(version) = crate::executable::binary_version(&exe) {
@@ -125,6 +131,9 @@ impl PiHarness {
             .kill_on_drop(true);
         #[cfg(unix)]
         cmd.process_group(0);
+        let scratch = mcp
+            .map(|config| self::mcp::configure(&mut cmd, config))
+            .transpose()?;
         let mut child = cmd.spawn()?;
         let tail = crate::StderrTail::default();
         let mut lines = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
@@ -141,6 +150,7 @@ impl PiHarness {
         );
         Ok(Process {
             child,
+            _scratch: scratch,
             transport,
             tail,
             stderr_task,
@@ -150,6 +160,7 @@ impl PiHarness {
 }
 struct Process {
     child: Child,
+    _scratch: Option<crate::scratch::ScratchDir>,
     transport: rpc::Transport,
     tail: crate::StderrTail,
     stderr_task: tokio::task::JoinHandle<()>,
@@ -297,7 +308,7 @@ impl Harness for PiHarness {
         } else {
             vec![]
         };
-        let process = self.spawn(Path::new(&request.cwd), &args)?;
+        let process = self.spawn(Path::new(&request.cwd), &args, request.mcp.as_ref())?;
         let (tx, rx) = mpsc::channel(256);
         let kill_grace = self.kill_grace;
         let interrupt_grace = self.interrupt_grace;

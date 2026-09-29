@@ -608,6 +608,7 @@ enum MutateParams {
 }
 
 pub struct EngineRpc {
+    native_forks: Option<crate::native_forks::NativeForks>,
     sessions: SessionsEngine,
     doc_host: DocHost,
     workspace: WorkspaceHost,
@@ -650,9 +651,13 @@ impl EngineRpc {
             device_id: doc_host.device_id().to_string(),
             workspace_scope,
             cursor_sdk_version: Some(zeron_harness::CursorHarness::sdk_version().into()),
-            capabilities: zeron_proto::capabilities::current(),
+            capabilities: zeron_proto::capabilities::current()
+                .into_iter()
+                .filter(|c| c != zeron_proto::capabilities::NATIVE_MESSAGE_FORK_V1)
+                .collect(),
         };
         Self {
+            native_forks: None,
             sessions,
             doc_host,
             workspace,
@@ -673,6 +678,14 @@ impl EngineRpc {
             local_import: None,
             engine_info,
         }
+    }
+
+    pub fn with_native_forks(mut self, forks: crate::native_forks::NativeForks) -> Self {
+        self.native_forks = Some(forks);
+        self.engine_info
+            .capabilities
+            .push(zeron_proto::capabilities::NATIVE_MESSAGE_FORK_V1.into());
+        self
     }
 
     pub fn with_previews(mut self, previews: zeron_preview::PreviewService) -> Self {
@@ -1337,6 +1350,8 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::FORK_SIDE_CHAT
+            | methods::FORK_MESSAGE_SIDE_CHAT
+            | methods::GET_NATIVE_FORK_AVAILABILITY
             | methods::LIST_HARNESSES
             | methods::INSTALL_HARNESS
             | methods::CANCEL_INSTALL
@@ -1853,6 +1868,25 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "outcome": outcome }))
+            }
+            methods::GET_NATIVE_FORK_AVAILABILITY => {
+                let forks = self.native_forks.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Update the chat host to fork this message".into())
+                })?;
+                let request = parse_params(params)?;
+                RpcReply::value(
+                    &forks
+                        .availability(request)
+                        .await
+                        .map_err(RpcError::Failed)?,
+                )
+            }
+            methods::FORK_MESSAGE_SIDE_CHAT => {
+                let forks = self.native_forks.as_ref().ok_or_else(|| {
+                    RpcError::Failed("Update the chat host to fork this message".into())
+                })?;
+                let request = parse_params(params)?;
+                RpcReply::value(&forks.create(request).await.map_err(RpcError::Failed)?)
             }
             methods::FORK_SIDE_CHAT => {
                 #[derive(Deserialize)]

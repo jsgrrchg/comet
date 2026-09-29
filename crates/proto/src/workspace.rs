@@ -25,6 +25,7 @@ pub mod capabilities {
         MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         HARNESS_UPDATES_V1,
+        NATIVE_MESSAGE_FORK_V1,
     ];
 
     pub fn current() -> Vec<String> {
@@ -104,7 +105,8 @@ mod tests {
                     "message-queue-attachments-v1",
                     "message-queue-clean-attachment-text-v1",
                     "message-queue-edit-lease-v1",
-                    "harness-updates-v1"
+                    "harness-updates-v1",
+                    "native-message-fork-v1"
                 ],
             })
         );

@@ -80,7 +80,8 @@ const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
 const ROW_PAD_X: f32 = 8.0;
 const ROW_RADIUS: f32 = 8.0;
 const PANEL_RADIUS: f32 = 16.0;
-const PANEL_PAD_TOP: f32 = 0.0;
+const PANEL_PAD_X: f32 = 4.0;
+const PANEL_PAD_TOP: f32 = 4.0;
 /// The custom 24px queue glyphs have quieter geometry than the legacy set, so
 /// render them slightly larger to preserve the previous optical weight.
 const QUEUE_ICON_SIZE: f32 = 13.0;
@@ -231,8 +232,10 @@ fn queue_panel_surface(theme: &Theme) -> gpui::Div {
         .border_1()
         .border_color(theme.border)
         .when(!theme.is_frost(), |el| el.shadow_lg())
-        // Keep visible rows flush with the tray; only the portion tucked behind
-        // the composer needs padding.
+        // GPUI clips children to rectangles, so inset the rows to keep their
+        // hover and editing backgrounds inside the tray's rounded corners.
+        .px(px(PANEL_PAD_X))
+        .pt(px(PANEL_PAD_TOP))
         .pb(px(QUEUE_COMPOSER_OVERLAP))
         .flex()
         .flex_col()
@@ -508,7 +511,7 @@ impl Composer {
             .id(SharedString::from(format!("{key}-row")))
             .h(px(ROW_HEIGHT))
             .flex_none()
-            .px(px(ROW_PAD_X))
+            .px(px(ROW_PAD_X - PANEL_PAD_X))
             .flex()
             .flex_row()
             .items_center()

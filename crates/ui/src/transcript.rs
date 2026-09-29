@@ -6661,7 +6661,7 @@ impl Transcript {
         // entry's last row. Timestamp, copy action, and copied feedback only
         // flip visibility/content, so none of them shifts the virtualizer.
         // User entries align end (under the bubble), assistant entries start.
-        // Both read timestamp first, then the copy action.
+        // Timestamp first, followed by the compact fork/copy action group.
         let is_user_row = matches!(row.kind, RowKind::User { .. });
         let hovered = self
             .hovered_entry
@@ -6729,7 +6729,13 @@ impl Transcript {
                 .flex_row()
                 .items_center()
                 .gap(px(Theme::SPACE_SM));
-            let metadata = metadata.child(timestamp).children(fork).children(copy);
+            let actions = div()
+                .flex()
+                .items_center()
+                .gap(px(Theme::SPACE_XS))
+                .children(fork)
+                .children(copy);
+            let metadata = metadata.child(timestamp).child(actions);
             div()
                 .h(px(Theme::SPACE_SM + Theme::SPACE_MD * 2.0))
                 .pt(px(Theme::SPACE_SM))
@@ -7901,9 +7907,22 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A quiet fork seam. The source gets its own constrained line so long
+fn fork_marker_labels(source_title: SharedString) -> (&'static str, Option<SharedString>) {
+    // Older native forks persisted an internal reply ID as their display title.
+    // Keep those existing markers consistent with newly created native forks.
+    if source_title.as_ref() == "Conversation"
+        || source_title.starts_with("Conversation through reply ")
+    {
+        ("Forked from conversation", None)
+    } else {
+        ("Forked from", Some(source_title))
+    }
+}
+
+/// A quiet fork seam. Named sources get a constrained second line so long
 /// titles cannot widen a narrow side-chat pane. No message metadata lane.
 fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
+    let (label, source_title) = fork_marker_labels(source_title);
     let rule = || div().flex_1().min_w_0().h(px(1.0)).bg(theme.border_strong);
     div()
         .py(px(14.0))
@@ -7926,21 +7945,23 @@ fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
                         .flex_none()
                         .text_size(crate::typography::ui_rems(12.0))
                         .text_color(theme.text_muted.opacity(0.7))
-                        .child("Forked from"),
+                        .child(label),
                 )
                 .child(rule()),
         )
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .truncate()
-                .text_center()
-                .text_size(crate::typography::ui_rems(13.0))
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(theme.text_muted)
-                .child(source_title),
-        )
+        .when_some(source_title, |marker, source_title| {
+            marker.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .truncate()
+                    .text_center()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(source_title),
+            )
+        })
         .into_any_element()
 }
 
@@ -14105,6 +14126,23 @@ mod tests {
             events.borrow().len(),
             2,
             "Unavailable actions must not emit requests"
+        );
+    }
+
+    #[test]
+    fn native_fork_marker_uses_conversation_label_for_new_and_existing_forks() {
+        for source in [
+            "Conversation",
+            "Conversation through reply a622f54d-cfe1-4be1-9557-dc1df3838239",
+        ] {
+            assert_eq!(
+                fork_marker_labels(source.into()),
+                ("Forked from conversation", None)
+            );
+        }
+        assert_eq!(
+            fork_marker_labels("Main conversation".into()),
+            ("Forked from", Some("Main conversation".into()))
         );
     }
 

@@ -199,6 +199,14 @@ async fn native_fork_rpc_freezes_exact_prefix_dedupes_and_preserves_canonical_li
         entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
         ["u1", "a1", "fork:child"]
     );
+    assert_eq!(
+        entries[2].parts,
+        vec![MessagePart::Fork {
+            id: "fork:child".into(),
+            source_chat_id: "main".into(),
+            source_title: "Conversation".into(),
+        }]
+    );
     assert!(harness.requests.lock().unwrap().is_empty());
     assert_eq!(
         harness.sessions.lock().unwrap()[child.harness_session_id.as_ref().unwrap()],

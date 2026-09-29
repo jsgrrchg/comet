@@ -487,10 +487,7 @@ impl NativeForks {
                     parts: vec![MessagePart::Fork {
                         id: marker,
                         source_chat_id: op.request.source_chat_id.clone(),
-                        source_title: format!(
-                            "Conversation through reply {}",
-                            op.request.source_message_id
-                        ),
+                        source_title: "Conversation".into(),
                     }],
                     created_at: chrono::Utc::now().timestamp_millis(),
                     device_id: self.0.docs.device_id().into(),

@@ -27,6 +27,123 @@ pub enum HarnessId {
     Mock,
 }
 
+/// Durable user preference for one agent's independently-installed CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessUpdatePolicy {
+    /// Check and surface an update, but never mutate the installation without
+    /// an explicit action.
+    #[default]
+    Notify,
+    /// Apply a discovered update after the harness execution gate becomes idle.
+    AutoWhenIdle,
+    /// Do not probe or update this harness.
+    Off,
+}
+
+/// Best-effort classification of the installation that owns an agent CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessInstallSource {
+    Npm,
+    Homebrew,
+    Cargo,
+    Vendor,
+    ManagedByZeron,
+    #[default]
+    Unknown,
+}
+
+/// The externally visible harness-update state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessUpdatePhase {
+    Dormant,
+    Checking,
+    Current,
+    Available,
+    WaitingForIdle,
+    Preparing,
+    Downloading,
+    Installing,
+    Verifying,
+    Updated,
+    ManualActionRequired,
+    Failed,
+}
+
+/// Real provider progress only. An absent value means the UI must render an
+/// indeterminate activity indicator rather than inventing a percentage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessUpdateProgress {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessUpdateFailure {
+    pub message: String,
+    #[serde(default)]
+    pub retryable: bool,
+}
+
+/// One row in the device-local harness-update stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessUpdateStatus {
+    pub harness: HarnessId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel: Option<String>,
+    #[serde(default)]
+    pub source: HarnessInstallSource,
+    #[serde(default)]
+    pub policy: HarnessUpdatePolicy,
+    pub phase: HarnessUpdatePhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<HarnessUpdateProgress>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<HarnessUpdateFailure>,
+    /// Whether this device can safely apply the update without guessing which
+    /// package manager owns the installation. Older engines omit this field,
+    /// so clients must default to the conservative read-only behavior.
+    #[serde(default)]
+    pub can_apply: bool,
+    /// Provider command shown when mutation cannot be safely automated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_command: Option<String>,
+}
+
+impl HarnessUpdateStatus {
+    /// Home notices describe discovered releases or an update in progress.
+    /// Manual checks remain available in Settings without implying that a
+    /// newer release exists.
+    pub fn show_update_notice(&self) -> bool {
+        matches!(
+            self.phase,
+            HarnessUpdatePhase::Available
+                | HarnessUpdatePhase::WaitingForIdle
+                | HarnessUpdatePhase::Preparing
+                | HarnessUpdatePhase::Downloading
+                | HarnessUpdatePhase::Installing
+                | HarnessUpdatePhase::Verifying
+                | HarnessUpdatePhase::Updated
+                | HarnessUpdatePhase::Failed
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningLevel {
@@ -126,6 +243,29 @@ pub struct RunRequest {
     /// host ignores it and runs in `cwd` (the repo's main checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeSpec>,
+    /// Zeron's own MCP server, injected by the HOST engine as it starts the
+    /// run: the `zeron mcp` subcommand of this same binary, pointed at the
+    /// engine's loopback IPC and stamped with the originating chat so the
+    /// agent can spawn, read, and message side chats. Additive +
+    /// serde-defaulted — an old host leaves it unset and the agent simply has
+    /// no Zeron tools; title runs never carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpServer>,
+}
+
+/// A stdio MCP server the harness should add to the agent's session, on top
+/// of whatever the user configured. Each driver spells it in its own dialect
+/// (Claude `--mcp-config`, ACP `session/new` `mcpServers`, Codex
+/// `mcp_servers.*` config overrides).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServer {
+    pub name: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
@@ -577,6 +717,61 @@ mod tests {
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
             "\"claude-code\""
         );
+    }
+
+    #[test]
+    fn harness_update_status_uses_stable_wire_names() {
+        let status = HarnessUpdateStatus {
+            harness: HarnessId::ClaudeCode,
+            installed_version: Some("1.0.0".into()),
+            latest_version: Some("1.1.0".into()),
+            channel: Some("stable".into()),
+            source: HarnessInstallSource::Npm,
+            policy: HarnessUpdatePolicy::AutoWhenIdle,
+            phase: HarnessUpdatePhase::WaitingForIdle,
+            progress: None,
+            checked_at: Some(42),
+            error: None,
+            can_apply: true,
+            manual_command: Some("claude update".into()),
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["harness"], "claude-code");
+        assert_eq!(json["installedVersion"], "1.0.0");
+        assert_eq!(json["policy"], "auto-when-idle");
+        assert_eq!(json["phase"], "waiting-for-idle");
+        assert_eq!(json["canApply"], true);
+        assert_eq!(
+            serde_json::from_value::<HarnessUpdateStatus>(json.clone()).unwrap(),
+            status
+        );
+        let mut legacy = json;
+        legacy.as_object_mut().unwrap().remove("canApply");
+        assert!(
+            !serde_json::from_value::<HarnessUpdateStatus>(legacy)
+                .unwrap()
+                .can_apply
+        );
+    }
+
+    #[test]
+    fn manual_checks_do_not_claim_an_available_update() {
+        let mut status: HarnessUpdateStatus = serde_json::from_value(serde_json::json!({
+            "harness": "cursor",
+            "phase": "manual-action-required",
+            "canApply": true,
+        }))
+        .unwrap();
+        assert!(!status.show_update_notice());
+        status.phase = HarnessUpdatePhase::Available;
+        status.latest_version = Some("2.0.0".into());
+        status.can_apply = false;
+        assert!(
+            status.show_update_notice(),
+            "known manual releases still need attention"
+        );
+        status.phase = HarnessUpdatePhase::Installing;
+        assert!(status.show_update_notice());
     }
 }
 

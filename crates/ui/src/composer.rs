@@ -68,7 +68,8 @@ pub const COMPOSER_MAX_HEIGHT: f32 = TEXTAREA_MAX + ACTIONS_ROW_HEIGHT + PILL_BO
 /// (scrollHeight rounds to 47 in the original) + the 2px hairline = 49. The
 /// compact cluster (`py-1.5` + h-8 = 44) is shorter, so the textarea wins.
 pub const COMPACT_TOTAL_HEIGHT: f32 = 49.0;
-/// `max-w-3xl`: stable outer width of the centered composer column.
+/// `max-w-3xl`: outer width of the new-chat composer, also used when no shell
+/// width is supplied. Established threads follow the conversation column.
 pub const COMPOSER_MAX_WIDTH: f32 = 768.0;
 /// The queue reads as a narrower tray emerging from behind the composer.
 const QUEUE_SIDE_INSET: f32 = 16.0;
@@ -80,7 +81,7 @@ pub(crate) const QUEUE_COMPOSER_OVERLAP: f32 = 18.0;
 const NEW_THREAD_SELECTOR_ROW_HEIGHT: f32 = 20.0;
 // Accommodate the 24px usage indicator and PR badge without overflowing the
 // row's equal 8px top/bottom gutters.
-const SESSION_FOOTER_HEIGHT: f32 = 24.0;
+pub(crate) const SESSION_FOOTER_HEIGHT: f32 = 24.0;
 
 /// Route chrome dissolves around the middle of the shared-element move. The
 /// two ramps never overlap, which avoids duplicate picker ids/popovers while
@@ -5365,6 +5366,7 @@ pub struct Composer {
     model_handoff_morph: Option<FlipMorph>,
     model_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     dock_frame: Option<crate::composer_dock::DockFrame>,
+    dock_reflow: crate::composer_dock::DockReflow,
     /// The shared clock owns this frame's height, including its final step.
     dock_height_changed: bool,
     dock_clearance_correction: f32,
@@ -5378,6 +5380,11 @@ pub struct Composer {
     route_snap_until: Option<Instant>,
     _observe: Subscription,
     _pickers_observe: Subscription,
+    /// The footer's rings: plan usage of the session harness's live
+    /// account, and context occupancy — each opening a popover.
+    account_usage: Entity<crate::account_usage::AccountUsage>,
+    /// A side chat's composer: its footer keeps only the context ring.
+    side_chat: bool,
     _picker_focus: Subscription,
     _input_events: Subscription,
 }
@@ -5417,10 +5424,11 @@ impl Composer {
         &self.pickers
     }
 
-    /// Feed the stable conversation-column width into responsive composer
-    /// controls.
+    /// Feed the shell's current outer width into responsive composer controls.
+    /// During a route transition this is the interpolated width, including
+    /// when returning from a wider conversation to the new-chat composer.
     pub fn set_available_width(&mut self, width: f32, cx: &mut Context<Self>) {
-        let composer_width = width.clamp(0.0, COMPOSER_MAX_WIDTH);
+        let composer_width = width.max(0.0);
         if composer_width_changed(self.last_available_width, composer_width) {
             self.last_available_width = Some(composer_width);
             // The shell renders before this child, so this queues one more
@@ -5448,6 +5456,7 @@ impl Composer {
             input
         });
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
+        let account_usage = cx.new(|cx| crate::account_usage::AccountUsage::new(state.clone(), cx));
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
@@ -5577,6 +5586,7 @@ impl Composer {
             model_handoff_morph: None,
             model_bounds: Default::default(),
             dock_frame: None,
+            dock_reflow: Default::default(),
             dock_height_changed: false,
             dock_clearance_correction: 0.0,
             surface_bounds: Default::default(),
@@ -5586,6 +5596,8 @@ impl Composer {
             route_snap_until: None,
             _observe: observe,
             _pickers_observe: pickers_observe,
+            account_usage,
+            side_chat: false,
             _picker_focus: picker_focus,
             _input_events: input_events,
         };
@@ -5740,6 +5752,33 @@ impl Composer {
     }
 
     pub fn show_appshot_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.show_error(message, cx);
+    }
+
+    /// Mark this as a side chat's composer: below the input it shows only
+    /// the context ring (no checkout/ref footer, no plan usage).
+    pub(crate) fn set_side_chat(&mut self, cx: &mut Context<Self>) {
+        self.side_chat = true;
+        cx.notify();
+    }
+
+    /// Whether the draft holds anything a close would lose: text, staged
+    /// attachments or appshots, or staged review comments.
+    pub(crate) fn has_draft(&self, cx: &App) -> bool {
+        composer_has_content(
+            self.input.read(cx).text(),
+            self.staged().len() + self.staged_appshots().len(),
+            self.staged_comments(cx).len(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failure(&self) -> Option<&SharedString> {
+        self.failure.as_ref()
+    }
+
+    /// Show a dismissable failure chip for the current draft's session.
+    pub(crate) fn show_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.failure = Some(message.into());
         self.failure_key = Some(self.current_key.clone());
         cx.notify();
@@ -6267,62 +6306,57 @@ impl Composer {
         self.sync_mention_controls(cx);
     }
 
-    fn file_search_params(&self, query: &str, cx: &App) -> Option<serde_json::Value> {
-        let selected_worktree = match self.pickers.read(cx).checkout_plan() {
-            crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
-            _ => None,
-        };
-        let (params, target) = {
-            let state = self.state.read(cx);
-            let mut params = serde_json::Map::new();
-            params.insert("query".into(), query.into());
-            let target = if let Some(chat) = state.selected_chat_row() {
-                params.insert("chatId".into(), chat.id.clone().into());
-                params.insert("cwd".into(), chat.cwd.clone().into());
-                Some(chat.device_id.clone())
-            } else if let Some(space) = state.selected_space_row() {
-                params.insert("spaceId".into(), space.id.clone().into());
-                params.insert("cwd".into(), space.path.clone().into());
-                if let Some(path) = selected_worktree {
-                    params.insert("path".into(), path.into());
-                }
-                Some(space.device_id.clone())
-            } else {
-                None
-            };
-            if let Some(target) = &target {
-                params.insert("targetDeviceId".into(), target.clone().into());
+    /// File mentions and provider catalogs share a workspace target. A new
+    /// side chat inherits its parent's checkout but has no persisted row until
+    /// its first send, so discovery must address the parent in the meantime.
+    fn completion_workspace_params(&self, cx: &App) -> Option<serde_json::Value> {
+        let state = self.state.read(cx);
+        if let Some(chat) = state.selected_chat_row() {
+            let chat_id = chat
+                .parent_chat_id
+                .as_deref()
+                .filter(|_| state.side_chat_unsaved())
+                .unwrap_or(&chat.id);
+            Some(serde_json::json!({
+                "chatId": chat_id,
+                "targetDeviceId": chat.device_id,
+                // Include the inherited cwd in the cache identity, too.
+                "cwd": chat.cwd,
+            }))
+        } else if let Some(space) = state.selected_space_row() {
+            let mut params = serde_json::json!({
+                "spaceId": space.id,
+                "targetDeviceId": space.device_id,
+                "cwd": space.path,
+            });
+            if let crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } =
+                self.pickers.read(cx).checkout_plan()
+            {
+                params["path"] = path.into();
             }
-            (serde_json::Value::Object(params), target)
-        };
-        target.map(|_| params)
+            Some(params)
+        } else {
+            None
+        }
+    }
+
+    fn file_search_params(&self, query: &str, cx: &App) -> Option<serde_json::Value> {
+        let mut params = self.completion_workspace_params(cx)?;
+        params["query"] = query.into();
+        Some(params)
     }
 
     fn catalog_params(&self, cx: &App) -> serde_json::Value {
-        let harness = self.pickers.read(cx).resolved(cx).harness;
-        let selected_worktree = match self.pickers.read(cx).checkout_plan() {
-            crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
-            _ => None,
-        };
-        let mut params = serde_json::json!({ "harness": harness });
-        {
-            let state = self.state.read(cx);
-            if let Some(chat) = state.selected_chat_row() {
-                params["chatId"] = chat.id.clone().into();
-                params["targetDeviceId"] = chat.device_id.clone().into();
-                // Include the resolved cwd in the cache identity, too.
-                params["cwd"] = chat.cwd.clone().into();
-            } else if let Some(space) = state.selected_space_row() {
-                params["spaceId"] = space.id.clone().into();
-                params["targetDeviceId"] = space.device_id.clone().into();
-                params["cwd"] = space.path.clone().into();
-                if let Some(path) = selected_worktree {
-                    params["path"] = path.into();
-                }
-            } else if let Some(device) = state.effective_device_id() {
+        let mut params = self.completion_workspace_params(cx).unwrap_or_else(|| {
+            let mut params = serde_json::json!({});
+            if let Some(device) = self.state.read(cx).effective_device_id() {
                 params["targetDeviceId"] = device.into();
             }
-        }
+            params
+        });
+        // The workspace can come from the parent; the agent always comes from
+        // this composer's selection, including changes before the first send.
+        params["harness"] = serde_json::json!(self.pickers.read(cx).resolved(cx).harness);
         params
     }
 
@@ -7259,6 +7293,11 @@ impl Composer {
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
+            if !key.is_empty() && !self.current_key.is_empty() {
+                // Switching between established chats still snaps to the new
+                // draft; a tail from a hero transition belongs to its old chat.
+                self.dock_reflow = Default::default();
+            }
             let new_thread_launch =
                 self.launching_new_chat && self.current_key.is_empty() && !key.is_empty();
             let returning_to_new_thread = !self.current_key.is_empty() && key.is_empty();
@@ -7575,6 +7614,19 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
+        let create_side_chat = self.state.update(cx, |state, _| {
+            if state.side_chat_unsaved()
+                && let Some(mut config) = resolved.chat_config()
+            {
+                // Freeze the same resolved provider settings in createChat and
+                // Run, including defaults learned since the harness was picked.
+                if let Some(existing) = state.selected_chat_row().and_then(|c| c.config.as_ref()) {
+                    config.sandbox = existing.sandbox;
+                }
+                state.apply_chat_config(&chat_id, config);
+            }
+            state.unsaved_side_chat_create(&chat_id)
+        });
         if queue && !is_new {
             let capability = if self.staged().is_empty() && self.staged_appshots().is_empty() {
                 capabilities::MESSAGE_QUEUE_V1
@@ -8043,6 +8095,30 @@ impl Composer {
                         tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
                     }
                 }
+                // A hand-started side chat is minted by its first send. Unlike
+                // a fresh session this one must land: the doc host would
+                // materialize it without its parent link.
+                if let Some(create) = create_side_chat {
+                    if let Err(err) = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::MUTATE,
+                        create,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %err, "side chat createChat failed");
+                        return Err("Couldn't create the side chat.".to_string());
+                    }
+                    let saved = chat_id.clone();
+                    this.update(cx, |composer, cx| {
+                        composer
+                            .state
+                            .update(cx, |s, cx| s.side_chat_saved(&saved, cx));
+                    })
+                    .ok();
+                }
 
                 if queue {
                     // A queue row is editable UI state, so its text must stay
@@ -8083,6 +8159,7 @@ impl Composer {
                     .is_some();
                 let command = SessionCommandPayload::Run {
                     request: RunRequest {
+                        mcp: None,
                         prompt: content.clone(),
                         harness: resolved.harness,
                         model: resolved.model.clone(),
@@ -8879,19 +8956,21 @@ impl Render for Composer {
             .route_snap_until
             .is_some_and(|until| Instant::now() < until);
         let dock_height_changed = std::mem::take(&mut self.dock_height_changed);
-        self.flip_morph =
-            if dock_height_changed || self.dock_frame.is_some_and(|frame| frame.active) {
-                None
-            } else {
-                flip_morph_step(
-                    self.flip_morph,
-                    committed_flip && !new_chat,
-                    self.last_rendered_height,
-                    now_ms,
-                    motion::reduced_motion(cx),
-                    route_snap,
-                )
-            };
+        self.flip_morph = if dock_height_changed
+            || self.dock_frame.is_some_and(|frame| frame.active)
+            || self.dock_reflow.active()
+        {
+            None
+        } else {
+            flip_morph_step(
+                self.flip_morph,
+                committed_flip && !new_chat,
+                self.last_rendered_height,
+                now_ms,
+                motion::reduced_motion(cx),
+                route_snap,
+            )
+        };
         let expanded = self.expanded_mode;
 
         // Chat-scoped failures render only under their own chat; a global
@@ -8931,10 +9010,11 @@ impl Render for Composer {
                 (text, offline)
             })
         };
-        // Centered composer column (zeron `mx-auto w-full max-w-3xl`).
+        // The shell owns the width and its route animation. A route-dependent
+        // cap here would cut a wide composer before its return glide finishes.
         let container = div()
             .w_full()
-            .max_w(px(COMPOSER_MAX_WIDTH))
+            .max_w(px(self.last_available_width.unwrap_or(COMPOSER_MAX_WIDTH)))
             .mx_auto()
             .flex()
             .flex_col()
@@ -9042,16 +9122,17 @@ impl Render for Composer {
         let session_expanded = expanded;
         let expanded = expanded || new_chat;
         let dock_amount = self.dock_frame.map_or(0.0, |frame| frame.amount);
-        let dock_height = |amount: f32| {
-            let hero = composer_total_height(content_height);
-            let session = if session_expanded {
+        let mut dock_layout = crate::composer_dock::DockLayout {
+            hero_height: composer_total_height(content_height),
+            thread_height: if session_expanded {
                 (content_height + TEXTAREA_PAD_V).clamp(TEXTAREA_MIN - 16.0, TEXTAREA_MAX)
                     + ACTIONS_ROW_HEIGHT
                     + PILL_BORDER_V
             } else {
                 COMPACT_TOTAL_HEIGHT
-            };
-            motion::lerp(hero, session, amount)
+            },
+            extra_height: 0.0,
+            compact: !session_expanded,
         };
 
         // Committed-height morph: the layout below is already the NEW mode's;
@@ -9069,7 +9150,7 @@ impl Render for Composer {
         let strip_h = attachment_strip_height(staged_count, strip_width_hint);
         let comment_strip_h = comment_strip_height(self.staged_comments(cx).len());
         let base_height = if self.dock_frame.is_some() {
-            dock_height(dock_amount)
+            dock_layout.height(dock_amount)
         } else if expanded {
             composer_total_height(content_height)
         } else {
@@ -9077,6 +9158,15 @@ impl Render for Composer {
         };
         let target_height =
             base_height + strip_h + appshot_strip_height(appshot_count) + comment_strip_h;
+        dock_layout.extra_height = strip_h + appshot_strip_height(appshot_count) + comment_strip_h;
+        let dock_owns_layout = self.dock_frame.is_some_and(|frame| frame.active)
+            || dock_height_changed
+            || self.dock_reflow.active();
+        let (reflow_height, dock_compact_amount) =
+            self.dock_frame.map_or((0.0, dock_amount), |frame| {
+                self.dock_reflow
+                    .sample(dock_layout, frame, motion::reduced_motion(cx), now)
+            });
         let coordinated_route_morph = self
             .flip_morph
             .filter(|m| m.spec == motion::NEW_THREAD_TRANSITION && !m.done(now_ms));
@@ -9100,26 +9190,26 @@ impl Render for Composer {
             || route_chrome_opacities(new_thread_chrome),
             |frame| (frame.selectors(), frame.footer()),
         );
-        self.height_morph =
-            if dock_height_changed || self.dock_frame.is_some_and(|frame| frame.active) {
-                None
-            } else if coordinated_route_morph.is_some() {
-                coordinated_route_morph
-            } else {
-                flip_morph_step(
-                    self.height_morph,
-                    (target_height - self.last_target_height).abs() > 0.5,
-                    self.last_rendered_height,
-                    now_ms,
-                    motion::reduced_motion(cx),
-                    route_snap,
-                )
-            };
+        self.height_morph = if dock_owns_layout {
+            None
+        } else if coordinated_route_morph.is_some() {
+            coordinated_route_morph
+        } else {
+            flip_morph_step(
+                self.height_morph,
+                (target_height - self.last_target_height).abs() > 0.5,
+                self.last_rendered_height,
+                now_ms,
+                motion::reduced_motion(cx),
+                route_snap,
+            )
+        };
         self.last_target_height = target_height;
         let pill_height = self
             .height_morph
-            .map_or(target_height, |m| m.height(target_height, now_ms));
-        if self.height_morph.is_some() {
+            .map_or(target_height, |m| m.height(target_height, now_ms))
+            + reflow_height;
+        if self.height_morph.is_some() || self.dock_reflow.active() {
             window.request_animation_frame();
         }
         let (_, morph_t, morphing) = match self.flip_morph {
@@ -9136,24 +9226,19 @@ impl Render for Composer {
         }
         self.last_rendered_height = pill_height;
         self.dock_clearance_correction = self.dock_frame.map_or(0.0, |frame| {
-            dock_height(if frame.docked { 1.0 } else { 0.0 })
-                + strip_h
-                + appshot_strip_height(appshot_count)
-                + comment_strip_h
-                - pill_height
+            dock_layout.height(if frame.docked { 1.0 } else { 0.0 }) - pill_height
         });
         // Route morphs use the dock's reversible clock; typing flips keep
         // their existing local clock once the composer reaches its dock.
-        let layout_morph_t =
-            if self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded {
-                if expanded {
-                    1.0 - dock_amount
-                } else {
-                    dock_amount
-                }
+        let layout_morph_t = if dock_owns_layout {
+            if expanded {
+                1.0 - dock_compact_amount
             } else {
-                morph_t
-            };
+                dock_compact_amount
+            }
+        } else {
+            morph_t
+        };
         let text_pt = morph_text_pad(layout_morph_t);
         let surface_radius = COMPOSER_RADIUS - 4.0 * dock_amount;
         let route_to_single_line =
@@ -9186,7 +9271,7 @@ impl Render for Composer {
             } else {
                 INPUT_LINE_HEIGHT
             };
-            let resizing = self.height_morph.is_some();
+            let resizing = self.height_morph.is_some() || self.dock_reflow.active();
             let top_padding = if expanded { text_pt } else { 0.0 };
             if input.viewport_height != Some(height)
                 || input.settled_viewport_height != Some(settled_height)
@@ -9237,16 +9322,7 @@ impl Render for Composer {
         let appshot_strip = self.render_appshot_strip(&theme, window, cx);
         let comments_chip = self.render_comments_chip(&theme, cx);
 
-        // A translucent cool silver/slate edge sits more naturally on frost
-        // than the general-purpose white/black separator color.
-        let pill_border = if theme.is_frost() {
-            match theme.appearance {
-                crate::theme::Appearance::Dark => gpui::hsla(210.0 / 360.0, 0.18, 0.78, 0.09),
-                crate::theme::Appearance::Light => gpui::hsla(210.0 / 360.0, 0.18, 0.32, 0.10),
-            }
-        } else {
-            theme.border
-        };
+        let pill_border = theme.composer_surface_border();
         // Compensate for the transcript canvas beneath the frosted surface.
         // Keep the opaque fallback when frost is disabled or unsupported.
         let pill = div()
@@ -9263,10 +9339,8 @@ impl Render for Composer {
             .rounded(px(surface_radius))
             .border_1()
             .border_color(pill_border)
-            .when(theme.is_frost(), |el| el.bg(theme.composer_sidebar_tint()))
-            .when(!theme.is_frost(), |el| {
-                el.bg(theme.input_glass_bg()).shadow_lg()
-            });
+            .bg(theme.composer_surface_bg())
+            .when(!theme.is_frost(), |el| el.shadow_lg());
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
@@ -9281,24 +9355,30 @@ impl Render for Composer {
             self.model_handoff_morph = self.flip_morph;
         }
         let compact_target = if expanded { 0.0 } else { 1.0 };
-        self.model_handoff_position =
-            if self.dock_frame.is_some_and(|frame| frame.active) && !session_expanded {
-                dock_amount
-            } else {
-                self.flip_morph.map_or(compact_target, |morph| {
-                    motion::lerp(
-                        self.model_handoff_from,
-                        compact_target,
-                        motion::EASE_IN_OUT.eval(morph.raw(now_ms)),
-                    )
-                })
-            };
-        let surface_width = self
-            .surface_bounds
-            .get()
-            .map_or(strip_width_hint + PILL_BORDER_V, |bounds| {
-                f32::from(bounds.size.width)
-            });
+        self.model_handoff_position = if dock_owns_layout {
+            dock_compact_amount
+        } else {
+            self.flip_morph.map_or(compact_target, |morph| {
+                motion::lerp(
+                    self.model_handoff_from,
+                    compact_target,
+                    motion::EASE_IN_OUT.eval(morph.raw(now_ms)),
+                )
+            })
+        };
+        // The shell supplies this frame's animated width before rendering us.
+        // Measured bounds still belong to the previous frame here; using them
+        // would add the per-frame width delta to the model selector's glide.
+        let surface_width = self.last_available_width.map_or_else(
+            || {
+                self.surface_bounds
+                    .get()
+                    .map_or(strip_width_hint + PILL_BORDER_V, |bounds| {
+                        f32::from(bounds.size.width)
+                    })
+            },
+            |width| (width - 2.0 * Theme::SPACE_LG).max(0.0),
+        );
         let model_travel = (surface_width
             - PILL_BORDER_V
             - action_inset
@@ -9395,8 +9475,8 @@ impl Render for Composer {
             // its expanded resting place via a decaying relative offset, and
             // attachment/Send hold their spots (the centering delta gliding
             // in), with the model handoff sharing that same timeline.
-            let text_glide = if self.dock_frame.is_some_and(|frame| frame.active) {
-                collapse_text_glide(dock_height(0.0), dock_amount)
+            let text_glide = if dock_owns_layout {
+                collapse_text_glide(dock_layout.hero_height, dock_compact_amount)
             } else {
                 match self.flip_morph {
                     Some(m) if morphing => collapse_text_glide(m.from, morph_t),
@@ -9543,11 +9623,24 @@ impl Render for Composer {
             session_chrome
         };
         let container = if bottom_slot > 0.0 {
-            let footer = (session_chrome_opacity > 0.0).then(|| {
+            let footer = (session_chrome_opacity > 0.0 && !self.side_chat).then(|| {
                 self.pickers
                     .update(cx, |pickers, cx| pickers.render_footer(cx))
             });
-            let usage = self.state.read(cx).context_usage;
+            if session_chrome_opacity > 0.0 {
+                let harness = (!self.side_chat)
+                    .then(|| self.pickers.read(cx).resolved(cx).harness)
+                    .flatten();
+                let target = {
+                    let state = self.state.read(cx);
+                    state
+                        .selected_chat_row()
+                        .map(|chat| chat.device_id.clone())
+                        .filter(|device| state.local_device_id.as_ref() != Some(device))
+                };
+                self.account_usage
+                    .update(cx, |usage, cx| usage.track(harness, target, cx));
+            }
             container.child(
                 div()
                     .w_full()
@@ -9578,15 +9671,16 @@ impl Render for Composer {
                                 .items_center()
                                 .opacity(session_chrome_opacity)
                                 .child(div().flex_1().min_w_0().children(footer.flatten()))
-                                .children(crate::context_usage::has_window(usage).then(|| {
-                                    div().flex_none().pr(px(10.0)).child(
-                                        crate::context_usage::render(
-                                            usage,
-                                            self.state.clone(),
-                                            &theme,
-                                        ),
-                                    )
-                                })),
+                                .child(
+                                    // The footer row's own 4px gap: the PR badge
+                                    // ends flush with the row, so the rings keep
+                                    // their distance here.
+                                    div()
+                                        .flex_none()
+                                        .pl(px(4.0))
+                                        .pr(px(10.0))
+                                        .child(self.account_usage.clone()),
+                                ),
                         )
                     }),
             )
@@ -9673,36 +9767,46 @@ mod tests {
         let input = handle
             .read_with(cx, |composer, _| composer.input.clone())
             .unwrap();
-        for docked in [true, false] {
-            let amounts = if docked {
-                [0.0, 0.2, 0.6, 0.98, 1.0]
-            } else {
-                [1.0, 0.98, 0.6, 0.2, 0.0]
-            };
-            for amount in amounts {
-                handle
-                    .update(cx, |composer, _, cx| {
-                        composer.state.update(cx, |state, _| {
-                            state.selected_chat = docked.then(|| "chat".into());
-                        });
-                        composer.on_state_changed(cx);
-                        composer
-                            .input
-                            .update(cx, |input, cx| input.set_text("Hi", cx));
-                        composer.expanded_mode = false;
-                        let mut frame = crate::composer_dock::DockFrame::settled(docked);
-                        frame.amount = amount;
-                        frame.active = amount != if docked { 1.0 } else { 0.0 };
-                        composer.set_dock_frame(frame, cx);
+        for thread_width in [436.0, 592.0, 768.0, 1232.0] {
+            for docked in [true, false] {
+                let amounts = if docked {
+                    [0.0, 0.2, 0.6, 0.98, 1.0]
+                } else {
+                    [1.0, 0.98, 0.6, 0.2, 0.0]
+                };
+                for amount in amounts {
+                    let outer_width = motion::lerp(COMPOSER_MAX_WIDTH, thread_width, amount);
+                    cx.update(|cx| {
+                    handle
+                        .update(cx, |composer, window, cx| {
+                            window.resize(size(px(outer_width), px(800.0)));
+                            composer.set_available_width(outer_width, cx);
+                            composer.state.update(cx, |state, _| {
+                                state.selected_chat = docked.then(|| "chat".into());
+                            });
+                            composer.on_state_changed(cx);
+                            composer
+                                .input
+                                .update(cx, |input, cx| input.set_text("Hi", cx));
+                            composer.expanded_mode = false;
+                            let mut frame = crate::composer_dock::DockFrame::settled(docked);
+                            frame.amount = amount;
+                            frame.active = amount != if docked { 1.0 } else { 0.0 };
+                            composer.set_dock_frame(frame, cx);
+                        })
+                        .unwrap();
+                    cx.update_window(handle.into(), |_, window, cx| {
+                        window.refresh();
+                        window.draw(cx).clear();
                     })
                     .unwrap();
-                cx.update_window(handle.into(), |_, window, cx| {
-                    window.draw(cx).clear();
-                })
-                .unwrap();
-                handle.read_with(cx, |composer, cx| {
+                    // Inspect the first painted frame before TestAppContext
+                    // flushes effects and automatically draws dirty views.
+                    handle.read_with(cx, |composer, cx| {
                     assert_eq!(composer.input, input);
                     let surface = composer.surface_bounds.get().unwrap();
+                    assert!((f32::from(surface.size.width) - (outer_width - 2.0 * Theme::SPACE_LG)).abs() <= 1.0,
+                        "surface width clipped: docked={docked}, amount={amount}, outer={outer_width}, surface={surface:?}");
                     let origin = input.read(cx).last_bounds.unwrap().origin;
                     assert!((f32::from(origin.y - surface.top()) - (17.0 - 4.0 * amount)).abs() <= 1.0,
                         "editor jumped: docked={docked}, amount={amount}, origin={origin:?}, surface={surface:?}");
@@ -9718,7 +9822,9 @@ mod tests {
                     let expected = if docked { COMPACT_TOTAL_HEIGHT } else { COMPOSER_MIN_HEIGHT };
                     assert!((composer.last_rendered_height + composer.dock_clearance_correction - expected).abs() < 0.1);
                     assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1);
-                }).unwrap();
+                        }).unwrap();
+                    });
+                }
             }
         }
     }
@@ -9736,6 +9842,267 @@ mod tests {
             assert!(drift.abs() <= 6.0);
             assert!(side == 0.0 || side == 1.0);
         }
+    }
+
+    #[gpui::test]
+    fn dock_reflow_paints_attachment_wrap_without_a_height_jump(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD,
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aF1cAAAAASUVORK5CYII=").unwrap();
+        handle
+            .update(cx, |composer, _, cx| {
+                composer
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("chat".into()));
+                composer.on_state_changed(cx);
+                composer.attachments.insert(
+                    composer.current_key.clone(),
+                    (0..10)
+                        .map(|i| {
+                            attachments::stage_png_bytes(format!("image-{i}.png"), png.clone())
+                        })
+                        .collect(),
+                );
+                composer.set_available_width(698.0, cx);
+                composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Hi", cx));
+            })
+            .unwrap();
+        let mut frame = crate::composer_dock::DockFrame::settled(true);
+        frame.active = true;
+        frame.amount = 0.4;
+        handle
+            .update(cx, |composer, _, cx| composer.set_dock_frame(frame, cx))
+            .unwrap();
+        let before = handle
+            .read_with(cx, |composer, _| composer.last_rendered_height)
+            .unwrap();
+        // Both widths are within the same route frame: only the thumbnail row
+        // changes. Inspect before GPUI's automatic follow-up paints can hide it.
+        cx.update(|cx| {
+            handle
+                .update(cx, |composer, _, cx| {
+                    composer.set_available_width(697.0, cx)
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            })
+            .unwrap();
+            handle
+                .read_with(cx, |composer, cx| {
+                    assert_eq!(composer.staged().len(), 10);
+                    assert_eq!(attachment_strip_height(10, 698.0 - 34.0), 68.0);
+                    assert_eq!(attachment_strip_height(10, 697.0 - 34.0), 132.0);
+                    let surface = composer.surface_bounds.get().unwrap();
+                    assert!(
+                        (f32::from(surface.size.height) - before).abs() <= 1.0,
+                        "attachment reflow jumped from {before} to {:?}",
+                        surface.size.height
+                    );
+                    assert!(composer.dock_reflow.active());
+                    assert!(composer.height_morph.is_none());
+                    assert!(
+                        (composer.last_rendered_height + composer.dock_clearance_correction
+                            - (COMPACT_TOTAL_HEIGHT + 132.0))
+                            .abs()
+                            < 0.1,
+                        "transcript clearance must reserve the destination height"
+                    );
+                    assert_eq!(composer.input.read(cx).text(), "Hi");
+                })
+                .unwrap();
+        });
+    }
+
+    #[gpui::test]
+    fn dock_reflow_keeps_text_growth_and_model_controls_continuous(cx: &mut gpui::TestAppContext) {
+        let (_dir, handle) = composer_focus_window(cx);
+        handle
+            .update(cx, |composer, _, cx| {
+                composer
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("chat".into()));
+                composer.on_state_changed(cx);
+                composer.set_available_width(592.0, cx);
+                composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
+                composer
+                    .input
+                    .update(cx, |input, cx| input.set_text("Hi", cx));
+            })
+            .unwrap();
+        let mut frame = crate::composer_dock::DockFrame::settled(true);
+        frame.active = true;
+        frame.amount = 0.7;
+        handle
+            .update(cx, |composer, _, cx| composer.set_dock_frame(frame, cx))
+            .unwrap();
+        let (before, model_before) = handle
+            .read_with(cx, |composer, _| {
+                (
+                    composer.last_rendered_height,
+                    composer.model_bounds.get().unwrap().left(),
+                )
+            })
+            .unwrap();
+        cx.update(|cx| {
+            handle
+                .update(cx, |composer, _, cx| {
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text("One\nTwo\nThree\nFour", cx));
+                })
+                .unwrap();
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            })
+            .unwrap();
+            handle
+                .read_with(cx, |composer, _| {
+                    assert!(composer.expanded_mode);
+                    assert!(composer.dock_reflow.active());
+                    assert!(composer.flip_morph.is_none());
+                    assert!(
+                        (composer.last_rendered_height - before).abs() <= 1.0,
+                        "text growth jumped from {before} to {}",
+                        composer.last_rendered_height
+                    );
+                    assert!((composer.model_handoff_position - 0.7).abs() < 0.001);
+                    assert!(
+                        (f32::from(composer.model_bounds.get().unwrap().left() - model_before))
+                            .abs()
+                            <= 1.0,
+                        "model selector jumped on the compact/expanded commit"
+                    );
+                })
+                .unwrap();
+        });
+    }
+
+    #[gpui::test]
+    fn conversation_resize_reflows_the_live_draft_and_preserves_the_flip(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (_dir, handle) = composer_focus_window(cx);
+        let draft = "A draft near the compact boundary. ".repeat(2);
+        handle
+            .update(cx, |composer, window, cx| {
+                composer
+                    .state
+                    .update(cx, |state, _| state.selected_chat = Some("chat".into()));
+                composer.on_state_changed(cx);
+                composer.route_snap_until = None;
+                composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
+                composer.set_available_width(1232.0, cx);
+                window.resize(size(px(1232.0), px(800.0)));
+            })
+            .unwrap();
+        let draw = |cx: &mut gpui::TestAppContext| {
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear();
+            })
+            .unwrap();
+        };
+        for _ in 0..3 {
+            draw(cx);
+        }
+        // Finish measuring the wide input before typing; the hero's previous
+        // width must not accidentally put this fixture into the resize hold.
+        handle
+            .update(cx, |composer, _, cx| {
+                composer.width_changed_at = None;
+                composer.input.update(cx, |input, cx| {
+                    input.set_text(draft.clone(), cx);
+                    input.selected_range = 2..8;
+                });
+            })
+            .unwrap();
+        for _ in 0..3 {
+            draw(cx);
+        }
+        let input = handle
+            .read_with(cx, |composer, cx| {
+                assert!(
+                    !composer.expanded_mode,
+                    "draft must fit the wide compact input: text={}, capacity={}",
+                    composer.input.read(cx).measured_text_width(),
+                    composer.compact_capacity,
+                );
+                assert!(composer.input.read(cx).measured_text_width() < composer.compact_capacity);
+                composer.input.clone()
+            })
+            .unwrap();
+
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.set_available_width(592.0, cx);
+                window.resize(size(px(592.0), px(800.0)));
+            })
+            .unwrap();
+        for _ in 0..3 {
+            draw(cx);
+        }
+        handle
+            .update(cx, |composer, _, _| {
+                assert!(
+                    composer.expanded_mode,
+                    "narrowing must expand the overflowing draft immediately"
+                );
+                assert!(
+                    composer.flip_morph.is_some(),
+                    "resize must retain the height/controls morph"
+                );
+                assert!(composer.last_target_height > COMPACT_TOTAL_HEIGHT);
+                composer.morph_clock -= Duration::from_secs(1);
+            })
+            .unwrap();
+        draw(cx);
+        handle
+            .read_with(cx, |composer, _| {
+                let surface = composer.surface_bounds.get().unwrap();
+                let model = composer.model_bounds.get().unwrap();
+                let left = surface.left() + px(1.0 + 12.0 + 28.0 + ACTION_UTILITY_GAP);
+                assert!(
+                    (f32::from(model.left() - left)).abs() <= 1.0,
+                    "expanded controls must finish on the left"
+                );
+            })
+            .unwrap();
+
+        handle
+            .update(cx, |composer, window, cx| {
+                composer.set_available_width(1232.0, cx);
+                window.resize(size(px(1232.0), px(800.0)));
+            })
+            .unwrap();
+        for _ in 0..3 {
+            draw(cx);
+        }
+        handle
+            .update(cx, |composer, _, _| {
+                assert!(
+                    composer.expanded_mode,
+                    "widening must wait for resize to settle before collapsing"
+                );
+                composer.width_changed_at =
+                    Some(Instant::now() - Duration::from_millis(RESIZE_SETTLE_MS + 1));
+            })
+            .unwrap();
+        draw(cx);
+        handle
+            .read_with(cx, |composer, cx| {
+                assert!(!composer.expanded_mode);
+                assert!(composer.flip_morph.is_some());
+                assert_eq!(composer.last_target_height, COMPACT_TOTAL_HEIGHT);
+                assert_eq!(composer.input, input);
+                assert_eq!(input.read(cx).text(), draft);
+                assert_eq!(input.read(cx).selected_range, 2..8);
+            })
+            .unwrap();
     }
 
     #[gpui::test]
@@ -10688,6 +11055,220 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// A hand-started side chat discovers commands, skills and files through
+    /// its parent without writing a row. Its first send creates it before the
+    /// run and switches subsequent discovery to its own persisted identity.
+    #[gpui::test]
+    fn unsaved_side_chat_is_created_by_its_first_send(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+        let parent = cx.new(|_| AppState::new());
+        parent.update(cx, |state, _| {
+            state.data_dir = Some(directory.path().to_path_buf());
+            state.chats = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "main", "deviceId": "local", "cwd": "/tmp/main",
+                    "archived": false, "createdAt": chrono::Utc::now(),
+                    "config": { "harness": "codex", "sandbox": "workspace-write" },
+                }))
+                .unwrap(),
+            ];
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+        });
+        let chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "side", "parentChatId": "main", "deviceId": "local", "cwd": "/tmp/main",
+            "archived": false, "createdAt": chrono::Utc::now(),
+            "config": { "harness": "codex", "model": "child-model", "reasoning": "low",
+                "sandbox": "workspace-write" },
+        }))
+        .unwrap();
+        let side = cx.new(|cx| AppState::side_chat_state(&parent, chat, true, cx));
+        let mut drain = || {
+            let mut frames = Vec::new();
+            while let Ok(frame) = requests.try_recv() {
+                frames.push(serde_json::from_str::<zeron_rpc::ClientFrame>(&frame).unwrap());
+            }
+            frames
+        };
+        let touches_side = |frame: &zeron_rpc::ClientFrame| frame.params["chatId"] == "side";
+        cx.run_until_parked();
+        assert!(!drain().iter().any(touches_side));
+
+        let composer = cx.new(|cx| Composer::new(side.clone(), cx));
+        // Discovery must work before createChat, including a different agent
+        // from the parent's. Opening any completion must remain read-only.
+        // Ends on the inherited harness, so the first send below mints the
+        // fixture's config.
+        let inherited = side
+            .read_with(cx, |state, _| {
+                state.selected_chat_row().and_then(|c| c.config.clone())
+            })
+            .unwrap();
+        for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
+            side.update(cx, |state, cx| {
+                let mut config = inherited.clone();
+                config.harness = harness;
+                state.apply_chat_config("side", config);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            for trigger in ["/", "$", "@"] {
+                if trigger == "$" && harness != HarnessId::Codex {
+                    continue;
+                }
+                composer.update(cx, |composer, cx| {
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text(trigger, cx));
+                });
+                cx.run_until_parked();
+                cx.executor().advance_clock(Duration::from_millis(100));
+                cx.run_until_parked();
+                let mut discovery = Vec::new();
+                for frame in drain() {
+                    assert_ne!(frame.method.as_deref(), Some(methods::MUTATE));
+                    assert!(
+                        !touches_side(&frame),
+                        "unsaved chat must not be queried: {frame:?}"
+                    );
+                    let value = match frame.method.as_deref() {
+                        Some(methods::LIST_COMMANDS) => serde_json::json!([
+                            { "name": "compact", "description": "Compact" }
+                        ]),
+                        Some(methods::LIST_SKILLS) => serde_json::json!([
+                            { "name": "review", "path": "/skills/SKILL.md",
+                              "description": "Review", "enabled": true }
+                        ]),
+                        Some(methods::SEARCH_FILES) => serde_json::json!([
+                            { "path": "README.md", "isDir": false }
+                        ]),
+                        _ => continue,
+                    };
+                    assert_eq!(frame.params["chatId"], "main");
+                    assert_eq!(frame.params["targetDeviceId"], "local");
+                    assert_eq!(frame.params["cwd"], "/tmp/main");
+                    if frame.method.as_deref() != Some(methods::SEARCH_FILES) {
+                        assert_eq!(frame.params["harness"], serde_json::json!(harness));
+                    }
+                    discovery.push(frame.method.clone().unwrap());
+                    replies
+                        .try_send(
+                            serde_json::to_string(&zeron_rpc::ServerFrame {
+                                id: frame.id,
+                                ok: Some(value),
+                                ..Default::default()
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap();
+                }
+                let expected = match trigger {
+                    "/" => vec![methods::LIST_COMMANDS, methods::LIST_SKILLS],
+                    "$" => vec![methods::LIST_SKILLS],
+                    _ => vec![methods::SEARCH_FILES],
+                };
+                discovery.sort();
+                assert_eq!(discovery, expected);
+                runtime.block_on(async { tokio::task::yield_now().await });
+                cx.run_until_parked();
+                composer.read_with(cx, |composer, _| {
+                    if trigger == "@" {
+                        assert!(!composer.mention.loading);
+                        assert!(composer.mention.error.is_none());
+                        assert_eq!(composer.mention.results[0].path, "README.md");
+                    } else {
+                        assert!(!composer.slash.loading);
+                        assert!(composer.slash.error.is_none());
+                        let expected = if trigger == "$" { "review" } else { "compact" };
+                        assert!(
+                            composer.slash_cache[&composer.slash.context]
+                                .iter()
+                                .any(|row| row.name == expected)
+                        );
+                    }
+                });
+                assert!(side.read_with(cx, |state, _| state.side_chat_unsaved()));
+                assert_eq!(parent.read_with(cx, |state, _| state.chats.len()), 1);
+            }
+        }
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("hello", cx));
+            composer.on_submit(cx);
+        });
+        cx.run_until_parked();
+        let sent: Vec<_> = drain().into_iter().filter(touches_side).collect();
+        let [create] = sent.as_slice() else {
+            panic!("expected only createChat, got {sent:?}");
+        };
+        assert_eq!(create.method.as_deref(), Some(methods::MUTATE));
+        assert_eq!(create.params["op"], "createChat");
+        assert_eq!(create.params["parentChatId"], "main");
+        assert_eq!(create.params["cwd"], "/tmp/main");
+        assert_eq!(create.params["config"]["harness"], "codex");
+        assert_eq!(create.params["config"]["model"], "child-model");
+        replies
+            .try_send(
+                serde_json::to_string(&zeron_rpc::ServerFrame {
+                    id: create.id,
+                    ok: Some(serde_json::json!({})),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        let after: Vec<_> = drain().into_iter().filter(touches_side).collect();
+        let called = |method: &str| after.iter().any(|f| f.method.as_deref() == Some(method));
+        assert!(called(methods::WATCH_DOC_MESSAGES), "{after:?}");
+        assert!(called(methods::QUEUE_COMMAND), "{after:?}");
+        let run = after
+            .iter()
+            .find(|f| f.method.as_deref() == Some(methods::QUEUE_COMMAND))
+            .unwrap();
+        let request = &run.params["command"]["request"];
+        for field in ["harness", "model", "reasoning", "modelOptions"] {
+            assert_eq!(request[field], create.params["config"][field], "{field}");
+        }
+        assert_eq!(request["cwd"], "/tmp/main");
+        assert_eq!(request["resume"], serde_json::Value::Null);
+        assert!(!after.iter().any(|f| f.params["op"] == "createChat"));
+        assert!(!side.read_with(cx, |state, _| state.side_chat_unsaved()));
+        composer.update(cx, |composer, cx| {
+            assert_eq!(
+                composer.file_search_params("src", cx).unwrap()["chatId"],
+                "side"
+            );
+            assert_eq!(composer.catalog_params(cx)["chatId"], "side");
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("/", cx));
+        });
+        cx.run_until_parked();
+        let catalogs: Vec<_> = drain()
+            .into_iter()
+            .filter(|frame| {
+                matches!(
+                    frame.method.as_deref(),
+                    Some(methods::LIST_COMMANDS | methods::LIST_SKILLS)
+                )
+            })
+            .collect();
+        assert_eq!(catalogs.len(), 2);
+        assert!(catalogs.iter().all(touches_side));
     }
 
     #[gpui::test]

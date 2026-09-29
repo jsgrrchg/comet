@@ -25,6 +25,9 @@ pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
+pub mod thread_naming;
+pub mod wallpaper;
+pub mod wallpaper_colors;
 pub mod widgets;
 
 /// Sidebar drag-resize bounds (px).
@@ -315,13 +318,50 @@ pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Re
     let staged = crate::attachments::stage_file(source)?;
     // Do not persist the candidate or retire the old managed file until the
     // renderer's decoder has accepted the exact bytes we are about to save.
-    crate::new_thread_background_image::decode(staged.bytes()).map_err(|_| {
+    let image = crate::new_thread_background_image::decode(staged.bytes()).map_err(|_| {
         "This background image is unsupported or damaged. Choose a valid image such as PNG or JPEG.".to_string()
     })?;
+    let proxy = image.thumbnail(64, 64).to_rgba8();
+    let color = wallpaper_colors::extract(proxy.pixels().map(|pixel| pixel.0));
+    install_staged_background(source, staged, color, cx)
+}
+
+fn install_staged_background(
+    source: &Path,
+    staged: crate::attachments::StagedAttachment,
+    color: Option<zeron_theme::Color>,
+    cx: &mut App,
+) -> Result<(), String> {
     let data_dir = cx
         .try_global::<SettingsStore>()
         .map(|store| store.data_dir.clone())
         .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
+    let prepared = prepare_background_file(staged, &data_dir)?;
+    commit_background(source, prepared, color, cx)
+}
+
+/// Owns a prewritten managed file until it is committed; dropped queue entries
+/// and failed commits clean up their files without touching the active image.
+pub(super) struct PreparedBackgroundFile(Option<NewThreadComposerBackground>);
+
+impl PreparedBackgroundFile {
+    fn path(&self) -> &Path {
+        Path::new(&self.0.as_ref().unwrap().path)
+    }
+}
+
+impl Drop for PreparedBackgroundFile {
+    fn drop(&mut self) {
+        if let Some(background) = &self.0 {
+            let _ = std::fs::remove_file(&background.path);
+        }
+    }
+}
+
+fn prepare_background_file(
+    staged: crate::attachments::StagedAttachment,
+    data_dir: &Path,
+) -> Result<PreparedBackgroundFile, String> {
     let backgrounds_dir = data_dir.join(NEW_THREAD_BACKGROUND_DIR);
     std::fs::create_dir_all(&backgrounds_dir).map_err(|_| {
         "Unable to save the image. Check folder permissions and try again.".to_string()
@@ -351,7 +391,28 @@ pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Re
         path: destination.to_string_lossy().into_owned(),
         name: staged.name,
     };
+    Ok(PreparedBackgroundFile(Some(replacement)))
+}
+
+fn commit_background(
+    source: &Path,
+    mut prepared: PreparedBackgroundFile,
+    color: Option<zeron_theme::Color>,
+    cx: &mut App,
+) -> Result<(), String> {
+    let data_dir = cx
+        .try_global::<SettingsStore>()
+        .map(|store| store.data_dir.clone())
+        .ok_or_else(|| "Unable to save the image. Restart Zeron and try again.".to_string())?;
+    let backgrounds_dir = data_dir.join(NEW_THREAD_BACKGROUND_DIR);
+    let replacement = prepared.0.as_ref().unwrap().clone();
     let mut next = current(cx);
+    if let Some(previous) = &next.wallpaper_source {
+        wallpaper::remember(&mut next.wallpaper_history, previous);
+    }
+    wallpaper::remember(&mut next.wallpaper_history, source);
+    next.wallpaper_source = Some(source.to_path_buf());
+    next.wallpaper_color = color;
     let previous = next
         .new_thread_composer_background
         .replace(replacement.clone());
@@ -359,13 +420,16 @@ pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Re
     // updates memory first and only logs an I/O failure; for a file-backed
     // setting that order can leave disk pointing at an image we just deleted.
     if next.save(&data_dir).is_err() {
-        let _ = std::fs::remove_file(&destination);
         return Err(
             "Unable to save the image. Check folder permissions and try again.".to_string(),
         );
     }
+    prepared.0.take();
     replace(next, SavePolicy::Immediate, cx);
     remove_managed_new_thread_background(previous.as_ref(), &backgrounds_dir);
+    if current(cx).wallpaper_theme_colors {
+        crate::appearance::apply(cx);
+    }
     cx.refresh_windows();
     Ok(())
 }
@@ -377,6 +441,8 @@ pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String>
         .ok_or_else(|| "Unable to remove the image. Restart Zeron and try again.".to_string())?;
     let mut next = current(cx);
     let previous = next.new_thread_composer_background.take();
+    next.wallpaper_source = None;
+    next.wallpaper_color = None;
     if previous.is_none() {
         return Ok(());
     }
@@ -390,6 +456,9 @@ pub fn remove_new_thread_composer_background(cx: &mut App) -> Result<(), String>
         previous.as_ref(),
         &data_dir.join(NEW_THREAD_BACKGROUND_DIR),
     );
+    if current(cx).wallpaper_theme_colors {
+        crate::appearance::apply(cx);
+    }
     cx.refresh_windows();
     Ok(())
 }
@@ -634,11 +703,12 @@ pub struct SkillCompletionSettings {
 }
 
 impl SkillCompletionSettings {
-    pub fn for_harness(harness: zeron_proto::HarnessId) -> Self {
-        let native_dollar = harness == zeron_proto::HarnessId::Codex;
+    /// Every harness defaults to `$` skills kept out of the `/` menu; an
+    /// explicit per-harness choice (or the legacy slash-menu flag) wins.
+    pub fn for_harness(_harness: zeron_proto::HarnessId) -> Self {
         Self {
-            dollar: native_dollar,
-            separate_from_slash: native_dollar,
+            dollar: true,
+            separate_from_slash: true,
         }
     }
 }
@@ -686,6 +756,9 @@ pub struct UiSettings {
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
+    /// The sidebar's "Star on GitHub" banner was dismissed (its close button
+    /// or following the link). Device-local; never shown again once set.
+    pub github_star_banner_dismissed: bool,
     /// The last selected space — restored on boot when the row still exists;
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -733,6 +806,9 @@ pub struct UiSettings {
     /// the foreground case).
     pub notifications_background_only: bool,
     pub files_panel_width: f32,
+    /// Desktop banners for newly discovered agent CLI releases. In-app chips
+    /// remain enabled independently of this preference.
+    pub agent_update_notifications: bool,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
@@ -754,6 +830,10 @@ pub struct UiSettings {
     /// Whether bare Escape stops the active agent after contextual consumers
     /// decline it. Device-local and opt-in.
     pub escape_stops_active_agent: bool,
+    /// The Settings section last viewed. ⌘, / Ctrl+,, the footer gear and the
+    /// palette reopen it; links naming a section replace it. Files without
+    /// it, or with a name this build does not know, open on General.
+    pub settings_section: crate::shell::SettingsSection,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
     /// Optional columns shown in every Git History pane.
@@ -784,7 +864,8 @@ pub struct UiSettings {
     /// Agent-sent Markdown fences: wrap long lines to the chat width instead
     /// of exposing their horizontal scroll plane.
     pub code_fences_fit_content: bool,
-    /// Maximum conversation width in logical pixels; composer width is independent.
+    /// Maximum message and docked composer surface width in logical pixels.
+    /// The centered new-chat composer keeps its own width.
     pub transcript_width: f32,
     /// Open a normal web-link activation in the session Browser. Explicit
     /// context-menu actions remain available regardless of this preference.
@@ -808,6 +889,13 @@ pub struct UiSettings {
     /// Optional device-local artwork behind the blank new-thread composer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub new_thread_composer_background: Option<NewThreadComposerBackground>,
+    /// Device-local folder used by the random wallpaper shortcut.
+    pub wallpaper_folder: Option<PathBuf>,
+    pub wallpaper_source: Option<PathBuf>,
+    /// Most recently displayed sources first; bounded by the shuffle cooldown.
+    pub wallpaper_history: Vec<PathBuf>,
+    pub wallpaper_theme_colors: bool,
+    pub wallpaper_color: Option<zeron_theme::Color>,
     /// Non-destructive treatment composited inside the artwork's fade mask.
     pub new_thread_background_effect: NewThreadBackgroundEffect,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
@@ -833,6 +921,7 @@ impl Default for UiSettings {
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
+            github_star_banner_dismissed: false,
             last_space_id: None,
             last_project_action_by_space_id: std::collections::HashMap::new(),
             open_tabs: None,
@@ -848,12 +937,14 @@ impl Default for UiSettings {
             notifications_enabled: true,
             notifications_background_only: true,
             files_panel_width: FILES_PANEL_DEFAULT,
+            agent_update_notifications: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
             keymap: KeymapConfig::default(),
             escape_stops_active_agent: false,
+            settings_section: crate::shell::SettingsSection::default(),
             composer_send_behavior: ComposerSendBehavior::default(),
             skills_in_slash_menu: false,
             skill_completion_by_harness: Default::default(),
@@ -885,6 +976,11 @@ impl Default for UiSettings {
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
             new_thread_composer_background: None,
+            wallpaper_folder: None,
+            wallpaper_source: None,
+            wallpaper_history: Vec::new(),
+            wallpaper_theme_colors: false,
+            wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             legacy_accent_color: None,
         }
@@ -921,6 +1017,7 @@ const JUMP_LABELS: [&str; JUMP_SLOTS] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
     CaptureAppshot,
+    RandomWallpaper,
     SaveFile,
     BrowserReload,
     ToggleSidebar,
@@ -937,8 +1034,9 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 13 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 14 + JUMP_SLOTS] = [
         ShortcutId::CaptureAppshot,
+        ShortcutId::RandomWallpaper,
         ShortcutId::SaveFile,
         ShortcutId::BrowserReload,
         ShortcutId::ToggleSidebar,
@@ -969,6 +1067,7 @@ impl ShortcutId {
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
+            ShortcutId::RandomWallpaper => "Random wallpaper",
             ShortcutId::CaptureAppshot => "Capture Appshot",
             ShortcutId::SaveFile => "Save file",
             ShortcutId::BrowserReload => "Reload browser page",
@@ -979,8 +1078,8 @@ impl ShortcutId {
             ShortcutId::NewSession => "New session",
             ShortcutId::NewProject => "New project",
             ShortcutId::OpenModelPicker => "Open model picker",
-            ShortcutId::NextSession => "Next session",
-            ShortcutId::PrevSession => "Previous session",
+            ShortcutId::NextSession => "Next session or right pane tab",
+            ShortcutId::PrevSession => "Previous session or right pane tab",
             ShortcutId::ArchiveSession => "Archive session",
             ShortcutId::JumpSession(slot) => JUMP_LABELS.get(slot).copied().unwrap_or(""),
         }
@@ -995,6 +1094,7 @@ impl ShortcutId {
     /// this guards against only exists off macOS).
     pub fn default_combo_on(self, mac: bool) -> &'static str {
         match self {
+            ShortcutId::RandomWallpaper => "mod-u",
             ShortcutId::CaptureAppshot if mac => "ctrl-alt-space",
             ShortcutId::CaptureAppshot => "mod-alt-space",
             ShortcutId::SaveFile => "mod-s",
@@ -1044,6 +1144,7 @@ impl ShortcutId {
 pub struct KeymapConfig {
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
     pub capture_appshot: String,
+    pub random_wallpaper: String,
     pub save_file: String,
     pub browser_reload: String,
     pub toggle_sidebar: String,
@@ -1108,6 +1209,7 @@ impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
             capture_appshot: ShortcutId::CaptureAppshot.default_combo().into(),
+            random_wallpaper: ShortcutId::RandomWallpaper.default_combo().into(),
             save_file: ShortcutId::SaveFile.default_combo().into(),
             browser_reload: ShortcutId::BrowserReload.default_combo().into(),
             toggle_sidebar: ShortcutId::ToggleSidebar.default_combo().into(),
@@ -1129,6 +1231,7 @@ impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
             ShortcutId::CaptureAppshot => &self.capture_appshot,
+            ShortcutId::RandomWallpaper => &self.random_wallpaper,
             ShortcutId::SaveFile => &self.save_file,
             ShortcutId::BrowserReload => &self.browser_reload,
             ShortcutId::ToggleSidebar => &self.toggle_sidebar,
@@ -1152,6 +1255,7 @@ impl KeymapConfig {
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
             ShortcutId::CaptureAppshot => self.capture_appshot = combo,
+            ShortcutId::RandomWallpaper => self.random_wallpaper = combo,
             ShortcutId::SaveFile => self.save_file = combo,
             ShortcutId::BrowserReload => self.browser_reload = combo,
             ShortcutId::ToggleSidebar => self.toggle_sidebar = combo,
@@ -1631,13 +1735,13 @@ mod tests {
         let mut settings = UiSettings::default();
         for (harness, _) in SKILL_COMPLETION_HARNESSES {
             let preferences = settings.skill_completion(harness);
-            assert_eq!(preferences.dollar, harness == HarnessId::Codex);
-            assert_eq!(preferences.separate_from_slash, harness == HarnessId::Codex);
+            assert!(preferences.dollar);
+            assert!(preferences.separate_from_slash);
         }
         settings.skill_completion_by_harness.insert(
             HarnessId::ClaudeCode,
             SkillCompletionSettings {
-                dollar: true,
+                dollar: false,
                 separate_from_slash: true,
             },
         );
@@ -1654,8 +1758,8 @@ mod tests {
             settings.skill_completion_by_harness,
             loaded.skill_completion_by_harness
         );
-        assert!(loaded.skill_completion(HarnessId::ClaudeCode).dollar);
-        assert!(!loaded.skill_completion(HarnessId::Cursor).dollar);
+        assert!(!loaded.skill_completion(HarnessId::ClaudeCode).dollar);
+        assert!(loaded.skill_completion(HarnessId::Cursor).dollar);
         let legacy: UiSettings = serde_json::from_str(r#"{"skillsInSlashMenu":true}"#).unwrap();
         assert!(
             !legacy
@@ -1750,6 +1854,59 @@ mod tests {
         let saved: WindowGeometry = serde_json::from_str(&encoded).unwrap();
         assert_eq!(saved.restore(&[primary, secondary], 0), Some((1, saved)));
         assert_eq!(saved.restore(&[secondary, primary], 1), Some((0, saved)));
+    }
+
+    #[test]
+    fn settings_section_round_trips_and_old_or_unknown_values_read_as_general() {
+        use crate::shell::SettingsSection;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = UiSettings {
+            settings_section: SettingsSection::Appearance,
+            ..Default::default()
+        };
+        settings.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        assert!(
+            text.contains(r#""settingsSection": "appearance""#),
+            "{text}"
+        );
+        assert_eq!(
+            UiSettings::load(dir.path()).settings_section,
+            SettingsSection::Appearance
+        );
+        for section in SettingsSection::ALL {
+            let encoded = serde_json::to_string(&UiSettings {
+                settings_section: section,
+                ..Default::default()
+            })
+            .unwrap();
+            let decoded: UiSettings = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded.settings_section, section);
+        }
+
+        // A file written before the field existed.
+        let legacy: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
+        assert_eq!(legacy.settings_section, SettingsSection::General);
+        assert_eq!(legacy.sidebar_width, 300.0);
+        // Unknown names and malformed values read as General without
+        // defaulting the rest of the file.
+        for raw in [r#""billing""#, "42", "null", r#"{"section":"devices"}"#] {
+            std::fs::write(
+                UiSettings::path(dir.path()),
+                format!(r#"{{"sidebarWidth": 300, "settingsSection": {raw}}}"#),
+            )
+            .unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert_eq!(loaded.settings_section, SettingsSection::General, "{raw}");
+            assert_eq!(loaded.sidebar_width, 300.0, "{raw}");
+        }
+        // The legacy Accounts alias still reads, and reopens as Providers.
+        let alias: UiSettings = serde_json::from_str(r#"{"settingsSection":"agents"}"#).unwrap();
+        assert_eq!(alias.settings_section, SettingsSection::Agents);
+        assert_eq!(
+            alias.settings_section.reopenable(),
+            SettingsSection::Harnesses
+        );
     }
 
     #[test]
@@ -2166,6 +2323,7 @@ mod tests {
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
+            github_star_banner_dismissed: true,
             last_space_id: Some("space-1".into()),
             last_project_action_by_space_id: std::collections::HashMap::from([(
                 "space-1".into(),
@@ -2196,6 +2354,7 @@ mod tests {
             notifications_enabled: false,
             notifications_background_only: false,
             files_panel_width: 310.0,
+            agent_update_notifications: false,
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,
@@ -2205,6 +2364,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             escape_stops_active_agent: true,
+            settings_section: crate::shell::SettingsSection::Shortcuts,
             composer_send_behavior: ComposerSendBehavior::ModEnter,
             skills_in_slash_menu: true,
             skill_completion_by_harness: Default::default(),
@@ -2261,6 +2421,11 @@ mod tests {
                 path: "/tmp/zeron/new-thread-background.png".into(),
                 name: "background.png".into(),
             }),
+            wallpaper_folder: Some("/tmp/wallpapers".into()),
+            wallpaper_source: Some("/tmp/wallpapers/background.png".into()),
+            wallpaper_history: vec!["/tmp/wallpapers/background.png".into()],
+            wallpaper_theme_colors: false,
+            wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
             legacy_accent_color: None,
         };

@@ -67,6 +67,39 @@ jobs:
           path: ${{ runner.temp }}/rdp-protocol
           if-no-files-found: warn
 
+  changes:
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      ios: ${{ steps.filter.outputs.result }}
+    steps:
+      - uses: actions/github-script@v8
+        id: filter
+        with:
+          script: |
+            // Preserve iOS coverage for main pushes and manual runs.
+            if (context.eventName !== 'pull_request') return true;
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            // Run conservatively if the API did not return the full diff.
+            if (files.length < context.payload.pull_request.changed_files) return true;
+            // The app links the Rust mobile core and everything it depends on.
+            const mobileCore = ['crates/mobile/', 'crates/client/', 'crates/text/', 'crates/markdown/',
+              'crates/doc/', 'crates/sync/', 'crates/proto/', 'crates/rpc/', 'crates/syntax/',
+              'scripts/ios/'];
+            const affectsIOS = path => path?.startsWith('apps/ios/')
+              || mobileCore.some(prefix => path?.startsWith(prefix))
+              || path === 'Cargo.lock'
+              || path === 'Cargo.toml'
+              || path === 'rust-toolchain.toml'
+              || path === '.github/workflows/ui-tests.yml';
+            return files.some(file => affectsIOS(file.filename)
+              || affectsIOS(file.previous_filename));
+
   session-sync-regressions:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -128,6 +161,8 @@ jobs:
             frame-source-tests
       - name: Check macOS application
         run: cargo check --release --locked -p zeron
+      - name: Updater tests (bundle staging, install detection)
+        run: cargo test --release --locked -p zeron-update
       - name: Native diff font geometry regression
         run: cargo test --release --locked -p zeron-ui --lib native_diff_font_geometry -- --test-threads=1
       - name: Native notification click regressions
@@ -185,8 +220,10 @@ jobs:
         run: cargo test --release --locked -p gpui_macos --test frame_source_recovery
 
   ios-tests:
+    needs: changes
+    if: needs.changes.outputs.ios == 'true'
     runs-on: macos-latest
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - name: Select an available iPhone simulator
@@ -201,6 +238,19 @@ jobs:
           with open(os.environ["GITHUB_ENV"], "a") as env:
               env.write("IOS_SIMULATOR_ID=" + iphones[0]["udid"] + "\n")
           PYTHON
+      - name: Rust toolchain + iOS targets
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ios-core
+      - name: Rust mobile core tests
+        run: cargo test --locked -p zeron-text -p zeron-markdown -p zeron-client -p zeron-mobile
+      - name: Generated Swift bindings are current
+        run: |
+          scripts/ios/build-core.sh iphonesimulator
+          git diff --exit-code -- apps/ios/Zeron/Core/Generated
       - name: Run iOS unit tests
         working-directory: apps/ios
         run: |

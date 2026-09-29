@@ -14,6 +14,7 @@ async fn live_run(cancel: bool) {
     let (steer, steering) = mpsc::channel(8);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        execution_lease: None,
         steering,
         interrupt: interrupt.clone(),
         request_input: Box::new(|_| {
@@ -23,6 +24,7 @@ async fn live_run(cancel: bool) {
         }),
     };
     let request = RunRequest {
+        mcp: None,
         prompt: "Run the shell command `printf ACP-TOOL-OK` exactly once using bash. After seeing its result, reply exactly FIRST-DONE. Do not call any other tools.".into(),
         harness: None, model: None, reasoning: None,
         model_options: serde_json::Map::new(), cwd: cwd.path().display().to_string(),

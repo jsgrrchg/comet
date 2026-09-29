@@ -29,11 +29,13 @@ async fn managed_install_reaches_session_started() {
     let (_steer_tx, steering) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
+        execution_lease: None,
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
         steering,
         interrupt: interrupt.clone(),
     };
     let request = RunRequest {
+        mcp: None,
         prompt: "say the word ok and stop".into(),
         harness: None,
         model: None,

@@ -19,6 +19,7 @@ async fn real_pi_mock_lifecycle() {
         let (steer, steering) = mpsc::channel(8);
         let token = CancellationToken::new();
         let controls = RunControls {
+            execution_lease: None,
             steering,
             interrupt: token.clone(),
             request_input: Box::new(|_| {
@@ -28,6 +29,7 @@ async fn real_pi_mock_lifecycle() {
             }),
         };
         let request = RunRequest {
+            mcp: None,
             prompt: match scenario {
                 "boundary" => "slow-model",
                 "interrupt" | "mid-kill" => "slow-tool",

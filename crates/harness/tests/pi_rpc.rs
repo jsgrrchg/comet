@@ -335,3 +335,163 @@ async fn extension_dialogs_roundtrip_without_autoaccepting_and_preserve_editor_t
         );
     }
 }
+
+#[tokio::test]
+async fn multiple_steers_are_confirmed_in_order_before_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "slow"), c)
+        .await
+        .unwrap();
+    for prompt in ["redirect one", "redirect two"] {
+        tx.send(SteerMessage {
+            prompt: prompt.into(),
+            message_id: None,
+        })
+        .await
+        .unwrap();
+    }
+    drop(tx);
+    let mut confirms = 0;
+    let mut done = 0;
+    let mut text = String::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                AgentEvent::Steered { .. } => confirms += 1,
+                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                AgentEvent::Done { status, .. } => {
+                    assert_eq!(status, DoneStatus::Completed);
+                    done += 1;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(confirms, 2);
+    assert!(done >= 1);
+    assert!(
+        text.contains("reply:redirect one") && text.contains("reply:redirect two"),
+        "{text}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn crash_interrupt_and_consumer_drop_reap_descendants_even_with_inherited_pipes() {
+    for scenario in ["inherited-pipe-crash", "interrupt", "drop"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (c, tx, token) = controls();
+        let prompt = if scenario == "inherited-pipe-crash" {
+            scenario
+        } else {
+            "tree"
+        };
+        let mut stream = harness()
+            .with_session_store(dir.path().join("index"))
+            .run(request(dir.path(), prompt), c)
+            .await
+            .unwrap();
+        let mut terminals = vec![];
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                match event.unwrap() {
+                    AgentEvent::TextDelta { text } if text == "tree ready" => {
+                        if scenario == "drop" {
+                            break;
+                        }
+                        token.cancel();
+                    }
+                    AgentEvent::Done { status, error, .. } => {
+                        if scenario == "inherited-pipe-crash" {
+                            assert!(error.unwrap().contains("inherited pipe diagnostic"));
+                        }
+                        terminals.push(status);
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(stream);
+        drop(tx);
+        if scenario != "drop" {
+            assert_eq!(
+                terminals,
+                vec![if scenario == "interrupt" {
+                    DoneStatus::Interrupted
+                } else {
+                    DoneStatus::Errored
+                }]
+            );
+        }
+        for file in ["pi.pid", "tool.pid"] {
+            let pid = std::fs::read_to_string(dir.path().join(file)).unwrap();
+            tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    let stat =
+                        std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                    if stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z") {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("owned descendant must be dead");
+        }
+    }
+}
+
+#[tokio::test]
+async fn late_extension_notifications_do_not_reopen_completed_turns() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    let mut stream = harness()
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "late-notify"), c)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(
+            stream.next().await.unwrap().unwrap(),
+            AgentEvent::Done { .. }
+        ) {}
+    })
+    .await
+    .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), stream.next())
+            .await
+            .is_err()
+    );
+    tx.send(SteerMessage {
+        prompt: "next".into(),
+        message_id: None,
+    })
+    .await
+    .unwrap();
+    drop(tx);
+    let events: Vec<_> =
+        tokio::time::timeout(Duration::from_secs(5), stream.map(Result::unwrap).collect())
+            .await
+            .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(
+                e,
+                AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                }
+            ))
+            .count(),
+        1
+    );
+}

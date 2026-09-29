@@ -118,7 +118,7 @@ fn assert_done(events: &[AgentEvent], expected: DoneStatus) {
 
 async fn delayed_turn(scenario: &str) {
     init_env();
-    let harness = AcpHarness::pi().with_executable(fixture_path());
+    let harness = AcpHarness::grok().with_executable(fixture_path());
     assert!(harness.authoritative_prompt_end());
     let (controls, steer, token) = controls();
     let mut stream = harness.run(request(scenario), controls).await.unwrap();
@@ -232,7 +232,7 @@ async fn open_tools_then_silence_preserves_prompt() {
 async fn cancel_quiet(scenario: &str) {
     init_env();
     let (controls, steer, token) = controls();
-    let mut stream = AcpHarness::pi()
+    let mut stream = AcpHarness::grok()
         .with_executable(fixture_path())
         .run(request(scenario), controls)
         .await
@@ -284,7 +284,7 @@ async fn unresponsive_quiet_turn_is_killed_on_cancel() {
 async fn missing_response_at_eof_is_error_not_success() {
     init_env();
     let (controls, _steer, _token) = controls();
-    let mut stream = AcpHarness::pi()
+    let mut stream = AcpHarness::grok()
         .with_executable(fixture_path())
         .run(request("eof"), controls)
         .await
@@ -295,7 +295,7 @@ async fn missing_response_at_eof_is_error_not_success() {
 #[tokio::test]
 async fn protocol_error_keeps_code_and_agent_detail() {
     let (controls, _steer, _token) = controls();
-    let mut stream = AcpHarness::pi()
+    let mut stream = AcpHarness::grok()
         .with_executable(fixture_path())
         .run(request("error"), controls)
         .await

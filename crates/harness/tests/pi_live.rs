@@ -1,154 +1,145 @@
-//! Opt-in real Pi lifecycle probe. Run with an isolated adapter wrapper and a
-//! local mock provider; PI_LIVE_DIR contains the wrapper's adapter.pid file.
+//! Real native Pi, isolated settings, and a local provider (no network/API spend).
 #![cfg(unix)]
-
 use futures::StreamExt;
-use std::{path::PathBuf, time::Duration};
+use std::{os::unix::fs::PermissionsExt, time::Duration};
 use tokio::sync::{mpsc, oneshot};
-use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
-use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel};
+use zeron_harness::{CancellationToken, Harness, PiHarness, RunControls, SteerMessage};
+use zeron_proto::{AgentEvent, DoneStatus, RunRequest, SandboxLevel, UserInputAnswer};
 
 #[tokio::test]
-#[ignore = "requires an isolated real Pi adapter and local mock provider"]
+#[ignore = "requires Pi >= 0.85.1 installed; uses only a local mock provider"]
 async fn real_pi_mock_lifecycle() {
-    let cwd = PathBuf::from(std::env::var_os("PI_LIVE_DIR").expect("isolated Pi cwd"));
-    let harness = AcpHarness::pi();
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
+    let agent = cwd.join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("settings.json"),
+        r#"{"retry":{"enabled":false}}"#,
+    )
+    .unwrap();
+    let extensions = agent.join("extensions");
+    std::fs::create_dir_all(&extensions).unwrap();
+    std::fs::write(
+        extensions.join("probe.ts"),
+        include_str!("fixtures/pi-rpc-probe.ts"),
+    )
+    .unwrap();
+    let exe = PiHarness::new()
+        .resolve_executable()
+        .expect("Pi CLI installed");
+    let quote =
+        |p: &std::path::Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+    let wrapper = cwd.join("pi-probe");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexport PI_CODING_AGENT_DIR={}\nexec {} \"$@\"\n",
+            quote(&agent),
+            quote(&exe)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let harness = PiHarness::new()
+        .with_executable(wrapper)
+        .with_session_store(cwd.join("index"));
     let mut session = None;
-    for scenario in ["boundary", "idle-kill", "resume", "interrupt", "mid-kill"] {
-        let _ = std::fs::remove_file(cwd.join("tool.pid"));
+    for (prompt, expected) in [
+        ("hello", DoneStatus::Completed),
+        ("resume", DoneStatus::Completed),
+        ("/probe-noop", DoneStatus::Completed),
+        ("/probe-input", DoneStatus::Completed),
+        ("error", DoneStatus::Errored),
+        ("slow", DoneStatus::Interrupted),
+        ("steering slow", DoneStatus::Completed),
+    ] {
         let (steer, steering) = mpsc::channel(8);
-        let token = CancellationToken::new();
+        let interrupt = CancellationToken::new();
         let controls = RunControls {
             execution_lease: None,
             steering,
-            interrupt: token.clone(),
-            request_input: Box::new(|_| {
+            interrupt: interrupt.clone(),
+            request_input: Box::new(|questions| {
                 let (tx, rx) = oneshot::channel();
-                let _ = tx.send(Vec::new());
+                tx.send(vec![UserInputAnswer {
+                    question_id: questions[0].id.clone(),
+                    labels: vec!["local answer".into()],
+                }])
+                .unwrap();
                 rx
             }),
         };
         let request = RunRequest {
-            mcp: None,
-            prompt: match scenario {
-                "boundary" => "slow-model",
-                "interrupt" | "mid-kill" => "slow-tool",
-                _ => "hello",
-            }
-            .into(),
+            prompt: prompt.into(),
             harness: None,
-            model: Some("mock/mock".into()),
+            model: Some("zeron-probe/mock".into()),
             reasoning: None,
             model_options: Default::default(),
             cwd: cwd.display().to_string(),
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
-            attachments: Vec::new(),
+            resume: session.clone(),
+            attachments: vec![],
             worktree: None,
-            resume: if scenario == "resume" {
-                session.clone()
-            } else {
-                None
-            },
+            mcp: None,
         };
         let mut stream = harness.run(request, controls).await.unwrap();
-        let kill = || {
-            let pid: i32 = std::fs::read_to_string(cwd.join("adapter.pid"))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
-            // SAFETY: wrapper records the owned adapter for this test.
-            assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0);
-        };
-        let mut done_count = 0;
-        let mut started = false;
-        let mut tool_seen = false;
+        let mut sender = Some(steer);
+        let mut done = 0;
+        let mut confirmed = 0;
         let mut text = String::new();
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(Duration::from_secs(20), async {
             while let Some(event) = stream.next().await {
                 match event.unwrap() {
                     AgentEvent::SessionStarted { session_id, .. } => {
-                        if scenario == "resume" {
-                            assert_eq!(Some(session_id), session);
+                        if let Some(old) = &session {
+                            assert_eq!(old, &session_id);
                         }
-                        if scenario == "boundary" && !started {
-                            started = true;
-                            steer
+                        session = Some(session_id);
+                        if prompt == "steering slow" {
+                            sender
+                                .take()
+                                .unwrap()
                                 .send(SteerMessage {
-                                    prompt: "second".into(),
+                                    prompt: "redirect".into(),
                                     message_id: None,
                                 })
                                 .await
                                 .unwrap();
+                        } else {
+                            sender.take();
+                        }
+                        if prompt == "slow" {
+                            let token = interrupt.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(150)).await;
+                                token.cancel();
+                            });
                         }
                     }
                     AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
-                    AgentEvent::ToolCall { .. } if !tool_seen => {
-                        tool_seen = true;
-                        tokio::time::timeout(Duration::from_secs(3), async {
-                            while !cwd.join("tool.pid").exists() {
-                                tokio::time::sleep(Duration::from_millis(10)).await;
-                            }
-                        })
-                        .await
-                        .expect("mock bash tool must actually start");
-                        if scenario == "interrupt" {
-                            token.cancel();
-                        }
-                        if scenario == "mid-kill" {
-                            kill();
-                        }
-                    }
-                    AgentEvent::Done {
-                        status,
-                        error,
-                        session_id,
-                        ..
-                    } => {
-                        done_count += 1;
-                        let expected = match scenario {
-                            "interrupt" => DoneStatus::Interrupted,
-                            "mid-kill" => DoneStatus::Errored,
-                            _ => DoneStatus::Completed,
-                        };
-                        assert_eq!(status, expected, "{scenario}: {error:?}");
-                        if scenario == "mid-kill" {
-                            assert!(error.as_deref().unwrap().contains("signal 9"), "{error:?}");
-                        }
-                        if scenario == "idle-kill" {
-                            session = session_id;
-                            kill();
-                        }
-                        if scenario == "boundary" && done_count == 2 || scenario == "resume" {
-                            token.cancel();
-                            break;
-                        }
+                    AgentEvent::Steered { .. } => confirmed += 1,
+                    AgentEvent::Done { status, error, .. } => {
+                        assert_eq!(status, expected, "{prompt}: {error:?}");
+                        done += 1;
                     }
                     _ => {}
                 }
             }
         })
         .await
-        .expect("real Pi lifecycle must settle");
-        assert_eq!(done_count, if scenario == "boundary" { 2 } else { 1 });
-        if matches!(scenario, "boundary" | "idle-kill" | "resume") {
-            assert!(text.contains("MOCK-DONE"));
+        .expect("native Pi run must settle");
+        assert_eq!(done, 1, "{prompt}: {text}");
+        if prompt == "/probe-input" {
+            assert!(text.contains("answer:local answer"), "{text}");
         }
-        if matches!(scenario, "interrupt" | "mid-kill") {
-            assert!(tool_seen);
+        if prompt == "steering slow" {
+            assert_eq!(confirmed, 1);
+            assert!(text.contains("MOCK:redirect"), "{text}");
         }
-        if tool_seen {
-            let pid = std::fs::read_to_string(cwd.join("tool.pid")).unwrap();
-            let stat =
-                std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())).unwrap_or_default();
-            assert!(
-                stat.is_empty() || stat.split_whitespace().nth(2) == Some("Z"),
-                "tool survived {scenario}: {stat}"
-            );
+        if matches!(prompt, "hello" | "resume") {
+            assert_eq!(text, format!("MOCK:{prompt}"));
         }
-        drop(stream);
-        drop(steer);
-        eprintln!("live {scenario}: {done_count} terminal(s), tool={tool_seen}");
     }
 }

@@ -5,8 +5,7 @@
 //! `grok agent stdio`), Devin ([`AcpHarness::devin`], `devin acp`) and Hermes
 //! ([`AcpHarness::hermes`], `hermes acp`) and Antigravity
 //! ([`AcpHarness::antigravity`], Google's `agy_acp_server`, installed from its
-//! pinned release archive) — plus pi ([`AcpHarness::pi`]) via the community
-//! `pi-acp` adapter until a native driver exists. Claude, Codex and Cursor moved to native drivers
+//! pinned release archive). Pi, Claude, Codex and Cursor use native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
 //! after adapter-mediated ACP kept manufacturing done-status bugs the native
 //! wires don't have (turn-hold bookkeeping vs the CLI's own eager result).
@@ -31,7 +30,6 @@
 mod antigravity_paths;
 mod devin_models;
 mod normalize;
-mod pi_mcp;
 mod subagent;
 mod subagent_devin;
 mod system_message;
@@ -55,13 +53,13 @@ use zeron_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
+pub(crate) use crate::process::owned as child;
 use crate::process::{Command, Stdio};
 use crate::scratch::ScratchDir;
-use child::Child;
-pub(crate) mod child;
 use crate::{
     CancellationToken, Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child,
 };
+use child::Child;
 use normalize::{map_update, parse_commands, preferred_allow_option};
 use subagent::SubagentTracker;
 use subagent_devin::DevinTracker;
@@ -94,7 +92,7 @@ struct AcpAgentSpec {
     extra_paths: fn() -> Vec<PathBuf>,
     /// The agent's own CLI binary (`claude`, `codex`, …) — what "installed"
     /// means to the user. Distinct from `executable` where the spawned adapter
-    /// wraps the CLI (`claude-agent-acp`, `codex-acp`, `pi-acp`), and the npx
+    /// wraps the CLI (third-party ACP adapters), and the npx
     /// fallback deliberately doesn't count: npx can fetch an adapter on
     /// demand, but an absent CLI still means no logins/config to drive.
     cli_executable: &'static str,
@@ -190,27 +188,6 @@ fn devin_effort_values(
         Some(ReasoningLevel::Minimal) => vec!["none", "minimal", "low"],
         _ => default_effort_values(reasoning, model),
     }
-}
-
-/// npm-global bin dirs for an adapter binary (`npm i -g` installs).
-fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
-    // fn pointers can't capture; probe the fixed npm-global locations and
-    // append the exe at call time via a small per-exe shim table.
-    match exe {
-        "pi-acp" => || npm_global_bins("pi-acp"),
-        _ => || Vec::new(),
-    }
-}
-
-fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = crate::executable::home_dir() {
-        dirs.push(home.join(".local").join("bin").join(exe));
-        dirs.push(home.join(".npm-global").join("bin").join(exe));
-    }
-    dirs.push(PathBuf::from("/opt/homebrew/bin").join(exe));
-    dirs.push(PathBuf::from("/usr/local/bin").join(exe));
-    dirs
 }
 
 fn grok_install_paths() -> Vec<PathBuf> {
@@ -424,69 +401,6 @@ fn hermes_spec() -> AcpAgentSpec {
         // Hermes exposes no effort config over ACP today (hybrid reasoning is
         // model-internal); revisit when the adapter advertises a ladder.
         reasoning_levels: &[],
-        prompt_transform: identity_transform,
-        effort_values: default_effort_values,
-        ladder_extras: &[],
-        prompt_complete_extension: false,
-        prompt_stall: None,
-        stall_hint: "The agent process is likely wedged.",
-        effort_in_model_id: false,
-        auth_method: None,
-        skill_dirs: Vec::new,
-        hidden_commands: &[],
-        drops_unstarted_cancelled_prompt: false,
-    }
-}
-
-fn pi_spec() -> AcpAgentSpec {
-    AcpAgentSpec {
-        id: HarnessId::Pi,
-        display_name: "Pi",
-        executable: "pi-acp",
-        env_override: "PI_ACP_EXECUTABLE",
-        args: &[],
-        npm_package: Some("pi-acp@0.0.33"),
-        archive: None,
-        extra_paths: npm_global_paths("pi-acp"),
-        cli_executable: "pi",
-        cli_extra_paths: || npm_global_bins("pi"),
-        install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
-             and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the pinned \
-             pi-acp automatically when npm is available — the pi CLI itself is \
-             still required, `npm install -g --ignore-scripts \
-             @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
-        // pi routes models through its own provider config (~/.pi); the picker
-        // advertises the pass-through entry and pi keeps whatever the user set
-        // up. Unknown ids are skipped by the config-option set.
-        models: || {
-            vec![Model {
-                id: "default".into(),
-                label: "pi default".into(),
-                description: Some("Runs the model configured in pi (`pi` settings)".into()),
-                reasoning_levels: vec![
-                    ReasoningLevel::Minimal,
-                    ReasoningLevel::Low,
-                    ReasoningLevel::Medium,
-                    ReasoningLevel::High,
-                    ReasoningLevel::XHigh,
-                    ReasoningLevel::Max,
-                ],
-                options: Vec::new(),
-            }]
-        },
-        // No `_session/steering` extension: a steer preempts the generation
-        // (waiting out running tools) and continues the turn — immediate.
-        steering_mode: SteeringMode::StepBoundary,
-        // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron
-        // equivalent and is left to the agent default).
-        reasoning_levels: &[
-            ReasoningLevel::Minimal,
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
@@ -1264,7 +1178,7 @@ pub fn prewarm_managed_adapters() {
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         return;
     };
-    for spec in [grok_spec(), pi_spec()] {
+    for spec in [grok_spec()] {
         let Some(pkg) = spec.npm_package else {
             continue;
         };
@@ -1368,12 +1282,6 @@ impl AcpHarness {
     /// Hermes Agent (`hermes acp`) — Nous Research's native ACP server.
     pub fn hermes() -> Self {
         Self::with_spec(hermes_spec())
-    }
-
-    /// The pi coding agent over ACP — the community `pi-acp` adapter wrapping
-    /// pi's RPC mode.
-    pub fn pi() -> Self {
-        Self::with_spec(pi_spec()).with_model_discovery_timeout(Duration::from_secs(60))
     }
 
     /// google antigravity over its acp server (`agy_acp_server`).
@@ -1770,7 +1678,7 @@ impl AcpHarness {
         cwd: Option<&str>,
         block_on_install: bool,
         extra_args: &[String],
-        mcp: Option<&zeron_proto::McpServer>,
+        _mcp: Option<&zeron_proto::McpServer>,
     ) -> Result<
         (
             Option<ScratchDir>,
@@ -1807,13 +1715,6 @@ impl AcpHarness {
         if let Some(dir) = &scratch {
             dir.apply(&mut cmd);
         }
-        let scratch = if self.spec.id == HarnessId::Pi
-            && let Some(mcp) = mcp
-        {
-            Some(pi_mcp::configure(&mut cmd, mcp)?)
-        } else {
-            scratch
-        };
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -2288,8 +2189,7 @@ impl Harness for AcpHarness {
                 Launch::Managed { .. } => None,
             };
         }
-        // Overrides select the ACP transport. Pi's transport is pi-acp,
-        // whereas version checks and self-updates must target the pi CLI.
+        // Version checks and updates target the agent CLI when its transport differs.
         if self.spec.executable == self.spec.cli_executable {
             if let Some(path) = &self.executable {
                 return Some(path.clone());
@@ -4997,14 +4897,6 @@ mod tests {
     }
 
     #[test]
-    fn pi_discovery_allows_cold_extension_startup() {
-        let pi = AcpHarness::pi();
-        assert_eq!(pi.model_discovery_timeout, Duration::from_secs(60));
-        assert_eq!(pi.handshake_timeout, Duration::from_secs(120));
-        assert!(pi.spec.prompt_stall.is_none());
-    }
-
-    #[test]
     fn antigravity_discovery_budget_covers_cold_start_without_changing_handshake() {
         let harness = AcpHarness::antigravity();
         assert_eq!(harness.model_discovery_timeout, Duration::from_secs(90));
@@ -5275,24 +5167,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cli_update_path_does_not_use_a_separate_acp_adapter_override() {
-        let adapter = PathBuf::from("/test/custom-pi-acp");
-        let pi = AcpHarness::pi().with_executable(&adapter);
-        assert_eq!(
-            pi.executable_path(),
-            find_on_paths(pi.spec.cli_executable, (pi.spec.cli_extra_paths)())
-        );
-        assert_ne!(pi.executable_path(), Some(adapter.clone()));
-        // Native ACP agents use the same executable for both roles.
-        assert_eq!(
-            AcpHarness::grok()
-                .with_executable(&adapter)
-                .executable_path(),
-            Some(adapter)
-        );
-    }
-
     /// runs in a child process, since installs resolve through the
     /// process-wide `ZERON_ADAPTERS_DIR`.
     #[cfg(any(unix, windows))]
@@ -5490,32 +5364,6 @@ mod tests {
                 "the pinned digest needs no registry archive"
             );
         }
-    }
-
-    #[test]
-    fn cli_update_path_ignores_pi_acp_environment_override() {
-        const ADAPTER: &str = "/test/environment-pi-acp";
-        if std::env::var("PI_ACP_EXECUTABLE").as_deref() != Ok(ADAPTER) {
-            // Run with a private environment; do not mutate process-global
-            // variables while other harness tests are running.
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "acp::tests::cli_update_path_ignores_pi_acp_environment_override",
-                    "--nocapture",
-                ])
-                .env("PI_ACP_EXECUTABLE", ADAPTER)
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
-            return;
-        }
-        let pi = AcpHarness::pi();
-        assert_eq!(
-            pi.executable_path(),
-            find_on_paths("pi", (pi.spec.cli_extra_paths)())
-        );
-        assert_ne!(pi.executable_path(), Some(PathBuf::from(ADAPTER)));
     }
 
     #[test]

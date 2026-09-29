@@ -3,7 +3,7 @@ use serde_json::{Value, json};
 use std::{
     io::{BufRead, Write},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -57,6 +57,10 @@ fn main() {
         )
         .unwrap();
     }
+    if !args.iter().any(|a| a == "--no-session") {
+        std::fs::write("pi.pid", std::process::id().to_string()).unwrap();
+    }
+    let queue = Arc::new(Mutex::new(std::collections::VecDeque::<String>::new()));
     let active = Arc::new(AtomicBool::new(false));
     let abort = Arc::new(AtomicBool::new(false));
     let mut dialog = None;
@@ -107,11 +111,30 @@ fn main() {
                     );
                     continue;
                 }
+                #[cfg(unix)]
+                if matches!(text.as_str(), "tree" | "inherited-pipe-crash") {
+                    let child = std::process::Command::new("sh")
+                        .args(["-c", "sleep 30"])
+                        .spawn()
+                        .unwrap();
+                    std::fs::write("tool.pid", child.id().to_string()).unwrap();
+                    if text == "inherited-pipe-crash" {
+                        eprintln!("inherited pipe diagnostic");
+                        std::process::exit(7);
+                    }
+                }
                 if text == "crash" {
                     eprintln!("mock crash diagnostic");
                     std::process::exit(7);
                 }
+                let mut queued = queue.lock().unwrap();
+                if active.load(Ordering::SeqCst) {
+                    queued.push_back(text);
+                    response(&v, json!({}));
+                    continue;
+                }
                 active.store(true, Ordering::SeqCst);
+                drop(queued);
                 abort.store(false, Ordering::SeqCst);
                 response(&v, json!({}));
                 emit(json!({"type":"agent_start"}));
@@ -120,41 +143,71 @@ fn main() {
                 );
                 let active = active.clone();
                 let abort = abort.clone();
+                let queue = queue.clone();
                 std::thread::spawn(move || {
-                    if text == "slow" {
-                        for _ in 0..100 {
-                            if abort.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
+                    let mut text = text;
+                    loop {
+                        if text == "tree" {
+                            emit(
+                                json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"tree ready"}}),
+                            );
                         }
-                    }
-                    if text == "retry" {
-                        message("", "error");
-                        emit(json!({"type":"agent_end","willRetry":true}));
-                        std::thread::sleep(Duration::from_millis(150));
-                        emit(json!({"type":"agent_start"}));
-                    }
-                    if text == "compact" {
+                        if text == "slow" || text == "tree" {
+                            for _ in 0..100 {
+                                if abort.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                        }
+                        if text == "retry" {
+                            message("", "error");
+                            emit(json!({"type":"agent_end","willRetry":true}));
+                            std::thread::sleep(Duration::from_millis(150));
+                            emit(json!({"type":"agent_start"}));
+                        }
+                        if text == "compact" {
+                            emit(json!({"type":"agent_end"}));
+                            emit(json!({"type":"compaction_start"}));
+                            std::thread::sleep(Duration::from_millis(100));
+                            emit(
+                                json!({"type":"compaction_end","result":{"estimatedTokensAfter":9}}),
+                            );
+                        }
+                        if abort.load(Ordering::SeqCst) {
+                            message("", "aborted");
+                        } else if text == "error" {
+                            message("", "error");
+                        } else {
+                            emit(json!({"type":"message_start","message":{"role":"assistant"}}));
+                            emit(
+                                json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"reply:"}}),
+                            );
+                            message(&format!("reply:{text}"), "stop");
+                        }
                         emit(json!({"type":"agent_end"}));
-                        emit(json!({"type":"compaction_start"}));
-                        std::thread::sleep(Duration::from_millis(100));
-                        emit(json!({"type":"compaction_end","result":{"estimatedTokensAfter":9}}));
+                        let mut queued = queue.lock().unwrap();
+                        if !abort.load(Ordering::SeqCst)
+                            && let Some(next) = queued.pop_front()
+                        {
+                            text = next;
+                            emit(
+                                json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":text}]}}),
+                            );
+                            continue;
+                        }
+                        active.store(false, Ordering::SeqCst);
+                        emit(json!({"type":"agent_settled"}));
+                        if text == "late-notify" {
+                            std::thread::spawn(|| {
+                                std::thread::sleep(Duration::from_millis(30));
+                                emit(
+                                    json!({"type":"extension_ui_request","method":"notify","message":"background notice"}),
+                                );
+                            });
+                        }
+                        break;
                     }
-                    if abort.load(Ordering::SeqCst) {
-                        message("", "aborted");
-                    } else if text == "error" {
-                        message("", "error");
-                    } else {
-                        emit(json!({"type":"message_start","message":{"role":"assistant"}}));
-                        emit(
-                            json!({"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"reply:"}}),
-                        );
-                        message(&format!("reply:{text}"), "stop");
-                    }
-                    emit(json!({"type":"agent_end"}));
-                    active.store(false, Ordering::SeqCst);
-                    emit(json!({"type":"agent_settled"}));
                 });
             }
             "steer" => {
@@ -163,7 +216,10 @@ fn main() {
                     json!({"type":"message_start","message":{"role":"user","content":[{"type":"text","text":v["message"]}]}}),
                 );
             }
-            "clear_queue" => response(&v, json!({"steering":[],"followUp":[]})),
+            "clear_queue" => {
+                queue.lock().unwrap().clear();
+                response(&v, json!({"steering":[],"followUp":[]}));
+            }
             "abort" => {
                 abort.store(true, Ordering::SeqCst);
                 response(&v, json!({}));

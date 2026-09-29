@@ -8,7 +8,7 @@ mod ui;
 
 use crate::{
     Harness, HarnessError, RunControls,
-    process::{Child, Command, Stdio},
+    process::{Command, Stdio, owned::Child},
 };
 use async_trait::async_trait;
 use futures::{StreamExt, stream::BoxStream};
@@ -134,7 +134,7 @@ impl PiHarness {
         let scratch = mcp
             .map(|config| self::mcp::configure(&mut cmd, config))
             .transpose()?;
-        let mut child = cmd.spawn()?;
+        let mut child = Child::new(cmd.spawn()?);
         let tail = crate::StderrTail::default();
         let mut lines = BufReader::new(child.stderr.take().expect("piped stderr")).lines();
         let stderr = tail.clone();
@@ -155,6 +155,7 @@ impl PiHarness {
             tail,
             stderr_task,
             dialogs: Default::default(),
+            exit_deadline: None,
         })
     }
 }
@@ -165,6 +166,7 @@ struct Process {
     tail: crate::StderrTail,
     stderr_task: tokio::task::JoinHandle<()>,
     dialogs: ui::Dialogs,
+    exit_deadline: Option<tokio::time::Instant>,
 }
 impl Drop for Process {
     fn drop(&mut self) {
@@ -172,14 +174,34 @@ impl Drop for Process {
     }
 }
 impl Process {
+    async fn next(&mut self) -> Result<Value, HarnessError> {
+        loop {
+            tokio::select! {
+                // Drain buffered output before reporting process death. A descendant
+                // may retain stdout, so EOF alone cannot govern liveness.
+                biased;
+                _ = async {
+                    match self.exit_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => return Err(HarnessError::Protocol("Pi exited".into())),
+                status = self.child.wait(), if self.exit_deadline.is_none() => {
+                    status?;
+                    self.exit_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(100));
+                }
+                frame = self.transport.incoming.recv() => return frame.unwrap_or_else(|| Err(HarnessError::Protocol("Pi disconnected".into()))),
+            }
+        }
+    }
     async fn query(
         &mut self,
         command: Value,
         backlog: &mut Vec<Value>,
     ) -> Result<Value, HarnessError> {
         let id = self.transport.client.request(command)?;
-        while let Some(frame) = self.transport.incoming.recv().await {
-            let frame = frame?;
+        loop {
+            let frame = self.next().await?;
             if frame["type"] == "response" && frame["id"] == id {
                 return response_data(frame);
             }
@@ -189,10 +211,10 @@ impl Process {
                 backlog.push(frame);
             }
         }
-        Err(HarnessError::Protocol("Pi disconnected".into()))
     }
     async fn shutdown(&mut self, grace: Duration) {
-        crate::shutdown_child(&mut self.child, grace).await;
+        self.dialogs.cancel();
+        self.child.shutdown(grace).await;
     }
 }
 fn response_data(frame: Value) -> Result<Value, HarnessError> {
@@ -613,9 +635,7 @@ impl Runner {
                 return Ok(());
             }
             tokio::select! {
-                incoming=self.process.transport.incoming.recv()=>{
-                    match incoming {Some(frame)=>self.frame(frame?).await?,None=>return Err(HarnessError::Protocol("Pi disconnected".into()))}
-                }
+                incoming=self.process.next()=>self.frame(incoming?).await?,
                 steer=steering.recv(),if open=>match steer {Some(steer)=>self.queued.push_back(steer),None=>open=false}
             }
         }
@@ -653,7 +673,7 @@ impl Runner {
             return;
         };
         let _ = tokio::time::timeout(grace, async {
-            while let Some(Ok(frame)) = self.process.transport.incoming.recv().await {
+            while let Ok(frame) = self.process.next().await {
                 if frame["id"] == abort && frame["success"] == true {
                     break;
                 }
@@ -666,17 +686,19 @@ impl Runner {
     }
     async fn frame(&mut self, frame: Value) -> Result<(), HarnessError> {
         if frame["type"] == "extension_ui_request" {
+            if !self.active {
+                // A background notification must not reopen a completed engine turn.
+                // No foreground run can own a dialog here, so cancel it explicitly.
+                ui::Dialogs::default().request(self.process.transport.client.clone(), &frame);
+                tracing::debug!(method = %string(&frame, "method"), "Pi UI request outside a run");
+                return Ok(());
+            }
             self.process
                 .dialogs
                 .request(self.process.transport.client.clone(), &frame);
             if frame["method"] == "notify" {
                 self.emit(AgentEvent::TextDelta {
-                    text: format!(
-                        "
-{}
-",
-                        string(&frame, "message")
-                    ),
+                    text: format!("\n{}\n", string(&frame, "message")),
                 })
                 .await?;
             }

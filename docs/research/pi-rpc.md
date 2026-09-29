@@ -1,8 +1,8 @@
 **Investigación: pasar Pi de ACP a RPC nativo en Zeron — 2026-09-29**
 
-Recomendación: implementar `PiHarness` en Rust y conectar directamente con `pi --mode rpc`. La interfaz `Harness` y los eventos de Zeron permiten conservar gran parte del engine y de la UI. El trabajo principal está en el ciclo de vida, la normalización de eventos, las sesiones y las extensiones. Esta investigación no implementa la migración.
+Recomendación: implementar `PiHarness` en Rust y conectar directamente con `pi --mode rpc`. La interfaz `Harness` y los eventos de Zeron permiten conservar gran parte del engine y de la UI. El trabajo principal está en el ciclo de vida, la normalización de eventos, las sesiones y las extensiones. La migración está implementada; esta investigación conserva el diagnóstico previo. El contrato definitivo está en [PROTOCOL.md](../../crates/harness/src/pi/PROTOCOL.md) y la guía operativa en [Pi](../pi.md).
 
-Hoy el recorrido es `Zeron → AcpHarness → pi-acp → pi --mode rpc`. La propuesta es `Zeron → PiHarness → pi --mode rpc`. Se elimina un proceso intermediario y la dependencia de instalación del adaptador; Pi y sus dependencias siguen siendo necesarios. No se midió una mejora de latencia.
+Antes el recorrido era `Zeron → AcpHarness → pi-acp → pi --mode rpc`. Ahora es `Zeron → PiHarness → pi --mode rpc`. Se elimina un proceso intermediario y la dependencia de instalación del adaptador; Pi y sus dependencias siguen siendo necesarios. No se midió una mejora de latencia.
 
 **Evidencia revisada**
 
@@ -54,7 +54,9 @@ Hay otra ruta terminal: comandos de extensiones o handlers de input que consumen
 
 La documentación actual incorpora `data.disposition = started | queued | handled`. Sin embargo, Pi 0.85.1 probado devuelve éxito sin ese campo, y el [código correspondiente a 0.87.1](https://github.com/earendil-works/pi/blob/f07218c4d4bbc12bef056a7058c3dd49dfe41abe/packages/coding-agent/src/modes/rpc/rpc-mode.ts) también usa una confirmación booleana de preflight sin disposición. No conviene implementar suponiendo que `latest` documentado equivale al npm instalado.
 
-La implementación debe fijar una matriz de versiones y resolver explícitamente esa ruta: compatibilidad probada para las versiones sin disposición, o una versión publicada verificada que ya incluya el campo. Un timeout o una lectura aislada de `isStreaming: false` no demuestra finalización durante reintentos o compactación. Los comandos conocidos de extensiones pueden tratarse de forma específica, pero los handlers que consumen prompts normales requieren cobertura adicional.
+Compatibilidad resuelta durante la implementación: tras el ACK se envía `get_state` por el mismo canal, procesando todos los eventos anteriores. En 0.85.1 y el código inspeccionado de 0.87.1, `isStreaming` refleja `_isAgentRunActive`, incluyendo reintentos y continuaciones, y se activa sincrónicamente antes del siguiente comando de stdin. `isStreaming: false` y `isCompacting: false` en esa barrera ordenada permiten cerrar un prompt consumido sin run. Cada barrera pertenece a una época de envío; no es un temporizador de silencio. La prueba con Pi real cubre el comando `/probe-noop` y la continuidad de sesiones.
+
+El envío de steering usa `prompt` con `streamingBehavior: "steer"`: Pi encola si está activo y empieza un run si está idle, en una operación atómica. Esto evita la carrera de una lectura de estado seguida de un `steer` separado.
 
 Para steering, el ACK indica que se encoló, no que ya se incorporó al contexto. Rotar el segmento del transcript al observar su incorporación, mantener los `message_id` de Zeron y cubrir la carrera entre encolar y quedar idle. `follow_up` existe, pero `RunControls` sólo dispone hoy de una entrada de steering: ofrecer ambos comportamientos al usuario requiere ampliar el contrato/UI. Para interrumpir, vaciar la cola mediante `clear_queue`, enviar `abort` y conservar la escalada de terminación si no responde. [Comandos RPC](https://pi.dev/docs/latest/rpc-commands).
 

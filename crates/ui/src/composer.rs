@@ -1729,6 +1729,12 @@ pub struct ComposerInput {
     /// Key context for the binding map ("Composer", or "PaletteSearch" for
     /// palette filters whose navigation keys must bubble).
     key_context: &'static str,
+    /// Cmd+C with no input selection copies the transcript selection. Only
+    /// the message composer keeps focus while the user reads the transcript;
+    /// dialog and palette fields copy only their own selection. A flag rather
+    /// than `key_context`, which the question wizard swaps while it borrows
+    /// the message input.
+    copies_transcript_selection: bool,
     accessibility_role: Role,
     focus_handle: FocusHandle,
     content: String,
@@ -1836,6 +1842,7 @@ impl ComposerInput {
     ) -> Self {
         Self {
             key_context,
+            copies_transcript_selection: false,
             accessibility_role: Role::MultilineTextInput,
             focus_handle: cx.focus_handle(),
             content: String::new(),
@@ -2791,11 +2798,9 @@ impl ComposerInput {
                 text.clone(),
                 serde_json::json!({ "zeronComposerV1": raw, "text": text }),
             ));
-        } else if self.key_context == MESSAGE_COMPOSER_CONTEXT
+        } else if self.copies_transcript_selection
             && let Some(text) = crate::markdown::selection::selected_text()
         {
-            // Only the message composer keeps focus while reading the transcript.
-            // Generic inputs in dialogs and palettes copy their own selection.
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
@@ -5455,6 +5460,7 @@ impl Composer {
             let mut input =
                 ComposerInput::with_context("Do anything…", MESSAGE_COMPOSER_CONTEXT, cx);
             input.enable_mentions();
+            input.copies_transcript_selection = true;
             input
         });
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
@@ -11328,8 +11334,16 @@ mod tests {
             crate::markdown::selection::end_active_drag();
             input.copy(&Copy, window, cx);
             let copied = cx.read_from_clipboard().and_then(|item| item.text());
+            // The question wizard borrows this input under the generic
+            // context; it is still the message composer.
+            cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+            input.set_key_context(message_input_context(true), cx);
+            input.copy(&Copy, window, cx);
+            let copied_in_wizard = cx.read_from_clipboard().and_then(|item| item.text());
+            input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
             crate::markdown::selection::clear_if_owner(key);
             assert_eq!(copied.as_deref(), Some(text));
+            assert_eq!(copied_in_wizard.as_deref(), Some(text));
         });
     }
 

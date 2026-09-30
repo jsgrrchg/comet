@@ -433,7 +433,15 @@ impl Composer {
             Some(QueueDeliveryGate::ReviewRequired { .. }) if !being_edited => {
                 SharedString::from("Needs review")
             }
-            _ => one_line(&queue_visible_text(&item.text, &item.attachments)),
+            _ => {
+                let raw = queue_visible_text(&item.text, &item.attachments);
+                // Project references only for display; editing and delivery
+                // still need their canonical identities in the stored text.
+                let display = crate::composer::sent_mention_display(&raw)
+                    .map(|(text, _)| text)
+                    .unwrap_or(raw);
+                one_line(&display)
+            }
         };
 
         let edit_id = item.id.clone();

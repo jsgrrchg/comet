@@ -63,6 +63,7 @@ mod chat_dropzone;
 #[cfg(test)]
 mod chat_dropzone_tests;
 mod command_palette;
+mod file_mutations;
 mod files_panel;
 mod harness_updates;
 mod navigation_focus;
@@ -969,6 +970,10 @@ const SIDEBAR_LIST_PAD_TOP: f32 = 4.0;
 
 /// Active and archived sessions share harness/title geometry.
 const SIDEBAR_ACTIVE_HARNESS_ICON_SIZE: f32 = 13.0;
+/// Compact-row time slot while a text jump hint ("Ctrl+9") stands in for the
+/// time: wide enough for the widest of them at 11px on one line. In
+/// default-size pixels; scaled with the UI font via `ui_rems`.
+const COMPACT_JUMP_HINT_WIDTH: f32 = 42.0;
 const SIDEBAR_ACTIVE_HARNESS_TITLE_GAP: f32 = Theme::SPACE_SM;
 /// The sidebar footer's profile and settings buttons share one hit target.
 const SIDEBAR_FOOTER_BUTTON_SIZE: f32 = 28.0;
@@ -1269,13 +1274,14 @@ fn new_thread_background_opacity(is_frost: bool) -> f32 {
     }
 }
 
-fn new_thread_background_height(viewport_height: f32) -> f32 {
+pub(crate) fn new_thread_background_height(viewport_height: f32) -> f32 {
     (viewport_height.max(0.0) * NEW_THREAD_BACKGROUND_VIEWPORT_RATIO)
         .min(NEW_THREAD_BACKGROUND_MAX_HEIGHT)
 }
 
 fn new_thread_background(
     artwork: Option<std::sync::Arc<gpui::RenderImage>>,
+    adjustment: settings::NewThreadBackgroundAdjustment,
     viewport_height: f32,
     hero_width: f32,
     composer_bounds: crate::new_thread_background_mask::SurfaceBounds,
@@ -1320,6 +1326,7 @@ fn new_thread_background(
                                     artwork.clone(),
                                     bounds,
                                     composer,
+                                    adjustment,
                                     cutout,
                                     window,
                                 );
@@ -3117,10 +3124,43 @@ impl Shell {
             .collect()
     }
 
+    /// Attach a workspace path only while the surface it came from still
+    /// shows this chat's workspace; a drag outliving a session switch is dropped.
+    fn attach_workspace_drag(
+        &mut self,
+        payload: &WorkspacePathDrag,
+        composer: &Entity<Composer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(origin) = &payload.origin else {
+            return;
+        };
+        let current = crate::files::client::FilesRequestContext::for_chat(
+            self.state.read(cx),
+            &self.panel_key(cx),
+        );
+        if current.as_ref() != Some(&origin.context) || !matches!(self.route, Route::Chat) {
+            return;
+        }
+        let valid = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .any(|files| {
+                files.entity_id() == origin.surface_id && files.read(cx).accepts_origin(origin, cx)
+            });
+        if valid {
+            composer.update(cx, |composer, cx| {
+                composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
+            });
+        }
+    }
+
     fn workspace_path_for_surface(
         &self,
         surface: RightSurface,
-        _cx: &App,
+        cx: &App,
     ) -> Option<WorkspacePathDrag> {
         let path = match surface {
             RightSurface::File(id) => self.file_surface_paths.get(&id)?.clone(),
@@ -3134,7 +3174,15 @@ impl Shell {
                 return None;
             }
         };
-        Some(WorkspacePathDrag::new(path, false))
+        let RightSurface::File(id) = surface else {
+            return None;
+        };
+        let origin = self.file_surfaces.get(&id)?.read(cx).interaction_origin(cx);
+        Some(WorkspacePathDrag::new(path, false).with_origin(
+            origin,
+            crate::files::WorkspacePathSource::FileTab,
+            None,
+        ))
     }
 
     /// Drag-reorder a surface tab within this chat's strip.
@@ -3656,6 +3704,35 @@ impl Shell {
                     return;
                 }
                 match event {
+                    FilesEvent::HoldMutation { origin, path } => {
+                        let surfaces = this
+                            .files
+                            .values()
+                            .chain(this.file_surfaces.values())
+                            .filter(|s| s.read(cx).shares_workspace(origin))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for surface in surfaces {
+                            surface.update(cx, |files, cx| files.hold_mutation(path.clone(), cx));
+                        }
+                    }
+                    FilesEvent::AddToChat {
+                        path,
+                        is_directory,
+                        origin,
+                    } => {
+                        let payload = WorkspacePathDrag::new(path.clone(), *is_directory)
+                            .with_origin(
+                                Some(origin.clone()),
+                                crate::files::WorkspacePathSource::Tree,
+                                None,
+                            );
+                        let composer = this.composer.clone();
+                        this.attach_workspace_drag(&payload, &composer, window, cx);
+                    }
+                    FilesEvent::Mutate(intent) => {
+                        this.start_file_mutation(source.clone(), intent.clone(), cx)
+                    }
                     // Navigation from an editor stays in its own chat.
                     FilesEvent::OpenFile(path) => {
                         let owner = (source.read(cx).chat_id().to_owned(), owner_state.clone());
@@ -4545,6 +4622,8 @@ impl Shell {
         self.settings.transcript_width = current.transcript_width;
         self.settings.skill_completion_by_harness = current.skill_completion_by_harness;
         self.settings.skills_in_slash_menu = current.skills_in_slash_menu;
+        self.settings.reduce_motion = current.reduce_motion;
+        self.settings.pause_animations_in_background = current.pause_animations_in_background;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -6338,6 +6417,7 @@ impl Shell {
             .child(window_control_button(
                 "toggle-sidebar",
                 icons::SIDEBAR_MINIMALISTIC_LEFT,
+                ShortcutId::ToggleSidebar.label(),
                 &theme,
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
             ))
@@ -6351,6 +6431,7 @@ impl Shell {
                     .child(nav_history_button(
                         "nav-back",
                         icons::ARROW_LEFT,
+                        "Back",
                         can_back,
                         &theme,
                         cx.listener(|this, _, _, cx| this.navigate_back(cx)),
@@ -6358,6 +6439,7 @@ impl Shell {
                     .child(nav_history_button(
                         "nav-forward",
                         icons::ARROW_RIGHT,
+                        "Forward",
                         can_forward,
                         &theme,
                         cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
@@ -6371,6 +6453,7 @@ impl Shell {
                     .child(window_control_button(
                         "titlebar-new-session",
                         icons::PLUS,
+                        ShortcutId::NewSession.label(),
                         &theme,
                         cx.listener(|this, _, _, cx| this.open_new_session(cx)),
                     ))
@@ -7163,6 +7246,7 @@ impl Shell {
                     .px(px(4.0))
                     .rounded(px(4.0))
                     .bg(tone.opacity(0.08))
+                    .whitespace_nowrap()
                     .text_size(crate::typography::ui_rems(10.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(tone.opacity(0.85))
@@ -7559,14 +7643,30 @@ impl Shell {
                         }))
                     })
                     .when(compact, |el| {
+                        // The time slot is 30px, which holds "17m" but not
+                        // "Ctrl+2": unwrapped, the hint broke after the `+`
+                        // and stacked two lines. A text-length hint keeps one
+                        // line in a wider slot — a floor, not content sized,
+                        // so "Ctrl+1" (a narrower glyph) doesn't nudge its
+                        // row's badge off the others'. The floor scales with
+                        // the UI font like the text does, and a longer
+                        // rebound combo grows the slot instead of spilling
+                        // over the title.
+                        let text_hint = compact_jump_label
+                            .as_ref()
+                            .is_some_and(|label| label.chars().count() > 3);
                         el.child(
                             div()
                                 .debug_selector({
                                     let id = id.clone();
                                     move || format!("chat-time-{id}")
                                 })
-                                .w(px(30.0))
+                                .when(text_hint, |el| {
+                                    el.min_w(crate::typography::ui_rems(COMPACT_JUMP_HINT_WIDTH))
+                                })
+                                .when(!text_hint, |el| el.w(px(30.0)))
                                 .flex_none()
+                                .whitespace_nowrap()
                                 .text_right()
                                 .text_size(crate::typography::ui_rems(11.0))
                                 .text_color(subline)
@@ -8286,6 +8386,7 @@ impl Shell {
                             cx.stop_propagation();
                             this.dismiss_github_star_banner(cx);
                         }))
+                        .tooltip(crate::settings::widgets::text_tooltip("Dismiss"))
                         .child(icon(icons::CLOSE).size(px(10.0)).text_color(tone)),
                 )
                 .into_any_element(),
@@ -9934,6 +10035,10 @@ impl Shell {
         let ui_settings = settings::current(cx);
         let new_thread_background_setting = ui_settings.new_thread_composer_background;
         let new_thread_background_effect = ui_settings.new_thread_background_effect;
+        let new_thread_background_adjustment = new_thread_background_setting
+            .as_ref()
+            .map(|background| background.adjustment)
+            .unwrap_or_default();
         let frame_time = self.render_time.unwrap_or_else(std::time::Instant::now);
         // Prewarm even in an established thread. Decode/effect work is not
         // contingent on a hero measurement or a navigation gesture.
@@ -9949,6 +10054,10 @@ impl Shell {
             });
         let artwork_frame = self.new_thread_artwork_ready.frame(
             artwork,
+            new_thread_background_setting
+                .as_ref()
+                .map(|background| std::path::Path::new(&background.path)),
+            new_thread_background_adjustment,
             new_thread_background_setting.is_some(),
             self.reduced_motion,
             frame_time,
@@ -9996,6 +10105,7 @@ impl Shell {
                 .inset_0()
                 .child(new_thread_background(
                     artwork_frame.previous,
+                    artwork_frame.previous_adjustment,
                     self.viewport_height,
                     width,
                     bounds.clone(),
@@ -10004,6 +10114,7 @@ impl Shell {
                 ))
                 .child(new_thread_background(
                     artwork_frame.current,
+                    artwork_frame.current_adjustment,
                     self.viewport_height,
                     width,
                     bounds,
@@ -10114,6 +10225,7 @@ impl Shell {
         };
         let status = self.render_status_strip(composer_width, cx);
         self.chat_dropzone("chat-dropzone", self.composer.clone(), cx)
+            .debug_selector(|| "chat-dropzone".into())
             .track_focus(&self.navigation_focus.main)
             .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
                 this.capture_navigation_focus(false, false, window, cx);
@@ -11342,6 +11454,7 @@ impl Shell {
                     cx.notify();
                 }
             }))
+            .tooltip(crate::settings::widgets::text_tooltip("New tab"))
             .child(
                 icon(icons::PLUS)
                     .size(px(13.0))
@@ -11988,6 +12101,7 @@ fn grid_backdrop(theme: &Theme) -> AnyElement {
 fn window_control_button(
     id: &'static str,
     icon_path: &'static str,
+    label: &'static str,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
@@ -12027,6 +12141,7 @@ fn window_control_button(
             cx.stop_propagation();
             on_click(event, window, cx)
         })
+        .tooltip(crate::settings::widgets::text_tooltip(label))
         .child(icon(icon_path).size(px(16.0)).text_color(muted))
 }
 
@@ -12142,6 +12257,7 @@ fn linux_caption_button(
 fn nav_history_button(
     id: &'static str,
     icon_path: &'static str,
+    label: &'static str,
     enabled: bool,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -12163,7 +12279,7 @@ fn nav_history_button(
             )
             .into_any_element();
     }
-    window_control_button(id, icon_path, theme, on_click).into_any_element()
+    window_control_button(id, icon_path, label, theme, on_click).into_any_element()
 }
 
 /// A size-7 icon button for the main-panel header (zeron __root.tsx:
@@ -12171,6 +12287,7 @@ fn nav_history_button(
 fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
+    label: &'static str,
     theme: &Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Stateful<gpui::Div> {
@@ -12201,11 +12318,24 @@ fn header_icon_button(
             cx.stop_propagation();
             on_click(event, window, cx)
         })
+        .tooltip(crate::settings::widgets::text_tooltip(label))
         .child(icon(icon_path).size(px(16.0)).text_color(muted))
 }
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_files_key = self.panel_key(cx);
+        let hidden_explorers = self
+            .files
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() != active_files_key || !matches!(self.route, Route::Chat)
+            })
+            .map(|(_, files)| files.clone())
+            .collect::<Vec<_>>();
+        for files in hidden_explorers {
+            files.update(cx, |files, cx| files.suspend_tree_interactions(cx));
+        }
         settings::wallpaper::preload(cx);
         self.navigation_focus
             .remember(&self.shortcut_focus, window, cx);
@@ -12401,6 +12531,7 @@ impl Render for Shell {
             self.activation_sub = Some(cx.observe_window_activation(
                 window,
                 |this: &mut Shell, window, cx| {
+                    motion::window_activation_changed(window.is_window_active(), cx);
                     if window.is_window_active()
                         && let Some(update) = crate::app_update::AppUpdate::global(cx)
                     {
@@ -14723,6 +14854,56 @@ mod exit_regressions {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn shell_saves_keep_motion_settings_chosen_in_appearance(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                // The Appearance page writes these straight to the store,
+                // outside the shell's working copy.
+                settings::update(SavePolicy::Immediate, cx, |settings| {
+                    settings.reduce_motion = crate::motion::ReduceMotion::On;
+                    settings.pause_animations_in_background = true;
+                });
+                // Any shell-owned change (sidebar width, panels) republishes
+                // the working copy; it must not revert the motion choices.
+                shell.schedule_save(cx);
+                let saved = settings::current(cx);
+                assert_eq!(saved.reduce_motion, crate::motion::ReduceMotion::On);
+                assert!(saved.pause_animations_in_background);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

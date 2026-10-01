@@ -79,3 +79,18 @@ project directory. Creation performs no inference and does not restore files.
 Offline helper tests: `node --test crates/harness/src/claude/fork.test.mjs`.
 The storage test additionally accepts `CLAUDE_FORK_TEST_SDK=/absolute/path/to/sdk.mjs`
 with the pinned package and runs `node --test crates/harness/src/claude/fork.storage.test.mjs`.
+
+### Native Pi message forks
+
+Pi 0.85.1 replies use official `SessionManager.createBranchedSession(entryId)`
+through the managed `@earendil-works/pi-coding-agent@0.85.1` storage module. Node
+>=22.19.0 is required, with npm for first preparation. The helper and point-capture
+extension are embedded in the harness binary. Creation performs no inference,
+keeps the parent session intact and verifies the exact inclusive branch/context.
+Native children require their saved session and cannot fall back to a fresh run.
+
+Offline tests: `node --test crates/harness/src/pi/fork.test.mjs`. Set
+`PI_FORK_SDK_MODULE` to the pinned SDK's absolute `dist/core/session-manager.js`
+to include actual storage tests. Isolated real-process tests use a local mock:
+`cargo test -p zeron-harness --test pi_live -- --ignored --nocapture`.
+See [Pi setup and continuity](../../docs/pi.md) for configuration and limitations.

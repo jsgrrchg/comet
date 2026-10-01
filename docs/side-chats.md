@@ -1,6 +1,6 @@
 # Side chats
 
-Hover a completed Codex, Claude Code, or OpenCode reply and click the fork icon immediately to the left of Copy. Its menu offers **Fork in side chat** and **Fork as main conversation**. A main conversation appears in the left sidebar and opens in the main chat area. The same controls are reachable by keyboard. Zeron opens a saved conversation with an empty composer and the original conversation through that reply. Creating it does not send a prompt or run the model.
+Hover a completed Codex, Claude Code, OpenCode, or Pi reply and click the fork icon immediately to the left of Copy. Its menu offers **Fork in side chat** and **Fork as main conversation**. A main conversation appears in the left sidebar and opens in the main chat area. The same controls are reachable by keyboard. Zeron opens a saved conversation with an empty composer and the original conversation through that reply. Creating it does not send a prompt or run the model.
 
 The new conversation resumes an independent native provider session. Later turns in the original conversation are excluded. The original chat keeps running. Both chats use the same execution device, provider, and current checkout; this action does not restore files or create a worktree. The provider picker stays locked in either saved destination.
 

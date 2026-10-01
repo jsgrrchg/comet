@@ -12,6 +12,7 @@ use zeron_rpc::methods;
 
 #[derive(Default)]
 struct NativeStore {
+    provider: Option<HarnessId>,
     forks: AtomicUsize,
     sessions: Mutex<std::collections::HashMap<String, Vec<String>>>,
     requests: Mutex<Vec<RunRequest>>,
@@ -25,7 +26,7 @@ struct NativeStore {
 #[async_trait]
 impl Harness for NativeStore {
     fn id(&self) -> HarnessId {
-        HarnessId::Mock
+        self.provider.unwrap_or(HarnessId::Mock)
     }
     fn display_name(&self) -> &str {
         "Native store"
@@ -64,10 +65,14 @@ impl Harness for NativeStore {
             release.notified().await;
         }
         assert_eq!(point.source_session_id, "canonical");
-        let NativeForkBoundary::AppServerTurn { turn_id } = &point.boundary else {
-            panic!()
-        };
-        assert_eq!(turn_id, "a1");
+        match &point.boundary {
+            NativeForkBoundary::AppServerTurn { turn_id } => assert_eq!(turn_id, "a1"),
+            NativeForkBoundary::PiEntry { entry_id } => {
+                assert_eq!(self.id(), HarnessId::Pi);
+                assert_eq!(entry_id, "native-a1");
+            }
+            _ => panic!("unexpected boundary"),
+        }
         let id = format!("native-child-{}", self.forks.load(Ordering::SeqCst));
         self.sessions
             .lock()
@@ -109,15 +114,22 @@ impl Harness for NativeStore {
     }
 }
 fn setup(dir: &std::path::Path, harness: Arc<NativeStore>) -> EngineCore {
+    let provider = harness.id();
     let registry = Arc::new(HarnessRegistry::new());
     registry.register(harness);
-    let core = EngineCore::assemble(dir, registry, HarnessId::Mock, None).unwrap();
+    let core = EngineCore::assemble(dir, registry, provider, None).unwrap();
     core.workspace
         .create_chat(
             "main",
             None,
             Some(&core.device_id),
-            None,
+            (provider == HarnessId::Pi).then(|| ChatConfig {
+                harness: provider,
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+            }),
             Some("/tmp".into()),
         )
         .unwrap();
@@ -152,12 +164,18 @@ fn setup(dir: &std::path::Path, harness: Arc<NativeStore>) -> EngineCore {
             "a1",
             &NativeForkPoint {
                 format_version: 1,
-                harness: HarnessId::Mock,
+                harness: provider,
                 source_device_id: core.device_id.clone(),
                 source_session_id: "canonical".into(),
                 cwd: "/tmp".into(),
-                boundary: NativeForkBoundary::AppServerTurn {
-                    turn_id: "a1".into(),
+                boundary: if provider == HarnessId::Pi {
+                    NativeForkBoundary::PiEntry {
+                        entry_id: "native-a1".into(),
+                    }
+                } else {
+                    NativeForkBoundary::AppServerTurn {
+                        turn_id: "a1".into(),
+                    }
                 },
             },
         )
@@ -174,6 +192,117 @@ fn request(core: &EngineCore) -> ForkMessageSideChatRequest {
         parent_chat_id: None,
         target_device_id: core.device_id.clone(),
     }
+}
+#[tokio::test]
+async fn native_pi_forks_publish_both_destinations_and_resume_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(NativeStore {
+        provider: Some(HarnessId::Pi),
+        ..Default::default()
+    });
+    let core = setup(dir.path(), harness.clone());
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let available: std::collections::HashMap<String, NativeForkAvailability> = client.call_as(methods::GET_NATIVE_FORK_AVAILABILITY,
+        serde_json::json!({"sourceChatId":"main","messageIds":["a1"],"targetDeviceId":core.device_id})).await.unwrap();
+    assert!(available["a1"].available);
+    for (destination, id) in [
+        (NativeForkDestination::SideChat, "child"),
+        (NativeForkDestination::MainConversation, "pi-main"),
+    ] {
+        let mut req = request(&core);
+        req.destination = destination;
+        req.chat_id = id.into();
+        req.request_id = format!("pi-{id}");
+        let child: Chat = client
+            .call_as(
+                methods::FORK_MESSAGE_SIDE_CHAT,
+                serde_json::to_value(req).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(child.config.as_ref().unwrap().harness, HarnessId::Pi);
+        assert_eq!(
+            child.parent_chat_id.as_deref(),
+            if destination == NativeForkDestination::SideChat {
+                Some("main")
+            } else {
+                None
+            }
+        );
+        let entries = core
+            .doc_host
+            .open(id)
+            .unwrap()
+            .doc()
+            .read_entries()
+            .unwrap();
+        assert_eq!(
+            entries.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            vec!["u1", "a1", &format!("fork:{id}")]
+        );
+        assert_eq!(
+            entries[1]
+                .native_fork_point
+                .as_ref()
+                .unwrap()
+                .source_session_id,
+            "canonical"
+        );
+    }
+    assert!(harness.requests.lock().unwrap().is_empty());
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 2);
+    core.shutdown().await;
+    drop(client);
+    drop(core);
+    let registry = Arc::new(HarnessRegistry::new());
+    registry.register(harness.clone());
+    let restarted = EngineCore::assemble(dir.path(), registry, HarnessId::Pi, None).unwrap();
+    for id in ["child", "pi-main"] {
+        let expected = restarted
+            .workspace
+            .chat(id)
+            .unwrap()
+            .unwrap()
+            .harness_session_id;
+        restarted
+            .sessions
+            .dispatch(id, HarnessId::Pi, send_request("Continue here"), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if harness
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r.resume == expected)
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    let requests = harness.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    for req in requests {
+        assert_eq!(req.resume_policy, ResumePolicy::RequireExisting);
+        assert_eq!(req.prompt, "Continue here");
+    }
+    assert_eq!(
+        restarted
+            .workspace
+            .chat("main")
+            .unwrap()
+            .unwrap()
+            .harness_session_id
+            .as_deref(),
+        Some("canonical")
+    );
+    restarted.shutdown().await;
 }
 #[tokio::test]
 async fn native_fork_rpc_freezes_exact_prefix_dedupes_and_preserves_canonical_lineage() {

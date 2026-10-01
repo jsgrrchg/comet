@@ -72,6 +72,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - name: Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
@@ -79,11 +82,17 @@ jobs:
         run: |
           cargo test --locked -p zeron-harness --lib opencode::
           cargo test --locked -p zeron-harness --test opencode
+      - name: Pi native fork and RPC regressions
+        run: |
+          cargo test --locked -p zeron-harness --lib pi::
+          cargo test --locked -p zeron-harness --features native-fixture --test pi_rpc
+          node --test crates/harness/src/pi/fork.test.mjs
       - name: Durable session publication and recovery
         run: |
           cargo test --locked -p zeron-sync --lib
           cargo test --locked -p zeron-update --lib
           cargo test --locked -p zeron-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles
+          cargo test --locked -p zeron-engine --test native_side_chats --test native_points --test side_chats
 
   ui-tests:
     runs-on: ubuntu-24.04

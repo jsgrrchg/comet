@@ -14034,7 +14034,12 @@ mod tests {
             MessageStatus::Complete,
             vec![text_part("p", "First paragraph.\n\nSecond paragraph.")],
         );
-        for provider in [HarnessId::Codex, HarnessId::ClaudeCode, HarnessId::Opencode] {
+        for provider in [
+            HarnessId::Codex,
+            HarnessId::ClaudeCode,
+            HarnessId::Opencode,
+            HarnessId::Pi,
+        ] {
             assert!(native_forks::eligible(&entry, provider, false));
             assert!(!native_forks::eligible(&entry, provider, true));
         }

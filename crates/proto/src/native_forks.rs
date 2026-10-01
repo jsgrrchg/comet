@@ -13,6 +13,7 @@ pub enum NativeForkBoundary {
     AppServerTurn { turn_id: String },
     ClaudeMessage { uuid: String },
     OpenCodeReply { assistant_message_id: String },
+    PiEntry { entry_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +62,7 @@ impl NativeForkPoint {
             NativeForkBoundary::OpenCodeReply {
                 assistant_message_id,
             } => (HarnessId::Opencode, assistant_message_id),
+            NativeForkBoundary::PiEntry { entry_id } => (HarnessId::Pi, entry_id),
         };
         if self.format_version != 1
             || (self.harness != harness && self.harness != HarnessId::Mock)
@@ -82,7 +84,7 @@ impl NativeForkPoint {
 pub fn native_fork_provider(harness: HarnessId) -> bool {
     matches!(
         harness,
-        HarnessId::Codex | HarnessId::ClaudeCode | HarnessId::Opencode
+        HarnessId::Codex | HarnessId::ClaudeCode | HarnessId::Opencode | HarnessId::Pi
     )
 }
 
@@ -189,6 +191,12 @@ mod tests {
                 HarnessId::Opencode,
                 NativeForkBoundary::OpenCodeReply {
                     assistant_message_id: "m1".into(),
+                },
+            ),
+            (
+                HarnessId::Pi,
+                NativeForkBoundary::PiEntry {
+                    entry_id: "entry-1".into(),
                 },
             ),
         ] {

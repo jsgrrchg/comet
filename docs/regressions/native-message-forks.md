@@ -21,15 +21,22 @@ Copied approvals are resolved, inherited patch attribution is removed, tool side
 | Codex 0.158.0 | App-server schema exposes `thread/fork.lastTurnId`; source and child `thread/read` verify the inclusive completed-turn prefix. | Read-only schema probe cached by executable identity. Unknown contracts are disabled. |
 | Claude Code 2.1.284 | Official Agent SDK `forkSession` with `upToMessageId`; `getSessionMessages` verifies the inclusive prefix despite remapped transcript UUIDs. | Managed `@anthropic-ai/claude-agent-sdk@0.3.284`; Node >=18. Verified with Node 22.23.1. |
 | OpenCode 1.18.33 | HTTP v1 `/session/{id}/fork`, exclusive next-message boundary, followed by child transcript verification. | Existing native HTTP/SSE driver. |
+| Pi 0.85.1 | Official `SessionManager.createBranchedSession(entryId)` copies the inclusive root-to-assistant path into an independent session. Native entry identity and reconstructed context are verified. | Managed `@earendil-works/pi-coding-agent@0.85.1`; Node >=22.19.0; npm for first preparation. |
 | OpenCode 2.0.11 | HTTP v2 `/api/session/{id}/fork` with the executable’s `before` field, envelopes and cursor pagination; ordering is specified only on the first page. | Pinned `@opencode/cli@2.0.11` used for additional validation. |
 
 The 2.0.11 executable’s `/openapi.json` specifies `before`, despite the current website describing `messageID`. A real probe detected that sending the latter over-copied history; child verification rejected it before publication. The pinned v2 wire and fixtures therefore use `before`.
 
-These are checked contracts, not assumed minimum versions. OpenCode currently enables only the listed versions. Cursor, Devin, Grok, Hermes, Pi, and Antigravity do not advertise or render this action. The mock harness implements the contract only in tests.
+These are checked contracts, not assumed minimum versions. OpenCode currently enables only the listed versions. Cursor, Devin, Grok, Hermes, and Antigravity do not advertise or render this action. The mock harness implements the contract only in tests.
 
 The Claude helper is embedded with `include_str!` and materialized as an immutable, content-addressed file beside its pinned managed SDK installation. It is shipped with the harness on all platforms; no global SDK or `npx latest` is used. npm is needed for first preparation, Node for execution. The helper inherits `CLAUDE_CONFIG_DIR`, runs in the source project directory, uses official storage APIs only, and never calls `query()`. Installation cancellation/deadlines reap the npm process before releasing the provider execution lease. Native process tests here ran on Linux; macOS and Windows packaging/runtime verification remains a release-platform check.
 
 OpenCode serializes native prompt admission with boundary preparation per provider session. Historical fixed boundaries can be copied while a later turn runs. Whole-session copying requires both host idle and native idle, held stable against new Zeron prompt admissions. Synthetic usage events never replace the native assistant ID. Unknown IDs and successful HTTP responses containing extra history fail verification.
+
+Pi uses an embedded extension to associate `turn_end.message` with the same message object in the authoritative native session entry. Only `stopReason: stop` produces a point; partial/tool-use, aborted and errored iterations do not. Internal metadata notifications are consumed by the harness and never rendered. The fork helper imports only the pinned official storage module: it does not instantiate an agent, load extensions or invoke a model. It checks source UUID, format and canonical cwd before opening, rejects old formats rather than migrating the parent, verifies the selected branch and effective context, and syncs the child file and lookup mapping before returning. Later parent entries are excluded even when the parent is running. Canonical inherited points keep their source session.
+
+Pi forks require their native child on every cold resume. Missing files, incompatible formats/projects and unexpected session changes produce an error; Pi's ordinary fresh-session recovery is unavailable for these chats. Both the helper and the per-run extension are embedded with `include_str!`, so no separately packaged assets or global SDK are required. Unknown Pi fork contracts remain disabled; ordinary Pi RPC conversations still support their existing version range.
+
+Validation on 2026-10-01 used Pi 0.85.1 and Node 22.23.1 on Linux. Real CLI tests use an isolated local mock provider, with no model API requests. Historical and final forks, an active parent with a later turn, unchanged parent bytes, child continuation after process restart, missing-child rejection, extension-driven session-switch rejection, tool loops and native-point IDs during steering bursts were checked. Storage tests also exercise labels, compaction, custom entries and two generations of forks. Administrative process tests cancel/time out after a simulated provider creation, verify an indeterminate result and require process reaping before releasing the update lease. A cross-platform mapping test covers the writable flush handle required by Windows. macOS/Windows native process verification remains a release-platform check.
 
 ## Reproduction
 
@@ -43,11 +50,14 @@ cargo test -p zeron-harness --test claude
 cargo test -p zeron-harness --lib opencode::
 cargo test -p zeron-harness --lib native_fork
 cargo test -p zeron-harness --lib adapter_install
+cargo test -p zeron-harness --features native-fixture --test pi_rpc
+cargo test -p zeron-harness --lib pi::fork::tests
 cargo test -p zeron-engine --test native_side_chats --test native_points --test side_chats
 cargo test -p zeron-engine --lib native_fork
 cargo test -p zeron-ui --lib native_fork
 cargo check -p zeron-ui
 node --test crates/harness/src/claude/fork.test.mjs
+node --test crates/harness/src/pi/fork.test.mjs
 CLAUDE_FORK_TEST_SDK=/absolute/path/to/claude-agent-sdk-0.3.284/sdk.mjs \
   node --test crates/harness/src/claude/fork.storage.test.mjs
 cargo fmt --all -- --check
@@ -55,6 +65,20 @@ git diff --check
 ```
 
 The storage test writes valid temporary transcripts and uses the actual pinned SDK without inference. The Rust fixtures assert observable provider calls, exact native prefixes, ID remapping, no inference during fork, strict resume rejection, invalid boundaries, old messages, continuation durability, late finalization, terminal journal ordering, duplicate requests, changed request payloads, a destination created by another action during provider I/O, update blocking, recovery with a missing workspace row, indeterminate restart, and first sends after restart. GPUI tests exercise mouse double-click deduplication and Enter key down/up through the real action; existing Copy, metadata-strip, and side-chat tests also run.
+
+Pi's real-process tests use an installed 0.85.1 CLI with a local mock provider,
+without model API requests. The SDK storage tests accept the pinned module path:
+
+```sh
+cargo test -p zeron-harness --test pi_live -- --ignored --nocapture
+PI_FORK_SDK_MODULE=/absolute/path/to/pi-coding-agent-0.85.1/dist/core/session-manager.js \
+  node --test crates/harness/src/pi/fork.test.mjs
+```
+
+CI runs Pi's offline unit/RPC/helper contracts and the host fork suites. The actual
+SDK storage tests skip without the explicit module path, and the real Pi tests
+remain ignored unless selected. Windows runs the index durability test in the
+existing harness unit suite.
 
 Live probes consume inference in an isolated temporary project:
 

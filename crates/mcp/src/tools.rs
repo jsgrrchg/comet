@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -268,9 +268,11 @@ struct DeviceArgs {
     device: Option<String>,
 }
 
+/// Messages already in the transcript before a send. Replies are matched by
+/// id, not by time: `createdAt` is stamped on the host's clock, which can run
+/// behind the caller's when the chat lives on another device.
 #[derive(Clone, Default)]
 struct TurnStart {
-    since_millis: i64,
     message_ids: Vec<String>,
 }
 
@@ -356,9 +358,10 @@ fn wait_duration(secs: Option<u64>) -> Duration {
         .min(MAX_WAIT)
 }
 
+#[cfg(test)]
 fn now_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or_default()
 }
@@ -809,17 +812,14 @@ impl Tools {
                 last_seen_at: None,
                 room_gen: None,
             };
-            let sent_at = now_millis();
             let sent = self
                 .deliver(&chat, space.as_ref(), &harnesses, None, prompt, "run")
                 .await?;
             result["sent"] = sent;
             let pending = Arc::new(PendingTurn {
                 baseline: None,
-                start: TurnStart {
-                    since_millis: sent_at,
-                    message_ids: vec![],
-                },
+                // A new chat has no earlier messages.
+                start: TurnStart::default(),
             });
             self.pending_turns
                 .lock()
@@ -895,7 +895,6 @@ impl Tools {
             .map(|m| m.id)
             .collect();
         let body = self.attribute(&chat, text).await;
-        let sent_at = now_millis();
         let mut result = json!({
             "chatId": chat.id,
             "title": chat.title,
@@ -905,10 +904,7 @@ impl Tools {
             .await?;
         let pending = Arc::new(PendingTurn {
             baseline,
-            start: TurnStart {
-                since_millis: sent_at,
-                message_ids,
-            },
+            start: TurnStart { message_ids },
         });
         self.pending_turns
             .lock()
@@ -1153,7 +1149,7 @@ impl Tools {
     }
 
     /// Wait, then report the outcome with the assistant messages that
-    /// landed since `since_millis`.
+    /// are not in `start`'s baseline.
     async fn await_turn(
         &self,
         chat: &Chat,
@@ -1195,9 +1191,7 @@ impl Tools {
             replies = rendered
                 .iter()
                 .filter(|m| m.role == zeron_doc::MessageRole::Assistant)
-                .filter(|m| {
-                    m.created_at >= start.since_millis && !start.message_ids.contains(&m.id)
-                })
+                .filter(|m| !start.message_ids.contains(&m.id))
                 .cloned()
                 .collect();
             if !expect_turn
@@ -1939,6 +1933,8 @@ mod tests {
         sent: Mutex<Option<(i64, Instant, String)>>,
         reply_delay: Duration,
         never_reply: bool,
+        /// Host clock offset: a remote engine stamps createdAt on its own clock.
+        host_skew_millis: i64,
     }
 
     #[async_trait]
@@ -1988,27 +1984,24 @@ mod tests {
                 }
                 methods::WATCH_DOC_MESSAGES => {
                     let sent = self.sent.lock().unwrap().clone();
-                    let mut messages = json!([{
-                        "id":"previous-reply", "role":"assistant", "createdAt":now_millis() - 1,
-                        "deviceId":"dev-remote", "status":"complete", "parts":[{"kind":"text", "id":"t", "text":"old reply"}]
-                    }]);
+                    // Only the existing chat has history. Its previous reply
+                    // shares the send's timestamp, so only its id tells them apart.
+                    let mut messages = json!([]);
+                    if params["chatId"] == "chat-beta-2" {
+                        let created_at = sent.as_ref().map_or_else(now_millis, |(t, _, _)| *t);
+                        messages.as_array_mut().unwrap().push(json!({
+                            "id":"previous-reply", "role":"assistant", "createdAt":created_at,
+                            "deviceId":"dev-remote", "status":"complete", "parts":[{"kind":"text", "id":"t", "text":"old reply"}]
+                        }));
+                    }
                     if let Some((timestamp, started, _)) = sent
                         && started.elapsed() >= self.reply_delay
                         && !self.never_reply
                     {
                         messages.as_array_mut().unwrap().push(json!({
-                            "id":"new-reply", "role":"assistant", "createdAt":timestamp,
+                            "id":"new-reply", "role":"assistant", "createdAt":timestamp + self.host_skew_millis,
                             "deviceId":"dev-remote", "status":"complete", "parts":[{"kind":"text", "id":"t", "text":"new reply"}]
                         }));
-                    }
-                    // The old message predates the send even when the transcript
-                    // snapshot is taken after completion.
-                    if let Some((timestamp, _, _)) = self.sent.lock().unwrap().as_ref() {
-                        messages[0]["createdAt"] = json!(if params["chatId"] == "chat-beta-2" {
-                            *timestamp
-                        } else {
-                            timestamp - 1_000
-                        });
                     }
                     Ok(stream(json!({"reset":messages})))
                 }
@@ -2028,6 +2021,7 @@ mod tests {
                 sent: Mutex::new(None),
                 reply_delay: Duration::from_millis(450),
                 never_reply: false,
+                host_skew_millis: 0,
             });
             let tools = Tools::new(Arc::new(Zeron::with_client(
                 memory_client(service),
@@ -2066,6 +2060,7 @@ mod tests {
                 sent: Mutex::new(None),
                 reply_delay: Duration::from_millis(450),
                 never_reply: false,
+                host_skew_millis: 0,
             });
             let tools = Tools::new(Arc::new(Zeron::with_client(
                 memory_client(service),
@@ -2101,6 +2096,43 @@ mod tests {
         }
     }
 
+    /// A remote host stamps replies on its own clock. One running behind the
+    /// caller must not hide the reply to this send.
+    #[tokio::test]
+    async fn wait_returns_the_reply_from_a_host_whose_clock_is_behind() {
+        for create in [true, false] {
+            let service = Arc::new(DelayedTurn {
+                world: World {
+                    beta_remote: true,
+                    ..Default::default()
+                },
+                sent: Mutex::new(None),
+                reply_delay: Duration::from_millis(100),
+                never_reply: false,
+                host_skew_millis: -30_000,
+            });
+            let tools = Tools::new(Arc::new(Zeron::with_client(
+                memory_client(service),
+                Origin::default(),
+            )));
+            let (name, args) = if create {
+                (
+                    "create_chat",
+                    json!({"kind":"chat", "device":"Worker", "prompt":"go", "wait":true, "timeout_secs":2}),
+                )
+            } else {
+                (
+                    "send_message",
+                    json!({"chat":"Beta", "text":"go", "wait":true, "timeout_secs":2}),
+                )
+            };
+            let result = tools.call(name, args).await.unwrap();
+            assert_eq!(result["turn"]["outcome"], "completed", "{result}");
+            let replies = result["turn"]["replies"].as_array().unwrap();
+            assert!(replies.iter().any(|r| r["text"] == "new reply"), "{result}");
+        }
+    }
+
     #[tokio::test]
     async fn completed_session_without_new_transcript_times_out_without_old_reply() {
         let service = Arc::new(DelayedTurn {
@@ -2111,6 +2143,7 @@ mod tests {
             sent: Mutex::new(None),
             reply_delay: Duration::ZERO,
             never_reply: true,
+            host_skew_millis: 0,
         });
         let tools = Tools::new(Arc::new(Zeron::with_client(
             memory_client(service),

@@ -1219,14 +1219,16 @@ impl TerminalPanel {
                         } else {
                             theme.text_muted
                         };
-                        // Match the right sidebar: the leading icon becomes
-                        // the close button while the tab is hovered.
+                        // Match the right sidebar: keep the terminal icon on
+                        // the left and reveal the trailing close on tab hover.
                         let close_btn = div()
                             .id(("terminal-tab-close", key))
                             .size(px(18.0))
                             .flex_none()
                             .rounded(px(4.0))
                             .relative()
+                            .role(gpui::Role::Button)
+                            .aria_label("Close terminal")
                             .hover(|s| s.bg(crate::theme::wash(0.12)))
                             .on_mouse_down(MouseButton::Left, |_, window, cx| {
                                 window.prevent_default();
@@ -1237,24 +1239,6 @@ impl TerminalPanel {
                                 this.close_tab(&chat_close2, key, window, cx);
                             }))
                             .tooltip(crate::settings::widgets::text_tooltip("Close terminal"))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .group_hover(group.clone(), |s| s.opacity(0.0))
-                                    .child(
-                                        crate::icons::icon(crate::icons::TERMINAL)
-                                            .size(px(12.0))
-                                            .text_color(if selected {
-                                                theme.text_muted
-                                            } else {
-                                                theme.text_muted.opacity(0.7)
-                                            }),
-                                    ),
-                            )
                             .child(
                                 div()
                                     .absolute()
@@ -1281,8 +1265,7 @@ impl TerminalPanel {
                             .flex_row()
                             .items_center()
                             .gap(px(3.0))
-                            .pl(px(4.0))
-                            .pr(px(8.0))
+                            .px(px(4.0))
                             .rounded(px(6.0))
                             .when(selected, |el| el.bg(crate::theme::wash(0.10)))
                             .when(!selected, |el| el.hover(|s| s.bg(crate::theme::wash(0.06))))
@@ -1324,15 +1307,33 @@ impl TerminalPanel {
                                 },
                             )
                             .when(exited, |el| el.opacity(0.55))
-                            .child(close_btn)
                             .child(
                                 div()
+                                    .flex_none()
+                                    .size(px(18.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        crate::icons::icon(crate::icons::TERMINAL)
+                                            .size(px(12.0))
+                                            .text_color(if selected {
+                                                theme.text_muted
+                                            } else {
+                                                theme.text_muted.opacity(0.7)
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_size(crate::typography::ui_rems(11.5))
                                     .text_color(text_color)
                                     .child(title),
-                            );
+                            )
+                            .child(close_btn);
 
                         // Sliding transform while a sibling is dragged over: animate
                         // 150 ms between committed offsets.

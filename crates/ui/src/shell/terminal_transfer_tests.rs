@@ -174,7 +174,6 @@ fn last_terminal_moves_to_empty_strip_and_keeps_session_state(cx: &mut TestAppCo
     });
     let to = cx.debug_bounds("right-surface-strip").unwrap().center();
     begin_drag(cx, key, to);
-    assert!(cx.debug_bounds("terminal-tab-insertion").is_some());
     shell.read_with(cx, |shell, cx| {
         assert!(
             shell

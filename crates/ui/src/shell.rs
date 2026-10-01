@@ -11465,22 +11465,6 @@ impl Shell {
         // The empty-state picker already offers every surface. Show a single
         // Chrome-style add-tab affordance only after at least one tab exists.
         strip = strip.when(count > 0, |strip| strip.child(plus));
-        if let Some(insertion) = &self.terminal_tab_insertion {
-            strip = strip.child(
-                div()
-                    .id("terminal-tab-insertion")
-                    .debug_selector(|| "terminal-tab-insertion".into())
-                    .absolute()
-                    .left(px(
-                        (insertion.index.min(count) as f32 * CHIP_SLOT - 2.0).max(0.0)
-                    ))
-                    .top(px(6.0))
-                    .bottom(px(6.0))
-                    .w(px(2.0))
-                    .rounded_full()
-                    .bg(theme.accent),
-            );
-        }
         // Edge fades on whichever side hides tabs (flags computed above).
         // Glass: per-glyph EdgeFade scope over the chips' own opacity ramps;
         // opaque: painted gradients in the shell surface tone.

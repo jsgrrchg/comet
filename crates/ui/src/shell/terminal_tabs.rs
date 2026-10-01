@@ -81,7 +81,7 @@ impl Shell {
         });
         let surface = RightSurface::Terminal(key);
         let tabs = self.right_tabs.entry(payload.chat.clone()).or_default();
-        // Stored lists may include stale surfaces; the indicator indexes only
+        // Stored lists may include stale surfaces; the drop position indexes only
         // visible rows. Resolve its neighboring surface before inserting.
         let stored_index = rows
             .get(index)

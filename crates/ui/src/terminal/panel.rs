@@ -39,7 +39,9 @@ use super::view::{
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
-pub const TAB_WIDTH: f32 = 118.0;
+pub const TAB_WIDTH: f32 = 112.0;
+const TAB_GAP: f32 = 4.0;
+const TAB_SLOT: f32 = TAB_WIDTH + TAB_GAP;
 pub const TAB_BAR_HEIGHT: f32 = 40.0;
 const SELECTION_SCROLL_TICK_MS: u64 = 24;
 
@@ -308,15 +310,15 @@ impl Render for TabGhost {
         let theme = Theme::of(cx);
         div()
             .w(px(TAB_WIDTH))
-            .h(px(28.0))
-            .px(px(Theme::SPACE_SM))
+            .h(px(24.0))
+            .px(px(8.0))
             .flex()
             .items_center()
-            .rounded(px(Theme::CONTROL_RADIUS))
+            .rounded(px(6.0))
             .bg(theme.surface_raised)
             .border_1()
             .border_color(theme.border_strong)
-            .text_size(px(12.0))
+            .text_size(crate::typography::ui_rems(11.5))
             .text_color(theme.text)
             .opacity(0.85)
             .child(div().truncate().child(self.title.clone()))
@@ -1154,7 +1156,7 @@ impl TerminalPanel {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(4.0))
+            .gap(px(TAB_GAP))
             .pl(px(8.0))
             .pr(px(6.0))
             .border_b_1()
@@ -1175,8 +1177,9 @@ impl TerminalPanel {
                     else {
                         return;
                     };
-                    let rel_x = f32::from(event.event.position.x) - f32::from(event.bounds.left());
-                    let over = drop_index(rel_x, TAB_WIDTH, count);
+                    let rel_x =
+                        f32::from(event.event.position.x) - f32::from(event.bounds.left()) - 8.0;
+                    let over = drop_index(rel_x, TAB_SLOT, count);
                     this.update_drag_over(from, over, cx);
                 },
             ))
@@ -1210,60 +1213,79 @@ impl TerminalPanel {
                         let chat_close2 = chat_owned.clone();
                         let chat_drag = chat_owned.clone();
                         let ghost_title = title.clone();
-                        // Zeron tab: `h-7 rounded-lg pl-2 pr-1 gap-1.5 text-xs`,
-                        // terminal glyph + label + close; active = white/8 wash.
-                        let (text_color, bg, glyph_alpha) = if selected {
-                            (theme.text, crate::theme::ink(0.08), 0.8)
+                        let group: SharedString = format!("terminal-tab-{key}").into();
+                        let text_color = if selected {
+                            theme.text
                         } else {
-                            (
-                                theme.text_muted.opacity(0.6),
-                                gpui::transparent_black(),
-                                0.6,
-                            )
+                            theme.text_muted
                         };
+                        // Match the right sidebar: the leading icon becomes
+                        // the close button while the tab is hovered.
                         let close_btn = div()
                             .id(("terminal-tab-close", key))
-                            .size(px(20.0))
+                            .size(px(18.0))
                             .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .when(!selected, |el| el.invisible())
-                            .cursor_pointer()
-                            .hover(|s| s.bg(crate::theme::ink(0.09)))
+                            .rounded(px(4.0))
+                            .relative()
+                            .hover(|s| s.bg(crate::theme::wash(0.12)))
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                window.prevent_default();
+                                cx.stop_propagation();
+                            })
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_tab(&chat_close2, key, window, cx);
                             }))
                             .tooltip(crate::settings::widgets::text_tooltip("Close terminal"))
                             .child(
-                                crate::icons::icon(crate::icons::CLOSE)
-                                    .size(px(12.0))
-                                    .text_color(theme.text_muted.opacity(0.8)),
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .group_hover(group.clone(), |s| s.opacity(0.0))
+                                    .child(
+                                        crate::icons::icon(crate::icons::TERMINAL)
+                                            .size(px(12.0))
+                                            .text_color(if selected {
+                                                theme.text_muted
+                                            } else {
+                                                theme.text_muted.opacity(0.7)
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .opacity(0.0)
+                                    .group_hover(group.clone(), |s| s.opacity(1.0))
+                                    .child(
+                                        crate::icons::icon(crate::icons::CLOSE)
+                                            .size(px(12.0))
+                                            .text_color(theme.text_muted),
+                                    ),
                             );
                         let tab_el = div()
                             .id(("terminal-tab", key))
                             .debug_selector(move || format!("terminal-tab-{key}"))
+                            .group(group)
                             .w(px(TAB_WIDTH))
-                            .h(px(28.0))
+                            .h(px(24.0))
                             .flex_none()
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap(px(6.0))
-                            .pl(px(8.0))
-                            .pr(px(4.0))
-                            .rounded(px(8.0))
-                            // zeron terminal-panel.tsx tab: `transition-colors`.
-                            .bg(motion::hover_blend(
-                                &format!("term-tab-{key}"),
-                                bg,
-                                theme.element_hover,
-                            ))
-                            .on_hover(motion::hover_listener(format!("term-tab-{key}")))
-                            .text_size(px(12.0))
-                            .text_color(text_color)
+                            .gap(px(3.0))
+                            .pl(px(4.0))
+                            .pr(px(8.0))
+                            .rounded(px(6.0))
+                            .when(selected, |el| el.bg(crate::theme::wash(0.10)))
+                            .when(!selected, |el| el.hover(|s| s.bg(crate::theme::wash(0.06))))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.select_tab(&chat_select, ix, cx);
@@ -1302,20 +1324,22 @@ impl TerminalPanel {
                                 },
                             )
                             .when(exited, |el| el.opacity(0.55))
+                            .child(close_btn)
                             .child(
-                                crate::icons::icon(crate::icons::TERMINAL)
-                                    .size(px(16.0))
-                                    .text_color(text_color.opacity(glyph_alpha)),
-                            )
-                            .child(div().flex_1().min_w_0().truncate().child(title))
-                            .child(close_btn);
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::typography::ui_rems(11.5))
+                                    .text_color(text_color)
+                                    .child(title),
+                            );
 
                         // Sliding transform while a sibling is dragged over: animate
                         // 150 ms between committed offsets.
                         match drag {
                             Some((from, over, epoch, prev_over)) if ix != from => {
-                                let target = slide_offset(ix, from, over) * TAB_WIDTH;
-                                let start = slide_offset(ix, from, prev_over) * TAB_WIDTH;
+                                let target = slide_offset(ix, from, over) * TAB_SLOT;
+                                let start = slide_offset(ix, from, prev_over) * TAB_SLOT;
                                 div()
                                     .relative()
                                     .child(tab_el.with_animation(
@@ -1330,7 +1354,7 @@ impl TerminalPanel {
                             // slides into the vacated slot.
                             Some((from, ..)) if ix == from => div()
                                 .w(px(TAB_WIDTH))
-                                .h(px(28.0))
+                                .h(px(24.0))
                                 .flex_none()
                                 .into_any_element(),
                             _ => tab_el.into_any_element(),
@@ -1340,18 +1364,17 @@ impl TerminalPanel {
             .child(
                 div()
                     .id("terminal-new-tab")
-                    .size(px(28.0))
+                    .size(px(24.0))
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.0))
+                    .rounded(px(6.0))
                     .cursor_pointer()
-                    // zeron terminal-panel.tsx icon buttons: `transition-colors`.
                     .bg(motion::hover_blend(
                         "term-new-tab",
-                        gpui::transparent_black(),
-                        crate::theme::ink(0.05),
+                        crate::theme::wash(0.0),
+                        crate::theme::wash(0.11),
                     ))
                     .on_hover(motion::hover_listener("term-new-tab"))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1362,8 +1385,8 @@ impl TerminalPanel {
                     .tooltip(crate::settings::widgets::text_tooltip("New terminal"))
                     .child(
                         crate::icons::icon(crate::icons::PLUS)
-                            .size(px(16.0))
-                            .text_color(theme.text_muted.opacity(0.6)),
+                            .size(px(13.0))
+                            .text_color(theme.text_muted),
                     ),
             )
             // Collapse chevron pinned right (zeron "Hide terminal" ⌘J).

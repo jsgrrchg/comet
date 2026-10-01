@@ -11198,6 +11198,9 @@ impl Shell {
                         .size(px(18.0))
                         .rounded(px(4.0))
                         .relative()
+                        .role(gpui::Role::Button)
+                        .aria_label("Close tab")
+                        .tooltip(crate::settings::widgets::text_tooltip("Close tab"))
                         .hover(|s| s.bg(crate::theme::wash(0.12)))
                         // The tab owns a drag payload. Claim the close press
                         // before it reaches that parent or GPUI starts a tab
@@ -15835,6 +15838,18 @@ mod right_tab_mouse_regressions {
             assert!(shell.subagent_tabs.contains_key(&2));
             assert_eq!(shell.resolved_right_active(cx), RightSurface::Subagent(2));
         });
+    }
+
+    #[gpui::test]
+    fn right_tab_close_sits_at_the_trailing_edge(cx: &mut TestAppContext) {
+        let (_shell, cx) = setup(cx);
+        let tab = cx.debug_bounds("right-surface-tab-0").unwrap();
+        let close = cx.debug_bounds("right-surface-close-0").unwrap();
+        assert!(
+            close.left() > tab.center().x,
+            "close is not after the title"
+        );
+        assert_eq!(close.right(), tab.right() - px(4.));
     }
 
     #[gpui::test]

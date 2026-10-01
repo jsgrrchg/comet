@@ -21,11 +21,8 @@ use base64::Engine as _;
 use gpui::{
     App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, SharedString,
-    Subscription, Task, Window, actions, div, prelude::*, px,
+    Subscription, Task, WeakEntity, Window, actions, div, prelude::*, px,
 };
-
-use zeron_proto::{TerminalEvent, TerminalSession};
-use zeron_rpc::methods;
 
 use crate::motion::{self, AnimationExt as _, TAB_SLIDE};
 use crate::popover::{MenuScrollbarMetrics, MenuScrollbarState, ScrollRailHost};
@@ -33,10 +30,12 @@ use crate::settings::{TERMINAL_MAX_VH, TERMINAL_MIN_HEIGHT};
 use crate::state::{AppState, CANVAS_PANEL_PREFIX, EngineHandle};
 use crate::theme::Theme;
 
+use super::session::TerminalSessionModel;
+
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
 use super::view::{
-    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
-    cell_at, keystroke_bytes, paste_bytes, terminal_panel_bg,
+    SELECTION_DRAG_THRESHOLD, TerminalElement, cell_at, keystroke_bytes, paste_bytes,
+    terminal_panel_bg,
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
@@ -119,7 +118,10 @@ pub fn active_after_reorder(active: usize, from: usize, to: usize) -> usize {
 
 /// Merge the `targetDeviceId` passthrough into RPC params (no-op for chats on
 /// the connected engine's own device).
-fn with_target(mut params: serde_json::Value, target: &Option<String>) -> serde_json::Value {
+pub(super) fn with_target(
+    mut params: serde_json::Value,
+    target: &Option<String>,
+) -> serde_json::Value {
     if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
         object.insert(
             "targetDeviceId".into(),
@@ -154,7 +156,7 @@ pub fn shell_title(shell: &str) -> String {
     }
 }
 
-fn decode_base64(data: &str) -> Vec<u8> {
+pub(super) fn decode_base64(data: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
         .decode(data)
         .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(data))
@@ -164,7 +166,7 @@ fn decode_base64(data: &str) -> Vec<u8> {
         })
 }
 
-fn encode_base64(bytes: &[u8]) -> String {
+pub(super) fn encode_base64(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
@@ -258,19 +260,20 @@ fn selection_scroll_lines(geometry: GridGeometry, position: gpui::Point<Pixels>)
 
 struct TerminalTab {
     key: u64,
-    title: SharedString,
-    terminal_id: Option<String>,
-    target_device_id: Option<String>,
-    emulator: Emulator,
-    /// Fractional wheel movement in rows, retained across trackpad events.
-    scroll_remainder: f32,
-    exited: Option<i32>,
-    last_seq: u64,
-    coalescer: InputCoalescer,
-    flush_task: Option<Task<()>>,
-    resize_task: Option<Task<()>>,
-    /// Open + subscribe/reconnect lifecycle; dropping it cancels the stream.
-    _run: Option<Task<()>>,
+    session: Entity<TerminalSessionModel>,
+    _observe: Subscription,
+}
+
+impl TerminalTab {
+    fn new(session: Entity<TerminalSessionModel>, cx: &mut Context<TerminalPanel>) -> Self {
+        let key = session.read(cx).key;
+        let observe = cx.observe(&session, |_, _, cx| cx.notify());
+        Self {
+            key,
+            session,
+            _observe: observe,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -288,9 +291,11 @@ struct DragState {
 }
 
 /// The dragged-tab payload (gpui drag-and-drop).
-struct TabDragPayload {
-    chat: String,
-    from: usize,
+pub(crate) struct TerminalTabDrag {
+    pub(crate) chat: String,
+    pub(crate) key: u64,
+    pub(crate) origin: WeakEntity<TerminalPanel>,
+    generation: u64,
     title: SharedString,
 }
 
@@ -340,9 +345,9 @@ pub struct TerminalPanel {
     /// rounded; each full-bleed layer rounds itself).
     window_corner_bl: bool,
     window_corner_br: bool,
-    tab_seq: u64,
     drag: Option<DragState>,
     last_selected: Option<String>,
+    drag_generation: u64,
     /// Last reported grid placement; `None` until the first prepaint.
     geometry: Option<GridGeometry>,
     /// Left-button gesture in flight, if any.
@@ -364,6 +369,7 @@ pub struct TerminalPanel {
 impl TerminalPanel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
+        let last_selected = Some(state.read(cx).panel_session_key());
         Self {
             state,
             focus_handle: cx.focus_handle(),
@@ -374,9 +380,9 @@ impl TerminalPanel {
             resize_suspended: false,
             window_corner_bl: false,
             window_corner_br: false,
-            tab_seq: 0,
             drag: None,
-            last_selected: None,
+            last_selected,
+            drag_generation: 0,
             geometry: None,
             selection_drag: None,
             selection_scroll_task: None,
@@ -422,6 +428,10 @@ impl TerminalPanel {
     /// selected chat or new-session canvas (drawer mode; embedded tabs are
     /// explicit); closing keeps every session alive (detach ≠ close).
     pub fn set_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.open && !open {
+            self.drag_generation += 1;
+            self.drag = None;
+        }
         self.open = open;
         if !open {
             self.focus_pending = false;
@@ -438,17 +448,6 @@ impl TerminalPanel {
         self.open
     }
 
-    /// A tab's display label: the live OSC 0/2 title when the running
-    /// program set one (shells title themselves with the cwd / running
-    /// command — the contextual name, user request), else the fixed
-    /// "Terminal N".
-    fn display_title(tab: &TerminalTab) -> SharedString {
-        match tab.emulator.title().map(str::trim) {
-            Some(title) if !title.is_empty() => title.to_string().into(),
-            _ => tab.title.clone(),
-        }
-    }
-
     // ---- externally managed session API. Project Actions use these helpers
     // ---- in the bottom drawer; the right-pane host also uses the keyed tab
     // ---- operations because its surface strip lives in Shell.
@@ -461,7 +460,10 @@ impl TerminalPanel {
             .map(|tabs| {
                 tabs.tabs
                     .iter()
-                    .map(|t| (t.key, Self::display_title(t), t.exited.is_some()))
+                    .map(|t| {
+                        let model = t.session.read(cx);
+                        (t.key, model.display_title(), model.exited.is_some())
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -470,9 +472,9 @@ impl TerminalPanel {
     /// Open a fresh tab for the selected chat and return its key.
     pub fn open_tab_for_selected(&mut self, cx: &mut Context<Self>) -> Option<u64> {
         let chat = self.selected_chat(cx);
-        self.open_tab(chat, cx);
+        let key = self.open_tab(chat, cx)?;
         self.request_focus(cx);
-        Some(self.tab_seq)
+        Some(key)
     }
 
     /// Create a named placeholder tab without opening a PTY. Project Actions
@@ -483,74 +485,90 @@ impl TerminalPanel {
         title: impl Into<SharedString>,
         cx: &mut Context<Self>,
     ) -> u64 {
-        self.tab_seq += 1;
-        let key = self.tab_seq;
+        let state = self.state.clone();
+        let title = title.into();
+        let session = cx.new(|cx| TerminalSessionModel::new(state, chat.clone(), title, cx));
+        let tab = TerminalTab::new(session, cx);
+        let key = tab.key;
         let entry = self.chats.entry(chat).or_default();
-        entry.tabs.push(TerminalTab {
-            key,
-            title: title.into(),
-            terminal_id: None,
-            target_device_id: None,
-            emulator: Emulator::new(80, 24),
-            scroll_remainder: 0.0,
-            exited: None,
-            last_seq: 0,
-            coalescer: InputCoalescer::default(),
-            flush_task: None,
-            resize_task: None,
-            _run: None,
-        });
+        entry.tabs.push(tab);
         entry.active = entry.tabs.len() - 1;
         cx.notify();
         key
     }
 
-    /// Attach and stream a PTY that was already opened by the owning engine.
-    pub fn attach_reserved_session(
-        &mut self,
+    /// Stable session handle for asynchronous project-action results.
+    pub(crate) fn session_for_tab(
+        &self,
         chat: &str,
         key: u64,
-        session: TerminalSession,
-        target_device_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.tab_mut(chat, key).is_none() {
-            return false;
-        }
-        let Some(engine) = self.engine(cx) else {
-            return false;
-        };
-        let run = Self::spawn_session(
-            chat.to_string(),
-            key,
-            engine,
-            target_device_id,
-            Some(session),
-            None,
-            cx,
-        );
-        if let Some(tab) = self.tab_mut(chat, key) {
-            tab._run = Some(run);
-            true
-        } else {
-            false
+    ) -> Option<Entity<TerminalSessionModel>> {
+        self.chats
+            .get(chat)?
+            .tabs
+            .iter()
+            .find(|tab| tab.key == key)
+            .map(|tab| tab.session.clone())
+    }
+
+    pub(crate) fn accepts_drag(&self, payload: &TerminalTabDrag, cx: &App) -> bool {
+        !self.embedded
+            && self.drag_generation == payload.generation
+            && self.open
+            && self.selected_chat(cx) == payload.chat
+            && self.session_for_tab(&payload.chat, payload.key).is_some()
+    }
+
+    pub(crate) fn has_tab_drag(&self) -> bool {
+        self.drag.is_some()
+    }
+
+    pub(crate) fn cancel_tab_drag(&mut self, cx: &mut Context<Self>) {
+        if self.drag.take().is_some() {
+            cx.notify();
         }
     }
 
-    /// Turn a placeholder into a visible failed tab without opening a PTY.
-    pub fn fail_reserved_tab(
+    /// Transfer removes presentation only. The session and all its tasks stay
+    /// alive in the returned entity; close_tab is deliberately a separate path.
+    pub(crate) fn take_session(
         &mut self,
-        chat: &str,
-        key: u64,
-        message: &str,
+        payload: &TerminalTabDrag,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<TerminalSessionModel>> {
+        if payload.origin != cx.weak_entity() || !self.accepts_drag(payload, cx) {
+            return None;
+        }
+        let tabs = self.chats.get_mut(&payload.chat)?;
+        let ix = tabs.tabs.iter().position(|tab| tab.key == payload.key)?;
+        let tab = tabs.tabs.remove(ix);
+        tabs.active = active_after_close(tabs.active, ix, tabs.tabs.len());
+        if tabs.tabs.is_empty() {
+            // Gate ensure_tab before any AppState observer can see the gap.
+            self.open = false;
+            self.focus_pending = false;
+        }
+        self.drag = None;
+        self.selection_drag = None;
+        self.selection_scroll_task = None;
+        self.rail_tab_key = None;
+        self.bar.end_press();
+        cx.notify();
+        Some(tab.session)
+    }
+
+    pub(crate) fn insert_session(
+        &mut self,
+        chat: String,
+        session: Entity<TerminalSessionModel>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(tab) = self.tab_mut(chat, key) {
-            tab.emulator
-                .feed(format!("\x1b[31mfailed to run action: {message}\x1b[0m\r\n").as_bytes());
-            tab.exited = Some(-1);
-            cx.notify();
-        }
+        let tab = TerminalTab::new(session, cx);
+        let tabs = self.chats.entry(chat).or_default();
+        tabs.tabs.push(tab);
+        tabs.active = tabs.tabs.len() - 1;
+        self.open = true;
+        cx.notify();
     }
 
     /// Make `key` the rendered tab of the selected chat.
@@ -578,6 +596,7 @@ impl TerminalPanel {
         let switched = Some(selected_key.clone()) != prev;
         if switched {
             self.last_selected = Some(selected_key.clone());
+            self.drag_generation += 1;
             self.drag = None;
         }
         if self.open && !self.embedded {
@@ -643,26 +662,20 @@ impl TerminalPanel {
             && state.terminal_open_cwd_for(session_key).is_none()
     }
 
-    fn tab_mut(&mut self, chat: &str, key: u64) -> Option<&mut TerminalTab> {
-        self.chats
-            .get_mut(chat)?
-            .tabs
-            .iter_mut()
-            .find(|t| t.key == key)
+    fn active_session(&self, cx: &App) -> Option<Entity<TerminalSessionModel>> {
+        let tabs = self.chats.get(&self.selected_chat(cx))?;
+        Some(tabs.tabs.get(tabs.active)?.session.clone())
     }
 
-    fn active_tab(&self, cx: &App) -> Option<&TerminalTab> {
-        let chat = self.selected_chat(cx);
-        let tabs = self.chats.get(&chat)?;
-        tabs.tabs.get(tabs.active)
+    fn active_tab<'a>(&'a self, cx: &'a App) -> Option<&'a TerminalSessionModel> {
+        let tabs = self.chats.get(&self.selected_chat(cx))?;
+        Some(tabs.tabs.get(tabs.active)?.session.read(cx))
     }
 
     // ---- open / stream lifecycle ----
 
-    fn open_tab(&mut self, chat: String, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
+    fn open_tab(&mut self, chat: String, cx: &mut Context<Self>) -> Option<u64> {
+        let engine = self.engine(cx)?;
         let tab_no = self
             .chats
             .get(&chat)
@@ -670,277 +683,16 @@ impl TerminalPanel {
         let key = self.reserve_tab_for_chat(chat.clone(), format!("Terminal {tab_no}"), cx);
         let target = self.chat_target(&chat, cx);
         let cwd = self.state.read(cx).terminal_open_cwd_for(&chat);
-        let run = Self::spawn_session(chat.clone(), key, engine, target, None, cwd, cx);
-        if let Some(tab) = self.tab_mut(&chat, key) {
-            tab._run = Some(run);
-        }
+        let session = self.session_for_tab(&chat, key)?;
+        session.update(cx, |model, cx| model.open(engine, target, cwd, cx));
         cx.notify();
+        Some(key)
     }
 
-    /// OpenTerminal, then pump SubscribeTerminal with reconnect backoff.
-    fn spawn_session(
-        chat: String,
-        key: u64,
-        engine: EngineHandle,
-        target: Option<String>,
-        existing_session: Option<TerminalSession>,
-        cwd: Option<String>,
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            let (cols, rows) = this
-                .update(cx, |panel, _| {
-                    panel
-                        .tab_mut(&chat, key)
-                        .map(|t| (t.emulator.cols() as u16, t.emulator.rows() as u16))
-                        .unwrap_or((80, 24))
-                })
-                .unwrap_or((80, 24));
-
-            let session = match existing_session {
-                Some(session) => session,
-                None => {
-                    let mut params =
-                        serde_json::json!({ "chatId": chat, "cols": cols, "rows": rows });
-                    if let (Some(cwd), Some(object)) = (cwd, params.as_object_mut()) {
-                        object.insert("cwd".into(), serde_json::Value::String(cwd));
-                    }
-                    match engine
-                        .client()
-                        .call_as::<TerminalSession>(
-                            methods::OPEN_TERMINAL,
-                            with_target(params, &target),
-                        )
-                        .await
-                    {
-                        Ok(session) => session,
-                        Err(err) => {
-                    tracing::warn!(error = %err, "OpenTerminal failed");
-                    let _ = this.update(cx, |panel, cx| {
-                        if let Some(tab) = panel.tab_mut(&chat, key) {
-                            tab.emulator.feed(
-                                format!("\x1b[31mfailed to open terminal: {err}\x1b[0m\r\n")
-                                    .as_bytes(),
-                            );
-                            tab.exited = Some(-1);
-                            cx.notify();
-                        }
-                    });
-                    return;
-                        }
-                    }
-                }
-            };
-            let terminal_id = session.id.clone();
-            let attached = this
-                .update(cx, |panel, cx| {
-                    if let Some(tab) = panel.tab_mut(&chat, key) {
-                        tab.terminal_id = Some(terminal_id.clone());
-                        tab.target_device_id = target.clone();
-                        cx.notify();
-                        true
-                    } else {
-                        false
-                    }
-                })
-                .unwrap_or(false);
-            if !attached {
-                // Tab was closed before the open completed — release the PTY.
-                let _ = engine
-                    .client()
-                    .call(
-                        methods::CLOSE_TERMINAL,
-                        with_target(
-                            serde_json::json!({ "terminalId": terminal_id }),
-                            &target,
-                        ),
-                    )
-                    .await;
-                return;
-            }
-
-            let mut attempt: u32 = 0;
-            loop {
-                let Ok(after_seq) = this.update(cx, |panel, _| {
-                    panel.tab_mut(&chat, key).map(|t| t.last_seq)
-                }) else {
-                    return; // entity released
-                };
-                let Some(after_seq) = after_seq else { return }; // tab closed
-
-                let subscribed = engine
-                    .client()
-                    .subscribe(
-                        methods::SUBSCRIBE_TERMINAL,
-                        with_target(
-                            serde_json::json!({ "terminalId": terminal_id, "afterSeq": after_seq }),
-                            &target,
-                        ),
-                    )
-                    .await;
-                let mut rx = match subscribed {
-                    Ok(rx) => rx,
-                    Err(err) => {
-                        tracing::debug!(error = %err, attempt, "SubscribeTerminal failed; backing off");
-                        cx.background_executor()
-                            .timer(Duration::from_millis(backoff_ms(attempt)))
-                            .await;
-                        attempt = attempt.saturating_add(1);
-                        continue;
-                    }
-                };
-
-                while let Some(value) = rx.recv().await {
-                    let event: TerminalEvent = match serde_json::from_value(value) {
-                        Ok(event) => event,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "terminal: malformed stream frame");
-                            continue;
-                        }
-                    };
-                    attempt = 0;
-                    let outcome = this.update(cx, |panel, cx| {
-                        panel.apply_stream_event(&chat, key, &engine, event, cx)
-                    });
-                    match outcome {
-                        Ok(StreamDisposition::Continue) => {}
-                        Ok(StreamDisposition::Stop) => return,
-                        Err(_) => return,
-                    }
-                }
-
-                // Stream dropped without an exit — reconnect from afterSeq.
-                let done = this
-                    .update(cx, |panel, _| {
-                        panel.tab_mut(&chat, key).map(|t| t.exited.is_some()).unwrap_or(true)
-                    })
-                    .unwrap_or(true);
-                if done {
-                    return;
-                }
-                cx.background_executor()
-                    .timer(Duration::from_millis(backoff_ms(attempt)))
-                    .await;
-                attempt = attempt.saturating_add(1);
-            }
-        })
-    }
-
-    fn apply_stream_event(
-        &mut self,
-        chat: &str,
-        key: u64,
-        engine: &EngineHandle,
-        event: TerminalEvent,
-        cx: &mut Context<Self>,
-    ) -> StreamDisposition {
-        let Some(tab) = self.tab_mut(chat, key) else {
-            return StreamDisposition::Stop;
-        };
-        let target = tab.target_device_id.clone();
-        match event {
-            TerminalEvent::Data { seq, data } => {
-                tab.last_seq = seq;
-                let responses = tab.emulator.feed(&decode_base64(&data));
-                if !responses.is_empty()
-                    && let Some(id) = tab.terminal_id.clone()
-                {
-                    // Query responses (DSR etc.) go straight back, no coalescing.
-                    let engine = engine.clone();
-                    let data = encode_base64(&responses);
-                    cx.spawn(async move |_, _| {
-                        let _ = engine
-                            .client()
-                            .call(
-                                methods::WRITE_TERMINAL,
-                                with_target(
-                                    serde_json::json!({ "terminalId": id, "data": data }),
-                                    &target,
-                                ),
-                            )
-                            .await;
-                    })
-                    .detach();
-                }
-                cx.notify();
-                StreamDisposition::Continue
-            }
-            TerminalEvent::Exit { seq, exit_code, .. } => {
-                tab.last_seq = seq;
-                tab.exited = Some(exit_code);
-                tab.emulator.feed(&exit_message(exit_code));
-                cx.notify();
-                StreamDisposition::Stop
-            }
-        }
-    }
-
-    // ---- input ----
-
-    /// Queue keyboard bytes on the active tab (12 ms coalescing window).
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        let chat = self.selected_chat(cx);
-        let Some(tabs) = self.chats.get_mut(&chat) else {
-            return;
-        };
-        let active = tabs.active;
-        let Some(tab) = tabs.tabs.get_mut(active) else {
-            return;
-        };
-        if tab.exited.is_some() {
-            return;
+        if let Some(session) = self.active_session(cx) {
+            session.update(cx, |model, cx| model.queue_input(bytes, cx));
         }
-        // A keypress while scrolled back snaps to the live bottom (xterm).
-        if tab.emulator.display_offset() > 0 {
-            tab.emulator.scroll_to_bottom();
-        }
-        let key = tab.key;
-        if tab.coalescer.push(bytes) {
-            tab.flush_task = Some(Self::schedule_flush(chat, key, cx));
-        }
-    }
-
-    fn schedule_flush(chat: String, key: u64, cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(COALESCE_MS))
-                .await;
-            let _ = this.update(cx, |panel, cx| panel.flush_input(chat, key, cx));
-        })
-    }
-
-    fn flush_input(&mut self, chat: String, key: u64, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        let Some(tab) = self.tab_mut(&chat, key) else {
-            return;
-        };
-        let target = tab.target_device_id.clone();
-        if tab.coalescer.is_empty() {
-            return;
-        }
-        let Some(id) = tab.terminal_id.clone() else {
-            // OpenTerminal still in flight — keep the buffer, retry shortly.
-            if tab.exited.is_none() {
-                tab.flush_task = Some(Self::schedule_flush(chat, key, cx));
-            }
-            return;
-        };
-        let data = encode_base64(&tab.coalescer.take());
-        cx.spawn(async move |_, _| {
-            let _ = engine
-                .client()
-                .call(
-                    methods::WRITE_TERMINAL,
-                    with_target(
-                        serde_json::json!({ "terminalId": id, "data": data }),
-                        &target,
-                    ),
-                )
-                .await;
-        })
-        .detach();
     }
 
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
@@ -996,52 +748,10 @@ impl TerminalPanel {
         if self.resize_suspended {
             return;
         }
-        let (cols, rows) = (geometry.cols, geometry.rows);
-        let chat = self.selected_chat(cx);
-        let engine = self.engine(cx);
-        let Some(tabs) = self.chats.get_mut(&chat) else {
-            return;
-        };
-        let active = tabs.active;
-        let Some(tab) = tabs.tabs.get_mut(active) else {
-            return;
-        };
-        if tab.emulator.cols() == cols as usize && tab.emulator.rows() == rows as usize {
-            return;
-        }
-        tab.emulator.resize(cols, rows);
-        let key = tab.key;
-        let target = tab.target_device_id.clone();
-        if let (Some(engine), Some(tab)) = (engine, self.tab_mut(&chat, key)) {
-            let id = tab.terminal_id.clone();
-            tab.resize_task = Some(cx.spawn(async move |this, cx| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(RESIZE_DEBOUNCE_MS))
-                    .await;
-                // Re-read the *current* size — later prepaints may have
-                // resized again inside the debounce window.
-                let Ok(current) = this.update(cx, |panel, _| {
-                    panel
-                        .tab_mut(&chat, key)
-                        .map(|t| (t.terminal_id.clone(), t.emulator.cols(), t.emulator.rows()))
-                }) else {
-                    return;
-                };
-                let Some((stored_id, cols, rows)) = current else {
-                    return;
-                };
-                let Some(id) = stored_id.or(id) else { return };
-                let _ = engine
-                    .client()
-                    .call(
-                        methods::RESIZE_TERMINAL,
-                        with_target(
-                            serde_json::json!({ "terminalId": id, "cols": cols, "rows": rows }),
-                            &target,
-                        ),
-                    )
-                    .await;
-            }));
+        if let Some(session) = self.active_session(cx) {
+            session.update(cx, |model, cx| {
+                model.resize(geometry.cols, geometry.rows, cx)
+            });
         }
         // Deliberately no cx.notify(): this runs during prepaint of the
         // current frame, which already paints the resized grid.
@@ -1061,13 +771,11 @@ impl TerminalPanel {
     /// Run `f` against the active tab's emulator.
     fn with_active_emulator<R>(
         &mut self,
-        cx: &App,
+        cx: &mut Context<Self>,
         f: impl FnOnce(&mut Emulator) -> R,
     ) -> Option<R> {
-        let chat = self.selected_chat(cx);
-        let tabs = self.chats.get_mut(&chat)?;
-        let active = tabs.active;
-        tabs.tabs.get_mut(active).map(|tab| f(&mut tab.emulator))
+        let session = self.active_session(cx)?;
+        Some(session.update(cx, |model, _| f(&mut model.emulator)))
     }
 
     /// Window position → grid point, using this frame's placement. `None`
@@ -1075,7 +783,7 @@ impl TerminalPanel {
     fn grid_point_at(
         &mut self,
         position: gpui::Point<Pixels>,
-        cx: &App,
+        cx: &mut Context<Self>,
     ) -> Option<(GridPoint, Side)> {
         let geometry = self.geometry?;
         let hit = cell_at(
@@ -1222,15 +930,8 @@ impl TerminalPanel {
         if delta_lines == 0 {
             return;
         }
-        let chat = self.selected_chat(cx);
-        let Some(tabs) = self.chats.get_mut(&chat) else {
-            return;
-        };
-        let active = tabs.active;
-        if let Some(tab) = tabs.tabs.get_mut(active) {
-            tab.emulator.scroll(delta_lines);
-            cx.notify();
-        }
+        self.with_active_emulator(cx, |emulator| emulator.scroll(delta_lines));
+        cx.notify();
     }
 
     fn schedule_selection_scroll(&mut self, cx: &mut Context<Self>) {
@@ -1285,27 +986,13 @@ impl TerminalPanel {
         }
     }
 
-    fn rail_tab(&self) -> Option<&TerminalTab> {
-        let key = self.rail_tab_key?;
-        self.chats
-            .values()
-            .find_map(|tabs| tabs.tabs.iter().find(|tab| tab.key == key))
-    }
-
-    fn rail_tab_mut(&mut self) -> Option<&mut TerminalTab> {
-        let key = self.rail_tab_key?;
-        self.chats
-            .values_mut()
-            .find_map(|tabs| tabs.tabs.iter_mut().find(|tab| tab.key == key))
-    }
-
     /// The rendered grid's rail geometry in the shared metrics domain, plus
     /// the track's window y (the grid bounds — the rail strip spans the
     /// terminal body) and the scroll position in px from the top of the
     /// scrollback.
-    fn rail_frame(&self) -> Option<(MenuScrollbarMetrics, Pixels, f32)> {
+    fn rail_frame(&self, cx: &App) -> Option<(MenuScrollbarMetrics, Pixels, f32)> {
         let geometry = self.geometry?;
-        let tab = self.rail_tab()?;
+        let tab = self.active_tab(cx)?;
         let (viewport, content, offset) = rail_parts(
             geometry.line_h,
             tab.emulator.rows(),
@@ -1322,21 +1009,23 @@ impl TerminalPanel {
     /// Apply an engaged drag's target to the emulator. The shared target is a
     /// fraction of the scrollback from the TOP; the emulator's scroll-to API
     /// takes lines from the live bottom.
-    fn apply_rail_drag(&mut self, pointer_y: Pixels) -> bool {
+    fn apply_rail_drag(&mut self, pointer_y: Pixels, cx: &mut Context<Self>) -> bool {
         let Some(line_h) = self.geometry.map(|geometry| geometry.line_h) else {
             return false;
         };
-        let Some((metrics, track_top, _)) = self.rail_frame() else {
+        let Some((metrics, track_top, _)) = self.rail_frame(cx) else {
             return false;
         };
         let Some(fraction) = self.bar.drag_target_in(&metrics, track_top, pointer_y) else {
             return false;
         };
         let lines = (((1.0 - fraction) * metrics.max_scroll) / line_h).round() as usize;
-        let Some(tab) = self.rail_tab_mut() else {
+        if self
+            .with_active_emulator(cx, |emulator| emulator.scroll_to_offset(lines))
+            .is_none()
+        {
             return false;
-        };
-        tab.emulator.scroll_to_offset(lines);
+        }
         true
     }
 
@@ -1368,7 +1057,6 @@ impl TerminalPanel {
     }
 
     fn close_tab(&mut self, chat: &str, key: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let engine = self.engine(cx);
         let Some(tabs) = self.chats.get_mut(chat) else {
             return;
         };
@@ -1376,7 +1064,6 @@ impl TerminalPanel {
             return;
         };
         let tab = tabs.tabs.remove(ix);
-        let target = tab.target_device_id.clone();
         tabs.active = active_after_close(tabs.active, ix, tabs.tabs.len());
         let now_empty = tabs.tabs.is_empty();
         self.drag = None;
@@ -1387,18 +1074,7 @@ impl TerminalPanel {
         if now_empty && self.open && !self.embedded {
             window.dispatch_action(Box::new(ToggleTerminal), cx);
         }
-        if let (Some(engine), Some(id)) = (engine, tab.terminal_id.clone()) {
-            cx.spawn(async move |_, _| {
-                let _ = engine
-                    .client()
-                    .call(
-                        methods::CLOSE_TERMINAL,
-                        with_target(serde_json::json!({ "terminalId": id }), &target),
-                    )
-                    .await;
-            })
-            .detach();
-        }
+        tab.session.update(cx, |model, cx| model.close(cx));
         cx.notify();
     }
 
@@ -1444,6 +1120,7 @@ impl TerminalPanel {
             .as_ref()
             .map(|d| (d.from, d.over, d.epoch, d.prev_over));
         let chat_owned = chat.to_string();
+        let generation = self.drag_generation;
 
         let tab_elements: Vec<_> = tabs
             .map(|tabs| {
@@ -1456,8 +1133,9 @@ impl TerminalPanel {
                         // Contextual label (user request): the OSC title —
                         // the shell's own cwd/command name — wins over the
                         // fixed "Terminal N" fallback.
-                        let title = Self::display_title(tab);
-                        let exited = tab.exited.is_some();
+                        let model = tab.session.read(cx);
+                        let title = model.display_title();
+                        let exited = model.exited.is_some();
                         (ix, key, title, selected, exited)
                     })
                     .collect()
@@ -1481,28 +1159,48 @@ impl TerminalPanel {
             .pr(px(6.0))
             .border_b_1()
             .border_color(crate::theme::hairline(0.07))
-            .on_drag_move::<TabDragPayload>(cx.listener(
-                move |this, event: &gpui::DragMoveEvent<TabDragPayload>, _, cx| {
+            .on_drag_move::<TerminalTabDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<TerminalTabDrag>, _, cx| {
                     let payload = event.drag(cx);
-                    if payload.chat != bar_chat {
+                    if payload.chat != bar_chat
+                        || payload.origin != cx.weak_entity()
+                        || !this.accepts_drag(payload, cx)
+                    {
                         return;
                     }
-                    let from = payload.from;
+                    let Some(from) = this
+                        .chats
+                        .get(&bar_chat)
+                        .and_then(|tabs| tabs.tabs.iter().position(|tab| tab.key == payload.key))
+                    else {
+                        return;
+                    };
                     let rel_x = f32::from(event.event.position.x) - f32::from(event.bounds.left());
                     let over = drop_index(rel_x, TAB_WIDTH, count);
                     this.update_drag_over(from, over, cx);
                 },
             ))
-            .on_drop::<TabDragPayload>(cx.listener(move |this, payload: &TabDragPayload, _, cx| {
-                if payload.chat != drop_chat {
-                    this.drag = None;
-                    cx.notify();
-                    return;
-                }
-                let to = this.drag.as_ref().map(|d| d.over).unwrap_or(payload.from);
-                let chat = drop_chat.clone();
-                this.commit_reorder(&chat, payload.from, to, cx);
-            }))
+            .on_drop::<TerminalTabDrag>(cx.listener(
+                move |this, payload: &TerminalTabDrag, _, cx| {
+                    if payload.chat != drop_chat
+                        || payload.origin != cx.weak_entity()
+                        || !this.accepts_drag(payload, cx)
+                    {
+                        this.drag = None;
+                        cx.notify();
+                        return;
+                    }
+                    let Some(from) = this
+                        .chats
+                        .get(&drop_chat)
+                        .and_then(|tabs| tabs.tabs.iter().position(|tab| tab.key == payload.key))
+                    else {
+                        return;
+                    };
+                    let to = this.drag.as_ref().map(|d| d.over).unwrap_or(from);
+                    this.commit_reorder(&drop_chat, from, to, cx);
+                },
+            ))
             .children(
                 tab_elements
                     .into_iter()
@@ -1546,6 +1244,7 @@ impl TerminalPanel {
                             );
                         let tab_el = div()
                             .id(("terminal-tab", key))
+                            .debug_selector(move || format!("terminal-tab-{key}"))
                             .w(px(TAB_WIDTH))
                             .h(px(28.0))
                             .flex_none()
@@ -1578,13 +1277,26 @@ impl TerminalPanel {
                                 }),
                             )
                             .on_drag(
-                                TabDragPayload {
+                                TerminalTabDrag {
                                     chat: chat_drag,
-                                    from: ix,
+                                    key,
+                                    origin: cx.weak_entity(),
+                                    generation,
                                     title: ghost_title,
                                 },
                                 |payload, _point, _, cx| {
                                     let title = payload.title.clone();
+                                    let _ = payload.origin.update(cx, |panel, cx| {
+                                        if let Some(from) =
+                                            panel.chats.get(&payload.chat).and_then(|tabs| {
+                                                tabs.tabs
+                                                    .iter()
+                                                    .position(|tab| tab.key == payload.key)
+                                            })
+                                        {
+                                            panel.update_drag_over(from, from, cx);
+                                        }
+                                    });
                                     cx.stop_propagation();
                                     cx.new(|_| TabGhost { title })
                                 },
@@ -1607,7 +1319,7 @@ impl TerminalPanel {
                                 div()
                                     .relative()
                                     .child(tab_el.with_animation(
-                                        ("terminal-tab-slide", key | ((epoch as u64) << 32)),
+                                        format!("terminal-tab-slide-{key}-{epoch}"),
                                         TAB_SLIDE.animation(),
                                         move |el, t| el.left(px(motion::lerp(start, target, t))),
                                     ))
@@ -1692,8 +1404,8 @@ impl ScrollRailHost for TerminalPanel {
 
     /// Handle-less owner: the grid's own extents stand in for a scroll
     /// handle's bounds.
-    fn rail_metrics(&mut self) -> Option<MenuScrollbarMetrics> {
-        let (metrics, _, offset) = self.rail_frame()?;
+    fn rail_metrics(&mut self, cx: &mut Context<Self>) -> Option<MenuScrollbarMetrics> {
+        let (metrics, _, offset) = self.rail_frame(cx)?;
         // The activity signal is the view's place in the scrollback, not the
         // thumb's: appended output grows history and display offset together
         // (the viewport stays anchored) and a resize trades history rows for
@@ -1703,26 +1415,21 @@ impl ScrollRailHost for TerminalPanel {
         Some(metrics)
     }
 
-    fn rail_press(&mut self, pointer_y: Pixels) -> bool {
-        let Some((metrics, track_top, _)) = self.rail_frame() else {
+    fn rail_press(&mut self, pointer_y: Pixels, cx: &mut Context<Self>) -> bool {
+        let Some((metrics, track_top, _)) = self.rail_frame(cx) else {
             return false;
         };
         self.bar.begin_press_in(&metrics, track_top, pointer_y);
         // Pressing the rail claims terminal focus, as it did before the
         // shared rail; the next render's focus_pending pass applies it.
         self.focus_pending = true;
-        self.apply_rail_drag(pointer_y);
+        self.apply_rail_drag(pointer_y, cx);
         true
     }
 
-    fn rail_drag_to(&mut self, pointer_y: Pixels) -> bool {
-        self.apply_rail_drag(pointer_y)
+    fn rail_drag_to(&mut self, pointer_y: Pixels, cx: &mut Context<Self>) -> bool {
+        self.apply_rail_drag(pointer_y, cx)
     }
-}
-
-enum StreamDisposition {
-    Continue,
-    Stop,
 }
 
 impl Render for TerminalPanel {
@@ -1796,19 +1503,18 @@ impl Render for TerminalPanel {
                                 f32::from(delta.y) / line_h
                             }
                         };
-                        let chat = this.selected_chat(cx);
-                        let Some(tabs) = this.chats.get_mut(&chat) else {
+                        let Some(session) = this.active_session(cx) else {
                             return;
                         };
-                        let Some(tab) = tabs.tabs.get_mut(tabs.active) else {
-                            return;
-                        };
-                        if event.touch_phase == gpui::TouchPhase::Started {
-                            tab.scroll_remainder = 0.0;
-                        }
-                        tab.scroll_remainder += lines;
-                        let step = tab.scroll_remainder.trunc() as i32;
-                        tab.scroll_remainder -= step as f32;
+                        let step = session.update(cx, |model, _| {
+                            if event.touch_phase == gpui::TouchPhase::Started {
+                                model.scroll_remainder = 0.0;
+                            }
+                            model.scroll_remainder += lines;
+                            let step = model.scroll_remainder.trunc() as i32;
+                            model.scroll_remainder -= step as f32;
+                            step
+                        });
                         this.scroll_active(step, cx);
                         cx.stop_propagation();
                     }))
@@ -1822,6 +1528,7 @@ impl Render for TerminalPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeron_proto::{TerminalEvent, TerminalSession};
 
     #[gpui::test]
     fn slow_trackpad_scroll_accumulates_per_terminal(cx: &mut gpui::TestAppContext) {
@@ -1840,10 +1547,14 @@ mod tests {
             let mut panel = TerminalPanel::new(state, cx);
             for title in ["First", "Second"] {
                 let key = panel.reserve_tab_for_chat("chat".into(), title, cx);
-                let tab = panel.tab_mut("chat", key).unwrap();
-                for _ in 0..200 {
-                    tab.emulator.feed(b"scrollback\r\n");
-                }
+                panel
+                    .session_for_tab("chat", key)
+                    .unwrap()
+                    .update(cx, |model, _| {
+                        for _ in 0..200 {
+                            model.emulator.feed(b"scrollback\r\n");
+                        }
+                    });
             }
             panel
         });
@@ -1897,7 +1608,8 @@ mod tests {
         panel.update(cx, |panel, cx| {
             assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 11);
             assert_eq!(panel.active_tab(cx).unwrap().scroll_remainder, 0.25);
-            panel.select_tab_by_key(1, cx);
+            let first = panel.tab_summaries(cx)[0].0;
+            panel.select_tab_by_key(first, cx);
         });
         cx.update(|window, cx| window.draw(cx).clear());
         cx.simulate_event(ScrollWheelEvent {

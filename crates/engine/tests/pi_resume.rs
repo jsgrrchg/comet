@@ -86,6 +86,7 @@ async fn timed_out_native_question_resolves_and_finishes_without_user_input() {
                 attachments: vec![],
                 worktree: None,
                 resume: None,
+                resume_policy: Default::default(),
                 mcp: None,
             },
             None,

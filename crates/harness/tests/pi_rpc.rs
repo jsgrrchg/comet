@@ -22,6 +22,7 @@ fn request(cwd: &std::path::Path, prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         resume: None,
+        resume_policy: Default::default(),
         attachments: vec![],
         worktree: None,
         mcp: None,

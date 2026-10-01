@@ -13943,6 +13943,7 @@ mod tests {
                 status: Some(zeron_doc::MessageStatus::Streaming),
                 continuation_of: None,
                 duration_ms: None,
+                native_fork_point: None,
             }]
         };
         state.update(cx, |s, _| s.selected_chat = Some("a".into()));

@@ -1335,6 +1335,7 @@ async fn recover_stale_journal_settles_chips_in_completed_local_entries() {
             status: Some(MessageStatus::Complete),
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         })
         .unwrap();
     }
@@ -1403,6 +1404,7 @@ async fn subagent_done_without_a_live_sink_updates_a_persisted_chip() {
             status: Some(MessageStatus::Complete),
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         })
         .unwrap();
     core.sessions

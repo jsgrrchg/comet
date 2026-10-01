@@ -12191,6 +12191,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "zeron-doc",
  "zeron-harness",
+ "zeron-mcp",
  "zeron-preview",
  "zeron-proto",
  "zeron-rpc",

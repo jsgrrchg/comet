@@ -229,6 +229,11 @@ impl VoiceController {
         }
     }
 
+    /// The utterance the caption shows (a speaker turn), if the provider names it.
+    pub fn caption_item(&self) -> Option<&str> {
+        self.partial_item.as_deref()
+    }
+
     pub fn orb_state(&self) -> OrbState {
         orb_state(self.phase, self.snapshot.as_ref())
     }

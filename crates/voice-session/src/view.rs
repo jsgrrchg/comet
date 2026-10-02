@@ -78,6 +78,11 @@ impl VoiceView {
         self.snapshot.as_ref().map(|s| s.chat_id.as_str())
     }
 
+    /// The utterance (speaker turn) the caption belongs to, if named.
+    pub fn caption_item(&self) -> Option<&str> {
+        self.caption_item.as_deref()
+    }
+
     pub fn work(&self) -> VoiceWork {
         self.snapshot.as_ref().map_or(VoiceWork::Idle, |s| s.work)
     }

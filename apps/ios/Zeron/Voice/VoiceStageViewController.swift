@@ -16,6 +16,14 @@ final class VoiceStageViewController: UIViewController {
     private let host = UILabel()
     private let status = UILabel()
     private let caption = UILabel()
+    /// The previous speaker turn, fading out over the new caption.
+    private let previousCaption = UILabel()
+    /// Streamed words veil in as on desktop (`zeron-veil` through the core).
+    private let captionFader = CaptionFader(maxChars: 160)
+    private var captionLink: CADisplayLink?
+    private var captionSource: (item: String?, text: String, user: Bool) = (nil, "", false)
+    /// The caption holds an end-of-call message instead of the utterance.
+    private var captionShowsMessage = false
     private lazy var minimize = Glass.circleButton(symbol: "chevron.down", size: 44, pointSize: 16, action: UIAction { [weak self] _ in
         self?.dismiss(animated: true)
     })
@@ -80,7 +88,13 @@ final class VoiceStageViewController: UIViewController {
         caption.textAlignment = .center
         caption.numberOfLines = 4
         caption.lineBreakMode = .byTruncatingHead
-        for label in [status, caption] {
+        previousCaption.font = caption.font
+        previousCaption.textColor = Palette.secondary
+        previousCaption.textAlignment = .center
+        previousCaption.numberOfLines = 4
+        previousCaption.isAccessibilityElement = false
+        previousCaption.isHidden = true
+        for label in [status, caption, previousCaption] {
             label.translatesAutoresizingMaskIntoConstraints = false
             view.addSubview(label)
         }
@@ -147,6 +161,9 @@ final class VoiceStageViewController: UIViewController {
             caption.leadingAnchor.constraint(equalTo: status.leadingAnchor),
             caption.trailingAnchor.constraint(equalTo: status.trailingAnchor),
             caption.bottomAnchor.constraint(lessThanOrEqualTo: bar.topAnchor, constant: -16),
+            previousCaption.topAnchor.constraint(equalTo: caption.topAnchor),
+            previousCaption.leadingAnchor.constraint(equalTo: caption.leadingAnchor),
+            previousCaption.trailingAnchor.constraint(equalTo: caption.trailingAnchor),
 
             bar.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             bar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
@@ -161,6 +178,10 @@ final class VoiceStageViewController: UIViewController {
         view.addGestureRecognizer(swipe)
 
         token = voice.observe { [weak self] in self?.refresh() }
+        // The veil colors are resolved per appearance.
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: VoiceStageViewController, _) in
+            if !self.captionShowsMessage { self.paintCaption() }
+        }
         refresh()
     }
 
@@ -192,13 +213,21 @@ final class VoiceStageViewController: UIViewController {
 
         if let reason = voice.endReason, !voice.live {
             status.text = "Call ended"
+            stopCaptionLink()
+            captionShowsMessage = true
+            previousCaption.isHidden = true
+            caption.attributedText = nil
             caption.text = voice.message(for: reason)
             caption.textColor = Palette.secondary
             retry.configuration?.title = reason == .microphoneDenied ? "Open Settings" : "Call again"
         } else {
             status.text = voice.statusText
-            caption.text = Self.tail(state?.caption ?? "")
-            caption.textColor = state?.captionSpeaker == .user ? Palette.tertiary : Palette.secondary
+            let source = (item: state?.captionItem, text: state?.caption ?? "", user: state?.captionSpeaker == .user)
+            if captionShowsMessage || source != captionSource {
+                captionShowsMessage = false
+                captionSource = source
+                paintCaption()
+            }
         }
         let ended = !voice.live
         for v in [mute, routeWell, end] { v.isHidden = ended }
@@ -229,12 +258,38 @@ final class VoiceStageViewController: UIViewController {
         if !voice.start() { voice.dismissEndReason() }
     }
 
-    /// Captions show the tail of a long utterance (desktop `caption_tail`).
-    static func tail(_ text: String, max: Int = 160) -> String {
-        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard text.count > max else { return text }
-        return "…" + text.suffix(max).trimmingCharacters(in: .whitespaces)
+    /// The tail of the utterance, its newest words fading in and the previous
+    /// turn fading out; repaints every display frame until settled.
+    private func paintCaption() {
+        let frame = captionFader.frame(item: captionSource.item, text: captionSource.text, reducedMotion: UIAccessibility.isReduceMotionEnabled)
+        let color = (captionSource.user ? Palette.tertiary : Palette.secondary).resolvedColor(with: traitCollection)
+        let text = NSMutableAttributedString(string: frame.text, attributes: [.font: caption.font as Any, .foregroundColor: color])
+        for span in frame.spans where span.alpha < 1 {
+            let range = NSRange(location: Int(span.start), length: Int(span.end) - Int(span.start))
+            guard NSMaxRange(range) <= text.length else { continue }
+            text.addAttribute(.foregroundColor, value: color.withAlphaComponent(color.cgColor.alpha * CGFloat(span.alpha)), range: range)
+        }
+        caption.attributedText = text
+        previousCaption.text = frame.previous
+        previousCaption.alpha = CGFloat(frame.previousAlpha)
+        previousCaption.isHidden = frame.previous == nil
+        if frame.animating, captionLink == nil {
+            let link = CADisplayLink(target: CaptionLinkProxy(self), selector: #selector(CaptionLinkProxy.tick))
+            link.add(to: .main, forMode: .common)
+            captionLink = link
+        } else if !frame.animating {
+            stopCaptionLink()
+        }
     }
+
+    fileprivate func captionTick() { paintCaption() }
+
+    private func stopCaptionLink() {
+        captionLink?.invalidate()
+        captionLink = nil
+    }
+
+    deinit { captionLink?.invalidate() }
 
     private static func callButton(symbol: String, tint: UIColor, background: UIColor, width: CGFloat = 60, action: @escaping () -> Void) -> UIButton {
         var config = UIButton.Configuration.filled()
@@ -367,4 +422,11 @@ extension UIViewController {
             completion(items)
         }])
     }
+}
+
+/// CADisplayLink retains its target; the proxy keeps the stage releasable.
+private final class CaptionLinkProxy: NSObject {
+    weak var stage: VoiceStageViewController?
+    init(_ stage: VoiceStageViewController) { self.stage = stage }
+    @objc func tick() { MainActor.assumeIsolated { stage?.captionTick() } }
 }

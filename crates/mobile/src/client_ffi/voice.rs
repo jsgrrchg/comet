@@ -73,6 +73,8 @@ pub struct VoiceCallState {
     pub caption: String,
     /// Set once the caption is a final segment; live partials have none.
     pub caption_speaker: Option<VoiceSpeaker>,
+    /// The utterance the caption belongs to: a change is a new speaker turn.
+    pub caption_item: Option<String>,
     /// Normalized 0…1 peaks (microphone is 0 while muted).
     pub microphone: f32,
     pub speaker: f32,
@@ -158,6 +160,7 @@ fn call_state(view: &VoiceView) -> VoiceCallState {
             VoiceRole::User => VoiceSpeaker::User,
             VoiceRole::Assistant => VoiceSpeaker::Assistant,
         }),
+        caption_item: view.caption_item().map(str::to_owned),
         microphone: view.microphone_level(),
         speaker: view.speaker_level(),
         voices: view

@@ -13,22 +13,11 @@ const STAGE_ORB_BOX: f32 = 128.0 * VOICE_STAGE_ORB_SCALE + 112.0;
 const STAGE_ENTER_MS: f32 = 460.0;
 const STAGE_EXIT_MS: f32 = 220.0;
 /// Captions show the tail of a long utterance rather than wrapping off-stage.
-const STAGE_CAPTION_CHARS: usize = 160;
+pub(super) const STAGE_CAPTION_CHARS: usize = 160;
 const FOOTER_HOVER: &str = "voice-footer-orb";
 /// Call-bar geometry: round controls inside a floating pill.
 const BAR_CONTROL: f32 = 44.0;
 const BAR_PAD: f32 = 8.0;
-
-/// Text tail of `text` holding at most `max` characters, ellipsized in front.
-pub(super) fn caption_tail(text: &str, max: usize) -> String {
-    let text = text.trim();
-    let count = text.chars().count();
-    if count <= max {
-        return text.to_owned();
-    }
-    let tail: String = text.chars().skip(count - max).collect();
-    format!("…{}", tail.trim_start())
-}
 
 /// Stage visibility for a transition that flipped `elapsed_ms` ago.
 pub(super) fn stage_reveal(open: bool, elapsed_ms: f32, reduced: bool) -> f32 {
@@ -345,7 +334,10 @@ impl Shell {
             voice.microphone_level(),
             voice.speaker_level(),
         );
-        let caption = caption_tail(&voice.partial, STAGE_CAPTION_CHARS);
+        let (caption_item, partial) = (
+            voice.caption_item().map(str::to_owned),
+            voice.partial.clone(),
+        );
         let snapshot = voice.snapshot.clone();
         let chat_id = voice.chat_id.clone();
         let awaiting = snapshot
@@ -362,6 +354,18 @@ impl Shell {
         });
         if reveal <= 0.001 {
             return None;
+        }
+
+        // Streamed words veil in like transcript text; a new speaker turn
+        // fades the previous caption out (zeron-veil, shared with mobile).
+        let caption = self.voice_caption.advance(
+            caption_item.as_deref(),
+            &partial,
+            std::time::Instant::now(),
+            self.reduced_motion,
+        );
+        if self.voice_caption.is_animating() {
+            self.motion_active.set(true);
         }
 
         let theme = Theme::of(cx).clone();
@@ -433,6 +437,7 @@ impl Shell {
             .child(orb_block)
             .child(
                 div()
+                    .relative()
                     .mt(px(10.0))
                     .w(px(560.0))
                     .max_w(px((width - 48.0).max(200.0)))
@@ -442,7 +447,16 @@ impl Shell {
                     .text_size(crate::typography::ui_rems(14.0))
                     .line_height(px(22.0))
                     .text_color(theme.text_muted)
-                    .child(caption),
+                    .child(veiled_caption(caption.text, &caption.spans, &theme, window))
+                    .children(caption.previous.map(|(previous, opacity)| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .opacity(opacity)
+                            .child(previous)
+                    })),
             );
 
         let controls = self.render_voice_call_bar(&theme, awaiting, chat_id, cx);
@@ -686,6 +700,19 @@ impl Shell {
             .child(back);
         crate::frost::frosted(radius, 18.0, bar).into_any_element()
     }
+}
+
+/// The caption with its fading words recolored, paint-only (`apply_veil`).
+fn veiled_caption(
+    text: String,
+    spans: &[zeron_veil::VeilSpan],
+    theme: &Theme,
+    window: &Window,
+) -> gpui::StyledText {
+    let mut run = window.text_style().to_run(text.len());
+    run.color = theme.text_muted;
+    let runs = crate::markdown::veil::apply_veil(vec![run], spans);
+    gpui::StyledText::new(text).with_runs(runs)
 }
 
 fn stage_tooltip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
@@ -957,15 +984,6 @@ mod tests {
         let orb = cx.debug_bounds("voice-composer-orb").unwrap();
         cx.simulate_click(orb.center(), gpui::Modifiers::default());
         shell.read_with(cx, |shell, cx| assert!(shell.voice.read(cx).stage_open));
-    }
-
-    #[test]
-    fn caption_keeps_the_latest_words_of_a_long_utterance() {
-        assert_eq!(caption_tail("  short  ", 10), "short");
-        let tail = caption_tail("one two three four five", 9);
-        assert_eq!(tail, "…four five");
-        // Multibyte text is cut on character boundaries.
-        assert_eq!(caption_tail("ñandú camión", 6), "…camión");
     }
 
     #[test]

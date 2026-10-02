@@ -1775,6 +1775,8 @@ pub struct Shell {
     voice_stage_orb: Entity<crate::orb::Orb>,
     /// Above the composer, only while the orchestrator's own chat is open.
     voice_composer_orb: Entity<crate::orb::Orb>,
+    /// The stage caption's streaming veil (shared with mobile).
+    voice_caption: zeron_veil::CaptionVeil,
     voice_stage_focus: FocusHandle,
     voice_stage_was_open: bool,
     /// Last rendered route, used to distinguish navigation from staying in Settings.
@@ -2297,6 +2299,7 @@ impl Shell {
             voice_footer_orb,
             voice_stage_orb,
             voice_composer_orb,
+            voice_caption: zeron_veil::CaptionVeil::new(voice_stage::STAGE_CAPTION_CHARS),
             voice_stage_focus: cx.focus_handle(),
             voice_stage_was_open: false,
             voice_stage_route: Route::Chat,

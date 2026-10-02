@@ -264,9 +264,13 @@ final class RemoteVoiceController {
         previewTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
-                let (orb, work, caption, speaker) = script[(step / 40) % script.count]
+                let turn = (step / 40) % script.count
+                let (orb, work, caption, speaker) = script[turn]
                 let wave = Float(abs(sin(Double(step) / 2.3)))
-                self.state = VoiceCallState(phase: .active, orb: orb, chatId: "voice-orchestrator-preview", work: work, muted: self.muted, speaking: orb == .speaking, caption: caption, captionSpeaker: speaker, microphone: orb == .listening ? wave : 0, speaker: orb == .speaking ? wave : 0, voices: [])
+                // Words stream in, about three per second, like a live partial.
+                let words = caption.split(separator: " ")
+                let streamed = words.prefix(1 + (step % 40) / 3).joined(separator: " ")
+                self.state = VoiceCallState(phase: .active, orb: orb, chatId: "voice-orchestrator-preview", work: work, muted: self.muted, speaking: orb == .speaking, caption: streamed, captionSpeaker: speaker, captionItem: "preview-\(turn)", microphone: orb == .listening ? wave : 0, speaker: orb == .speaking ? wave : 0, voices: [])
                 step += 1
                 self.changed()
             }

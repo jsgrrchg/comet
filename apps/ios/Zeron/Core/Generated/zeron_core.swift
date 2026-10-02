@@ -672,6 +672,143 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 /**
+ * One call's caption. Advance it whenever the caption changes and on every
+ * display frame while the last frame was `animating`.
+ */
+public protocol CaptionFaderProtocol: AnyObject, Sendable {
+    
+    func frame(item: String?, text: String, reducedMotion: Bool)  -> CaptionFrame
+    
+}
+/**
+ * One call's caption. Advance it whenever the caption changes and on every
+ * display frame while the last frame was `animating`.
+ */
+open class CaptionFader: CaptionFaderProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_zeron_mobile_fn_clone_captionfader(self.handle, $0) }
+    }
+public convenience init(maxChars: UInt32) {
+    let handle =
+        try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_constructor_captionfader_new(
+        FfiConverterUInt32.lower(maxChars),uniffiCallStatus
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_zeron_mobile_fn_free_captionfader(handle, $0) }
+    }
+
+    
+
+    
+open func frame(item: String?, text: String, reducedMotion: Bool) -> CaptionFrame  {
+    return try!  FfiConverterTypeCaptionFrame_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_method_captionfader_frame(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionString.lower(item),
+        FfiConverterString.lower(text),
+        FfiConverterBool.lower(reducedMotion),uniffiCallStatus
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCaptionFader: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = CaptionFader
+
+    public static func lift(_ handle: UInt64) throws -> CaptionFader {
+        return CaptionFader(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: CaptionFader) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CaptionFader {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: CaptionFader, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCaptionFader_lift(_ handle: UInt64) throws -> CaptionFader {
+    return try FfiConverterTypeCaptionFader.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCaptionFader_lower(_ value: CaptionFader) -> UInt64 {
+    return FfiConverterTypeCaptionFader.lower(value)
+}
+
+
+
+
+
+
+/**
  * Receives coalesced change events (at most one burst per display frame).
  * Called on a client thread: hop to the main thread and pull there.
  */
@@ -4904,6 +5041,151 @@ public func FfiConverterTypeBoxPrim_lower(_ value: BoxPrim) -> RustBuffer {
 }
 
 
+public struct CaptionFrame: Equatable, Hashable {
+    /**
+     * The tail of the utterance to show (ellipsized in front when long).
+     */
+    public var text: String
+    public var spans: [CaptionSpan]
+    /**
+     * The previous utterance while it fades out, and its opacity.
+     */
+    public var previous: String?
+    public var previousAlpha: Float
+    /**
+     * Something is still fading: ask for the next frame.
+     */
+    public var animating: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The tail of the utterance to show (ellipsized in front when long).
+         */text: String, spans: [CaptionSpan], 
+        /**
+         * The previous utterance while it fades out, and its opacity.
+         */previous: String?, previousAlpha: Float, 
+        /**
+         * Something is still fading: ask for the next frame.
+         */animating: Bool) {
+        self.text = text
+        self.spans = spans
+        self.previous = previous
+        self.previousAlpha = previousAlpha
+        self.animating = animating
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CaptionFrame: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCaptionFrame: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CaptionFrame {
+        return
+            try CaptionFrame(
+                text: FfiConverterString.read(from: &buf), 
+                spans: FfiConverterSequenceTypeCaptionSpan.read(from: &buf), 
+                previous: FfiConverterOptionString.read(from: &buf), 
+                previousAlpha: FfiConverterFloat.read(from: &buf), 
+                animating: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CaptionFrame, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.text, into: &buf)
+        FfiConverterSequenceTypeCaptionSpan.write(value.spans, into: &buf)
+        FfiConverterOptionString.write(value.previous, into: &buf)
+        FfiConverterFloat.write(value.previousAlpha, into: &buf)
+        FfiConverterBool.write(value.animating, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCaptionFrame_lift(_ buf: RustBuffer) throws -> CaptionFrame {
+    return try FfiConverterTypeCaptionFrame.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCaptionFrame_lower(_ value: CaptionFrame) -> RustBuffer {
+    return FfiConverterTypeCaptionFrame.lower(value)
+}
+
+
+/**
+ * A veiled UTF-16 range of the caption and its opacity (0..1).
+ */
+public struct CaptionSpan: Equatable, Hashable {
+    public var start: UInt32
+    public var end: UInt32
+    public var alpha: Float
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(start: UInt32, end: UInt32, alpha: Float) {
+        self.start = start
+        self.end = end
+        self.alpha = alpha
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension CaptionSpan: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeCaptionSpan: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> CaptionSpan {
+        return
+            try CaptionSpan(
+                start: FfiConverterUInt32.read(from: &buf), 
+                end: FfiConverterUInt32.read(from: &buf), 
+                alpha: FfiConverterFloat.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: CaptionSpan, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.start, into: &buf)
+        FfiConverterUInt32.write(value.end, into: &buf)
+        FfiConverterFloat.write(value.alpha, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCaptionSpan_lift(_ buf: RustBuffer) throws -> CaptionSpan {
+    return try FfiConverterTypeCaptionSpan.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeCaptionSpan_lower(_ value: CaptionSpan) -> RustBuffer {
+    return FfiConverterTypeCaptionSpan.lower(value)
+}
+
+
 /**
  * A chat's run configuration. Ids are wire strings.
  */
@@ -8872,6 +9154,10 @@ public struct VoiceCallState: Equatable, Hashable {
      */
     public var captionSpeaker: VoiceSpeaker?
     /**
+     * The utterance the caption belongs to: a change is a new speaker turn.
+     */
+    public var captionItem: String?
+    /**
      * Normalized 0…1 peaks (microphone is 0 while muted).
      */
     public var microphone: Float
@@ -8894,6 +9180,9 @@ public struct VoiceCallState: Equatable, Hashable {
          * Set once the caption is a final segment; live partials have none.
          */captionSpeaker: VoiceSpeaker?, 
         /**
+         * The utterance the caption belongs to: a change is a new speaker turn.
+         */captionItem: String?, 
+        /**
          * Normalized 0…1 peaks (microphone is 0 while muted).
          */microphone: Float, speaker: Float, 
         /**
@@ -8907,6 +9196,7 @@ public struct VoiceCallState: Equatable, Hashable {
         self.speaking = speaking
         self.caption = caption
         self.captionSpeaker = captionSpeaker
+        self.captionItem = captionItem
         self.microphone = microphone
         self.speaker = speaker
         self.voices = voices
@@ -8936,6 +9226,7 @@ public struct FfiConverterTypeVoiceCallState: FfiConverterRustBuffer {
                 speaking: FfiConverterBool.read(from: &buf), 
                 caption: FfiConverterString.read(from: &buf), 
                 captionSpeaker: FfiConverterOptionTypeVoiceSpeaker.read(from: &buf), 
+                captionItem: FfiConverterOptionString.read(from: &buf), 
                 microphone: FfiConverterFloat.read(from: &buf), 
                 speaker: FfiConverterFloat.read(from: &buf), 
                 voices: FfiConverterSequenceString.read(from: &buf)
@@ -8951,6 +9242,7 @@ public struct FfiConverterTypeVoiceCallState: FfiConverterRustBuffer {
         FfiConverterBool.write(value.speaking, into: &buf)
         FfiConverterString.write(value.caption, into: &buf)
         FfiConverterOptionTypeVoiceSpeaker.write(value.captionSpeaker, into: &buf)
+        FfiConverterOptionString.write(value.captionItem, into: &buf)
         FfiConverterFloat.write(value.microphone, into: &buf)
         FfiConverterFloat.write(value.speaker, into: &buf)
         FfiConverterSequenceString.write(value.voices, into: &buf)
@@ -13781,6 +14073,31 @@ fileprivate struct FfiConverterSequenceTypeBoxPrim: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeCaptionSpan: FfiConverterRustBuffer {
+    typealias SwiftType = [CaptionSpan]
+
+    public static func write(_ value: [CaptionSpan], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeCaptionSpan.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [CaptionSpan] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [CaptionSpan]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeCaptionSpan.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeDebugEntry: FfiConverterRustBuffer {
     typealias SwiftType = [DebugEntry]
 
@@ -14931,6 +15248,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_zeron_mobile_checksum_func_wallpaper_safe_opacity() != 57056) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_zeron_mobile_checksum_method_captionfader_frame() != 19899) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_zeron_mobile_checksum_method_clientlistener_on_event() != 55106) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -15274,6 +15594,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_orbrenderer_set_orb() != 18211) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_constructor_captionfader_new() != 15591) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_constructor_coreclient_new() != 27504) {

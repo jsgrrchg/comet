@@ -49,14 +49,18 @@ final class RemoteVoiceLifecycleTests: XCTestCase {
         }
     }
 
-    @MainActor
-    func testStageCaptionShowsTheTailOfALongUtterance() {
-        XCTAssertEqual(VoiceStageViewController.tail("  short  "), "short")
+    func testCaptionShowsTheTailAndVeilsNewWords() {
+        let fader = CaptionFader(maxChars: 160)
+        XCTAssertEqual(fader.frame(item: "a", text: "  short  ", reducedMotion: true).text, "short")
         let long = String(repeating: "a", count: 300) + " end"
-        let tail = VoiceStageViewController.tail(long)
-        XCTAssertTrue(tail.hasPrefix("…"))
-        XCTAssertTrue(tail.hasSuffix(" end"))
-        XCTAssertLessThanOrEqual(tail.count, 161)
+        let frame = fader.frame(item: "b", text: long, reducedMotion: false)
+        XCTAssertTrue(frame.text.hasPrefix("…"))
+        XCTAssertTrue(frame.text.hasSuffix(" end"))
+        XCTAssertLessThanOrEqual(frame.text.count, 161)
+        // A new turn: its words fade in while the previous caption fades out.
+        XCTAssertTrue(frame.animating)
+        XCTAssertEqual(frame.previous, "short")
+        XCTAssertEqual(frame.spans.first?.alpha, 0)
     }
 
     @MainActor

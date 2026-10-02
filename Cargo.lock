@@ -13125,6 +13125,7 @@ dependencies = [
  "zeron-proto",
  "zeron-syntax",
  "zeron-text",
+ "zeron-veil",
  "zeron-voice-session",
 ]
 
@@ -13346,6 +13347,7 @@ dependencies = [
  "zeron-syntax",
  "zeron-theme",
  "zeron-update",
+ "zeron-veil",
  "zeron-voice",
  "zeron-voice-media",
  "zeron-voice-session",
@@ -13366,6 +13368,10 @@ dependencies = [
  "tracing",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "zeron-veil"
+version = "0.2.102"
 
 [[package]]
 name = "zeron-voice"

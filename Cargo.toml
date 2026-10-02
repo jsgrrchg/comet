@@ -5,6 +5,7 @@ members = [
     "crates/voice-media",
     "crates/voice-session",
     "crates/orb",
+    "crates/veil",
     "crates/theme",
     "crates/audio",
     "crates/proto",
@@ -34,6 +35,7 @@ publish = false
 [workspace.dependencies]
 zeron-voice-session = { path = "crates/voice-session" }
 zeron-orb = { path = "crates/orb" }
+zeron-veil = { path = "crates/veil" }
 zeron-voice-media = { path = "crates/voice-media" }
 zeron-audio = { path = "crates/audio" }
 zeron-proto = { path = "crates/proto" }

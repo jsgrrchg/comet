@@ -28,7 +28,13 @@ final class RemoteVoiceController {
     /// Styles the last host offered.
     private(set) var styles: [String] = defaultVoiceStyles()
 
-    var live: Bool { call != nil || previewing }
+    var live: Bool {
+        #if DEBUG
+        return call != nil || previewing
+        #else
+        return call != nil
+        #endif
+    }
     var active: Bool { state?.phase == .active }
     var orb: VoiceOrb { state?.orb ?? (live ? .connecting : .idle) }
 

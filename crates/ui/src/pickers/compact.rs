@@ -827,11 +827,18 @@ impl Pickers {
 
     /// The panel's shortcuts, live only while it is the picker's page: Up
     /// and Down open the model list on the model beside the selected one,
-    /// Tab cycles providers, Left/Right (Home/End) set the effort.
+    /// Tab cycles providers, Left/Right (Home/End) set the effort, F toggles
+    /// fast mode.
     pub(super) fn compact_panel_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
         self.compact_keyboard = true;
         match event.keystroke.key.as_str() {
             "escape" => self.animate_close(cx),
+            "f" if !event.keystroke.modifiers.modified() => {
+                let Some((option, choice, default, _)) = self.compact_fast_choice(cx) else {
+                    return;
+                };
+                self.pick_option(option, choice, default, cx);
+            }
             "up" | "down" => {
                 self.show_compact_models(cx);
                 let delta = if event.keystroke.key == "up" { -1 } else { 1 };

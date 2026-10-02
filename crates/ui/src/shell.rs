@@ -418,6 +418,14 @@ pub fn apply_keymap(
     // rebuilding Zeron's bindings so the file editor keymap remains active.
     gpui_base::init(cx);
     crate::composer::init(cx, composer_send_behavior);
+    cx.bind_keys([KeyBinding::new(
+        &valid_or_default(
+            &keymap.toggle_dictation,
+            ShortcutId::ToggleDictation.default_combo(),
+        ),
+        crate::composer::ToggleDictation,
+        Some("MessageComposer"),
+    )]);
     // Fixed app-level shortcuts (Settings on every platform; ⌘Q quit, ⌘W
     // close, ⌘M minimize, ⌘H hide on macOS) — these back the native menu
     // key equivalents and must survive keymap re-application.
@@ -523,6 +531,7 @@ pub enum SettingsSection {
     Appearance,
     Files,
     Notifications,
+    Voice,
     Shortcuts,
     /// Composer and conversation behavior plus thread naming.
     #[default]
@@ -533,10 +542,11 @@ pub enum SettingsSection {
 
 impl SettingsSection {
     /// Sections shown in Settings. `Agents` is a legacy Accounts route alias.
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::General,
         SettingsSection::Appearance,
         SettingsSection::Notifications,
+        SettingsSection::Voice,
         SettingsSection::Shortcuts,
         SettingsSection::Harnesses,
         SettingsSection::Devices,
@@ -561,7 +571,7 @@ impl SettingsSection {
 
     /// Where a generic "open Settings" lands for a remembered section: legacy
     /// aliases resolve to their page, and a section this build does not show
-    /// (Appshots off-desktop) falls back to General.
+    /// (Appshots off macOS/Linux) falls back to General.
     pub(crate) fn reopenable(self) -> Self {
         let section = self.canonical();
         if section.visible_in_nav() {
@@ -580,6 +590,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "appearance",
             SettingsSection::Files => "files",
             SettingsSection::Notifications => "notifications",
+            SettingsSection::Voice => "voice",
             SettingsSection::Shortcuts => "shortcuts",
             SettingsSection::General => "general",
             SettingsSection::Appshots => "appshots",
@@ -596,6 +607,7 @@ impl SettingsSection {
             "appearance" => SettingsSection::Appearance,
             "files" => SettingsSection::Files,
             "notifications" => SettingsSection::Notifications,
+            "voice" => SettingsSection::Voice,
             "shortcuts" => SettingsSection::Shortcuts,
             "general" | "conversations" => SettingsSection::General,
             "appshots" => SettingsSection::Appshots,
@@ -620,6 +632,7 @@ impl SettingsSection {
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
+            SettingsSection::Voice => "Voice",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::General => "General",
             SettingsSection::Appshots => "Appshots",
@@ -1963,6 +1976,9 @@ pub struct Shell {
     boot: EngineBootConfig,
     data_dir: PathBuf,
     settings: UiSettings,
+    /// The store's settings when `settings` last synced with it. Fields that
+    /// differ from this are the Shell's edits; all others follow the store.
+    settings_base: UiSettings,
     /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
     /// parity — heights stay in [`UiSettings`]).
     panels: SessionPanels,
@@ -2370,6 +2386,7 @@ impl Shell {
             import_current: None,
             boot,
             data_dir,
+            settings_base: settings::current(cx),
             settings,
             panels: SessionPanels::default(),
             active_chat: String::new(),
@@ -2771,14 +2788,18 @@ impl Shell {
             if state.read(cx).selected_chat.is_none() {
                 // A set sidebar filter is an explicit standing choice — the
                 // canvas defaults (project AND its device) follow it, even
-                // over a remembered "no project" opt-out. Otherwise the last
-                // selected project stands, unless opted out.
+                // over a remembered "no project" opt-out. Otherwise the canvas's
+                // own last pick stands (`last_space_id` also follows opened
+                // chats, so it is only the fallback), unless opted out.
                 let exists = |id: &String| state.read(cx).space_row(id).is_some();
                 let filter = self.settings.space_filter.clone().filter(&exists);
                 let target = match filter {
                     Some(filter) => Some(filter),
                     None if !state.read(cx).no_project => {
-                        self.settings.last_space_id.clone().filter(&exists)
+                        crate::settings::composer::ComposerDefaults::load(&self.data_dir)
+                            .project
+                            .filter(&exists)
+                            .or_else(|| self.settings.last_space_id.clone().filter(&exists))
                     }
                     None => None,
                 };
@@ -4478,37 +4499,20 @@ impl Shell {
         self.settings.theme_selection = crate::appearance::themes(cx);
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
-        self.sync_independent_settings(cx);
+        self.pull_settings(cx);
         settings::replace(self.settings.clone(), SavePolicy::Debounced, cx);
+        self.settings_base = settings::current(cx);
     }
 
-    /// Controls outside the Shell mutate these choices directly. A geometry
-    /// save must never publish the Shell's older values over those selections.
-    /// The typography globals own the font choices but persist every change
-    /// immediately, so the central store is an equally canonical read and
-    /// keeps this block on a single source.
-    fn sync_independent_settings(&mut self, cx: &App) {
+    /// Controls outside the Shell (Voice, typography, diff and transcript
+    /// toggles, …) save to the central store directly. Fold those into the
+    /// working copy while keeping the Shell's own edits, so a geometry save
+    /// can never publish an older value over another surface's choice.
+    fn pull_settings(&mut self, cx: &App) {
         let current = settings::current(cx);
-        self.settings.window_geometry = current.window_geometry;
-        self.settings.new_thread_composer_background = current.new_thread_composer_background;
-        self.settings.new_thread_background_effect = current.new_thread_background_effect;
-        self.settings.wallpaper_folder = current.wallpaper_folder;
-        self.settings.wallpaper_source = current.wallpaper_source;
-        self.settings.wallpaper_history = current.wallpaper_history;
-        self.settings.wallpaper_theme_colors = current.wallpaper_theme_colors;
-        self.settings.wallpaper_color = current.wallpaper_color;
-        self.settings.open_web_links_in_zeron = current.open_web_links_in_zeron;
-        self.settings.ui_font_family = current.ui_font_family;
-        self.settings.ui_font_size = current.ui_font_size;
-        self.settings.terminal_font_family = current.terminal_font_family;
-        self.settings.terminal_font_size = current.terminal_font_size;
-        self.settings.code_font_family = current.code_font_family;
-        self.settings.code_font_size = current.code_font_size;
-        self.settings.transcript_width = current.transcript_width;
-        self.settings.skill_completion_by_harness = current.skill_completion_by_harness;
-        self.settings.skills_in_slash_menu = current.skills_in_slash_menu;
-        self.settings.reduce_motion = current.reduce_motion;
-        self.settings.pause_animations_in_background = current.pause_animations_in_background;
+        self.settings =
+            UiSettings::merge_changes(&self.settings_base, &self.settings, current.clone());
+        self.settings_base = current;
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -4916,6 +4920,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Voice => crate::dictation::card(cx).into_any_element(),
             SettingsSection::Shortcuts | SettingsSection::General | SettingsSection::Appshots => {
                 if self.shortcuts_page.is_none() {
                     let state = self.state.clone();
@@ -6862,6 +6867,7 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER,
             SettingsSection::Notifications => icons::BELL,
+            SettingsSection::Voice => icons::MICROPHONE,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::General => icons::SETTINGS,
             SettingsSection::Appshots => icons::MONITOR,
@@ -11062,8 +11068,7 @@ impl Shell {
                 .h(px(24.0))
                 .w(px(CHIP_W))
                 .flex_none()
-                .pl(px(4.0))
-                .pr(px(8.0))
+                .px(px(4.0))
                 .rounded(px(6.0))
                 .flex()
                 .flex_row()
@@ -11163,8 +11168,62 @@ impl Shell {
                     this.reorder_right_tabs(payload.from, to, cx);
                 }))
                 .child(
-                    // Leading slot: icon normally, ✕ on tab hover — two
-                    // stacked layers opacity-swapped by the group hover.
+                    // Leading slot: the surface's icon.
+                    div()
+                        .flex_none()
+                        .size(px(18.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(if subagent_running {
+                            loaders::mini_glyph_spinner(
+                                format!("subagent-tab-{ix}"),
+                                2.0,
+                                theme.glyph,
+                                cx.entity_id(),
+                                cx,
+                            )
+                            .into_any_element()
+                        } else if let Some(favicon) = browser_favicon {
+                            gpui::img(favicon).size(px(12.0)).into_any_element()
+                        } else if matches!(surface, RightSurface::File(_)) {
+                            crate::file_icons::icon(
+                                crate::file_icons::FileIconIdentity::file(
+                                    file_identity_path.as_ref(),
+                                ),
+                                theme.appearance,
+                            )
+                            .size(px(14.0))
+                            .when(!is_active, |icon| icon.opacity(0.78))
+                            .into_any_element()
+                        } else {
+                            icon(icon_path)
+                                .size(px(12.0))
+                                .text_color(if is_active {
+                                    theme.text_muted
+                                } else {
+                                    theme.text_muted.opacity(0.7)
+                                })
+                                .into_any_element()
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(crate::typography::ui_rems(11.5))
+                        .text_color(if is_active {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
+                        .child(title),
+                )
+                .child(
+                    // Trailing slot: the unsaved dot normally, ✕ on tab
+                    // hover — two stacked layers opacity-swapped by the
+                    // group hover.
                     div()
                         .id(("right-surface-close", ix))
                         .debug_selector(|| format!("right-surface-close-{ix}"))
@@ -11172,6 +11231,9 @@ impl Shell {
                         .size(px(18.0))
                         .rounded(px(4.0))
                         .relative()
+                        .role(gpui::Role::Button)
+                        .aria_label("Close tab")
+                        .tooltip(crate::settings::widgets::text_tooltip("Close tab"))
                         .hover(|s| s.bg(crate::theme::wash(0.12)))
                         // The tab owns a drag payload. Claim the close press
                         // before it reaches that parent or GPUI starts a tab
@@ -11184,46 +11246,18 @@ impl Shell {
                             cx.stop_propagation();
                             this.close_right_surface(surface, window, cx);
                         }))
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .group_hover(group.clone(), |s| s.opacity(0.0))
-                                .child(if subagent_running {
-                                    loaders::mini_glyph_spinner(
-                                        format!("subagent-tab-{ix}"),
-                                        2.0,
-                                        theme.glyph,
-                                        cx.entity_id(),
-                                        cx,
-                                    )
-                                    .into_any_element()
-                                } else if let Some(favicon) = browser_favicon {
-                                    gpui::img(favicon).size(px(12.0)).into_any_element()
-                                } else if matches!(surface, RightSurface::File(_)) {
-                                    crate::file_icons::icon(
-                                        crate::file_icons::FileIconIdentity::file(
-                                            file_identity_path.as_ref(),
-                                        ),
-                                        theme.appearance,
-                                    )
-                                    .size(px(14.0))
-                                    .when(!is_active, |icon| icon.opacity(0.78))
-                                    .into_any_element()
-                                } else {
-                                    icon(icon_path)
-                                        .size(px(12.0))
-                                        .text_color(if is_active {
-                                            theme.text_muted
-                                        } else {
-                                            theme.text_muted.opacity(0.7)
-                                        })
-                                        .into_any_element()
-                                }),
-                        )
+                        .when(dirty, |slot| {
+                            slot.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .group_hover(group.clone(), |s| s.opacity(0.0))
+                                    .child(div().size(px(6.0)).rounded_full().bg(theme.text_muted)),
+                            )
+                        })
                         .child(
                             div()
                                 .absolute()
@@ -11239,28 +11273,7 @@ impl Shell {
                                         .text_color(theme.text_muted),
                                 ),
                         ),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(crate::typography::ui_rems(11.5))
-                        .text_color(if is_active {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
-                        .child(title),
-                )
-                .when(dirty, |chip| {
-                    chip.child(
-                        div()
-                            .flex_none()
-                            .size(px(6.0))
-                            .rounded_full()
-                            .bg(theme.text_muted),
-                    )
-                });
+                );
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the
@@ -12254,7 +12267,7 @@ impl Render for Shell {
         self.settings.theme_selection = crate::appearance::themes(cx);
         self.settings.accent = crate::appearance::accent(cx);
         self.settings.surface = crate::appearance::surface(cx);
-        self.sync_independent_settings(cx);
+        self.pull_settings(cx);
         let theme = Theme::of(cx);
         // The shell frost sits over native desktop blur on macOS and Windows.
         // Content surfaces add their own backgrounds over this shared tint.
@@ -14734,6 +14747,78 @@ mod exit_regressions {
     }
 
     #[gpui::test]
+    fn shell_saves_keep_every_setting_chosen_outside_the_shell(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, _, cx| {
+                // Voice, transcript and diff controls save straight to the
+                // store. None of them is known to the Shell.
+                settings::update(SavePolicy::Immediate, cx, |settings| {
+                    settings.dictation_enabled = true;
+                    settings.dictation_input = Some("coreaudio:usb".into());
+                    settings.transcript_compact_mode = true;
+                    settings.code_fences_fit_content = true;
+                    settings.diff_split = true;
+                    settings.diff_wrap = true;
+                });
+                // Leaving Settings and resizing both republish the Shell's copy.
+                shell.settings.settings_section = SettingsSection::Appearance;
+                shell.settings.sidebar_width = 300.0;
+                shell.schedule_save(cx);
+                let saved = settings::current(cx);
+                assert!(saved.dictation_enabled);
+                assert_eq!(saved.dictation_input.as_deref(), Some("coreaudio:usb"));
+                assert!(saved.transcript_compact_mode);
+                assert!(saved.code_fences_fit_content);
+                assert!(saved.diff_split);
+                assert!(saved.diff_wrap);
+                assert_eq!(saved.settings_section, SettingsSection::Appearance);
+                assert_eq!(saved.sidebar_width, 300.0);
+                // An outside change to a field the Shell also holds still wins
+                // once the Shell has nothing newer of its own.
+                settings::update(SavePolicy::Immediate, cx, |settings| {
+                    settings.dictation_enabled = false;
+                    settings.sidebar_width = 320.0;
+                });
+                shell.schedule_save(cx);
+                let saved = settings::current(cx);
+                assert!(!saved.dictation_enabled);
+                assert_eq!(saved.sidebar_width, 320.0);
+                assert_eq!(shell.settings.sidebar_width, 320.0);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn sidebar_settings_trigger_toggles_the_settings_route(cx: &mut TestAppContext) {
         // Just the footer row: the full shell's settings modal would cover it.
         struct FooterHost(Entity<Shell>);
@@ -15024,6 +15109,86 @@ mod exit_regressions {
                 shell.on_state_changed(&shell.state.clone(), cx);
                 assert!(shell.settings.space_filter.is_none());
                 assert!(shell.state.read(cx).no_project);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn new_session_reopens_where_it_was_left_after_visiting_a_chat(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        let space = |id: &str, device: &str| zeron_proto::Space {
+            id: id.into(),
+            device_id: device.into(),
+            path: format!("/{id}"),
+            name: None,
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc::now(),
+        };
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.apply_spaces(vec![space("mine", "local"), space("other", "remote")]);
+                    state.apply_chats(vec![zeron_proto::Chat {
+                        id: "elsewhere".into(),
+                        device_id: "remote".into(),
+                        title: None,
+                        archived: false,
+                        cwd: None,
+                        branch: None,
+                        checkout_id: None,
+                        source_context: None,
+                        config: None,
+                        last_message_preview: None,
+                        last_message_at: None,
+                        created_at: Utc::now(),
+                        harness_session_id: None,
+                        harness_session_cwd: None,
+                        parent_chat_id: None,
+                        space_id: Some("other".into()),
+                        last_seen_at: None,
+                        room_gen: None,
+                    }]);
+                    state.select_space(Some("mine".into()), cx);
+                });
+                shell.settings.space_filter = None;
+                shell.open_chat("elsewhere".into(), cx);
+                assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("other"));
+                shell.open_new_session(cx);
+                let state = shell.state.read(cx);
+                assert!(state.selected_chat.is_none());
+                assert_eq!(state.selected_space.as_deref(), Some("mine"));
+                assert_eq!(state.effective_device_id().as_deref(), Some("local"));
             })
             .unwrap();
     }
@@ -15870,6 +16035,18 @@ mod right_tab_mouse_regressions {
     }
 
     #[gpui::test]
+    fn right_tab_close_sits_at_the_trailing_edge(cx: &mut TestAppContext) {
+        let (_shell, cx) = setup(cx);
+        let tab = cx.debug_bounds("right-surface-tab-0").unwrap();
+        let close = cx.debug_bounds("right-surface-close-0").unwrap();
+        assert!(
+            close.left() > tab.center().x,
+            "close is not after the title"
+        );
+        assert_eq!(close.right(), tab.right() - px(4.));
+    }
+
+    #[gpui::test]
     fn tab_strip_scrolls_over_chips_inside_titlebar(cx: &mut TestAppContext) {
         let (shell, cx) = setup(cx);
         shell.update(cx, |shell, cx| {
@@ -16375,6 +16552,7 @@ mod settings_modal_regressions {
             ("settings/agents", SettingsSection::Harnesses),
             ("settings/harnesses", SettingsSection::Harnesses),
             ("settings/general", SettingsSection::General),
+            ("settings/voice", SettingsSection::Voice),
             ("settings/conversations", SettingsSection::General),
             ("settings/files", SettingsSection::Files),
             ("settings/appshots", SettingsSection::Appshots),

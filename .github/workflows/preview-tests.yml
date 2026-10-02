@@ -9,18 +9,23 @@ permissions:
   contents: read
 concurrency:
   group: preview-tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
+  # The Linux leg runs in the `core-tests` job of ui-tests.yml (same tests, one
+  # shared build with the rest of the Rust tests).
   networking:
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [macos-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
       - run: cargo test --locked -p zeron-preview
   coordinator:
     runs-on: ubuntu-latest

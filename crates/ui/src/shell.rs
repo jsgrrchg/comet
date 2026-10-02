@@ -14758,6 +14758,74 @@ mod exit_regressions {
     }
 
     #[gpui::test]
+    fn shell_saves_never_revert_settings_written_outside_the_shell(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        let before = cx.update(|cx| settings::current(cx));
+        window
+            .update(cx, |shell, _, cx| {
+                // Toggles that write the store directly (the General page's
+                // Compact mode, notification and sidebar switches, ...).
+                settings::set_transcript_compact_mode(!before.transcript_compact_mode, cx);
+                settings::update(SavePolicy::Immediate, cx, |s| {
+                    s.notifications_enabled = !before.notifications_enabled;
+                    s.sidebar_show_branch = !before.sidebar_show_branch;
+                    s.escape_stops_active_agent = !before.escape_stops_active_agent;
+                });
+                // Navigating away saves the shell's own working copy.
+                shell.remember_settings_section(SettingsSection::Notifications, cx);
+                // The shell's own writes still land.
+                shell.settings.sidebar_width += 10.0;
+                shell.schedule_save(cx);
+            })
+            .unwrap();
+        let after = cx.update(|cx| settings::current(cx));
+        assert_eq!(
+            after.transcript_compact_mode,
+            !before.transcript_compact_mode
+        );
+        assert_eq!(after.notifications_enabled, !before.notifications_enabled);
+        assert_eq!(after.sidebar_show_branch, !before.sidebar_show_branch);
+        assert_eq!(
+            after.escape_stops_active_agent,
+            !before.escape_stops_active_agent
+        );
+        assert_eq!(
+            after.settings_section,
+            SettingsSection::Notifications.canonical()
+        );
+        assert_eq!(after.sidebar_width, before.sidebar_width + 10.0);
+    }
+
+    #[gpui::test]
     fn workspace_slash_commands_open_existing_zeron_surfaces(cx: &mut TestAppContext) {
         use crate::composer::WorkspaceCommand;
         let dir = tempfile::tempdir().unwrap();

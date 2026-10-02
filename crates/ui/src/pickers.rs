@@ -360,6 +360,20 @@ pub fn browser_rows(listing: &FolderListing) -> Vec<&zeron_proto::FolderEntry> {
 /// the first Down lands on row 0.
 const NO_ACTIVE_ROW: usize = usize::MAX;
 
+/// What names the selected model, shared by the composer chip and the
+/// compact panel so the two never disagree about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelName {
+    /// The catalog row's label, else the remembered pick's, else the id.
+    Named(SharedString),
+    /// Nothing names it yet, but the harness or model catalog that would
+    /// is still on its way.
+    Loading,
+    /// Nothing offers a model: no agents at all, or a provider whose
+    /// catalog came back empty or failed with no pick remembered.
+    None { no_agents: bool },
+}
+
 /// Which pane the harness/model picker's icon rail is showing (t3code
 /// ModelPickerContent `selectedInstanceId | "favorites"`). `Harness` means
 /// "the effective harness's list" — the rail has no browse-without-commit
@@ -997,6 +1011,27 @@ impl Pickers {
             return None;
         }
         selected_catalog_model(models, selected)
+    }
+
+    fn model_name(&self, cx: &App) -> ModelName {
+        if self.no_agents_available() && self.effective_harness(cx).is_none() {
+            return ModelName::None { no_agents: true };
+        }
+        if let Some(label) = self.selected_model_label(cx) {
+            return ModelName::Named(label.into());
+        }
+        let catalog_loading = matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
+        let models_loading = self.effective_harness(cx).is_some_and(|harness| {
+            !matches!(
+                self.models.get(&harness),
+                Some(Loadable::Ready(_)) | Some(Loadable::Error(_))
+            )
+        });
+        if catalog_loading || models_loading {
+            ModelName::Loading
+        } else {
+            ModelName::None { no_agents: false }
+        }
     }
 
     fn selected_model_label(&self, cx: &App) -> Option<String> {
@@ -3052,13 +3087,31 @@ impl Pickers {
     /// A read-only footer label (locked sessions — t3code's
     /// `resolveLockedWorkspaceLabel` span).
     fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
+        Self::footer_label_shell(icon_path, theme)
+            .max_w(px(160.0))
+            .child(div().min_w_0().truncate().child(label))
+    }
+
+    /// A [`Self::footer_label`] that takes whatever width the row leaves it
+    /// and fades its tail only when that isn't enough.
+    fn footer_faded_label(
+        id: &'static str,
+        icon_path: &'static str,
+        label: SharedString,
+        theme: &Theme,
+    ) -> gpui::Div {
+        Self::footer_label_shell(icon_path, theme).child(crate::shell::sidebar_faded_label(
+            id.into(),
+            false,
+            label,
+        ))
+    }
+
+    fn footer_label_shell(icon_path: &'static str, theme: &Theme) -> gpui::Div {
         div()
             .h(px(20.0))
-            // Four of these share one row now (device, project, checkout,
-            // ref): cap each early and let them SHRINK (`min_w_0`) — without
-            // it the clusters overflowed into each other and the labels
-            // painted overlapped (user report).
-            .max_w(px(160.0))
+            // Labels SHRINK (`min_w_0`) — without it the clusters overflowed
+            // into each other and the labels painted overlapped (user report).
             .min_w_0()
             .flex()
             .flex_row()
@@ -3071,9 +3124,9 @@ impl Pickers {
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(12.0))
+                    .flex_none()
                     .text_color(theme.text_muted.opacity(0.6)),
             )
-            .child(div().min_w_0().truncate().child(label))
     }
 
     /// New-session destination controls. Machine and project form the
@@ -3283,7 +3336,8 @@ impl Pickers {
                 .items_center()
                 .gap(px(4.0))
                 .min_w_0()
-                .child(Self::footer_label(
+                .child(Self::footer_faded_label(
+                    "composer-session-branch",
                     crate::icons::GIT_BRANCH,
                     chat.branch
                         .clone()
@@ -5749,6 +5803,7 @@ impl Render for Pickers {
         // loaded, so that's a conclusion, not a loading gap) — the chip says
         // so instead of wearing a brand mark for an agent that can't run.
         let no_agents = self.no_agents_available() && self.effective_harness(cx).is_none();
+        let model_name = self.model_name(cx);
         let model_label: SharedString = if let Some(title) = &self.title {
             // The saved choice, not the tab being browsed.
             match (title.harness, title.model.as_deref()) {
@@ -5764,19 +5819,14 @@ impl Render for Pickers {
                     .unwrap_or_else(|| id.to_owned())
                     .into(),
             }
-        } else if no_agents {
-            SharedString::from("No agents available")
         } else {
-            let label = self.selected_model_label(cx);
-            label.map(SharedString::from).unwrap_or_default()
+            match &model_name {
+                ModelName::Named(label) => label.clone(),
+                ModelName::None { no_agents: true } => "No agents available".into(),
+                ModelName::Loading | ModelName::None { .. } => SharedString::default(),
+            }
         };
         let catalog_loading = matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
-        let models_loading = self.effective_harness(cx).is_some_and(|harness| {
-            !matches!(
-                self.models.get(&harness),
-                Some(Loadable::Ready(_)) | Some(Loadable::Error(_))
-            )
-        });
         // Harness unknown while the catalog resolves: the pixel-glyph loader
         // instead of guessing a brand mark.
         let chip_icon_loading = self.title.is_none()
@@ -5785,8 +5835,7 @@ impl Render for Pickers {
             && catalog_loading;
         // Harness known but nothing names the model yet (fresh install, no
         // remembered pick): a ghost label instead of a bare icon.
-        let chip_label_loading =
-            !no_agents && model_label.is_empty() && (catalog_loading || models_loading);
+        let chip_label_loading = self.title.is_none() && model_name == ModelName::Loading;
         let chip_harness = match &self.title {
             Some(title) => title.harness,
             None => self.effective_harness(cx),
@@ -7723,6 +7772,73 @@ mod tests {
         }
     }
     #[gpui::test]
+    fn model_name_never_reads_select_model_while_anything_can_still_name_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            let mut settings = crate::settings::UiSettings::default();
+            settings.compact_model_picker = true;
+            crate::settings::init(settings, dir.path(), cx);
+        });
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        let named = |label: &str| ModelName::Named(label.into());
+        handle
+            .update(cx, |picker, _, cx| {
+                // Harness catalog still loading, a pick remembered: named.
+                picker.config.harness = Some(HarnessId::Codex);
+                picker.defaults.remember_model(
+                    HarnessId::Codex,
+                    "gpt-6-luna".into(),
+                    "GPT-6-Luna".into(),
+                );
+                assert_eq!(picker.model_name(cx), named("GPT-6-Luna"));
+                // Model catalog loading, pick remembered: still named.
+                picker.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+                picker.models.insert(HarnessId::Codex, Loadable::Loading);
+                assert_eq!(picker.model_name(cx), named("GPT-6-Luna"));
+                // A draft id the catalog never learned keeps its id.
+                picker.config.model = Some("gpt-7".into());
+                assert_eq!(picker.model_name(cx), named("gpt-7"));
+                // Nothing picked or remembered while loading: loading, not
+                // "Select model".
+                picker.config.model = None;
+                picker.defaults.model_by_harness.clear();
+                assert_eq!(picker.model_name(cx), ModelName::Loading);
+                picker.harnesses = Loadable::Loading;
+                assert_eq!(picker.model_name(cx), ModelName::Loading);
+                // Catalog in, nothing remembered: its default model.
+                picker.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+                picker.models.insert(
+                    HarnessId::Codex,
+                    Loadable::Ready(vec![bare_model("gpt-a", "A"), bare_model("gpt-b", "B")]),
+                );
+                assert_eq!(picker.model_name(cx), named("A"));
+                // Only a provider with nothing to offer is unnamed.
+                picker
+                    .models
+                    .insert(HarnessId::Codex, Loadable::Ready(Vec::new()));
+                assert_eq!(picker.model_name(cx), ModelName::None { no_agents: false });
+                picker
+                    .models
+                    .insert(HarnessId::Codex, Loadable::Error("offline".into()));
+                assert_eq!(picker.model_name(cx), ModelName::None { no_agents: false });
+                // ...and a remembered pick names it even then.
+                picker.defaults.remember_model(
+                    HarnessId::Codex,
+                    "gpt-6-luna".into(),
+                    "GPT-6-Luna".into(),
+                );
+                assert_eq!(picker.model_name(cx), named("GPT-6-Luna"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn compact_panel_shortcuts_drive_models_providers_and_effort(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {
@@ -7936,7 +8052,7 @@ mod tests {
             Pickers::new(state, cx)
         });
         handle
-            .update(cx, |pickers, _, cx| {
+            .update(cx, |pickers, window, cx| {
                 let mut grok = bare_model("grok-4.6", "Grok 4.6");
                 grok.options = vec![ModelOption {
                     id: "fast".into(),
@@ -7966,6 +8082,19 @@ mod tests {
                 pickers.pick_option(option, next, default, cx);
                 assert!(pickers.compact_fast_choice(cx).unwrap().3);
                 assert!(!pickers.explicit_options(cx).contains_key("fast"));
+                // F on the open panel flips it the same way.
+                pickers.open.open(PickerKind::HarnessModel);
+                let key = |key: &str| KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse(key).unwrap(),
+                    is_held: false,
+                    prefer_character_input: false,
+                };
+                pickers.on_key_down(&key("f"), window, cx);
+                assert!(!pickers.compact_fast_choice(cx).unwrap().3);
+                pickers.on_key_down(&key("cmd-f"), window, cx);
+                assert!(!pickers.compact_fast_choice(cx).unwrap().3);
+                pickers.on_key_down(&key("f"), window, cx);
+                assert!(pickers.compact_fast_choice(cx).unwrap().3);
             })
             .unwrap();
     }
@@ -8020,13 +8149,16 @@ mod tests {
                     Loadable::Ready(vec![bare_model("claude", "Claude model")]),
                 );
                 picker.catalog_rev += 1;
-                // The list holds one provider's models; the provider page
-                // switches to the newly loaded one.
-                assert_eq!(picker.model_rows_len(cx), 1);
-                picker.pick_compact_provider(HarnessId::ClaudeCode, cx);
+                // A provider's models become directly selectable when its
+                // catalog finishes loading; no provider-page detour is needed.
+                assert_eq!(picker.model_rows_len(cx), 2);
+                assert_eq!(picker.model_rows(cx)[1].harness, HarnessId::ClaudeCode);
+                picker.activate_model_index(1, cx);
+                assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
+                assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude"));
                 picker.show_compact_models(cx);
-                assert_eq!(picker.model_rows_len(cx), 1);
-                assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::ClaudeCode);
+                assert_eq!(picker.model_rows_len(cx), 2);
+                assert_eq!(picker.model_rows(cx)[picker.active].harness, HarnessId::ClaudeCode);
             })
             .unwrap();
     }
@@ -8194,10 +8326,25 @@ mod tests {
             .update(cx, |picker, window, cx| {
                 picker.open_model_menu(window, cx);
                 assert!(!picker.compact_model_list);
-                // The list holds the current provider's models only.
+                // Models from every offered provider are directly selectable.
                 picker.show_compact_models(cx);
-                assert_eq!(picker.model_rows_len(cx), 1);
+                assert_eq!(picker.model_rows_len(cx), 2);
                 assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::Codex);
+                assert_eq!(picker.model_rows(cx)[1].harness, HarnessId::ClaudeCode);
+                // Searching must also find another provider's model.
+                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                assert_eq!(picker.model_rows_len(cx), 1);
+                assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::ClaudeCode);
+                picker.activate_model_index(0, cx);
+                assert!(!picker.compact_model_list);
+                assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
+                assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude-model"));
+                picker.pick_harness(HarnessId::Codex, cx);
+                // Clicking a foreign-provider row works without a search too.
+                picker.show_compact_models(cx);
+                picker.activate_model_index(1, cx);
+                assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
+                picker.pick_harness(HarnessId::Codex, cx);
                 // The provider page lists every provider, highlighting the
                 // current one, and a pick lands back on the panel.
                 picker.show_compact_providers(cx);
@@ -8219,6 +8366,9 @@ mod tests {
                 picker.show_compact_models(cx);
                 assert_eq!(picker.model_rows_len(cx), 1);
                 assert_eq!(picker.rail_descriptors(cx)[0].id, HarnessId::Codex);
+                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                assert_eq!(picker.model_rows_len(cx), 0);
+                picker.search.update(cx, |input, cx| input.set_text("", cx));
                 // A chat's provider is fixed: the provider page stays shut.
                 picker.compact_model_list = false;
                 picker.show_compact_providers(cx);

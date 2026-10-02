@@ -5699,6 +5699,11 @@ pub struct Composer {
     /// Rows awaiting a host-authoritative removal acknowledgement. They stay
     /// visible but inert until the host wins the race against queue delivery.
     pub(crate) queue_removing: HashSet<String>,
+    /// The agent's checklist tray: latest list of the selected chat, and the
+    /// per-chat open/fold state (in memory, like the right-pane flags).
+    pub(crate) todo_cache: crate::todo_panel::TodoCache,
+    pub(crate) todo_panels: HashMap<String, crate::todo_panel::TodoPanelState>,
+    pub(crate) todo_scroll: gpui::ScrollHandle,
     /// Whether the modifier overlay should currently reveal the queue hint.
     /// The shell owns modifier tracking and clears this on window deactivation.
     queue_shortcut_revealed: bool,
@@ -5979,6 +5984,9 @@ impl Composer {
             queue_full_preview: None,
             queue_previews: HashMap::new(),
             queue_removing: HashSet::new(),
+            todo_cache: Default::default(),
+            todo_panels: HashMap::new(),
+            todo_scroll: gpui::ScrollHandle::new(),
             queue_shortcut_revealed: false,
             expanded_mode: false,
             flip_epoch: 0,
@@ -10118,6 +10126,13 @@ impl Render for Composer {
                 self.staged().len() + self.staged_appshots().len(),
                 self.staged_comments(cx).len(),
             );
+        // The checklist tray stacks above the queue (or directly above the
+        // composer), one step narrower than what follows it.
+        let has_queue = !self.state.read(cx).queue.is_empty();
+        let container = container.when_some(
+            self.render_todo_panel(has_queue, window, cx),
+            |el, panel| el.child(motion::fade_quick("composer-todo", div().child(panel))),
+        );
         let container = container.when_some(
             self.render_queue_panel(show_queue_latest_shortcut, window, cx),
             |el, panel| {

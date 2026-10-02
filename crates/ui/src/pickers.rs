@@ -8140,13 +8140,16 @@ mod tests {
                     Loadable::Ready(vec![bare_model("claude", "Claude model")]),
                 );
                 picker.catalog_rev += 1;
-                // The list holds one provider's models; the provider page
-                // switches to the newly loaded one.
-                assert_eq!(picker.model_rows_len(cx), 1);
-                picker.pick_compact_provider(HarnessId::ClaudeCode, cx);
+                // A provider's models become directly selectable when its
+                // catalog finishes loading; no provider-page detour is needed.
+                assert_eq!(picker.model_rows_len(cx), 2);
+                assert_eq!(picker.model_rows(cx)[1].harness, HarnessId::ClaudeCode);
+                picker.activate_model_index(1, cx);
+                assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
+                assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude"));
                 picker.show_compact_models(cx);
-                assert_eq!(picker.model_rows_len(cx), 1);
-                assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::ClaudeCode);
+                assert_eq!(picker.model_rows_len(cx), 2);
+                assert_eq!(picker.model_rows(cx)[picker.active].harness, HarnessId::ClaudeCode);
             })
             .unwrap();
     }
@@ -8314,10 +8317,25 @@ mod tests {
             .update(cx, |picker, window, cx| {
                 picker.open_model_menu(window, cx);
                 assert!(!picker.compact_model_list);
-                // The list holds the current provider's models only.
+                // Models from every offered provider are directly selectable.
                 picker.show_compact_models(cx);
-                assert_eq!(picker.model_rows_len(cx), 1);
+                assert_eq!(picker.model_rows_len(cx), 2);
                 assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::Codex);
+                assert_eq!(picker.model_rows(cx)[1].harness, HarnessId::ClaudeCode);
+                // Searching must also find another provider's model.
+                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                assert_eq!(picker.model_rows_len(cx), 1);
+                assert_eq!(picker.model_rows(cx)[0].harness, HarnessId::ClaudeCode);
+                picker.activate_model_index(0, cx);
+                assert!(!picker.compact_model_list);
+                assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
+                assert_eq!(picker.resolved(cx).model.as_deref(), Some("claude-model"));
+                picker.pick_harness(HarnessId::Codex, cx);
+                // Clicking a foreign-provider row works without a search too.
+                picker.show_compact_models(cx);
+                picker.activate_model_index(1, cx);
+                assert_eq!(picker.resolved(cx).harness, Some(HarnessId::ClaudeCode));
+                picker.pick_harness(HarnessId::Codex, cx);
                 // The provider page lists every provider, highlighting the
                 // current one, and a pick lands back on the panel.
                 picker.show_compact_providers(cx);
@@ -8339,6 +8357,9 @@ mod tests {
                 picker.show_compact_models(cx);
                 assert_eq!(picker.model_rows_len(cx), 1);
                 assert_eq!(picker.rail_descriptors(cx)[0].id, HarnessId::Codex);
+                picker.search.update(cx, |input, cx| input.set_text("Claude", cx));
+                assert_eq!(picker.model_rows_len(cx), 0);
+                picker.search.update(cx, |input, cx| input.set_text("", cx));
                 // A chat's provider is fixed: the provider page stays shut.
                 picker.compact_model_list = false;
                 picker.show_compact_providers(cx);

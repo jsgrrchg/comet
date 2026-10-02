@@ -322,8 +322,15 @@ impl Pickers {
     }
 
     pub(super) fn show_compact_models(&mut self, cx: &mut Context<Self>) {
-        // The provider button picks the provider; the list holds its models.
-        self.show_compact_list(ModelRail::Harness, "Search models…", cx);
+        // Browse every offered provider, just as the standard picker's rail
+        // allows. rail_descriptors still limits existing chats to their provider.
+        // A foreign-provider row switches the provider before picking its model.
+        let rail = if self.harness_locked(cx) {
+            ModelRail::Harness
+        } else {
+            ModelRail::All
+        };
+        self.show_compact_list(rail, "Search models…", cx);
     }
 
     /// The starred models across providers, opened from the provider page.

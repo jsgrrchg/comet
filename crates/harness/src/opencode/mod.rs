@@ -363,6 +363,9 @@ impl Harness for OpencodeHarness {
             || self.base_url.is_some()
             || resolve_opencode_executable().is_some()
     }
+    fn executable_path(&self) -> Option<PathBuf> {
+        self.resolve_executable().ok()
+    }
     /// `session.status{idle}` is a real terminal frame per turn: the engine
     /// can retire its quiesce watchdogs.
     fn deterministic_turn_end(&self) -> bool {
@@ -602,33 +605,35 @@ impl Server {
             .arg(port.to_string())
             .arg("--hostname")
             .arg("127.0.0.1")
+            // 2.x prefers OPENCODE_PASSWORD over the legacy name; a user's
+            // own value would otherwise lock us out of our server (401).
+            .env("OPENCODE_PASSWORD", &password)
             .env("OPENCODE_SERVER_PASSWORD", &password)
             .env("OPENCODE_CLIENT", "zeron");
         if let Some(mcp) = mcp {
-            let version_exe = exe.to_path_buf();
-            let version = tokio::task::spawn_blocking(move || {
-                crate::executable::binary_version(&version_exe)
-            })
-            .await
-            .map_err(|e| HarnessError::Protocol(format!("opencode version probe: {e}")))?
-            .ok_or_else(|| {
-                HarnessError::Protocol(
-                    "cannot determine opencode version for MCP configuration".into(),
-                )
-            })?;
-            let protocol = if version.major >= 2 {
-                Protocol::V2
-            } else {
-                Protocol::V1
-            };
-            cmd.env(
-                "OPENCODE_CONFIG_CONTENT",
-                mcp_config(
-                    std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
-                    mcp,
-                    protocol,
-                )?,
-            );
+            // The config shape differs by generation. If even the cold probe
+            // can't tell, run without the Zeron MCP server rather than fail.
+            match opencode_version(exe).await {
+                Some(version) => {
+                    let protocol = if version.major >= 2 {
+                        Protocol::V2
+                    } else {
+                        Protocol::V1
+                    };
+                    cmd.env(
+                        "OPENCODE_CONFIG_CONTENT",
+                        mcp_config(
+                            std::env::var("OPENCODE_CONFIG_CONTENT").ok().as_deref(),
+                            mcp,
+                            protocol,
+                        )?,
+                    );
+                }
+                None => tracing::warn!(
+                    binary_path = %exe.display(),
+                    "opencode version unknown; starting without the Zeron MCP server"
+                ),
+            }
         }
         crate::compose_child_path(&mut cmd, exe);
         if let Some(cwd) = cwd {
@@ -1477,6 +1482,7 @@ async fn run_session(session: Session) {
         initial_native_command_selected,
     } = session;
     let RunControls {
+        execution_lease: _execution_lease,
         request_input,
         mut steering,
         interrupt,
@@ -3538,6 +3544,8 @@ fn map_questions(props: &Value) -> Vec<UserInputQuestion> {
                                     .collect()
                             })
                             .unwrap_or_default(),
+                        prefill: None,
+                        multiline: false,
                         multi_select: q.get("multiple").and_then(Value::as_bool).unwrap_or(false),
                     })
                 })
@@ -3653,13 +3661,41 @@ fn oc_tool_call(name: &str, input: &Value) -> ToolCall {
 /// - tools: `session.tool.input.started` (carries the NAME),
 ///   `.input.ended` (args as text), `.called` (args as object),
 ///   `.success` (content array) / `.error`.
-/// - usage: `session.usage.updated` with the cumulative token totals.
+/// - usage: `session.step.ended` carries the step's own tokens; the
+///   cumulative `session.usage.updated` totals are ignored.
 ///
 /// `tool_names` tracks pending calls by session, message, and provider call id.
+/// `session_models` remembers the latest model for step.ended, which omits it.
 type V2ToolKey = (String, String, String);
 const MAX_PENDING_V2_TOOLS: usize = 4096;
+/// Cache cap; overflow clears the cache instead of failing the run.
+const MAX_V2_SESSION_MODELS: usize = 4096;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct V2ModelIdentity {
+    provider_id: String,
+    model_id: String,
+}
+
+fn v2_model_identity(model: &Value) -> Option<V2ModelIdentity> {
+    let provider_id = model.get("providerID")?.as_str()?;
+    let model_id = model.get("id")?.as_str()?;
+    (!provider_id.is_empty() && !model_id.is_empty()).then(|| V2ModelIdentity {
+        provider_id: provider_id.to_owned(),
+        model_id: model_id.to_owned(),
+    })
+}
+
+#[cfg(test)]
 fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>) -> Vec<Value> {
+    normalize_v2_frame_with_session_models(event, tool_names, &mut HashMap::new())
+}
+
+fn normalize_v2_frame_with_session_models(
+    event: Value,
+    tool_names: &mut HashMap<V2ToolKey, String>,
+    session_models: &mut HashMap<String, V2ModelIdentity>,
+) -> Vec<Value> {
     let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
     let data = event.get("data").cloned().unwrap_or(Value::Null);
     if data
@@ -3757,12 +3793,20 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
             warning["type"] = json!("session.warning");
             vec![warning]
         }
-        "session.step.started" => vec![json!({
-            "type": "message.updated",
-            "properties": {
-                "info": { "sessionID": session(), "id": message(), "role": "assistant" }
+        "session.step.started" => {
+            if let (Some(session_id), Some(model)) = (
+                data.get("sessionID").and_then(Value::as_str),
+                data.get("model").and_then(v2_model_identity),
+            ) {
+                session_models.insert(session_id.to_owned(), model);
             }
-        })],
+            vec![json!({
+                "type": "message.updated",
+                "properties": {
+                    "info": { "sessionID": session(), "id": message(), "role": "assistant" }
+                }
+            })]
+        }
         "session.text.started" | "session.text.ended" => {
             vec![v2_stream_part(
                 &data,
@@ -3846,27 +3890,37 @@ fn normalize_v2_frame(event: Value, tool_names: &mut HashMap<V2ToolKey, String>)
                 &json!({ "status": "error", "error": message }),
             )]
         }
-        "session.usage.updated" => {
+        "session.step.ended" => {
             let tokens = data.get("tokens").cloned().unwrap_or(Value::Null);
-            if tokens.is_null() {
+            if !tokens.is_object() {
                 return Vec::new();
             }
-            // Cumulative totals keyed to a synthetic message: registers
-            // Usage + ContextUsage exactly like the 1.x assistant
-            // message.updated did. (No providerID/modelID on this frame —
-            // the context window is dropped.)
+            // One step's tokens are the prompt it sent plus its reply, which
+            // is what the 1.x assistant message carried. The frame omits the
+            // model, so the session's latest step supplies it and the
+            // advertised context limit resolves.
+            let mut info = json!({
+                "sessionID": session(),
+                "id": "usage",
+                "role": "assistant",
+                "tokens": tokens,
+            });
+            if let Some(model) = data
+                .get("sessionID")
+                .and_then(Value::as_str)
+                .and_then(|id| session_models.get(id))
+            {
+                info["providerID"] = json!(model.provider_id);
+                info["modelID"] = json!(model.model_id);
+            }
             vec![json!({
                 "type": "message.updated",
-                "properties": {
-                    "info": {
-                        "sessionID": session(),
-                        "id": "usage",
-                        "role": "assistant",
-                        "tokens": tokens,
-                    }
-                }
+                "properties": { "info": info }
             })]
         }
+        // Cumulative session totals (every step, title, and compaction
+        // summed), so they measure spend, not context occupancy.
+        "session.usage.updated" => Vec::new(),
         "session.created" => {
             let Some(id) = data.get("sessionID").and_then(Value::as_str) else {
                 return Vec::new();
@@ -3996,6 +4050,8 @@ async fn bus_task(
         Protocol::V2 => format!("{base}/api/event"),
     };
     let mut failures: u32 = 0;
+    let mut v2_tool_names: HashMap<V2ToolKey, String> = HashMap::new();
+    let mut v2_session_models: HashMap<String, V2ModelIdentity> = HashMap::new();
     loop {
         if tx.is_closed() {
             return;
@@ -4009,7 +4065,14 @@ async fn bus_task(
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
                 failures = 0;
-                stream_bus(&tx, resp, protocol).await;
+                stream_bus(
+                    &tx,
+                    resp,
+                    protocol,
+                    &mut v2_tool_names,
+                    &mut v2_session_models,
+                )
+                .await;
                 if tx.is_closed() {
                     return;
                 }
@@ -4027,13 +4090,16 @@ async fn bus_task(
     }
 }
 
-async fn stream_bus(tx: &mpsc::Sender<BusMsg>, resp: reqwest::Response, protocol: Protocol) {
+async fn stream_bus(
+    tx: &mpsc::Sender<BusMsg>,
+    resp: reqwest::Response,
+    protocol: Protocol,
+    v2_tool_names: &mut HashMap<V2ToolKey, String>,
+    v2_session_models: &mut HashMap<String, V2ModelIdentity>,
+) {
     let mut stream = resp.bytes_stream();
     let mut buf: Vec<u8> = Vec::new();
     let mut announced = false;
-    // 2.x names a tool only when its input starts streaming; the later
-    // called/success frames carry the call id alone.
-    let mut v2_tool_names: HashMap<V2ToolKey, String> = HashMap::new();
     while let Some(chunk) = stream.next().await {
         let Ok(bytes) = chunk else {
             return;
@@ -4062,10 +4128,22 @@ async fn stream_bus(tx: &mpsc::Sender<BusMsg>, resp: reqwest::Response, protocol
                     continue;
                 };
                 if protocol == Protocol::V2 {
-                    let payloads = normalize_v2_frame(event, &mut v2_tool_names);
+                    let payloads = normalize_v2_frame_with_session_models(
+                        event,
+                        v2_tool_names,
+                        v2_session_models,
+                    );
                     if v2_tool_names.len() > MAX_PENDING_V2_TOOLS {
                         let _ = tx.send(BusMsg::Disconnected).await;
                         return;
+                    }
+                    // Model identity only feeds usage frames. Dropping the
+                    // cache degrades to "window preserved" and refills on the
+                    // next step.started, so — unlike leaked pending tools — it
+                    // must not fail the run, especially now that the cache
+                    // survives reconnects.
+                    if v2_session_models.len() > MAX_V2_SESSION_MODELS {
+                        v2_session_models.clear();
                     }
                     for payload in payloads {
                         if tx.send(BusMsg::Event(payload)).await.is_err() {
@@ -4114,6 +4192,88 @@ mod context_tests {
             })
         );
     }
+
+    #[test]
+    fn malformed_usage_is_ignored_without_panicking() {
+        let windows = HashMap::from([("provider/model".to_owned(), 200_000)]);
+        for info in [
+            json!({}),
+            json!({"tokens": null}),
+            json!({"tokens": "12"}),
+            json!({"tokens": [1, 2]}),
+            json!({"tokens": {"input": -1, "output": 1.5, "cache": "x"}}),
+            json!({"providerID": 1, "modelID": null, "tokens": {"input": "3"}}),
+        ] {
+            assert_eq!(context_usage_event(&info, &windows), None, "{info}");
+        }
+        // Unexpected model fields drop only the window, never the count.
+        assert_eq!(
+            context_usage_event(
+                &json!({"providerID": ["provider"], "modelID": "model",
+                        "tokens": {"input": 7, "cache": {"read": "x", "write": 3}}}),
+                &windows
+            ),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(10),
+                window: None
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_model_preserves_the_previous_window() {
+        // A catalog that failed to load (or lags the 2.x model sync)
+        // advertises nothing; an absent model must not read as "no limit".
+        let info = json!({"providerID":"provider","modelID":"unknown",
+                          "tokens":{"input":10,"output":2}});
+        assert_eq!(
+            context_usage_event(&info, &HashMap::new()),
+            Some(AgentEvent::ContextUsage {
+                tokens: Some(12),
+                window: None
+            })
+        );
+    }
+}
+
+/// Budget for a `--version` the shared probe gave up on: a freshly installed
+/// binary's first exec waits on the OS malware scan (1.1s on an M-series Mac
+/// for 2.0.20, longer on slower machines and under Windows Defender).
+const COLD_VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The shared probe caps `--version` at 2s and caches a timeout for the
+/// binary's lifetime, so one cold first exec after an upgrade failed every
+/// later run instantly until restart. Retry past that cache with a longer
+/// budget, and on success clear the cached failure for other callers.
+async fn opencode_version(exe: &std::path::Path) -> Option<semver::Version> {
+    let cached_exe = exe.to_path_buf();
+    let cached =
+        tokio::task::spawn_blocking(move || crate::executable::binary_version(&cached_exe))
+            .await
+            .ok()
+            .flatten();
+    if cached.is_some() {
+        return cached;
+    }
+    let mut cmd = Command::new(exe);
+    cmd.arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(COLD_VERSION_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let version = crate::executable::parse_version(&output.stdout)
+        .or_else(|| crate::executable::parse_version(&output.stderr))?;
+    if let Some(stem) = exe.file_stem().and_then(|s| s.to_str()) {
+        crate::executable::invalidate_versions(&[stem]);
+    }
+    Some(version)
 }
 
 /// Inline config is the final user config layer. Preserve inherited overrides
@@ -4225,6 +4385,108 @@ http.createServer((req, res) => {{
                 a_config["command"],
                 json!(["/path with spaces/zeron", "mcp"])
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unknown_version_starts_without_mcp_instead_of_failing() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let exe = fixture.path().join("opencode");
+        // `--version` fails (a probe that timed out or printed no version).
+        let script = r#"#!/usr/bin/env node
+const http = require('node:http');
+if (process.argv.includes('--version')) process.exit(1);
+const config = process.env.OPENCODE_CONFIG_CONTENT ?? null;
+const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
+http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  if (req.url === '/config-probe') { res.end(JSON.stringify({config})); return; }
+  if (req.url === '/api/info') { res.end(JSON.stringify({version: '2.0.20'})); return; }
+  res.statusCode = 404; res.end('{}');
+}).listen(port, '127.0.0.1');
+"#;
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "zeron".into(),
+            args: vec!["mcp".into()],
+            env: Default::default(),
+        };
+        let mut server = Server::spawn(
+            &exe,
+            fixture.path().to_str(),
+            Duration::from_secs(5),
+            Some(&mcp),
+        )
+        .await
+        .expect("an unknown version must not fail the run");
+        let probe = server.get_json("/config-probe", None).await.unwrap();
+        server.shutdown(Duration::from_millis(100)).await;
+        assert_eq!(probe["config"], Value::Null);
+    }
+
+    /// A freshly installed binary's first `--version` outlasts the shared
+    /// 2s probe (OS malware scan). That cached failure used to fail every
+    /// run; the cold retry must still find 2.x and inject the MCP config.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cold_first_version_probe_still_injects_mcp() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let exe = fixture.path().join("opencode");
+        let warmed = fixture.path().join("warmed");
+        let script = format!(
+            r#"#!/usr/bin/env node
+const fs = require('node:fs');
+const http = require('node:http');
+if (process.argv.includes('--version')) {{
+  const cold = !fs.existsSync({warmed:?});
+  fs.writeFileSync({warmed:?}, '');
+  setTimeout(() => {{ console.log('opencode v2.0.20'); process.exit(0); }}, cold ? 3000 : 0);
+}} else {{
+  const config = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
+  const auth = {{
+    password: process.env.OPENCODE_PASSWORD,
+    legacy: process.env.OPENCODE_SERVER_PASSWORD,
+  }};
+  const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
+  http.createServer((req, res) => {{
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/config-probe') {{
+      res.end(JSON.stringify({{server: config.mcp.servers.zeron, auth}})); return;
+    }}
+    if (req.url === '/api/info') {{ res.end(JSON.stringify({{version: '2.0.20'}})); return; }}
+    res.statusCode = 404; res.end('{{}}');
+  }}).listen(port, '127.0.0.1');
+}}
+"#
+        );
+        std::fs::write(&exe, script).unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mcp = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "zeron".into(),
+            args: vec!["mcp".into()],
+            env: Default::default(),
+        };
+        for _ in 0..2 {
+            let mut server = Server::spawn(
+                &exe,
+                fixture.path().to_str(),
+                Duration::from_secs(10),
+                Some(&mcp),
+            )
+            .await
+            .expect("a slow first --version must not fail the run");
+            let probe = server.get_json("/config-probe", None).await.unwrap();
+            server.shutdown(Duration::from_millis(100)).await;
+            assert_eq!(probe["server"]["command"], json!(["zeron", "mcp"]));
+            // 2.x reads OPENCODE_PASSWORD first: both must carry ours.
+            assert!(probe["auth"]["password"].is_string());
+            assert_eq!(probe["auth"]["password"], probe["auth"]["legacy"]);
         }
     }
 

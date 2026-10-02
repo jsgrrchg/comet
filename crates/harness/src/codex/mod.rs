@@ -583,6 +583,9 @@ impl Harness for CodexHarness {
     fn installed(&self) -> bool {
         self.resolve_executable().is_ok()
     }
+    fn executable_path(&self) -> Option<PathBuf> {
+        self.resolve_executable().ok()
+    }
     /// Done is the CLI's own terminal frame, for wake turns too.
     fn deterministic_turn_end(&self) -> bool {
         true
@@ -955,6 +958,7 @@ async fn run_session(session: Session) {
         stderr_tail,
     } = session;
     let RunControls {
+        execution_lease: _execution_lease,
         request_input,
         mut steering,
         interrupt,
@@ -1814,6 +1818,8 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                             .into(),
                     })
                     .collect(),
+                prefill: None,
+                multiline: false,
                 multi_select: ["multiSelect", "multi_select"]
                     .iter()
                     .find_map(|k| q.get(*k).and_then(Value::as_bool))
@@ -1867,6 +1873,8 @@ fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
         header,
         question,
         options: vec!["Yes".into(), "No".into()],
+        prefill: None,
+        multiline: false,
         multi_select: false,
     }
 }

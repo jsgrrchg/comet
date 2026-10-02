@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point, Role,
-    ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
-    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
-    prelude::*, px, quad, relative, size,
+    Focusable, GlobalElementId, KeyBinding, KeyDownEvent, KeyUpEvent, Keystroke, LayoutId,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    PaintQuad, PathPromptOptions, Pixels, Point, Role, ScrollWheelEvent, SharedString, Style,
+    StyledImage as _, Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle,
+    Window, WrappedLine, actions, div, fill, img, point, prelude::*, px, quad, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -392,7 +392,7 @@ pub const CLUSTER_Y_DELTA: f32 =
     ACTIONS_BOTTOM_PAD + 16.0 + PILL_BORDER_V / 2.0 - COMPACT_TOTAL_HEIGHT / 2.0;
 
 /// Attachment and Send share an outer inset: compact 8px, expanded 12px.
-/// Glide both edges together while the model picker changes groups.
+/// Keep both action groups aligned with the changing surface inset.
 pub const CLUSTER_X_DELTA: f32 = 4.0;
 /// Optical join between the picker group and the paperclip. This is tighter
 /// than the structural spacing ladder because the narrow paperclip glyph
@@ -400,17 +400,6 @@ pub const CLUSTER_X_DELTA: f32 = 4.0;
 pub const ACTION_UTILITY_GAP: f32 = 2.0;
 /// Structural separation between utility actions and the primary Send action.
 pub const ACTION_PRIMARY_GAP: f32 = Theme::SPACE_SM;
-
-/// Fade out at the old endpoint, relocate while invisible, then fade in at
-/// the new endpoint. Only a six-pixel nudge is visible; a long label never
-/// sweeps across the prompt. Compact amount is reversible with the shared clock.
-fn model_handoff(compact: f32) -> (f32, f32, f32) {
-    let compact = compact.clamp(0.0, 1.0);
-    let side = if compact < 0.5 { 0.0 } else { 1.0 };
-    let opacity = ((compact - 0.5).abs() - 0.06).max(0.0) / 0.44;
-    let drift = (1.0 - opacity) * if side == 0.0 { 6.0 } else { -6.0 };
-    (side, opacity, drift)
-}
 
 /// The shared outer inset for the in-flight morph: eases from the OLD mode's resting
 /// inset to the committed mode's (compact 8 ↔ expanded 12).
@@ -686,12 +675,16 @@ pub struct Wizard {
 impl Wizard {
     pub fn new(request_id: String, questions: Vec<UserInputQuestion>) -> Self {
         let n = questions.len();
+        let typed = questions
+            .iter()
+            .map(|q| q.prefill.clone().unwrap_or_default())
+            .collect();
         Self {
             request_id,
             questions,
             page: 0,
             picked: vec![Vec::new(); n],
-            typed: vec![String::new(); n],
+            typed,
         }
     }
 
@@ -780,8 +773,12 @@ impl Wizard {
             .iter()
             .enumerate()
             .map(|(ix, q)| {
-                let typed = self.typed.get(ix).map(|s| s.trim()).unwrap_or("");
-                let labels = if !typed.is_empty() {
+                let typed = self
+                    .typed
+                    .get(ix)
+                    .map(|s| if q.multiline { s.as_str() } else { s.trim() })
+                    .unwrap_or("");
+                let labels = if !typed.is_empty() || q.multiline {
                     vec![typed.to_string()]
                 } else {
                     self.picked
@@ -847,6 +844,7 @@ actions!(
         Undo,
         Redo,
         MentionTab,
+        ToggleDictation,
         OutdentList,
     ]
 );
@@ -1698,6 +1696,104 @@ pub enum ComposerInputEvent {
     },
 }
 
+#[derive(Clone)]
+enum DictationInputEvent {
+    /// The dictation shortcut went down (auto-repeat is ignored)…
+    Press,
+    /// …and came back up, or focus left the editor while it was held.
+    Release,
+    Changed,
+    Submit(u64),
+}
+
+/// A held dictation shortcut. `keystroke` is the binding, used to recognise
+/// its release: the key coming up, or any of its modifiers being let go
+/// (macOS does not deliver key-up for Command chords).
+struct DictationKey {
+    keystroke: Option<Keystroke>,
+    _blur: Subscription,
+}
+
+/// Dictation is hold to talk, from the microphone (pointer or Enter/Space
+/// while it is focused) and from the shortcut. Each releases only its own hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldSource {
+    Pointer,
+    Button,
+    Key,
+}
+
+struct DictationHold {
+    source: HoldSource,
+    /// When this hold started dictation; `None` when it took over a session
+    /// started another way (assistive Click), which it then only finishes.
+    started: Option<Instant>,
+}
+
+/// A release sooner than this is a click, not speech: explain hold to talk
+/// instead of transcribing a fraction of a second of audio.
+const DICTATION_TAP: Duration = Duration::from_millis(300);
+impl EventEmitter<DictationInputEvent> for ComposerInput {}
+
+/// The composer's morph into and out of dictation, and the clock's warning
+/// window before the recording limit.
+const VOICE_MORPH: Duration = Duration::from_millis(420);
+const VOICE_CURVE: motion::CubicBezier = motion::CubicBezier::new(0.2, 0.0, 0.0, 1.0);
+const VOICE_LIMIT_WARNING: Duration = Duration::from_secs(10);
+/// Height of the voice track and its gap to the Stop control.
+const VOICE_TRACK_HEIGHT: f32 = 32.0;
+const VOICE_TRACK_GAP: f32 = 8.0;
+
+/// Everything the voice track draws, captured from the dictation meter.
+#[derive(Clone)]
+struct VoiceFrame {
+    label: String,
+    mode: crate::dictation::waveform::Mode,
+    bars: Vec<crate::dictation::Bar>,
+    level: f32,
+    elapsed: Option<Duration>,
+}
+
+/// Interruptible 0↔1 progress of the dictation morph: a retarget starts from
+/// the current value, so toggling mid-flight reverses without a jump.
+#[derive(Clone, Copy)]
+struct VoiceTween {
+    from: f32,
+    to: f32,
+    start: Instant,
+}
+
+impl Default for VoiceTween {
+    fn default() -> Self {
+        Self {
+            from: 0.0,
+            to: 0.0,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl VoiceTween {
+    fn value(&self, now: Instant) -> f32 {
+        let raw = now.saturating_duration_since(self.start).as_secs_f32()
+            / (VOICE_MORPH.as_secs_f32() * motion::speed_scale());
+        motion::lerp(self.from, self.to, VOICE_CURVE.eval(raw))
+    }
+
+    fn retarget(&mut self, to: f32, now: Instant, reduced: bool) {
+        if self.to == to {
+            return;
+        }
+        self.from = if reduced { to } else { self.value(now) };
+        self.to = to;
+        self.start = now;
+    }
+
+    fn settled(&self, now: Instant) -> bool {
+        self.value(now) == self.to
+    }
+}
+
 /// Shaping inputs excluding mutable viewport and selection geometry.
 #[derive(Clone, PartialEq)]
 struct InputLayoutKey {
@@ -1729,6 +1825,12 @@ pub struct ComposerInput {
     /// Key context for the binding map ("Composer", or "PaletteSearch" for
     /// palette filters whose navigation keys must bubble).
     key_context: &'static str,
+    /// Cmd+C with no input selection copies the transcript selection. Only
+    /// the message composer keeps focus while the user reads the transcript;
+    /// dialog and palette fields copy only their own selection. A flag rather
+    /// than `key_context`, which the question wizard swaps while it borrows
+    /// the message input.
+    copies_transcript_selection: bool,
     accessibility_role: Role,
     focus_handle: FocusHandle,
     content: String,
@@ -1799,6 +1901,11 @@ pub struct ComposerInput {
     blink_anchor: Instant,
     /// Half-period repaint driver, alive only while the input is focused.
     blink_task: Option<Task<()>>,
+    dictation: crate::dictation::Dictation,
+    transcriber: Option<Box<dyn crate::dictation::Transcriber>>,
+    dictation_task: Option<Task<()>>,
+    /// The dictation shortcut while it is held down.
+    dictation_key: Option<DictationKey>,
     // -- undo history --
     undo_stack: Vec<EditSnapshot>,
     redo_stack: Vec<EditSnapshot>,
@@ -1836,6 +1943,7 @@ impl ComposerInput {
     ) -> Self {
         Self {
             key_context,
+            copies_transcript_selection: false,
             accessibility_role: Role::MultilineTextInput,
             focus_handle: cx.focus_handle(),
             content: String::new(),
@@ -1886,6 +1994,10 @@ impl ComposerInput {
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
             blink_task: None,
+            dictation: Default::default(),
+            transcriber: None,
+            dictation_task: None,
+            dictation_key: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             last_edit: None,
@@ -2169,6 +2281,7 @@ impl ComposerInput {
     }
 
     pub fn set_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.cancel_dictation();
         self.invalidate_mention_tooltip();
         self.edit_revision = self.edit_revision.wrapping_add(1);
         self.content = text.into();
@@ -2321,6 +2434,242 @@ impl ComposerInput {
         }
     }
 
+    pub(crate) fn cancel_dictation(&mut self) {
+        self.dictation.cancel();
+        self.transcriber = None; // Drop signals capture cancellation and invalidates pending results.
+        self.dictation_task = None;
+    }
+
+    fn begin_dictation(
+        &mut self,
+        transcriber: Box<dyn crate::dictation::Transcriber>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_dictation();
+        self.dictation.begin(
+            &self.content,
+            self.projection.normalize_range(self.selected_range.clone()),
+        );
+        self.transcriber = Some(transcriber);
+        self.last_edit = None;
+        let generation = self.dictation.generation;
+        let started = Instant::now();
+        self.dictation_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                if !this
+                    .update(cx, |input, cx| {
+                        let requesting =
+                            input.dictation.phase == crate::dictation::Phase::Requesting;
+                        let active = input.poll_dictation(generation, cx);
+                        if requesting && input.dictation.phase == crate::dictation::Phase::Listening
+                        {
+                            tracing::debug!(
+                                target: "zeron_ui::dictation",
+                                activation_to_listening_ms = started.elapsed().as_millis(),
+                                "Dictation capture ready"
+                            );
+                        }
+                        active
+                    })
+                    .unwrap_or(false)
+                {
+                    break;
+                }
+            }
+        }));
+        cx.emit(DictationInputEvent::Changed);
+        cx.notify();
+    }
+
+    pub(crate) fn finish_dictation(&mut self, send: bool, cx: &mut Context<Self>) -> bool {
+        if !self.dictation.phase.active() {
+            return false;
+        }
+        // Repeated clicks/Enter only mark one pending send and end audio once.
+        if self.dictation.finish(send, Instant::now()) {
+            if let Some(transcriber) = &mut self.transcriber {
+                transcriber.finish();
+            }
+        }
+        cx.emit(DictationInputEvent::Changed);
+        cx.notify();
+        true
+    }
+
+    fn complete_dictation(&mut self, phase: crate::dictation::Phase, cx: &mut Context<Self>) {
+        let send = self.dictation.complete(phase);
+        self.transcriber = None;
+        self.last_edit = None;
+        cx.emit(DictationInputEvent::Changed);
+        if send {
+            cx.emit(DictationInputEvent::Submit(self.dictation.generation));
+        }
+        cx.notify();
+    }
+
+    fn apply_dictation(&mut self, text: &str, cx: &mut Context<Self>) {
+        let before = (!self.dictation.has_partial && !text.is_empty()).then(|| self.snapshot());
+        if let Some(cursor) = self.dictation.replace(&mut self.content, text) {
+            if let Some(before) = before {
+                self.undo_stack.push(before);
+                if self.undo_stack.len() > UNDO_LIMIT {
+                    self.undo_stack.remove(0);
+                }
+                self.redo_stack.clear();
+            }
+            // Moving the selection explicitly stops dictation (see move_to /
+            // select_to). The original selection collapses on the first result.
+            self.selected_range = cursor..cursor;
+            self.selection_reversed = false;
+            self.caret_affinity = CaretAffinity::Downstream;
+            self.preferred_column = None;
+            self.edit_revision = self.edit_revision.wrapping_add(1);
+            self.refresh_projection();
+            self.invalidate_mention_tooltip();
+            self.follow_cursor = true;
+            self.reset_blink();
+            self.needs_measure = true;
+            cx.emit(ComposerInputEvent::Edited);
+            cx.notify();
+        }
+    }
+
+    fn poll_dictation(&mut self, generation: u64, cx: &mut Context<Self>) -> bool {
+        use crate::dictation::{Event, Phase};
+        if generation != self.dictation.generation || !self.dictation.phase.active() {
+            return false;
+        }
+        while let Some(event) = self.transcriber.as_mut().and_then(|service| service.poll()) {
+            match event {
+                Event::Listening => {
+                    if self.dictation.phase == Phase::Requesting {
+                        self.dictation.phase = Phase::Listening;
+                        self.dictation.meter.start(Instant::now());
+                    }
+                    cx.emit(DictationInputEvent::Changed);
+                    cx.notify();
+                }
+                Event::Finalizing => {
+                    self.finish_dictation(false, cx);
+                }
+                Event::Partial(text) => self.apply_dictation(&text, cx),
+                Event::Final(text) => {
+                    if text.trim().is_empty() && !self.dictation.has_partial {
+                        self.complete_dictation(Phase::NoSpeech, cx);
+                        return false;
+                    }
+                    self.apply_dictation(&text, cx);
+                    self.complete_dictation(Phase::Idle, cx);
+                    return false;
+                }
+                Event::Denied(message) => self.complete_dictation(Phase::Denied(message), cx),
+                Event::Unavailable(message) => {
+                    self.complete_dictation(Phase::Unavailable(message), cx)
+                }
+                Event::Failed(message) => self.complete_dictation(Phase::Failed(message), cx),
+                Event::Cancelled => {
+                    self.cancel_dictation();
+                    cx.emit(DictationInputEvent::Changed);
+                    cx.notify();
+                }
+            }
+            if !self.dictation.phase.active() {
+                self.transcriber = None;
+                return false;
+            }
+        }
+        if self.dictation.phase == Phase::Listening
+            && let Some(service) = self.transcriber.as_mut()
+        {
+            let level = service.level();
+            if self.dictation.meter.record(Instant::now(), level) {
+                // The composer drives smooth frames itself; this keeps the
+                // stepped reduced-motion waveform current.
+                cx.emit(DictationInputEvent::Changed);
+            }
+        }
+        if self.dictation.timed_out(Instant::now()) {
+            self.complete_dictation(
+                Phase::Failed(
+                    "Dictation took too long. Your draft is safe. Wait a moment, then try a shorter recording.".into(),
+                ),
+                cx,
+            );
+            return false;
+        }
+        true
+    }
+
+    fn toggle_dictation_action(
+        &mut self,
+        _: &ToggleDictation,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dictation_key.is_some() {
+            return; // Auto-repeat while held.
+        }
+        if !crate::dictation::enabled(cx) && !self.dictation.phase.active() {
+            // Off by default: let another binding of the same chord run.
+            cx.propagate();
+            return;
+        }
+        // Mirror `apply_keymap`, which binds the default for an unparseable combo.
+        let parse = |combo: &str| Keystroke::parse(&crate::settings::platform_combo(combo)).ok();
+        let keystroke = parse(&crate::settings::current(cx).keymap.toggle_dictation)
+            .or_else(|| parse(crate::settings::ShortcutId::ToggleDictation.default_combo()));
+        let blur = cx.on_blur(&self.focus_handle, window, |input, _, cx| {
+            input.release_dictation_key(cx);
+        });
+        self.dictation_key = Some(DictationKey {
+            keystroke,
+            _blur: blur,
+        });
+        cx.emit(DictationInputEvent::Press);
+    }
+
+    fn release_dictation_key(&mut self, cx: &mut Context<Self>) {
+        if self.dictation_key.take().is_some() {
+            cx.emit(DictationInputEvent::Release);
+        }
+    }
+
+    fn on_dictation_key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let released = self.dictation_key.as_ref().is_some_and(|held| {
+            held.keystroke
+                .as_ref()
+                .is_none_or(|binding| binding.key.eq_ignore_ascii_case(&event.keystroke.key))
+        });
+        if released {
+            self.release_dictation_key(cx);
+        }
+    }
+
+    fn on_dictation_modifiers(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let released = self
+            .dictation_key
+            .as_ref()
+            .and_then(|held| held.keystroke.as_ref())
+            .is_some_and(|binding| {
+                let (bound, now) = (&binding.modifiers, &event.modifiers);
+                (bound.platform && !now.platform)
+                    || (bound.control && !now.control)
+                    || (bound.alt && !now.alt)
+                    || (bound.shift && !now.shift)
+            });
+        if released {
+            self.release_dictation_key(cx);
+        }
+    }
+
     // ---- undo history ----
 
     fn snapshot(&self) -> EditSnapshot {
@@ -2335,6 +2684,7 @@ impl ComposerInput {
     /// Called with the range about to be replaced, BEFORE the content changes,
     /// so the pushed snapshot is the pre-edit state.
     fn record_edit(&mut self, range: &Range<usize>, new_text: &str) {
+        self.cancel_dictation();
         let kind = if new_text.is_empty() {
             EditKind::Delete
         } else {
@@ -2381,6 +2731,7 @@ impl ComposerInput {
     }
 
     fn restore(&mut self, snapshot: EditSnapshot, cx: &mut Context<Self>) {
+        self.cancel_dictation();
         self.invalidate_mention_tooltip();
         self.edit_revision = self.edit_revision.wrapping_add(1);
         self.content = snapshot.content;
@@ -2400,6 +2751,11 @@ impl ComposerInput {
     }
 
     fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.dictation.phase.active() {
+            cx.emit(DictationInputEvent::Changed);
+            cx.notify();
+        }
+        self.cancel_dictation();
         if self.read_only {
             return;
         }
@@ -2411,6 +2767,11 @@ impl ComposerInput {
     }
 
     fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if self.dictation.phase.active() {
+            cx.emit(DictationInputEvent::Changed);
+            cx.notify();
+        }
+        self.cancel_dictation();
         if self.read_only {
             return;
         }
@@ -2432,6 +2793,7 @@ impl ComposerInput {
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.cancel_dictation();
         self.last_edit = None;
         let offset = self.projection.normalize_range(offset..offset).start;
         self.selected_range = offset..offset;
@@ -2445,6 +2807,7 @@ impl ComposerInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.cancel_dictation();
         self.last_edit = None;
         self.extend_selection(offset, cx);
     }
@@ -2791,9 +3154,9 @@ impl ComposerInput {
                 text.clone(),
                 serde_json::json!({ "zeronComposerV1": raw, "text": text }),
             ));
-        } else if let Some(text) = crate::markdown::selection::selected_text() {
-            // The composer keeps focus while the user reads the transcript —
-            // Cmd+C with no input selection copies the markdown selection.
+        } else if self.copies_transcript_selection
+            && let Some(text) = crate::markdown::selection::selected_text()
+        {
             cx.write_to_clipboard(ClipboardItem::new_string(text));
         }
     }
@@ -2879,6 +3242,9 @@ impl ComposerInput {
         cx: &mut Context<Self>,
     ) {
         if self.read_only
+            // A delayed paste lookup must not rewrite the range captured by
+            // dictation and make its final transcript fail the draft guard.
+            || self.dictation.phase.active()
             || self.edit_revision != revision
             || self.text() != original
             || self.marked_range.is_some()
@@ -3034,6 +3400,13 @@ impl ComposerInput {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "escape" && self.dictation.phase.active() {
+            self.cancel_dictation();
+            cx.emit(DictationInputEvent::Changed);
+            cx.notify();
+            cx.stop_propagation();
+            return;
+        }
         if escape_dismisses_completion(&event.keystroke.key, self.mention_open) {
             cx.emit(ComposerInputEvent::MentionDismiss);
             cx.stop_propagation();
@@ -3929,6 +4302,7 @@ impl EntityInputHandler for ComposerInput {
         if self.read_only {
             return;
         }
+        self.cancel_dictation();
         let single_line_text;
         let new_text = if self.single_line {
             single_line_text = new_text.replace(['\r', '\n'], " ");
@@ -3977,6 +4351,7 @@ impl EntityInputHandler for ComposerInput {
         if self.read_only {
             return;
         }
+        self.cancel_dictation();
         let single_line_text;
         let new_text = if self.single_line {
             single_line_text = new_text.replace(['\r', '\n'], " ");
@@ -4552,6 +4927,9 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::message_newline_or_accept))
             .on_action(cx.listener(Self::modified_submit))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::toggle_dictation_action))
+            .on_key_up(cx.listener(Self::on_dictation_key_up))
+            .on_modifiers_changed(cx.listener(Self::on_dictation_modifiers))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_key_down(cx.listener(Self::on_key_down))
@@ -5312,6 +5690,7 @@ pub struct Composer {
     pub(crate) queue_edit_renew_task: Option<Task<()>>,
     /// Focus once on mount, navigation, or after opening/closing a queue edit.
     pub(crate) focus_pending: bool,
+    dictation_hold: Option<DictationHold>,
     /// Live drag over the queue panel: which row, and where it would land.
     pub(crate) queue_drag: Option<crate::queue::QueueDragState>,
     pub(crate) queue_scroll: gpui::ScrollHandle,
@@ -5361,9 +5740,7 @@ pub struct Composer {
     /// Pill height actually rendered last frame — a committed flip morphs
     /// from here, so mid-flight reversals hand off without a jump.
     last_rendered_height: f32,
-    model_handoff_position: f32,
-    model_handoff_from: f32,
-    model_handoff_morph: Option<FlipMorph>,
+    #[cfg(test)]
     model_bounds: Rc<std::cell::Cell<Option<Bounds<Pixels>>>>,
     dock_frame: Option<crate::composer_dock::DockFrame>,
     dock_reflow: crate::composer_dock::DockReflow,
@@ -5387,6 +5764,14 @@ pub struct Composer {
     side_chat: bool,
     _picker_focus: Subscription,
     _input_events: Subscription,
+    _dictation_events: Subscription,
+    dictation_activation: Option<Subscription>,
+    dictation_blur: Option<Subscription>,
+    dictation_focus: FocusHandle,
+    /// The last live frame of the voice pill, kept so it can settle away
+    /// after the transcript lands instead of vanishing.
+    voice_last: Option<VoiceFrame>,
+    voice_tween: VoiceTween,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -5447,12 +5832,16 @@ impl Composer {
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        cx.on_release(|this, cx| this.release_queue_previews(cx))
-            .detach();
+        cx.on_release(|this, cx| {
+            this.input.update(cx, |input, _| input.cancel_dictation());
+            this.release_queue_previews(cx);
+        })
+        .detach();
         let input = cx.new(|cx| {
             let mut input =
                 ComposerInput::with_context("Do anything…", MESSAGE_COMPOSER_CONTEXT, cx);
             input.enable_mentions();
+            input.copies_transcript_selection = true;
             input
         });
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
@@ -5516,9 +5905,28 @@ impl Composer {
             }
         });
         cx.observe_global::<crate::settings::SettingsStore>(|this, cx| {
+            if !crate::settings::current(cx).dictation_enabled {
+                this.input.update(cx, |input, _| input.cancel_dictation());
+            }
             this.on_input_edited(cx);
         })
         .detach();
+        let dictation_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
+            DictationInputEvent::Press => this.press_dictation(HoldSource::Key, cx),
+            DictationInputEvent::Release => this.release_dictation(HoldSource::Key, cx),
+            DictationInputEvent::Changed => cx.notify(),
+            DictationInputEvent::Submit(generation) => {
+                if this.input.read(cx).dictation.generation == *generation
+                    && composer_has_content(
+                        this.input.read(cx).text(),
+                        this.staged().len() + this.staged_appshots().len(),
+                        this.staged_comments(cx).len(),
+                    )
+                {
+                    this.on_submit(cx);
+                }
+            }
+        });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
             state,
@@ -5565,6 +5973,7 @@ impl Composer {
             queue_edit_task: None,
             queue_edit_renew_task: None,
             focus_pending: true,
+            dictation_hold: None,
             queue_drag: None,
             queue_scroll: gpui::ScrollHandle::new(),
             queue_full_preview: None,
@@ -5581,9 +5990,7 @@ impl Composer {
             settle_task: None,
             flip_morph: None,
             last_rendered_height: 0.0,
-            model_handoff_position: 1.0,
-            model_handoff_from: 1.0,
-            model_handoff_morph: None,
+            #[cfg(test)]
             model_bounds: Default::default(),
             dock_frame: None,
             dock_reflow: Default::default(),
@@ -5600,6 +6007,12 @@ impl Composer {
             side_chat: false,
             _picker_focus: picker_focus,
             _input_events: input_events,
+            _dictation_events: dictation_events,
+            dictation_activation: None,
+            dictation_blur: None,
+            dictation_focus: cx.focus_handle(),
+            voice_last: None,
+            voice_tween: VoiceTween::default(),
         };
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `ZERON_ATTACH=/path/a.png[,/path/b.png]`, and
@@ -5952,6 +6365,7 @@ impl Composer {
             let group: SharedString = format!("composer-att-{}", att.id).into();
             let preview = attachments::PreviewImage::new(att.name.clone(), att.image.clone());
             let remove_id = att.id.clone();
+            let remove_label: SharedString = format!("Remove {}", att.name).into();
             strip = strip.child(
                 div()
                     .group(group.clone())
@@ -6016,6 +6430,10 @@ impl Composer {
                                 cx.stop_propagation();
                                 this.remove_attachment(&remove_id, cx);
                             }))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| AppshotActionTooltip(remove_label.clone()))
+                                    .into()
+                            })
                             .child(
                                 crate::icons::icon(crate::icons::CLOSE_CIRCLE)
                                     .size(px(14.0))
@@ -6306,62 +6724,57 @@ impl Composer {
         self.sync_mention_controls(cx);
     }
 
-    fn file_search_params(&self, query: &str, cx: &App) -> Option<serde_json::Value> {
-        let selected_worktree = match self.pickers.read(cx).checkout_plan() {
-            crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
-            _ => None,
-        };
-        let (params, target) = {
-            let state = self.state.read(cx);
-            let mut params = serde_json::Map::new();
-            params.insert("query".into(), query.into());
-            let target = if let Some(chat) = state.selected_chat_row() {
-                params.insert("chatId".into(), chat.id.clone().into());
-                params.insert("cwd".into(), chat.cwd.clone().into());
-                Some(chat.device_id.clone())
-            } else if let Some(space) = state.selected_space_row() {
-                params.insert("spaceId".into(), space.id.clone().into());
-                params.insert("cwd".into(), space.path.clone().into());
-                if let Some(path) = selected_worktree {
-                    params.insert("path".into(), path.into());
-                }
-                Some(space.device_id.clone())
-            } else {
-                None
-            };
-            if let Some(target) = &target {
-                params.insert("targetDeviceId".into(), target.clone().into());
+    /// File mentions and provider catalogs share a workspace target. A new
+    /// side chat inherits its parent's checkout but has no persisted row until
+    /// its first send, so discovery must address the parent in the meantime.
+    fn completion_workspace_params(&self, cx: &App) -> Option<serde_json::Value> {
+        let state = self.state.read(cx);
+        if let Some(chat) = state.selected_chat_row() {
+            let chat_id = chat
+                .parent_chat_id
+                .as_deref()
+                .filter(|_| state.side_chat_unsaved())
+                .unwrap_or(&chat.id);
+            Some(serde_json::json!({
+                "chatId": chat_id,
+                "targetDeviceId": chat.device_id,
+                // Include the inherited cwd in the cache identity, too.
+                "cwd": chat.cwd,
+            }))
+        } else if let Some(space) = state.selected_space_row() {
+            let mut params = serde_json::json!({
+                "spaceId": space.id,
+                "targetDeviceId": space.device_id,
+                "cwd": space.path,
+            });
+            if let crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } =
+                self.pickers.read(cx).checkout_plan()
+            {
+                params["path"] = path.into();
             }
-            (serde_json::Value::Object(params), target)
-        };
-        target.map(|_| params)
+            Some(params)
+        } else {
+            None
+        }
+    }
+
+    fn file_search_params(&self, query: &str, cx: &App) -> Option<serde_json::Value> {
+        let mut params = self.completion_workspace_params(cx)?;
+        params["query"] = query.into();
+        Some(params)
     }
 
     fn catalog_params(&self, cx: &App) -> serde_json::Value {
-        let harness = self.pickers.read(cx).resolved(cx).harness;
-        let selected_worktree = match self.pickers.read(cx).checkout_plan() {
-            crate::pickers::CheckoutPlan::ReuseWorktree { path, .. } => Some(path),
-            _ => None,
-        };
-        let mut params = serde_json::json!({ "harness": harness });
-        {
-            let state = self.state.read(cx);
-            if let Some(chat) = state.selected_chat_row() {
-                params["chatId"] = chat.id.clone().into();
-                params["targetDeviceId"] = chat.device_id.clone().into();
-                // Include the resolved cwd in the cache identity, too.
-                params["cwd"] = chat.cwd.clone().into();
-            } else if let Some(space) = state.selected_space_row() {
-                params["spaceId"] = space.id.clone().into();
-                params["targetDeviceId"] = space.device_id.clone().into();
-                params["cwd"] = space.path.clone().into();
-                if let Some(path) = selected_worktree {
-                    params["path"] = path.into();
-                }
-            } else if let Some(device) = state.effective_device_id() {
+        let mut params = self.completion_workspace_params(cx).unwrap_or_else(|| {
+            let mut params = serde_json::json!({});
+            if let Some(device) = self.state.read(cx).effective_device_id() {
                 params["targetDeviceId"] = device.into();
             }
-        }
+            params
+        });
+        // The workspace can come from the parent; the agent always comes from
+        // this composer's selection, including changes before the first send.
+        params["harness"] = serde_json::json!(self.pickers.read(cx).resolved(cx).harness);
         params
     }
 
@@ -7307,11 +7720,15 @@ impl Composer {
                 self.launching_new_chat && self.current_key.is_empty() && !key.is_empty();
             let returning_to_new_thread = !self.current_key.is_empty() && key.is_empty();
             self.launching_new_chat = false;
-            let old_text = self.input.read(cx).text().to_string();
-            if old_text.is_empty() {
-                self.drafts.remove(&self.current_key);
-            } else {
-                self.drafts.insert(self.current_key.clone(), old_text);
+            // A question temporarily borrows the editor. Its answer must never
+            // replace the ordinary chat draft saved when the panel opened.
+            if self.wizard.is_none() {
+                let old_text = self.input.read(cx).text().to_string();
+                if old_text.is_empty() {
+                    self.drafts.remove(&self.current_key);
+                } else {
+                    self.drafts.insert(self.current_key.clone(), old_text);
+                }
             }
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
@@ -7369,8 +7786,21 @@ impl Composer {
                     .as_ref()
                     .is_some_and(|w| w.request_id == request_id);
                 if !same {
+                    self.input.update(cx, |input, _| input.cancel_dictation());
+                    if self.wizard.is_none() {
+                        self.drafts.insert(
+                            self.current_key.clone(),
+                            self.input.read(cx).text().to_string(),
+                        );
+                    }
                     self.reset_mention(None, cx);
+                    let prefill = questions
+                        .first()
+                        .and_then(|q| q.prefill.clone())
+                        .unwrap_or_default();
                     self.wizard = Some(Wizard::new(request_id, questions));
+                    self.input
+                        .update(cx, |input, cx| input.set_text(prefill, cx));
                     self.advance_task = None;
                     // The shared input becomes the panel's free-text override.
                     self.input.update(cx, |input, cx| {
@@ -7396,8 +7826,15 @@ impl Composer {
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
-                        self.input
-                            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+                        let draft = self
+                            .drafts
+                            .get(&self.current_key)
+                            .cloned()
+                            .unwrap_or_default();
+                        self.input.update(cx, |input, cx| {
+                            input.set_text(draft, cx);
+                            input.set_placeholder("Do anything…", cx);
+                        });
                     }
                 }
             }
@@ -7466,11 +7903,12 @@ impl Composer {
         if self.editing_queued.is_some() {
             return SendButtonMode::Send;
         }
-        let has_text = composer_has_content(
-            self.input.read(cx).text(),
-            self.staged().len() + self.staged_appshots().len(),
-            self.staged_comments(cx).len(),
-        );
+        let has_text = self.input.read(cx).dictation.phase.active()
+            || composer_has_content(
+                self.input.read(cx).text(),
+                self.staged().len() + self.staged_appshots().len(),
+                self.staged_comments(cx).len(),
+            );
         send_button_mode(self.run_live(cx), has_text)
     }
 
@@ -7492,12 +7930,18 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
+        if self
+            .input
+            .update(cx, |input, cx| input.finish_dictation(true, cx))
+        {
+            return;
+        }
         if self.commit_queue_edit(cx) {
             return;
         }
         if self.wizard.is_some() {
             // Enter inside the panel's free-text input submits the page.
-            let typed = self.input.read(cx).text().trim().to_string();
+            let typed = self.input.read(cx).text().to_string();
             if let Some(w) = self.wizard.as_mut() {
                 w.set_typed(typed);
             }
@@ -7539,6 +7983,12 @@ impl Composer {
     /// content. With a truly empty composer it instead activates the most
     /// recently queued row, and never turns an empty chord into Stop.
     fn on_modified_submit(&mut self, cx: &mut Context<Self>) {
+        if self
+            .input
+            .update(cx, |input, cx| input.finish_dictation(true, cx))
+        {
+            return;
+        }
         if self.commit_queue_edit(cx) {
             return;
         }
@@ -7619,6 +8069,19 @@ impl Composer {
         };
         let space_id = space.as_ref().map(|s| s.id.clone());
         let space_path = space.as_ref().map(|s| s.path.clone());
+        let create_side_chat = self.state.update(cx, |state, _| {
+            if state.side_chat_unsaved()
+                && let Some(mut config) = resolved.chat_config()
+            {
+                // Freeze the same resolved provider settings in createChat and
+                // Run, including defaults learned since the harness was picked.
+                if let Some(existing) = state.selected_chat_row().and_then(|c| c.config.as_ref()) {
+                    config.sandbox = existing.sandbox;
+                }
+                state.apply_chat_config(&chat_id, config);
+            }
+            state.unsaved_side_chat_create(&chat_id)
+        });
         if queue && !is_new {
             let capability = if self.staged().is_empty() && self.staged_appshots().is_empty() {
                 capabilities::MESSAGE_QUEUE_V1
@@ -8087,6 +8550,30 @@ impl Composer {
                         tracing::warn!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
                     }
                 }
+                // A hand-started side chat is minted by its first send. Unlike
+                // a fresh session this one must land: the doc host would
+                // materialize it without its parent link.
+                if let Some(create) = create_side_chat {
+                    if let Err(err) = attachments::call_with_timeout(
+                        &engine,
+                        cx.background_executor(),
+                        methods::MUTATE,
+                        create,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %err, "side chat createChat failed");
+                        return Err("Couldn't create the side chat.".to_string());
+                    }
+                    let saved = chat_id.clone();
+                    this.update(cx, |composer, cx| {
+                        composer
+                            .state
+                            .update(cx, |s, cx| s.side_chat_saved(&saved, cx));
+                    })
+                    .ok();
+                }
 
                 if queue {
                     // A queue row is editable UI state, so its text must stay
@@ -8397,22 +8884,28 @@ impl Composer {
     }
 
     fn wizard_advance(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text().to_string();
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
+        wizard.set_typed(text);
         match wizard.advance() {
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             _ => {
-                // Moving on: clear the shared free-text input for the next page.
-                self.input.update(cx, |input, cx| input.set_text("", cx));
+                let text = wizard.typed.get(wizard.page).cloned().unwrap_or_default();
+                self.input.update(cx, |input, cx| input.set_text(text, cx));
                 cx.notify();
             }
         }
     }
 
     fn wizard_back(&mut self, cx: &mut Context<Self>) {
+        let text = self.input.read(cx).text().to_string();
         if let Some(wizard) = self.wizard.as_mut() {
+            wizard.set_typed(text);
             wizard.back();
+            let text = wizard.typed.get(wizard.page).cloned().unwrap_or_default();
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
             cx.notify();
         }
     }
@@ -8424,8 +8917,13 @@ impl Composer {
         };
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
+        let draft = self
+            .drafts
+            .get(&self.current_key)
+            .cloned()
+            .unwrap_or_default();
         self.input.update(cx, |input, cx| {
-            input.set_text("", cx);
+            input.set_text(draft, cx);
             // The panel borrowed the composer input; hand back its identity.
             input.set_placeholder("Do anything…", cx);
             input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
@@ -8532,7 +9030,7 @@ impl Composer {
         let page = wizard.page;
         let last = page + 1 >= wizard.questions.len();
         let typed_empty = self.input.read(cx).is_empty();
-        let can_advance = wizard.page_has_pick() || !typed_empty;
+        let can_advance = wizard.page_has_pick() || !typed_empty || question.multiline;
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
@@ -8605,16 +9103,20 @@ impl Composer {
                 })
         });
 
-        div()
+        // Stands in for the composer pill, so it is the same frosted surface:
+        // without the backdrop blur the translucent fill let the transcript
+        // show through unblurred.
+        let panel = div()
             .id("question-panel")
             .track_focus(&self.wizard_focus)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_wizard_key(event, window, cx)
             }))
+            .occlude()
             .rounded(px(COMPOSER_RADIUS))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_glass_bg())
+            .bg(theme.composer_surface_bg())
             .when(!theme.is_frost(), |el| el.shadow_lg())
             .flex()
             .flex_col()
@@ -8719,7 +9221,513 @@ impl Composer {
                             .when(!can_advance, |el| el.opacity(0.4))
                             .on_click(cx.listener(|this, _, _, cx| this.wizard_advance(cx))),
                     ),
+            );
+        crate::frost::frosted(COMPOSER_RADIUS, crate::frost::MENU_BLUR, panel).into_any_element()
+    }
+
+    /// `refocus` returns focus to the editor afterwards. Enter/Space on the
+    /// focused microphone keeps focus there so its key-up ends the hold.
+    fn toggle_dictation(&mut self, refocus: bool, cx: &mut Context<Self>) {
+        use crate::dictation::Phase;
+        if !crate::dictation::enabled(cx) && !self.input.read(cx).dictation.phase.active() {
+            return;
+        }
+        // A queue row still acquiring its edit lease is about to replace the
+        // draft, which would discard the dictation.
+        if self.wizard.is_some()
+            || self.queue_edit_finishing
+            || self.queue_edit_pending_id.is_some()
+            || self.sending
+            || self.input.read(cx).read_only
+        {
+            return;
+        }
+        self.input
+            .update(cx, |input, cx| match input.dictation.phase {
+                Phase::Requesting => {
+                    input.cancel_dictation();
+                    cx.emit(DictationInputEvent::Changed);
+                    cx.notify();
+                }
+                Phase::Listening => {
+                    input.finish_dictation(false, cx);
+                }
+                // The voice track's Cancel stops transcription.
+                Phase::Finalizing => {}
+                _ if input.marked_range.is_some() => {
+                    input.dictation.phase = Phase::Unavailable(
+                        "Finish composing the current character before starting dictation.".into(),
+                    );
+                    cx.emit(DictationInputEvent::Changed);
+                }
+                _ => {
+                    if let Some(service) = crate::dictation::start(cx) {
+                        input.begin_dictation(service, cx);
+                    }
+                }
+            });
+        self.focus_pending |= refocus;
+        cx.notify();
+    }
+
+    /// Hold to talk: the microphone or the shortcut going down starts
+    /// dictation. Pressing during a session started by assistive Click takes
+    /// it over, so releasing finishes it.
+    fn press_dictation(&mut self, source: HoldSource, cx: &mut Context<Self>) {
+        use crate::dictation::Phase;
+        let phase = self.input.read(cx).dictation.phase.clone();
+        // Repeats from the same source are ignored. Another source takes the
+        // session over, so a hold whose release went missing (focus moved
+        // within the composer) can always be ended.
+        if phase.active()
+            && self
+                .dictation_hold
+                .as_ref()
+                .is_some_and(|hold| hold.source == source)
+        {
+            return;
+        }
+        self.dictation_hold = None;
+        match phase {
+            Phase::Finalizing => {}
+            Phase::Requesting | Phase::Listening => {
+                self.dictation_hold = Some(DictationHold {
+                    source,
+                    started: None,
+                });
+            }
+            _ => {
+                self.toggle_dictation(source != HoldSource::Button, cx);
+                if self.input.read(cx).dictation.phase.active() {
+                    self.dictation_hold = Some(DictationHold {
+                        source,
+                        started: Some(Instant::now()),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Letting go transcribes what was said. A tap explains hold to talk,
+    /// and a release that only answered the permission prompt records nothing.
+    fn release_dictation(&mut self, source: HoldSource, cx: &mut Context<Self>) {
+        use crate::dictation::Phase;
+        if self
+            .dictation_hold
+            .as_ref()
+            .is_none_or(|hold| hold.source != source)
+        {
+            return;
+        }
+        let tapped = self
+            .dictation_hold
+            .take()
+            .and_then(|hold| hold.started)
+            .is_some_and(|started| started.elapsed() < DICTATION_TAP);
+        self.input
+            .update(cx, |input, cx| match input.dictation.phase {
+                Phase::Requesting if crate::dictation::permission_pending() => {
+                    input.cancel_dictation();
+                    cx.emit(DictationInputEvent::Changed);
+                    cx.notify();
+                }
+                Phase::Requesting | Phase::Listening if tapped => {
+                    input.cancel_dictation();
+                    input.dictation.phase = Phase::Tapped;
+                    cx.emit(DictationInputEvent::Changed);
+                    cx.notify();
+                }
+                Phase::Requesting | Phase::Listening => {
+                    input.finish_dictation(false, cx);
+                }
+                _ => {}
+            });
+        // Only the pointer moved focus to the microphone. A key hold already
+        // sits in the editor (or focus has left it on purpose), and Enter/Space
+        // keeps the microphone focused.
+        self.focus_pending |= source == HoldSource::Pointer;
+        cx.notify();
+    }
+
+    /// Microphone at rest; the one Stop control while dictating. `t` morphs
+    /// the mic glyph out and the accent glass plate, stop square or spinner
+    /// in; the glow follows the live voice level.
+    fn render_dictation_button(
+        &self,
+        t: f32,
+        frame: Option<&VoiceFrame>,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        use crate::dictation::{Phase, glass, waveform::Mode};
+        if !crate::dictation::enabled(cx) || self.wizard.is_some() {
+            return None;
+        }
+        let theme = Theme::of(cx).clone();
+        let phase = self.input.read(cx).dictation.phase.clone();
+        let active = phase.active();
+        let label = phase.action_label().to_owned();
+        let live = frame.is_some_and(|f| f.mode == Mode::Live);
+        let glow = frame.map_or(0.0, |f| f.level * f.level.sqrt());
+        // Spinner while the microphone opens or the model transcribes; the
+        // stop square once the voice is live (and while retracting from it).
+        let busy = matches!(phase, Phase::Requesting | Phase::Finalizing)
+            || (!active && frame.is_some_and(|f| f.mode != Mode::Live));
+        let tooltip = label.clone();
+        let composer = cx.entity().downgrade();
+        let centered = || {
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+        };
+        let button = div()
+            .id("composer-dictation")
+            .debug_selector(|| "composer-dictation".into())
+            .relative()
+            .size(px(28.0))
+            .flex_none()
+            .rounded_full()
+            .role(Role::Button)
+            .aria_label(label)
+            .aria_toggled(if active {
+                gpui::Toggled::True
+            } else {
+                gpui::Toggled::False
+            })
+            .tab_index(0)
+            .cursor_pointer()
+            // At rest it is a sibling of the paperclip: the same eased ink
+            // wash. Live, it is the accent plate and dims like Send.
+            .on_hover(motion::hover_listener("composer-dictation"))
+            .when(t <= 0.0, |el| {
+                el.bg(motion::hover_blend(
+                    "composer-dictation",
+                    gpui::transparent_black(),
+                    crate::theme::ink(0.10),
+                ))
+            })
+            .when(t > 0.0, |el| {
+                glass::accent(el, &theme, t, glow).hover(|style| style.opacity(0.85))
+            })
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .tooltip(crate::settings::widgets::text_tooltip(tooltip))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.press_dictation(HoldSource::Pointer, cx)),
             )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.release_dictation(HoldSource::Pointer, cx)),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.release_dictation(HoldSource::Pointer, cx)),
+            )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    if !event.is_held {
+                        this.press_dictation(HoldSource::Button, cx);
+                    }
+                }
+            }))
+            .on_key_up(cx.listener(|this, event: &KeyUpEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    this.release_dictation(HoldSource::Button, cx);
+                }
+            }))
+            // Assistive technology cannot hold: Click starts, then finishes.
+            .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                composer
+                    .update(cx, |this, cx| this.toggle_dictation(true, cx))
+                    .ok();
+            })
+            .when(t < 1.0, |el| {
+                let scale = 1.0 - 0.75 * t;
+                el.child(
+                    centered().child(
+                        crate::icons::icon(crate::icons::MICROPHONE)
+                            .size(px(18.0))
+                            .text_color(theme.text_muted.opacity(1.0 - t))
+                            .with_transformation(gpui::Transformation::scale(gpui::size(
+                                scale, scale,
+                            ))),
+                    ),
+                )
+            })
+            .when(t > 0.0 && busy, |el| {
+                el.child(
+                    centered()
+                        .opacity(t)
+                        .child(crate::loaders::mini_mono_spinner(
+                            "dictation-progress",
+                            2.0,
+                            theme.on_accent,
+                            cx.entity_id(),
+                            cx,
+                        )),
+                )
+            })
+            .when(t > 0.0 && !busy, |el| {
+                // Square grows from a quarter of its size, as the mic shrinks.
+                let side = 9.0 * (0.25 + 0.75 * t) * if live { 1.0 + 0.08 * glow } else { 1.0 };
+                el.child(
+                    centered().child(
+                        div()
+                            .size(px(side))
+                            .rounded(px(2.5))
+                            .bg(theme.on_accent.opacity(t)),
+                    ),
+                )
+            });
+        Some(button.into_any_element())
+    }
+
+    fn dismiss_dictation(&mut self, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| {
+            input.cancel_dictation();
+            cx.emit(DictationInputEvent::Changed);
+            cx.notify();
+        });
+        self.focus_pending = true;
+        cx.notify();
+    }
+
+    fn dictation_action_button(
+        &self,
+        active: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = Theme::of(cx);
+        let action_label = if active {
+            "Cancel dictation"
+        } else {
+            "Dismiss dictation message"
+        };
+        let composer = cx.entity().downgrade();
+        div()
+            .id("dictation-dismiss")
+            .debug_selector(|| "dictation-dismiss".into())
+            .role(Role::Button)
+            .aria_label(action_label)
+            .tab_index(0)
+            .flex_none()
+            .h(px(24.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .rounded_full()
+            .text_color(theme.text_muted)
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.surface_raised_hover).text_color(theme.text))
+            .focus_visible(|s| s.border_1().border_color(theme.accent))
+            .on_click(cx.listener(|this, _, _, cx| this.dismiss_dictation(cx)))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    this.dismiss_dictation(cx);
+                }
+            }))
+            .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                composer
+                    .update(cx, |this, cx| this.dismiss_dictation(cx))
+                    .ok();
+            })
+    }
+
+    fn render_dictation_status(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        // Live dictation renders inside the composer; only outcomes that
+        // need reading (no speech, errors) appear below it.
+        let phase = self.input.read(cx).dictation.phase.clone();
+        if phase.active() {
+            return None;
+        }
+        let (title, detail) = phase.status()?;
+        let (title, detail) = (title.to_owned(), detail.to_owned());
+        let phase = &phase;
+        let failed = matches!(
+            phase,
+            crate::dictation::Phase::Denied(_)
+                | crate::dictation::Phase::Unavailable(_)
+                | crate::dictation::Phase::Failed(_)
+        );
+        let theme = Theme::of(cx);
+        Some(
+            motion::fade_in(
+                "dictation-message-enter",
+                div()
+                    .id("dictation-status")
+                    .flex()
+                    .items_start()
+                    .gap(px(8.0))
+                    .px(px(12.0))
+                    .text_size(px(12.0))
+                    .line_height(px(18.0))
+                    .child(
+                        div()
+                            .flex_none()
+                            .mt(px(6.0))
+                            .size(px(6.0))
+                            .rounded_full()
+                            .bg(if failed {
+                                theme.warning
+                            } else {
+                                theme.text_faint
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("dictation-live-status")
+                            .role(Role::Status)
+                            .aria_label(format!("{title}. {detail}"))
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_wrap()
+                            .gap_x(px(8.0))
+                            .child(div().text_color(theme.text).child(title))
+                            .child(div().min_w_0().text_color(theme.text_muted).child(detail)),
+                    )
+                    .child(
+                        self.dictation_action_button(false, cx)
+                            .mt(px(-3.0))
+                            .child("Dismiss"),
+                    ),
+            )
+            .into_any_element(),
+        )
+    }
+
+    /// Advances the dictation morph. Returns its eased progress and the frame
+    /// to draw: live while dictating, the last live frame while retracting.
+    fn update_voice(&mut self, window: &mut Window, cx: &App) -> (f32, Option<VoiceFrame>) {
+        use crate::dictation::{Phase, waveform::Mode};
+        let now = Instant::now();
+        let reduced = motion::reduced_motion(cx);
+        let dictation = &self.input.read(cx).dictation;
+        let active = dictation.phase.active();
+        self.voice_tween
+            .retarget(if active { 1.0 } else { 0.0 }, now, reduced);
+        let t = self.voice_tween.value(now);
+        if active {
+            let meter = &dictation.meter;
+            let mode = match dictation.phase {
+                Phase::Listening => Mode::Live,
+                Phase::Finalizing if meter.since_start(now).is_some() => Mode::Processing,
+                _ => Mode::Waiting,
+            };
+            let label = dictation
+                .phase
+                .status()
+                .map(|(title, detail)| format!("{title}. {detail}"))
+                .unwrap_or_default();
+            self.voice_last = Some(VoiceFrame {
+                label,
+                mode,
+                bars: meter.bars(now, !reduced),
+                level: if mode == Mode::Live {
+                    meter.level(now)
+                } else {
+                    0.0
+                },
+                elapsed: meter.since_start(now).map(|_| meter.elapsed(now)),
+            });
+        } else if t <= 0.0 {
+            self.voice_last = None;
+        }
+        if !reduced && (active || !self.voice_tween.settled(now)) {
+            // Bars scroll, the glow follows the voice, and the morph advances.
+            window.request_animation_frame();
+        }
+        (t, self.voice_last.clone())
+    }
+
+    /// The waveform track that unrolls from Stop across the action row. `t`
+    /// is the morph progress; the box keeps its final geometry and occludes
+    /// the controls fading out beneath it.
+    fn render_voice_track(
+        &self,
+        t: f32,
+        frame: &VoiceFrame,
+        left: f32,
+        right: f32,
+        top: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        use crate::dictation::{glass, waveform};
+        let theme = Theme::of(cx).clone();
+        let animate = !motion::reduced_motion(cx);
+        let active = self.input.read(cx).dictation.phase.active();
+        let live = frame.mode == waveform::Mode::Live && active;
+        let clock = frame.elapsed.map(|elapsed| {
+            let limit = Duration::from_secs(zeron_voice::MAX_SECONDS as u64);
+            div()
+                .flex_none()
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.0))
+                .opacity(t)
+                .text_color(if live && elapsed + VOICE_LIMIT_WARNING >= limit {
+                    theme.warning
+                } else if live {
+                    theme.text_muted
+                } else {
+                    theme.text_faint
+                })
+                .child(waveform::clock(elapsed))
+        });
+        let track = glass::light(
+            div()
+                .id("dictation-live-status")
+                .role(Role::Status)
+                .aria_label(frame.label.clone())
+                .h_full()
+                .w(gpui::relative(t.max(0.0)))
+                .min_w(px(VOICE_TRACK_HEIGHT * t.min(1.0)))
+                .rounded_full()
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .pl(px(12.0))
+                .pr(px(12.0)),
+            &theme,
+            t,
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h(px(16.0))
+                .flex()
+                .child(waveform::waveform(
+                    frame.bars.clone(),
+                    frame.mode,
+                    waveform::Paint {
+                        ink: theme.text.opacity(0.8),
+                        quiet: theme.text_faint.opacity(0.5),
+                    },
+                    waveform::Phase {
+                        intro: t,
+                        collapse: if active { 0.0 } else { 1.0 - t },
+                    },
+                    animate,
+                )),
+        )
+        .children(clock);
+        div()
+            .id("dictation-track")
+            .absolute()
+            .left(px(left))
+            .right(px(right))
+            .top(px(top))
+            .h(px(VOICE_TRACK_HEIGHT))
+            .flex()
+            .justify_end()
+            .occlude()
+            .child(track)
             .into_any_element()
     }
 
@@ -8744,6 +9752,7 @@ impl Composer {
                 .cursor_pointer()
                 .hover(|s| s.opacity(0.85))
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt_selected(cx)))
+                .tooltip(crate::settings::widgets::text_tooltip("Stop"))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
             SendButtonMode::Send | SendButtonMode::Queue => {
@@ -8752,6 +9761,7 @@ impl Composer {
                 let blocked = self.send_blocked(cx);
                 div()
                     .id("composer-send")
+                    .debug_selector(|| "composer-send".into())
                     .size(px(28.0))
                     .flex_none()
                     .rounded_full()
@@ -8765,6 +9775,13 @@ impl Composer {
                             .hover(|s| s.opacity(0.85))
                             .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
+                    .tooltip(crate::settings::widgets::text_tooltip(
+                        if mode == SendButtonMode::Queue {
+                            "Queue message"
+                        } else {
+                            "Send message"
+                        },
+                    ))
                     .child(
                         crate::icons::icon(crate::icons::ARROW_UP)
                             .size(px(14.0))
@@ -8799,6 +9816,48 @@ impl Focusable for Composer {
 
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.dictation_blur.is_none() {
+            // Stop, Send and keyboard navigation within the composer must not
+            // discard capture. Only leaving the whole composer invalidates it.
+            let focus = self.dictation_focus.clone();
+            self.dictation_blur = Some(cx.on_focus_out(&focus, window, |this, _, _, cx| {
+                this.input.update(cx, |input, cx| {
+                    if !input.dictation.phase.active() {
+                        return;
+                    }
+                    if input.dictation.phase == crate::dictation::Phase::Requesting
+                        && crate::dictation::permission_pending()
+                    {
+                        return;
+                    }
+                    input.cancel_dictation();
+                    cx.emit(DictationInputEvent::Changed);
+                    cx.notify();
+                });
+            }));
+        }
+        if self.dictation_activation.is_none() {
+            self.dictation_activation =
+                Some(cx.observe_window_activation(window, |this, window, cx| {
+                    if !window.is_window_active() {
+                        this.input.update(cx, |input, cx| {
+                            if !input.dictation.phase.active() {
+                                return;
+                            }
+                            // The permission bridge checks the originating key
+                            // window before starting any capture after a prompt.
+                            if input.dictation.phase == crate::dictation::Phase::Requesting
+                                && crate::dictation::permission_pending()
+                            {
+                                return;
+                            }
+                            input.cancel_dictation();
+                            cx.notify();
+                        });
+                        cx.notify();
+                    }
+                }));
+        }
         if self.focus_pending {
             self.focus_pending = false;
             let focus = self.input.focus_handle(cx);
@@ -9255,6 +10314,10 @@ impl Render for Composer {
         });
 
         let send_button = self.render_send_button(mode, cx);
+        let (voice_t, voice_frame) = self.update_voice(window, cx);
+        let dictating = self.input.read(cx).dictation.phase.active();
+        let microphone = self.render_dictation_button(voice_t, voice_frame.as_ref(), cx);
+        let attach_action = cx.entity().downgrade();
         // Attach button — opens the native image picker (the original's hidden
         // `<input type=file accept="image/*" multiple>`); paste/drop also feed
         // the same strip. The leading utility group owns the spacing between
@@ -9275,15 +10338,95 @@ impl Render for Composer {
                 crate::theme::ink(0.10),
             ))
             .on_hover(motion::hover_listener("composer-attach"))
-            .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
-            .child(
-                crate::icons::icon(crate::icons::PAPERCLIP)
-                    // Its painted bounds are centered in the 24px viewbox;
-                    // a larger glyph balances the brand icon without moving
-                    // it off-center inside the unchanged 28px hit target.
-                    .size(px(18.0))
-                    .text_color(theme.text_muted),
-            );
+            .relative()
+            // While dictating, the attachment slot becomes Cancel: the
+            // paperclip and the cross swap with a scale and fade. The action
+            // follows the dictation phase, never the animation.
+            .role(Role::Button)
+            .aria_label(if dictating {
+                "Cancel dictation"
+            } else {
+                "Attach images"
+            })
+            .tab_index(0)
+            .focus_visible(|style| style.border_1().border_color(theme.accent))
+            .when(dictating, |el| {
+                el.debug_selector(|| "dictation-dismiss".into())
+            })
+            .tooltip(crate::settings::widgets::text_tooltip(if dictating {
+                "Cancel dictation"
+            } else {
+                "Attach images"
+            }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.input.read(cx).dictation.phase.active() {
+                    this.dismiss_dictation(cx);
+                } else {
+                    this.open_file_picker(cx);
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    if this.input.read(cx).dictation.phase.active() {
+                        this.dismiss_dictation(cx);
+                    } else {
+                        this.open_file_picker(cx);
+                    }
+                }
+            }))
+            .on_a11y_action(gpui::AccessibleAction::Click, move |_, _, cx| {
+                attach_action
+                    .update(cx, |this, cx| {
+                        if this.input.read(cx).dictation.phase.active() {
+                            this.dismiss_dictation(cx);
+                        } else {
+                            this.open_file_picker(cx);
+                        }
+                    })
+                    .ok();
+            })
+            .when(voice_t < 1.0, |el| {
+                let scale = 1.0 - 0.75 * voice_t;
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            crate::icons::icon(crate::icons::PAPERCLIP)
+                                // Its painted bounds are centered in the 24px viewbox;
+                                // a larger glyph balances the brand icon without moving
+                                // it off-center inside the unchanged 28px hit target.
+                                .size(px(18.0))
+                                .text_color(theme.text_muted.opacity(1.0 - voice_t))
+                                .with_transformation(gpui::Transformation::scale(gpui::size(
+                                    scale, scale,
+                                ))),
+                        ),
+                )
+            })
+            .when(voice_t > 0.0, |el| {
+                let scale = 0.25 + 0.75 * voice_t;
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            crate::icons::icon(crate::icons::CLOSE)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted.opacity(voice_t))
+                                .with_transformation(gpui::Transformation::scale(gpui::size(
+                                    scale, scale,
+                                ))),
+                        ),
+                )
+            });
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
@@ -9301,6 +10444,7 @@ impl Render for Composer {
                     // Open menus keep their own keyboard/search focus.
                     if !this.pickers.read(cx).is_open() {
                         window.focus(&this.input.focus_handle(cx), cx);
+                        window.prevent_default();
                     }
                 }),
             )
@@ -9312,31 +10456,9 @@ impl Render for Composer {
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
-        // (round-9 follow-up: the send/attach/chips must not ride the height,
-        // while the model picker fades between its two horizontal anchors).
+        // while the model selector stays in the right action group.
         let cluster_dy = morph_cluster_dy(layout_morph_t);
         let action_inset = morph_cluster_inset(expanded, layout_morph_t);
-        // Share the height/route timeline instead of starting an independent
-        // animation. Reversals continue from the current handoff phase.
-        if self.model_handoff_morph != self.flip_morph {
-            self.model_handoff_from = self.model_handoff_position;
-            self.model_handoff_morph = self.flip_morph;
-        }
-        let compact_target = if expanded { 0.0 } else { 1.0 };
-        self.model_handoff_position = if dock_owns_layout {
-            dock_compact_amount
-        } else {
-            self.flip_morph.map_or(compact_target, |morph| {
-                motion::lerp(
-                    self.model_handoff_from,
-                    compact_target,
-                    motion::EASE_IN_OUT.eval(morph.raw(now_ms)),
-                )
-            })
-        };
-        // The shell supplies this frame's animated width before rendering us.
-        // Measured bounds still belong to the previous frame here; using them
-        // would add the per-frame width delta to the model selector's glide.
         let surface_width = self.last_available_width.map_or_else(
             || {
                 self.surface_bounds
@@ -9347,37 +10469,55 @@ impl Render for Composer {
             },
             |width| (width - 2.0 * Theme::SPACE_LG).max(0.0),
         );
-        let model_travel = (surface_width
-            - PILL_BORDER_V
-            - action_inset
-            - 28.0
-            - ACTION_UTILITY_GAP
-            - self
-                .model_bounds
-                .get()
-                .map_or(0.0, |bounds| f32::from(bounds.size.width))
-            - ACTION_PRIMARY_GAP
-            - 28.0
-            - action_inset)
-            .max(0.0);
-        let (model_side, model_opacity, model_drift) = model_handoff(self.model_handoff_position);
-        let model_offset = (model_side - compact_target) * model_travel + model_drift;
-        let measured_model_bounds = self.model_bounds.clone();
         let model_picker = div()
             .min_w_0()
             .max_w(px(surface_width * 0.45))
             .relative()
-            .left(px(model_offset))
-            .opacity(model_opacity)
-            .child(self.pickers.clone())
-            .child(
+            .child(self.pickers.clone());
+        #[cfg(test)]
+        let model_picker = {
+            let measured_model_bounds = self.model_bounds.clone();
+            model_picker.child(
                 gpui::canvas(
                     move |bounds, _, _| measured_model_bounds.set(Some(bounds)),
                     |_, _, _, _| {},
                 )
                 .absolute()
                 .inset_0(),
-            );
+            )
+        };
+        // The model chip already contributes 6px of trailing padding. Remove
+        // that from its gap to the narrow microphone glyph so the visible
+        // label–mic and mic–Send spaces balance without shrinking hit targets.
+        let model_action_gap = if microphone.is_some() {
+            ACTION_PRIMARY_GAP - 6.0
+        } else {
+            ACTION_PRIMARY_GAP
+        };
+        // The voice track spans from the attachment slot to Stop, over the
+        // model selector (and, compact, the text), which fade beneath it.
+        let voice_track = voice_frame
+            .as_ref()
+            .filter(|_| voice_t > 0.0 && microphone.is_some())
+            .map(|frame| {
+                // Expanded: the row's 2px top pad; compact: centred in the
+                // 47px line, riding the same cluster glide as the buttons.
+                let top = if expanded {
+                    2.0
+                } else {
+                    (COMPACT_TOTAL_HEIGHT - PILL_BORDER_V - VOICE_TRACK_HEIGHT) / 2.0 - cluster_dy
+                };
+                self.render_voice_track(
+                    voice_t,
+                    frame,
+                    action_inset + 28.0 + VOICE_TRACK_GAP,
+                    action_inset + 28.0 + ACTION_PRIMARY_GAP + 28.0 + VOICE_TRACK_GAP,
+                    top,
+                    cx,
+                )
+            });
+        let beneath_voice = 1.0 - voice_t.clamp(0.0, 1.0);
+        let model_picker = model_picker.opacity(beneath_voice);
         let body = if expanded {
             // Expanded: textarea on top (`px-4 pb-1 pt-4`), actions row
             // (8px bottom + 2px top, 32px chips → 42px) ABSOLUTE at the pill's
@@ -9386,7 +10526,7 @@ impl Render for Composer {
             // text viewport follows the animated height so it cannot paint
             // over the controls. Its width stays fixed (no tween rewraps);
             // top padding eases 12→16. Attachment and Send stay on the bottom
-            // anchor while the model chip fades between its horizontal slots.
+            // anchor with the model selector always beside Send.
             pill.h(px(pill_height))
                 .overflow_hidden()
                 .relative()
@@ -9415,10 +10555,8 @@ impl Render for Composer {
                         .flex()
                         .flex_row()
                         .items_center()
-                        // Shared group geometry (see CLUSTER_X_DELTA): the
-                        // attachment belongs to the utility pickers, while
-                        // Send has a larger structural separation.
-                        .gap(px(ACTION_PRIMARY_GAP))
+                        // Attachment stays left; model, microphone and Send stay right.
+                        .gap(px(model_action_gap))
                         .px(px(action_inset))
                         .pt(px(2.0))
                         .pb(px(ACTIONS_BOTTOM_PAD))
@@ -9430,19 +10568,28 @@ impl Render for Composer {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(ACTION_UTILITY_GAP))
-                                .child(attach)
-                                .child(model_picker),
+                                .child(attach),
                         )
-                        .child(send_button),
+                        .child(model_picker)
+                        .child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(ACTION_PRIMARY_GAP))
+                                .children(microphone)
+                                .child(send_button),
+                        )
+                        .children(voice_track),
                 )
         } else {
             // Compact pill: attachment on the left, input in the middle,
-            // then model and Send on the right, all on one 47px line.
+            // then model, microphone and Send on the right, all on one 47px line.
             // The row is BOTTOM-justified: during the collapse morph the pill
             // top sweeps down over a stationary row, the text walks down from
             // its expanded resting place via a decaying relative offset, and
             // attachment/Send hold their spots (the centering delta gliding
-            // in), with the model handoff sharing that same timeline.
+            // in). The model selector remains beside microphone and Send.
             let text_glide = if dock_owns_layout {
                 collapse_text_glide(dock_layout.hero_height, dock_compact_amount)
             } else {
@@ -9462,6 +10609,7 @@ impl Render for Composer {
                 .child(
                     div()
                         .h(px(COMPACT_TOTAL_HEIGHT - PILL_BORDER_V))
+                        .relative()
                         .flex()
                         .flex_row()
                         .items_center()
@@ -9471,6 +10619,9 @@ impl Render for Composer {
                                 .pl(px(action_inset))
                                 .relative()
                                 .top(px(-cluster_dy))
+                                .flex()
+                                .items_center()
+                                .gap(px(ACTION_UTILITY_GAP))
                                 .child(attach),
                         )
                         .child(
@@ -9480,6 +10631,9 @@ impl Render for Composer {
                                 .px(px(8.0))
                                 .relative()
                                 .top(px(-text_glide))
+                                // The draft waits under the voice track and
+                                // fades back as the transcript lands in it.
+                                .opacity(beneath_voice)
                                 .child(self.render_input_with_completion()),
                         )
                         .child(
@@ -9493,12 +10647,17 @@ impl Render for Composer {
                         .child(
                             div()
                                 .flex_none()
-                                .pl(px(ACTION_PRIMARY_GAP))
+                                .pl(px(model_action_gap))
                                 .pr(px(action_inset))
                                 .relative()
                                 .top(px(-cluster_dy))
+                                .flex()
+                                .items_center()
+                                .gap(px(ACTION_PRIMARY_GAP))
+                                .children(microphone)
                                 .child(send_button),
-                        ),
+                        )
+                        .children(voice_track),
                 )
         };
         let new_thread_target_selectors = (new_thread_chrome_opacity > 0.0).then(|| {
@@ -9579,7 +10738,24 @@ impl Render for Composer {
         } else {
             container
         };
-        let container = container.child(pill_surface);
+        let dictation_status = self.render_dictation_status(cx);
+        let container = container.child(
+            div()
+                .track_focus(&self.dictation_focus)
+                .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape"
+                        && this.input.read(cx).dictation.phase.active()
+                    {
+                        this.dismiss_dictation(cx);
+                        cx.stop_propagation();
+                    }
+                }))
+                .flex()
+                .flex_col()
+                .gap(px(Theme::SPACE_SM))
+                .child(pill_surface)
+                .children(dictation_status),
+        );
 
         // The lower slot keeps a stable footprint for Git projects while its
         // old floating checkout/ref controls dissolve into the session footer.
@@ -9684,10 +10860,13 @@ impl Render for Composer {
 }
 
 #[cfg(test)]
+mod modal_selection_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn composer_focus_window(
+    pub(super) fn composer_focus_window(
         cx: &mut gpui::TestAppContext,
     ) -> (tempfile::TempDir, gpui::WindowHandle<Composer>) {
         let dir = tempfile::tempdir().unwrap();
@@ -9735,80 +10914,69 @@ mod tests {
         let input = handle
             .read_with(cx, |composer, _| composer.input.clone())
             .unwrap();
-        for thread_width in [436.0, 592.0, 768.0, 1232.0] {
-            for docked in [true, false] {
-                let amounts = if docked {
-                    [0.0, 0.2, 0.6, 0.98, 1.0]
-                } else {
-                    [1.0, 0.98, 0.6, 0.2, 0.0]
-                };
-                for amount in amounts {
-                    let outer_width = motion::lerp(COMPOSER_MAX_WIDTH, thread_width, amount);
-                    cx.update(|cx| {
-                    handle
-                        .update(cx, |composer, window, cx| {
-                            window.resize(size(px(outer_width), px(800.0)));
-                            composer.set_available_width(outer_width, cx);
-                            composer.state.update(cx, |state, _| {
-                                state.selected_chat = docked.then(|| "chat".into());
-                            });
-                            composer.on_state_changed(cx);
-                            composer
-                                .input
-                                .update(cx, |input, cx| input.set_text("Hi", cx));
-                            composer.expanded_mode = false;
-                            let mut frame = crate::composer_dock::DockFrame::settled(docked);
-                            frame.amount = amount;
-                            frame.active = amount != if docked { 1.0 } else { 0.0 };
-                            composer.set_dock_frame(frame, cx);
+        // The trigger stays beside Send whichever picker the chip opens.
+        for compact_picker in [false, true] {
+            cx.update(|cx| {
+                crate::settings::update(crate::settings::SavePolicy::Debounced, cx, |settings| {
+                    settings.compact_model_picker = compact_picker;
+                });
+            });
+            for thread_width in [436.0, 592.0, 768.0, 1232.0] {
+                for docked in [true, false] {
+                    let amounts = if docked {
+                        [0.0, 0.2, 0.6, 0.98, 1.0]
+                    } else {
+                        [1.0, 0.98, 0.6, 0.2, 0.0]
+                    };
+                    for amount in amounts {
+                        let outer_width = motion::lerp(COMPOSER_MAX_WIDTH, thread_width, amount);
+                        cx.update(|cx| {
+                        handle
+                            .update(cx, |composer, window, cx| {
+                                window.resize(size(px(outer_width), px(800.0)));
+                                composer.set_available_width(outer_width, cx);
+                                composer.state.update(cx, |state, _| {
+                                    state.selected_chat = docked.then(|| "chat".into());
+                                });
+                                composer.on_state_changed(cx);
+                                composer
+                                    .input
+                                    .update(cx, |input, cx| input.set_text("Hi", cx));
+                                composer.expanded_mode = false;
+                                let mut frame = crate::composer_dock::DockFrame::settled(docked);
+                                frame.amount = amount;
+                                frame.active = amount != if docked { 1.0 } else { 0.0 };
+                                composer.set_dock_frame(frame, cx);
+                            })
+                            .unwrap();
+                        cx.update_window(handle.into(), |_, window, cx| {
+                            window.refresh();
+                            window.draw(cx).clear();
                         })
                         .unwrap();
-                    cx.update_window(handle.into(), |_, window, cx| {
-                        window.refresh();
-                        window.draw(cx).clear();
-                    })
-                    .unwrap();
-                    // Inspect the first painted frame before TestAppContext
-                    // flushes effects and automatically draws dirty views.
-                    handle.read_with(cx, |composer, cx| {
-                    assert_eq!(composer.input, input);
-                    let surface = composer.surface_bounds.get().unwrap();
-                    assert!((f32::from(surface.size.width) - (outer_width - 2.0 * Theme::SPACE_LG)).abs() <= 1.0,
-                        "surface width clipped: docked={docked}, amount={amount}, outer={outer_width}, surface={surface:?}");
-                    let origin = input.read(cx).last_bounds.unwrap().origin;
-                    assert!((f32::from(origin.y - surface.top()) - (17.0 - 4.0 * amount)).abs() <= 1.0,
-                        "editor jumped: docked={docked}, amount={amount}, origin={origin:?}, surface={surface:?}");
-                    let model = composer.model_bounds.get().unwrap();
-                    let inset = motion::lerp(12.0, 8.0, amount);
-                    let left = surface.left() + px(1.0 + inset + 28.0 + ACTION_UTILITY_GAP);
-                    let travel = surface.size.width - px(2.0 + inset + 28.0 + ACTION_UTILITY_GAP
-                        + ACTION_PRIMARY_GAP + 28.0 + inset) - model.size.width;
-                    let (side, _, drift) = model_handoff(amount);
-                    let expected_x = left + travel * side + px(drift);
-                    assert!((f32::from(model.left() - expected_x)).abs() <= 1.0,
-                        "model jumped: docked={docked}, amount={amount}, actual={model:?}, expected={expected_x:?}");
-                    let expected = if docked { COMPACT_TOTAL_HEIGHT } else { COMPOSER_MIN_HEIGHT };
-                    assert!((composer.last_rendered_height + composer.dock_clearance_correction - expected).abs() < 0.1);
-                    assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1);
-                        }).unwrap();
-                    });
+                        // Inspect the first painted frame before TestAppContext
+                        // flushes effects and automatically draws dirty views.
+                        handle.read_with(cx, |composer, cx| {
+                        assert_eq!(composer.input, input);
+                        let surface = composer.surface_bounds.get().unwrap();
+                        assert!((f32::from(surface.size.width) - (outer_width - 2.0 * Theme::SPACE_LG)).abs() <= 1.0,
+                            "surface width clipped: docked={docked}, amount={amount}, outer={outer_width}, surface={surface:?}");
+                        let origin = input.read(cx).last_bounds.unwrap().origin;
+                        assert!((f32::from(origin.y - surface.top()) - (17.0 - 4.0 * amount)).abs() <= 1.0,
+                            "editor jumped: docked={docked}, amount={amount}, origin={origin:?}, surface={surface:?}");
+                        let model = composer.model_bounds.get().unwrap();
+                        let inset = motion::lerp(12.0, 8.0, amount);
+                        let expected_right = surface.right() - px(1.0 + inset + 28.0 + ACTION_PRIMARY_GAP);
+                        assert!((f32::from(model.right() - expected_right)).abs() <= 1.0,
+                            "model must stay right aligned: compact_picker={compact_picker}, docked={docked}, amount={amount}, actual={model:?}, expected={expected_right:?}");
+                        let expected = if docked { COMPACT_TOTAL_HEIGHT } else { COMPOSER_MIN_HEIGHT };
+                        assert!((composer.last_rendered_height + composer.dock_clearance_correction - expected).abs() < 0.1);
+                        assert!((composer.last_rendered_height - motion::lerp(COMPOSER_MIN_HEIGHT, COMPACT_TOTAL_HEIGHT, amount)).abs() < 0.1);
+                            }).unwrap();
+                        });
+                    }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn model_handoff_hides_relocation_and_keeps_visible_motion_local() {
-        assert_eq!(model_handoff(0.0), (0.0, 1.0, 0.0));
-        assert_eq!(model_handoff(1.0), (1.0, 1.0, -0.0));
-        for amount in [0.44, 0.49, 0.50, 0.51, 0.56] {
-            assert!(model_handoff(amount).1 < 0.0001);
-        }
-        for step in 0..=100 {
-            let (side, opacity, drift) = model_handoff(step as f32 / 100.0);
-            assert!((0.0..=1.0).contains(&opacity));
-            assert!(drift.abs() <= 6.0);
-            assert!(side == 0.0 || side == 1.0);
         }
     }
 
@@ -9939,7 +11107,6 @@ mod tests {
                         "text growth jumped from {before} to {}",
                         composer.last_rendered_height
                     );
-                    assert!((composer.model_handoff_position - 0.7).abs() < 0.001);
                     assert!(
                         (f32::from(composer.model_bounds.get().unwrap().left() - model_before))
                             .abs()
@@ -10033,10 +11200,10 @@ mod tests {
             .read_with(cx, |composer, _| {
                 let surface = composer.surface_bounds.get().unwrap();
                 let model = composer.model_bounds.get().unwrap();
-                let left = surface.left() + px(1.0 + 12.0 + 28.0 + ACTION_UTILITY_GAP);
+                let right = surface.right() - px(1.0 + 12.0 + 28.0 + ACTION_PRIMARY_GAP);
                 assert!(
-                    (f32::from(model.left() - left)).abs() <= 1.0,
-                    "expanded controls must finish on the left"
+                    (f32::from(model.right() - right)).abs() <= 1.0,
+                    "expanded controls must remain on the right"
                 );
             })
             .unwrap();
@@ -11025,6 +12192,220 @@ mod tests {
         }
     }
 
+    /// A hand-started side chat discovers commands, skills and files through
+    /// its parent without writing a row. Its first send creates it before the
+    /// run and switches subsequent discovery to its own persisted identity.
+    #[gpui::test]
+    fn unsaved_side_chat_is_created_by_its_first_send(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let directory = tempfile::tempdir().unwrap();
+        cx.update(|cx| crate::settings::init(Default::default(), directory.path(), cx));
+        let (out, mut requests) = tokio::sync::mpsc::channel::<String>(256);
+        let (replies, inbound) = tokio::sync::mpsc::channel::<String>(256);
+        let parent = cx.new(|_| AppState::new());
+        parent.update(cx, |state, _| {
+            state.data_dir = Some(directory.path().to_path_buf());
+            state.chats = vec![
+                serde_json::from_value(serde_json::json!({
+                    "id": "main", "deviceId": "local", "cwd": "/tmp/main",
+                    "archived": false, "createdAt": chrono::Utc::now(),
+                    "config": { "harness": "codex", "sandbox": "workspace-write" },
+                }))
+                .unwrap(),
+            ];
+            state.set_test_engine(crate::state::EngineHandle::from_test_client(
+                zeron_rpc::RpcClient::new(out, inbound),
+            ));
+        });
+        let chat: zeron_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "side", "parentChatId": "main", "deviceId": "local", "cwd": "/tmp/main",
+            "archived": false, "createdAt": chrono::Utc::now(),
+            "config": { "harness": "codex", "model": "child-model", "reasoning": "low",
+                "sandbox": "workspace-write" },
+        }))
+        .unwrap();
+        let side = cx.new(|cx| AppState::side_chat_state(&parent, chat, true, cx));
+        let mut drain = || {
+            let mut frames = Vec::new();
+            while let Ok(frame) = requests.try_recv() {
+                frames.push(serde_json::from_str::<zeron_rpc::ClientFrame>(&frame).unwrap());
+            }
+            frames
+        };
+        let touches_side = |frame: &zeron_rpc::ClientFrame| frame.params["chatId"] == "side";
+        cx.run_until_parked();
+        assert!(!drain().iter().any(touches_side));
+
+        let composer = cx.new(|cx| Composer::new(side.clone(), cx));
+        // Discovery must work before createChat, including a different agent
+        // from the parent's. Opening any completion must remain read-only.
+        // Ends on the inherited harness, so the first send below mints the
+        // fixture's config.
+        let inherited = side
+            .read_with(cx, |state, _| {
+                state.selected_chat_row().and_then(|c| c.config.clone())
+            })
+            .unwrap();
+        for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
+            side.update(cx, |state, cx| {
+                let mut config = inherited.clone();
+                config.harness = harness;
+                state.apply_chat_config("side", config);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            for trigger in ["/", "$", "@"] {
+                if trigger == "$" && harness != HarnessId::Codex {
+                    continue;
+                }
+                composer.update(cx, |composer, cx| {
+                    composer
+                        .input
+                        .update(cx, |input, cx| input.set_text(trigger, cx));
+                });
+                cx.run_until_parked();
+                cx.executor().advance_clock(Duration::from_millis(100));
+                cx.run_until_parked();
+                let mut discovery = Vec::new();
+                for frame in drain() {
+                    assert_ne!(frame.method.as_deref(), Some(methods::MUTATE));
+                    assert!(
+                        !touches_side(&frame),
+                        "unsaved chat must not be queried: {frame:?}"
+                    );
+                    let value = match frame.method.as_deref() {
+                        Some(methods::LIST_COMMANDS) => serde_json::json!([
+                            { "name": "compact", "description": "Compact" }
+                        ]),
+                        Some(methods::LIST_SKILLS) => serde_json::json!([
+                            { "name": "review", "path": "/skills/SKILL.md",
+                              "description": "Review", "enabled": true }
+                        ]),
+                        Some(methods::SEARCH_FILES) => serde_json::json!([
+                            { "path": "README.md", "isDir": false }
+                        ]),
+                        _ => continue,
+                    };
+                    assert_eq!(frame.params["chatId"], "main");
+                    assert_eq!(frame.params["targetDeviceId"], "local");
+                    assert_eq!(frame.params["cwd"], "/tmp/main");
+                    if frame.method.as_deref() != Some(methods::SEARCH_FILES) {
+                        assert_eq!(frame.params["harness"], serde_json::json!(harness));
+                    }
+                    discovery.push(frame.method.clone().unwrap());
+                    replies
+                        .try_send(
+                            serde_json::to_string(&zeron_rpc::ServerFrame {
+                                id: frame.id,
+                                ok: Some(value),
+                                ..Default::default()
+                            })
+                            .unwrap(),
+                        )
+                        .unwrap();
+                }
+                let expected = match trigger {
+                    "/" => vec![methods::LIST_COMMANDS, methods::LIST_SKILLS],
+                    "$" => vec![methods::LIST_SKILLS],
+                    _ => vec![methods::SEARCH_FILES],
+                };
+                discovery.sort();
+                assert_eq!(discovery, expected);
+                runtime.block_on(async { tokio::task::yield_now().await });
+                cx.run_until_parked();
+                composer.read_with(cx, |composer, _| {
+                    if trigger == "@" {
+                        assert!(!composer.mention.loading);
+                        assert!(composer.mention.error.is_none());
+                        assert_eq!(composer.mention.results[0].path, "README.md");
+                    } else {
+                        assert!(!composer.slash.loading);
+                        assert!(composer.slash.error.is_none());
+                        let expected = if trigger == "$" { "review" } else { "compact" };
+                        assert!(
+                            composer.slash_cache[&composer.slash.context]
+                                .iter()
+                                .any(|row| row.name == expected)
+                        );
+                    }
+                });
+                assert!(side.read_with(cx, |state, _| state.side_chat_unsaved()));
+                assert_eq!(parent.read_with(cx, |state, _| state.chats.len()), 1);
+            }
+        }
+        composer.update(cx, |composer, cx| {
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("hello", cx));
+            composer.on_submit(cx);
+        });
+        cx.run_until_parked();
+        let sent: Vec<_> = drain().into_iter().filter(touches_side).collect();
+        let [create] = sent.as_slice() else {
+            panic!("expected only createChat, got {sent:?}");
+        };
+        assert_eq!(create.method.as_deref(), Some(methods::MUTATE));
+        assert_eq!(create.params["op"], "createChat");
+        assert_eq!(create.params["parentChatId"], "main");
+        assert_eq!(create.params["cwd"], "/tmp/main");
+        assert_eq!(create.params["config"]["harness"], "codex");
+        assert_eq!(create.params["config"]["model"], "child-model");
+        replies
+            .try_send(
+                serde_json::to_string(&zeron_rpc::ServerFrame {
+                    id: create.id,
+                    ok: Some(serde_json::json!({})),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        runtime.block_on(async { tokio::task::yield_now().await });
+        cx.run_until_parked();
+        let after: Vec<_> = drain().into_iter().filter(touches_side).collect();
+        let called = |method: &str| after.iter().any(|f| f.method.as_deref() == Some(method));
+        assert!(called(methods::WATCH_DOC_MESSAGES), "{after:?}");
+        assert!(called(methods::QUEUE_COMMAND), "{after:?}");
+        let run = after
+            .iter()
+            .find(|f| f.method.as_deref() == Some(methods::QUEUE_COMMAND))
+            .unwrap();
+        let request = &run.params["command"]["request"];
+        for field in ["harness", "model", "reasoning", "modelOptions"] {
+            assert_eq!(request[field], create.params["config"][field], "{field}");
+        }
+        assert_eq!(request["cwd"], "/tmp/main");
+        assert_eq!(request["resume"], serde_json::Value::Null);
+        assert!(!after.iter().any(|f| f.params["op"] == "createChat"));
+        assert!(!side.read_with(cx, |state, _| state.side_chat_unsaved()));
+        composer.update(cx, |composer, cx| {
+            assert_eq!(
+                composer.file_search_params("src", cx).unwrap()["chatId"],
+                "side"
+            );
+            assert_eq!(composer.catalog_params(cx)["chatId"], "side");
+            composer
+                .input
+                .update(cx, |input, cx| input.set_text("/", cx));
+        });
+        cx.run_until_parked();
+        let catalogs: Vec<_> = drain()
+            .into_iter()
+            .filter(|frame| {
+                matches!(
+                    frame.method.as_deref(),
+                    Some(methods::LIST_COMMANDS | methods::LIST_SKILLS)
+                )
+            })
+            .collect();
+        assert_eq!(catalogs.len(), 2);
+        assert!(catalogs.iter().all(touches_side));
+    }
+
     #[gpui::test]
     fn pasted_reference_resolution_is_one_undo_step_and_rejects_stale_results(
         cx: &mut gpui::TestAppContext,
@@ -11061,6 +12442,32 @@ mod tests {
                 original,
                 "stale discovery cannot change a restored draft"
             );
+        });
+    }
+
+    #[gpui::test]
+    fn message_composer_still_copies_transcript_selection(cx: &mut gpui::TestAppContext) {
+        let _selection = crate::markdown::selection::test_state_lock();
+        with_composer_input(cx, |input, window, cx| {
+            let key = "message-composer-copy-test";
+            let text = "Selected transcript text";
+            input.set_text("Unselected draft", cx);
+            assert_eq!(input.key_context, MESSAGE_COMPOSER_CONTEXT);
+            assert!(input.selected_range.is_empty());
+            crate::markdown::selection::begin_with_span(key, text, 0..text.len());
+            crate::markdown::selection::end_active_drag();
+            input.copy(&Copy, window, cx);
+            let copied = cx.read_from_clipboard().and_then(|item| item.text());
+            // The question wizard borrows this input under the generic
+            // context; it is still the message composer.
+            cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+            input.set_key_context(message_input_context(true), cx);
+            input.copy(&Copy, window, cx);
+            let copied_in_wizard = cx.read_from_clipboard().and_then(|item| item.text());
+            input.set_key_context(MESSAGE_COMPOSER_CONTEXT, cx);
+            crate::markdown::selection::clear_if_owner(key);
+            assert_eq!(copied.as_deref(), Some(text));
+            assert_eq!(copied_in_wizard.as_deref(), Some(text));
         });
     }
 
@@ -12689,6 +14096,8 @@ mod tests {
             header: "Header".into(),
             question: format!("Question {id}"),
             options: options.iter().map(|s| s.to_string()).collect(),
+            prefill: None,
+            multiline: false,
             multi_select: multi,
         }
     }
@@ -13460,6 +14869,17 @@ mod tests {
     }
 
     #[test]
+    fn wizard_editor_preserves_prefill_whitespace_and_empty_edits() {
+        let mut q = question("editor", &[], false);
+        q.multiline = true;
+        q.prefill = Some("  first\nsecond\n".into());
+        let mut w = Wizard::new("req".into(), vec![q]);
+        assert_eq!(w.answers()[0].labels, vec!["  first\nsecond\n"]);
+        w.set_typed(String::new());
+        assert_eq!(w.answers()[0].labels, vec![""]);
+    }
+
+    #[test]
     fn wizard_number_keys_and_bounds() {
         let mut w = Wizard::new("req".into(), vec![question("q", &["a", "b"], false)]);
         assert_eq!(w.press_number(9), WizardStep::Stay, "out of range ignored");
@@ -13557,6 +14977,78 @@ mod tests {
             input.undo(&Undo, window, cx);
             assert_eq!(input.text(), committed);
             assert_ranges(input);
+        });
+    }
+
+    #[gpui::test]
+    fn wizard_restores_displaced_draft_after_submit_navigation_and_timeout(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let transcript = |id: &str, resolved: bool| {
+            let mut q = question("editor", &[], false);
+            q.prefill = Some("  initial\ntext\n".into());
+            q.multiline = true;
+            vec![SessionMessageEntry {
+                id: "assistant".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Input {
+                    id: "input".into(),
+                    request_id: id.into(),
+                    questions: vec![q],
+                    resolved,
+                }],
+                created_at: 0,
+                device_id: "device".into(),
+                status: Some(zeron_doc::MessageStatus::Streaming),
+                continuation_of: None,
+                duration_ms: None,
+            }]
+        };
+        state.update(cx, |s, _| s.selected_chat = Some("a".into()));
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            c.input
+                .update(cx, |i, cx| i.set_text("ordinary draft a", cx));
+        });
+        state.update(cx, |s, _| s.transcript = transcript("submit", false));
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            assert_eq!(c.input.read(cx).text(), "  initial\ntext\n");
+            c.input.update(cx, |i, cx| i.set_text("answer", cx));
+            c.wizard_advance(cx);
+            assert_eq!(c.input.read(cx).text(), "ordinary draft a");
+        });
+        state.update(cx, |s, _| s.transcript = transcript("expires", false));
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            c.input.update(cx, |i, cx| i.set_text("partial answer", cx));
+        });
+        state.update(cx, |s, _| {
+            s.selected_chat = Some("b".into());
+            s.transcript.clear();
+        });
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            assert!(c.input.read(cx).text().is_empty());
+            c.input
+                .update(cx, |i, cx| i.set_text("ordinary draft b", cx));
+        });
+        state.update(cx, |s, _| {
+            s.selected_chat = Some("a".into());
+            s.transcript = transcript("expires", false);
+        });
+        composer.update(cx, |c, cx| c.on_state_changed(cx));
+        state.update(cx, |s, _| s.transcript = transcript("expires", true));
+        composer.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            assert!(c.wizard.is_none());
+            assert_eq!(c.input.read(cx).text(), "ordinary draft a");
+            assert_eq!(
+                c.drafts.get("b").map(String::as_str),
+                Some("ordinary draft b")
+            );
         });
     }
 
@@ -13748,3 +15240,7 @@ impl Composer {
         cx.notify();
     }
 }
+
+#[cfg(test)]
+#[path = "composer_dictation_tests.rs"]
+mod dictation_tests;

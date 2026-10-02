@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         "grok" => Arc::new(AcpHarness::grok()),
         "devin" => Arc::new(AcpHarness::devin()),
         "hermes" => Arc::new(AcpHarness::hermes()),
-        "pi" => Arc::new(AcpHarness::pi()),
+        "pi" => Arc::new(zeron_harness::PiHarness::new()),
         "antigravity" => Arc::new(AcpHarness::antigravity()),
         _ => anyhow::bail!("unknown harness"),
     };
@@ -56,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
         resume: None,
     };
     let controls = RunControls {
+        execution_lease: None,
         steering,
         interrupt: interrupt.clone(),
         request_input: Box::new(|_| {

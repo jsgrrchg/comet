@@ -80,7 +80,8 @@ const ROW_SLOT: f32 = ROW_HEIGHT + ROW_GAP;
 const ROW_PAD_X: f32 = 8.0;
 const ROW_RADIUS: f32 = 8.0;
 const PANEL_RADIUS: f32 = 16.0;
-const PANEL_PAD_TOP: f32 = 0.0;
+const PANEL_PAD_X: f32 = 4.0;
+const PANEL_PAD_TOP: f32 = 4.0;
 /// The custom 24px queue glyphs have quieter geometry than the legacy set, so
 /// render them slightly larger to preserve the previous optical weight.
 const QUEUE_ICON_SIZE: f32 = 13.0;
@@ -217,7 +218,19 @@ fn queue_visible_text(text: &str, attachments: &[String]) -> String {
     }
 }
 
+/// The row's one-line label. Commands, skills and file mentions show the same
+/// labels as the transcript; editing and delivery still read the stored text,
+/// which keeps their canonical links.
+fn queue_row_text(text: &str, attachments: &[String]) -> SharedString {
+    let visible = queue_visible_text(text, attachments);
+    let display = crate::composer::sent_mention_display(&visible)
+        .map(|(display, _)| display)
+        .unwrap_or(visible);
+    one_line(&display)
+}
+
 /// Presentation-only metadata. Never expose the observed accessibility payload.
+/// Rows show thumbnails only; these names surface as tooltips and labels.
 fn queue_attachment_labels(text: &str, paths: &[String]) -> Vec<String> {
     let presentations = crate::appshots::presentations(text);
     paths
@@ -231,6 +244,12 @@ fn queue_attachment_labels(text: &str, paths: &[String]) -> Vec<String> {
                 .to_owned(),
         })
         .collect()
+}
+
+/// Names the attachments folded into the "+N" chip, so they stay discoverable.
+fn queue_hidden_attachments_label(labels: &[String], shown: usize) -> Option<String> {
+    let hidden = labels.get(shown..).filter(|hidden| !hidden.is_empty())?;
+    Some(format!("{} more: {}", hidden.len(), hidden.join(" · ")))
 }
 
 fn queue_panel_surface(theme: &Theme) -> gpui::Div {
@@ -247,8 +266,10 @@ fn queue_panel_surface(theme: &Theme) -> gpui::Div {
         .border_1()
         .border_color(theme.border)
         .when(!theme.is_frost(), |el| el.shadow_lg())
-        // Keep visible rows flush with the tray; only the portion tucked behind
-        // the composer needs padding.
+        // GPUI clips children to rectangles, so inset the rows to keep their
+        // hover and editing backgrounds inside the tray's rounded corners.
+        .px(px(PANEL_PAD_X))
+        .pt(px(PANEL_PAD_TOP))
         .pb(px(QUEUE_COMPOSER_OVERLAP))
         .flex()
         .flex_col()
@@ -423,7 +444,7 @@ impl Composer {
             Some(QueueDeliveryGate::ReviewRequired { .. }) if !being_edited => {
                 SharedString::from("Needs review")
             }
-            _ => one_line(&queue_visible_text(&item.text, &item.attachments)),
+            _ => queue_row_text(&item.text, &item.attachments),
         };
 
         let edit_id = item.id.clone();
@@ -524,7 +545,7 @@ impl Composer {
             .id(SharedString::from(format!("{key}-row")))
             .h(px(ROW_HEIGHT))
             .flex_none()
-            .px(px(ROW_PAD_X))
+            .px(px(ROW_PAD_X - PANEL_PAD_X))
             .flex()
             .flex_row()
             .items_center()
@@ -560,51 +581,30 @@ impl Composer {
             // from the editing state.
             .when(being_edited, |el| el.child(div().w(px(14.0)).flex_none()))
             .when(!being_edited, |el| {
-                let labels = queue_attachment_labels(&item.text, &item.attachments);
-                let summary = if labels.len() > 1 {
-                    format!("{} attachments · {}", labels.len(), labels.join(" · "))
-                } else {
-                    labels.join(" · ")
-                };
-                let only_images = text.as_ref() == crate::attachments::ATTACHMENT_ONLY_TEXT;
-                let title = if only_images {
-                    summary.clone().into()
-                } else {
-                    text
-                };
-                let mut content = div()
+                let content = div()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(QUEUE_TEXT_SIZE))
-                            .line_height(px(16.0))
-                            .text_color(theme.text.opacity(0.9))
-                            .child(title),
-                    );
-                if !labels.is_empty() && !only_images {
-                    content = content.child(
-                        div()
-                            .truncate()
-                            .text_size(px(11.0))
-                            .line_height(px(13.0))
-                            .text_color(theme.text_muted)
-                            .child(summary),
-                    );
-                }
+                    .truncate()
+                    .text_size(px(QUEUE_TEXT_SIZE))
+                    .line_height(px(16.0))
+                    .text_color(theme.text.opacity(0.9))
+                    .child(text);
+                let labels = queue_attachment_labels(&item.text, &item.attachments);
+                let limit = self.queue_preview_limit();
+                let hidden = queue_hidden_attachments_label(&labels, limit);
                 el.children(
                     item.attachments
                         .iter()
-                        .take(self.queue_preview_limit())
+                        .zip(&labels)
+                        .take(limit)
                         .enumerate()
-                        .map(|(index, path)| self.queue_thumbnail(&key, index, path, cx)),
+                        .map(|(index, (path, label))| {
+                            self.queue_thumbnail(&key, index, path, label.into(), cx)
+                        }),
                 )
-                .when(item.attachments.len() > self.queue_preview_limit(), |el| {
-                    let remaining = item.attachments.len() - self.queue_preview_limit();
+                .when_some(hidden, |el, hidden| {
+                    let remaining = item.attachments.len() - limit;
+                    let hidden: SharedString = hidden.into();
                     el.child(
                         div()
                             .id(SharedString::from(format!("{key}-more-attachments")))
@@ -618,9 +618,14 @@ impl Composer {
                             .bg(crate::theme::ink(0.06))
                             .text_size(px(11.0))
                             .text_color(theme.text_muted)
-                            .aria_label(format!(
-                                "{remaining} more attachments; edit message to view all"
-                            ))
+                            .aria_label(format!("{hidden}; edit message to view all"))
+                            .tooltip(move |_, cx| {
+                                cx.new(|_| QueueActionTooltip {
+                                    label: hidden.clone(),
+                                })
+                                .into()
+                            })
+                            .tooltip_show_delay(std::time::Duration::from_millis(350))
                             .child(format!("+{remaining}")),
                     )
                 })
@@ -845,6 +850,7 @@ impl Composer {
         key: &SharedString,
         index: usize,
         path: &str,
+        label: SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments;
@@ -872,10 +878,19 @@ impl Composer {
             .border_1()
             .border_color(crate::theme::hairline(0.1))
             .bg(crate::theme::ink(0.035))
-            .overflow_hidden();
+            .overflow_hidden()
+            .tooltip({
+                let label = label.clone();
+                move |_, cx| {
+                    cx.new(|_| QueueActionTooltip {
+                        label: label.clone(),
+                    })
+                    .into()
+                }
+            })
+            .tooltip_show_delay(std::time::Duration::from_millis(350));
         match snapshot {
             Some(image) => {
-                let label = image.name.clone();
                 let path = path.to_owned();
                 let accent = Theme::of(cx).accent;
                 frame
@@ -904,7 +919,7 @@ impl Composer {
                     let accent = Theme::of(cx).accent;
                     frame
                         .role(gpui::Role::Button)
-                        .aria_label("Open attachment preview")
+                        .aria_label(format!("Preview {label}"))
                         .tab_index(0)
                         .focus_visible(move |style| style.border_color(accent))
                         .cursor_pointer()
@@ -1477,6 +1492,12 @@ impl Composer {
         if self.editing_queued.is_none() {
             return false;
         }
+        if self
+            .input
+            .update(cx, |input, cx| input.finish_dictation(true, cx))
+        {
+            return true;
+        }
         let text = self.input.read(cx).text().to_string();
         if !self.check_reference_delivery(&text, cx) {
             return true;
@@ -1494,6 +1515,7 @@ impl Composer {
         if self.editing_queued.is_none() {
             return false;
         }
+        self.input.update(cx, |input, _| input.cancel_dictation());
         self.finish_queue_edit("cancel", None, cx);
         true
     }
@@ -1512,6 +1534,7 @@ impl Composer {
         self.queue_edit_pending_id = None;
         self.queue_edit_finishing = false;
         self.input.update(cx, |input, cx| {
+            input.cancel_dictation();
             input.read_only = false;
             cx.notify();
         });
@@ -1562,6 +1585,7 @@ impl Composer {
         });
         self.queue_edit_finishing = true;
         self.input.update(cx, |input, cx| {
+            input.cancel_dictation();
             input.read_only = true;
             cx.notify();
         });
@@ -1829,10 +1853,10 @@ mod tests {
     use zeron_rpc::methods;
 
     use super::{
-        PANEL_PAD_TOP, QueuePrimaryAction, ROW_SLOT, available_queue_primary_action,
-        latest_queued_message, one_line, queue_action_needs_host, queue_drag_offsets,
-        queue_drop_index, queue_latest_shortcut_visible, queue_mutation_acknowledged,
-        queue_visible_text, visible_queue_rows,
+        PANEL_PAD_TOP, PANEL_PAD_X, PANEL_RADIUS, QueuePrimaryAction, ROW_RADIUS, ROW_SLOT,
+        available_queue_primary_action, latest_queued_message, one_line, queue_action_needs_host,
+        queue_drag_offsets, queue_drop_index, queue_latest_shortcut_visible,
+        queue_mutation_acknowledged, queue_visible_text, visible_queue_rows,
     };
 
     #[test]
@@ -2007,6 +2031,65 @@ mod tests {
         assert_eq!(
             super::queue_attachment_labels(&malformed, &paths),
             vec!["shot & detail.png", "reference.png"]
+        );
+    }
+
+    /// GPUI clips the rows rectangularly, so a row's own rounded hover wash
+    /// must fit inside the tray's rounded top corners (within its 1px border).
+    #[test]
+    fn row_hover_corners_stay_inside_the_panel_curve() {
+        let border = 1.0_f32;
+        let row_corner_center = (
+            border + PANEL_PAD_X + ROW_RADIUS,
+            border + PANEL_PAD_TOP + ROW_RADIUS,
+        );
+        let reach = (PANEL_RADIUS - row_corner_center.0).hypot(PANEL_RADIUS - row_corner_center.1)
+            + ROW_RADIUS;
+        assert!(reach <= PANEL_RADIUS - border, "row corner reaches {reach}");
+    }
+
+    /// Filenames are no longer printed in the row, so every attachment folded
+    /// into the "+N" chip must still be named by its tooltip.
+    #[test]
+    fn overflow_chip_names_every_hidden_attachment() {
+        let labels = ["a.png", "Notes Appshot", "c.png"].map(String::from);
+        assert_eq!(
+            super::queue_hidden_attachments_label(&labels, 1).as_deref(),
+            Some("2 more: Notes Appshot · c.png")
+        );
+        assert_eq!(super::queue_hidden_attachments_label(&labels, 3), None);
+        assert_eq!(super::queue_hidden_attachments_label(&labels, 5), None);
+        assert_eq!(super::queue_hidden_attachments_label(&[], 2), None);
+    }
+
+    /// Rows label references the way the transcript does, never as raw
+    /// `zeron-invoke:`/`zeron-file:` links, and still hide attachment trailers.
+    #[test]
+    fn queue_rows_label_commands_skills_and_files() {
+        use zeron_proto::invocation::Invocation;
+        let command = Invocation::Command {
+            name: "compact".into(),
+        }
+        .link();
+        let skill = Invocation::Skill {
+            name: "review-pr".into(),
+            path: "/skills/review-pr/SKILL.md".into(),
+            command: None,
+        }
+        .link();
+        let file = zeron_proto::file_mentions::local_file_link("src/queue.rs", false);
+        let text = format!("{command} then {skill}\non {file}");
+        assert_eq!(
+            super::queue_row_text(&text, &[]).as_ref(),
+            "/compact then $review-pr on @queue.rs"
+        );
+
+        let paths = vec!["/tmp/image.png".to_string()];
+        let legacy = crate::attachments::with_attachments(&command, &paths);
+        assert_eq!(super::queue_row_text(&legacy, &paths).as_ref(), "/compact");
+        assert_eq!(
+            super::queue_row_text("plain  text", &[]).as_ref(),
+            "plain text"
         );
     }
 

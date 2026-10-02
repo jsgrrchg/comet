@@ -31,7 +31,9 @@ final class OrbView: UIView {
         contentMode = .redraw
         isUserInteractionEnabled = false
         isAccessibilityElement = false
-        for name in [UIApplication.didEnterBackgroundNotification, UIApplication.willEnterForegroundNotification, UIAccessibility.reduceMotionStatusDidChangeNotification] {
+        // Resume on didBecomeActive: at willEnterForeground the app still
+        // reports .background, so the display link would stay stopped.
+        for name in [UIApplication.didEnterBackgroundNotification, UIApplication.didBecomeActiveNotification, UIAccessibility.reduceMotionStatusDidChangeNotification] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 self?.syncLink()
             })

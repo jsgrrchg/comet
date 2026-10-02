@@ -8,6 +8,10 @@ on:
       - 'rust-toolchain.toml'
       - 'crates/**'
       - 'vendor/ironrdp-*/**'
+      - '.github/actions/linux-ci/**'
+      - 'scripts/ci/**'
+      - 'scripts/*cursor-sdk*'
+      - '.github/workflows/cursor-*.yml'
       - 'scripts/test-linux-browser.sh'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'scripts/test-remote-desktop.sh'
@@ -24,6 +28,10 @@ on:
       - 'rust-toolchain.toml'
       - 'crates/**'
       - 'vendor/ironrdp-*/**'
+      - '.github/actions/linux-ci/**'
+      - 'scripts/ci/**'
+      - 'scripts/*cursor-sdk*'
+      - '.github/workflows/cursor-*.yml'
       - 'scripts/test-linux-browser.sh'
       - 'scripts/run-macos-browser-fixture.sh'
       - 'scripts/test-remote-desktop.sh'
@@ -39,7 +47,7 @@ permissions:
 
 concurrency:
   group: ui-tests-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rdp-protocol:
@@ -100,43 +108,38 @@ jobs:
             return files.some(file => affectsIOS(file.filename)
               || affectsIOS(file.previous_filename));
 
-  session-sync-regressions:
+  # Every Linux Rust test that is not UI: one build, one nextest run (see
+  # scripts/ci/test-core.sh). Replaces session-sync-regressions and the Rust
+  # steps of cursor-compatibility and preview-tests.
+  core-tests:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
-      - name: OpenCode protocol and permission regressions
-        run: |
-          cargo test --locked -p zeron-harness --lib opencode::
-          cargo test --locked -p zeron-harness --test opencode
-      - name: Durable session publication and recovery
-        run: |
-          cargo test --locked -p zeron-sync --lib
-          cargo test --locked -p zeron-update --lib
-          cargo test --locked -p zeron-engine --lib --test session_publication --test restart_resume --test codex_subagents --test local_profiles
+      - uses: ./.github/actions/linux-ci
+        with:
+          rust-cache: core
+          save-rust-cache: 'true'
+      - name: Harness, engine, sync, update, doc and preview tests
+        run: scripts/ci/test-core.sh
 
   ui-tests:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: GPUI system dependencies
-        run: |
-          # Only Ubuntu packages are needed; unrelated runner repositories can be out of sync.
-          sudo apt-get update -qq -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
-          sudo apt-get install -y -qq \
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-dev libxcb1-dev libx11-xcb-dev \
-            libfontconfig1-dev libfreetype-dev libasound2-dev \
+      - uses: ./.github/actions/linux-ci
+        with:
+          rust-cache: ui
+          save-rust-cache: 'true'
+          apt-cache: gpui
+          apt-packages: >-
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+            libx11-dev libxcb1-dev libx11-xcb-dev
+            libfontconfig1-dev libfreetype-dev libasound2-dev
             libvulkan-dev pkg-config cmake libwebkit2gtk-4.1-dev libjson-glib-dev
-      - name: Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
       - name: UI and headless layout regressions
-        run: cargo test --release --locked -p zeron-ui --lib -- --test-threads=1
+        run: cargo nextest run --config-file scripts/ci/nextest.toml --locked --no-fail-fast -p zeron-ui --lib
 
   macos-frame-recovery:
     runs-on: macos-latest
@@ -155,6 +158,7 @@ jobs:
           git -C frame-source-tests checkout --detach FETCH_HEAD
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
           workspaces: |
             .
@@ -244,6 +248,8 @@ jobs:
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
           key: ios-core
       - name: Rust mobile core tests
         run: cargo test --locked -p zeron-text -p zeron-markdown -p zeron-client -p zeron-mobile
@@ -271,23 +277,22 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Native browser and GPUI dependencies
-        run: |
-          # Only Ubuntu packages are needed; unrelated runner repositories can be out of sync.
-          sudo apt-get update -qq -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" -o Dir::Etc::sourceparts="-"
-          sudo apt-get install -y -qq \
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-dev libxcb1-dev libx11-xcb-dev libfontconfig1-dev \
-            libfreetype-dev libasound2-dev libvulkan-dev pkg-config cmake \
-            libwebkit2gtk-4.1-dev libjson-glib-dev xvfb xdotool openbox \
+      - uses: ./.github/actions/linux-ci
+        with:
+          # Same dependency graph as ui-tests, which saves this cache on main.
+          rust-cache: ui
+          apt-cache: browser
+          apt-recommends: 'true'
+          apt-packages: >-
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+            libx11-dev libxcb1-dev libx11-xcb-dev libfontconfig1-dev
+            libfreetype-dev libasound2-dev libvulkan-dev pkg-config cmake
+            libwebkit2gtk-4.1-dev libjson-glib-dev xvfb xdotool openbox
             weston ffmpeg imagemagick fonts-noto-cjk
-      - name: Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
       - name: Native Remote Desktop rendering on X11 and Wayland
         run: |
-          cargo build --release --locked -p zeron-ui --example remote-desktop-fixture --features remote-desktop-fixture
-          scripts/test-remote-desktop.sh "$RUNNER_TEMP/rdp-native"
+          cargo build --locked -p zeron-ui --example remote-desktop-fixture --features remote-desktop-fixture
+          RDP_FIXTURE_BINARY=target/debug/examples/remote-desktop-fixture scripts/test-remote-desktop.sh "$RUNNER_TEMP/rdp-native"
       - name: Upload Linux Remote Desktop rendering evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -296,11 +301,12 @@ jobs:
           path: ${{ runner.temp }}/rdp-native
           if-no-files-found: warn
       - name: Build browser fixture
-        run: cargo build --release --locked -p zeron-ui --example browser-fixture --features browser-fixture
+        run: cargo build --locked -p zeron-ui --example browser-fixture --features browser-fixture
       - name: X11 and Wayland browser regressions
         timeout-minutes: 5
         env:
           RUST_LOG: gpui_wgpu=info
+          BROWSER_FIXTURE_BINARY: target/debug/examples/browser-fixture
         run: |
           scripts/test-linux-browser.sh "$RUNNER_TEMP/linux-browser/default"
           VK_DRIVER_FILES=/dev/null scripts/test-linux-browser.sh "$RUNNER_TEMP/linux-browser/opengl"

@@ -284,7 +284,7 @@ impl Render for Desktop {
             .on_key_up(cx.listener(Self::key_up))
             .on_modifiers_changed(cx.listener(Self::modifiers_changed))
             .on_mouse_move(cx.listener(Self::mouse_move))
-            .on_hover(cx.listener(|this, hovered, _, cx| {
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !hovered {
                     this.pointer = None;
                     cx.notify();

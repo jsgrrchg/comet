@@ -624,6 +624,17 @@ impl Pickers {
             .map(|o| o.id.clone())
     }
 
+    /// The panel's title for a [`ModelName`]. Loading also draws a ghost
+    /// bar in the name's place, as the composer chip does.
+    fn compact_title_text(name: &ModelName) -> SharedString {
+        match name {
+            ModelName::Named(label) => label.clone(),
+            ModelName::Loading => "Loading models…".into(),
+            ModelName::None { no_agents: true } => "No agents available".into(),
+            ModelName::None { .. } => "Select model".into(),
+        }
+    }
+
     /// The slider's stops: the model's reasoning ladder, else an option
     /// shaped like one (Cursor's `effort`/`reasoning` choices), so every
     /// model with an effort gets the same slider.
@@ -883,11 +894,17 @@ impl Pickers {
         let (levels, selected) = self
             .compact_effort(cx)
             .map_or((Vec::new(), 0), |e| (e.labels, e.selected));
-        let label: SharedString = self
-            .selected_model(cx)
-            .map(|m| m.label.clone())
-            .unwrap_or_else(|| "Select model".into())
-            .into();
+        let name = self.model_name(cx);
+        let label = Self::compact_title_text(&name);
+        let name_element: AnyElement = if name == ModelName::Loading {
+            popover::skeleton_bar(72.0, cx.entity_id(), cx)
+        } else {
+            div()
+                .min_w_0()
+                .truncate()
+                .child(label.clone())
+                .into_any_element()
+        };
         let effort: SharedString = levels
             .get(selected)
             .cloned()
@@ -985,7 +1002,7 @@ impl Pickers {
                                 .text_color(motion::mix(theme.text_muted, theme.text, hover))
                         }
                     })
-                    .child(div().min_w_0().truncate().child(label.clone()))
+                    .child(name_element)
                     .child(
                         // Leans 3pt toward the list and firms up on hover.
                         div()

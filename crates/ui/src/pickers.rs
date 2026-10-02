@@ -360,6 +360,20 @@ pub fn browser_rows(listing: &FolderListing) -> Vec<&zeron_proto::FolderEntry> {
 /// the first Down lands on row 0.
 const NO_ACTIVE_ROW: usize = usize::MAX;
 
+/// What names the selected model, shared by the composer chip and the
+/// compact panel so the two never disagree about it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelName {
+    /// The catalog row's label, else the remembered pick's, else the id.
+    Named(SharedString),
+    /// Nothing names it yet, but the harness or model catalog that would
+    /// is still on its way.
+    Loading,
+    /// Nothing offers a model: no agents at all, or a provider whose
+    /// catalog came back empty or failed with no pick remembered.
+    None { no_agents: bool },
+}
+
 /// Which pane the harness/model picker's icon rail is showing (t3code
 /// ModelPickerContent `selectedInstanceId | "favorites"`). `Harness` means
 /// "the effective harness's list" — the rail has no browse-without-commit
@@ -984,6 +998,27 @@ impl Pickers {
             return None;
         }
         selected_catalog_model(models, selected)
+    }
+
+    fn model_name(&self, cx: &App) -> ModelName {
+        if self.no_agents_available() && self.effective_harness(cx).is_none() {
+            return ModelName::None { no_agents: true };
+        }
+        if let Some(label) = self.selected_model_label(cx) {
+            return ModelName::Named(label.into());
+        }
+        let catalog_loading = matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
+        let models_loading = self.effective_harness(cx).is_some_and(|harness| {
+            !matches!(
+                self.models.get(&harness),
+                Some(Loadable::Ready(_)) | Some(Loadable::Error(_))
+            )
+        });
+        if catalog_loading || models_loading {
+            ModelName::Loading
+        } else {
+            ModelName::None { no_agents: false }
+        }
     }
 
     fn selected_model_label(&self, cx: &App) -> Option<String> {
@@ -5740,6 +5775,7 @@ impl Render for Pickers {
         // loaded, so that's a conclusion, not a loading gap) — the chip says
         // so instead of wearing a brand mark for an agent that can't run.
         let no_agents = self.no_agents_available() && self.effective_harness(cx).is_none();
+        let model_name = self.model_name(cx);
         let model_label: SharedString = if let Some(title) = &self.title {
             // The saved choice, not the tab being browsed.
             match (title.harness, title.model.as_deref()) {
@@ -5755,19 +5791,14 @@ impl Render for Pickers {
                     .unwrap_or_else(|| id.to_owned())
                     .into(),
             }
-        } else if no_agents {
-            SharedString::from("No agents available")
         } else {
-            let label = self.selected_model_label(cx);
-            label.map(SharedString::from).unwrap_or_default()
+            match &model_name {
+                ModelName::Named(label) => label.clone(),
+                ModelName::None { no_agents: true } => "No agents available".into(),
+                ModelName::Loading | ModelName::None { .. } => SharedString::default(),
+            }
         };
         let catalog_loading = matches!(self.harnesses, Loadable::Idle | Loadable::Loading);
-        let models_loading = self.effective_harness(cx).is_some_and(|harness| {
-            !matches!(
-                self.models.get(&harness),
-                Some(Loadable::Ready(_)) | Some(Loadable::Error(_))
-            )
-        });
         // Harness unknown while the catalog resolves: the pixel-glyph loader
         // instead of guessing a brand mark.
         let chip_icon_loading = self.title.is_none()
@@ -5776,8 +5807,7 @@ impl Render for Pickers {
             && catalog_loading;
         // Harness known but nothing names the model yet (fresh install, no
         // remembered pick): a ghost label instead of a bare icon.
-        let chip_label_loading =
-            !no_agents && model_label.is_empty() && (catalog_loading || models_loading);
+        let chip_label_loading = self.title.is_none() && model_name == ModelName::Loading;
         let chip_harness = match &self.title {
             Some(title) => title.harness,
             None => self.effective_harness(cx),
@@ -7713,6 +7743,73 @@ mod tests {
             supports_steering: false,
         }
     }
+    #[gpui::test]
+    fn model_name_never_reads_select_model_while_anything_can_still_name_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            cx.set_global(Theme::dark());
+            let mut settings = crate::settings::UiSettings::default();
+            settings.compact_model_picker = true;
+            crate::settings::init(settings, dir.path(), cx);
+        });
+        let handle = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Pickers::new(state, cx)
+        });
+        let named = |label: &str| ModelName::Named(label.into());
+        handle
+            .update(cx, |picker, _, cx| {
+                // Harness catalog still loading, a pick remembered: named.
+                picker.config.harness = Some(HarnessId::Codex);
+                picker.defaults.remember_model(
+                    HarnessId::Codex,
+                    "gpt-6-luna".into(),
+                    "GPT-6-Luna".into(),
+                );
+                assert_eq!(picker.model_name(cx), named("GPT-6-Luna"));
+                // Model catalog loading, pick remembered: still named.
+                picker.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+                picker.models.insert(HarnessId::Codex, Loadable::Loading);
+                assert_eq!(picker.model_name(cx), named("GPT-6-Luna"));
+                // A draft id the catalog never learned keeps its id.
+                picker.config.model = Some("gpt-7".into());
+                assert_eq!(picker.model_name(cx), named("gpt-7"));
+                // Nothing picked or remembered while loading: loading, not
+                // "Select model".
+                picker.config.model = None;
+                picker.defaults.model_by_harness.clear();
+                assert_eq!(picker.model_name(cx), ModelName::Loading);
+                picker.harnesses = Loadable::Loading;
+                assert_eq!(picker.model_name(cx), ModelName::Loading);
+                // Catalog in, nothing remembered: its default model.
+                picker.harnesses = Loadable::Ready(vec![descriptor(HarnessId::Codex, "Codex")]);
+                picker.models.insert(
+                    HarnessId::Codex,
+                    Loadable::Ready(vec![bare_model("gpt-a", "A"), bare_model("gpt-b", "B")]),
+                );
+                assert_eq!(picker.model_name(cx), named("A"));
+                // Only a provider with nothing to offer is unnamed.
+                picker
+                    .models
+                    .insert(HarnessId::Codex, Loadable::Ready(Vec::new()));
+                assert_eq!(picker.model_name(cx), ModelName::None { no_agents: false });
+                picker
+                    .models
+                    .insert(HarnessId::Codex, Loadable::Error("offline".into()));
+                assert_eq!(picker.model_name(cx), ModelName::None { no_agents: false });
+                // ...and a remembered pick names it even then.
+                picker.defaults.remember_model(
+                    HarnessId::Codex,
+                    "gpt-6-luna".into(),
+                    "GPT-6-Luna".into(),
+                );
+                assert_eq!(picker.model_name(cx), named("GPT-6-Luna"));
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn compact_panel_shortcuts_drive_models_providers_and_effort(cx: &mut gpui::TestAppContext) {
         let dir = tempfile::tempdir().unwrap();

@@ -5,7 +5,7 @@
 //! for benchmarks, and the scripted streaming reply.
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, ToolDiffStat};
-use zeron_proto::{TodoItem, ToolCall, UserInputQuestion};
+use zeron_proto::{TodoItem, TodoStatus, ToolCall, UserInputQuestion};
 
 pub(crate) const PHONE: &str = "ios-demo";
 
@@ -288,18 +288,15 @@ fn veil(host: &str, now: i64) -> Vec<SessionMessageEntry> {
                     "k3",
                     ToolCall::Todo {
                         items: vec![
-                            TodoItem {
-                                text: "Snap chunk splits to grapheme clusters".into(),
-                                done: true,
-                            },
-                            TodoItem {
-                                text: "Table test for ZWJ sequences".into(),
-                                done: true,
-                            },
-                            TodoItem {
-                                text: "Measure veil cost on 600-turn transcript".into(),
-                                done: false,
-                            },
+                            TodoItem::new(
+                                "Snap chunk splits to grapheme clusters",
+                                TodoStatus::Completed,
+                            ),
+                            TodoItem::new("Table test for ZWJ sequences", TodoStatus::Completed),
+                            TodoItem::new(
+                                "Measure veil cost on 600-turn transcript",
+                                TodoStatus::Pending,
+                            ),
                         ],
                     },
                     false,
@@ -355,6 +352,8 @@ fn picker(host: &str, now: i64) -> Vec<SessionMessageEntry> {
                                 "Local device".into(),
                                 "Union of both".into(),
                             ],
+                            prefill: None,
+                            multiline: false,
                             multi_select: false,
                         },
                         UserInputQuestion {
@@ -367,6 +366,8 @@ fn picker(host: &str, now: i64) -> Vec<SessionMessageEntry> {
                                 "OpenCode".into(),
                                 "Grok".into(),
                             ],
+                            prefill: None,
+                            multiline: false,
                             multi_select: true,
                         },
                     ],
@@ -788,6 +789,8 @@ pub(crate) fn asking() -> Vec<Step> {
             header: "Scope".into(),
             question: "Should the fix cover Android too?".into(),
             options: vec!["Yes, both platforms".into(), "iOS only".into()],
+            prefill: None,
+            multiline: false,
             multi_select: false,
         }]),
     ]

@@ -889,7 +889,14 @@ pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
         ToolCall::WebSearch { query } => query.clone(),
         ToolCall::Todo { items } => items
             .iter()
-            .map(|i| format!("{} {}", if i.done { "[x]" } else { "[ ]" }, i.text))
+            .map(|i| {
+                let mark = match i.status() {
+                    zeron_proto::TodoStatus::Completed => "[x]",
+                    zeron_proto::TodoStatus::InProgress => "[~]",
+                    zeron_proto::TodoStatus::Pending => "[ ]",
+                };
+                format!("{mark} {}", i.text)
+            })
             .collect::<Vec<_>>()
             .join("\n"),
         ToolCall::Mcp {
@@ -9025,10 +9032,14 @@ impl Render for Transcript {
             .on_mouse_move(cx.listener(Self::on_selection_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_selection_mouse_up))
-            // FIRST child ⇒ paints first: clears the frame's markdown text-
-            // selection registry before any row's text elements re-register
-            // (document paint order = selection order; see markdown/render.rs).
-            .child(crate::markdown::render::selection_frame_reset())
+            // FIRST child ⇒ paints first: clears this transcript's slice of the
+            // frame's markdown text-selection registry before any row's text
+            // elements re-register (document paint order = selection order;
+            // see markdown/render.rs). Keyed by entity so a side chat or
+            // subagent tab painted in the same frame can't wipe it.
+            .child(crate::markdown::render::selection_frame_reset_for(
+                cx.entity_id().as_u64(),
+            ))
             .child(content)
             .child(rail);
         // Full-size viewer for a clicked user-bubble thumbnail
@@ -13822,14 +13833,8 @@ mod tests {
         );
         let todo = ToolCall::Todo {
             items: vec![
-                zeron_proto::TodoItem {
-                    text: "a".into(),
-                    done: true,
-                },
-                zeron_proto::TodoItem {
-                    text: "b".into(),
-                    done: false,
-                },
+                zeron_proto::TodoItem::new("a", zeron_proto::TodoStatus::Completed),
+                zeron_proto::TodoItem::new("b", zeron_proto::TodoStatus::Pending),
             ],
         };
         assert_eq!(tool_chip_content(&todo), ("Todo", "1/2 done".to_string()));
@@ -13909,21 +13914,16 @@ mod tests {
         // Todos list one item per line with checkbox state.
         let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Todo {
             items: vec![
-                zeron_proto::TodoItem {
-                    text: "a".into(),
-                    done: true,
-                },
-                zeron_proto::TodoItem {
-                    text: "b".into(),
-                    done: false,
-                },
+                zeron_proto::TodoItem::new("a", zeron_proto::TodoStatus::Completed),
+                zeron_proto::TodoItem::new("b", zeron_proto::TodoStatus::InProgress),
+                zeron_proto::TodoItem::new("c", zeron_proto::TodoStatus::Pending),
             ],
         }) else {
             panic!("expected an output block")
         };
         assert_eq!(
             lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
-            vec!["[x] a", "[ ] b"]
+            vec!["[x] a", "[~] b", "[ ] c"]
         );
 
         // Blank invocation → no block; the chip stays a plain card.

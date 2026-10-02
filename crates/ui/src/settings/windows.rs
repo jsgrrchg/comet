@@ -225,6 +225,39 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    fn working_copy_merge_keeps_dictation_and_other_window_layouts(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            super::super::init(UiSettings::default(), dir.path(), cx);
+            super::super::update(SavePolicy::Immediate, cx, |settings| {
+                settings
+                    .windows
+                    .insert("a".into(), WindowSettings::default());
+                settings
+                    .windows
+                    .insert("b".into(), WindowSettings::default());
+            });
+            let base = current(Some("a"), cx);
+            let mut edited = base.clone();
+            edited.sidebar_width = 280.;
+            super::super::update(SavePolicy::Immediate, cx, |settings| {
+                settings.dictation_enabled = true;
+                settings.dictation_input = Some("microphone".into());
+                settings.windows.get_mut("b").unwrap().sidebar_width = 340.;
+            });
+            let stored = current(Some("a"), cx);
+            let merged = UiSettings::merge_changes(&base, &edited, stored.clone());
+            publish(Some("a"), &stored, &merged, Some("chat-a".into()), cx);
+            let saved = super::super::current(cx);
+            assert!(saved.dictation_enabled);
+            assert_eq!(saved.dictation_input.as_deref(), Some("microphone"));
+            assert_eq!(saved.windows["a"].sidebar_width, 280.);
+            assert_eq!(saved.windows["a"].selected_chat.as_deref(), Some("chat-a"));
+            assert_eq!(saved.windows["b"].sidebar_width, 340.);
+        });
+    }
+
     #[test]
     fn independent_nested_shortcuts_merge_without_reverting_each_other() {
         let old = serde_json::json!({"newSession":"mod-n", "newProject":"mod-shift-n"});

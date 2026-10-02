@@ -5827,7 +5827,7 @@ impl Render for Pickers {
             None => None,
         };
 
-        // The composer places this model chip beside Send:
+        // The composer places this model chip beside microphone and Send:
         // brand icon + model name, then the effort as the chip's muted second
         // tone — the ladder's level, else an effort option's choice (Cursor).
         // None for the title picker (titles always run at minimal reasoning).

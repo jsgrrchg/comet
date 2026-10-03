@@ -72,6 +72,17 @@ impl Shell {
         });
     }
 
+    /// Read whether this device's Codex can take a call; `force` re-reads it
+    /// after Settings → Agents changes or on coming back to a window that
+    /// hides voice (Codex may have been installed meanwhile).
+    pub(super) fn check_voice_codex(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.voice
+            .update(cx, |voice, cx| voice.check_codex(&engine, force, cx));
+    }
+
     pub(super) fn end_voice(&mut self, cx: &mut Context<Self>) {
         self.voice.update(cx, |voice, cx| voice.cancel(cx));
     }
@@ -118,8 +129,13 @@ impl Shell {
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> Option<AnyElement> {
+        self.check_voice_codex(false, cx);
         let voice = self.voice.read(cx);
+        // Without Codex on this device a call could only fail.
+        if !voice.offered() {
+            return None;
+        }
         let live = voice.is_live();
         let stage_open = voice.stage_open;
         let failure = (voice.phase == VoicePhase::Failed)
@@ -175,7 +191,8 @@ impl Shell {
                     cx.listener(move |this, _, _, cx| this.set_voice_stage_open(!stage_open, cx)),
                 )
                 .child(self.voice_footer_orb.clone())
-                .into_any_element();
+                .into_any_element()
+                .into();
         }
 
         let tooltip: SharedString = failure
@@ -198,7 +215,7 @@ impl Shell {
                     )),
             );
         let Some(failure) = failure else {
-            return button.into_any_element();
+            return Some(button.into_any_element());
         };
         // A failed start explains itself once, anchored to the microphone;
         // the next press retries.
@@ -256,6 +273,7 @@ impl Shell {
                 None,
             ))
             .into_any_element()
+            .into()
     }
 
     /// The live orb above the orchestrator chat's composer. Every other chat

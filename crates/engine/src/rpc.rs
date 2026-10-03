@@ -1106,6 +1106,14 @@ impl EngineRpc {
         zeron_proto::voice::VoiceRejection,
     > {
         use zeron_proto::voice::VoiceRejection;
+        // Without Codex here a retry can never connect: ask for an install.
+        if !self
+            .registry
+            .resolve(HarnessId::Codex)
+            .is_ok_and(|codex| codex.installed())
+        {
+            return Err(VoiceRejection::NativeRuntimeUnavailable);
+        }
         let mut request = self
             .doc_host
             .request_from_chat_row(chat, "")

@@ -14,7 +14,11 @@ async fn rejects_without_launching(client: &RpcClient, device: &str) {
         .await
         .unwrap();
     assert!(!eligibility.available);
-    assert_eq!(eligibility.reason, Some(VoiceRejection::Unsupported));
+    // The registry has no Codex: the reason asks for an install.
+    assert_eq!(
+        eligibility.reason,
+        Some(VoiceRejection::NativeRuntimeUnavailable)
+    );
     assert!(!eligibility.credits_excluded);
     assert_eq!(eligibility.ordinary_usage_allowed, None);
     assert!(

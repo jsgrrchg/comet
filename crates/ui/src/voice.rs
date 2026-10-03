@@ -36,6 +36,12 @@ pub struct VoiceController {
     epoch: u64,
     task: Option<Task<()>>,
     cancellation: tokio_util::sync::CancellationToken,
+    /// Whether this device's Codex is installed and enabled: no Codex, no
+    /// voice. `None` until the catalog answers.
+    codex_ready: Option<bool>,
+    /// The connection `codex_ready` was read from, and its read in flight.
+    codex_engine: Option<EngineHandle>,
+    codex_check: Option<Task<()>>,
 }
 impl Default for VoiceController {
     fn default() -> Self {
@@ -58,10 +64,61 @@ impl Default for VoiceController {
             epoch: 0,
             task: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            codex_ready: None,
+            codex_engine: None,
+            codex_check: None,
         }
     }
 }
 impl VoiceController {
+    /// Voice can be offered here. An unread catalog counts as yes, so a slow
+    /// or failed read never hides it; a live call or its failure stays.
+    pub fn offered(&self) -> bool {
+        self.codex_ready != Some(false) || self.is_live() || self.reason.is_some()
+    }
+
+    /// Read whether `engine`'s device can take a call: installed and enabled
+    /// in Settings → Agents. `force` re-reads a connection already read.
+    pub fn check_codex(&mut self, engine: &EngineHandle, force: bool, cx: &mut Context<Self>) {
+        let same = self
+            .codex_engine
+            .as_ref()
+            .is_some_and(|e| e.same_connection(engine));
+        if same && !force {
+            return;
+        }
+        if !same {
+            self.codex_ready = None;
+        }
+        self.codex_engine = Some(engine.clone());
+        let engine = engine.clone();
+        self.codex_check = Some(cx.spawn(async move |this, cx| {
+            let ready = engine
+                .client()
+                .call(zeron_rpc::methods::LIST_HARNESSES, serde_json::json!({}))
+                .await
+                .ok()
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<zeron_engine::registry::HarnessDescriptor>>(value)
+                        .ok()
+                })
+                .map(|list| {
+                    list.iter().any(|d| {
+                        d.id == zeron_proto::HarnessId::Codex
+                            && d.installed
+                            && zeron_engine::registry::descriptor_enabled(d)
+                    })
+                });
+            this.update(cx, |voice, cx| {
+                if ready.is_some() && ready != voice.codex_ready {
+                    voice.codex_ready = ready;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
     /// A session is underway (including its preparation and native stop).
     pub fn is_live(&self) -> bool {
         matches!(self.phase, VoicePhase::Checking) || self.phase.replaces_composer()
@@ -418,6 +475,22 @@ mod tests {
             voice: None,
             voices: Vec::new(),
         }
+    }
+
+    #[test]
+    fn voice_is_offered_unless_codex_is_known_missing() {
+        let mut voice = VoiceController::default();
+        assert!(voice.offered(), "an unread catalog never hides voice");
+        voice.codex_ready = Some(true);
+        assert!(voice.offered());
+        voice.codex_ready = Some(false);
+        assert!(!voice.offered());
+        // A failure explains itself before the trigger goes away.
+        voice.reason = Some(VoiceRejection::NativeRuntimeUnavailable);
+        assert!(voice.offered());
+        voice.reason = None;
+        voice.phase = VoicePhase::Checking;
+        assert!(voice.offered(), "a call in progress keeps its trigger");
     }
 
     #[gpui::test]

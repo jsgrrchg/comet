@@ -373,6 +373,33 @@ mod tests {
     }
 
     #[gpui::test]
+    fn dropped_selection_adds_one_reference_per_entry(cx: &mut TestAppContext) {
+        let (shell, files, cx) = setup(cx);
+        let origin = files
+            .read_with(cx, |files, cx| files.interaction_origin(cx))
+            .unwrap();
+        let item = |path: &str, is_directory| crate::files::WorkspacePathItem {
+            path: path.into(),
+            is_directory,
+            revision: Some("rev".into()),
+        };
+        let payload = WorkspacePathDrag::new("a.txt".into(), false)
+            .with_origin(
+                Some(origin),
+                crate::files::WorkspacePathSource::Tree,
+                Some("rev".into()),
+            )
+            .with_selection(vec![item("folder", true), item("a.txt", false)]);
+        shell.update_in(cx, |shell, window, cx| {
+            let composer = shell.composer.clone();
+            shell.attach_workspace_drag(&payload, &composer, window, cx);
+            let text = composer.read(cx).input.read(cx).text().to_string();
+            assert!(text.contains("folder"));
+            assert!(text.contains("a.txt"));
+        });
+    }
+
+    #[gpui::test]
     fn batch_failures_report_completed_entries(cx: &mut TestAppContext) {
         let (_, files, cx) = setup(cx);
         let intent = files.read_with(cx, |files, cx| MutationIntent {

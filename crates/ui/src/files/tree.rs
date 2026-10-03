@@ -263,11 +263,18 @@ impl FilesSurface {
                     cursor && focused && (!selected || self.tree.selection_len() > 1);
                 let is_directory = node.entry.kind == WorkspaceEntryKind::Directory;
                 let decoration = self.git_decoration(&row.path, is_directory, cx);
-                let drag_payload = WorkspacePathDrag::new(path.clone(), is_directory).with_origin(
-                    self.interaction_origin(cx),
-                    super::WorkspacePathSource::Tree,
-                    node.entry.mutation_revision.clone(),
-                );
+                let drag_payload = WorkspacePathDrag::new(path.clone(), is_directory)
+                    .with_origin(
+                        self.interaction_origin(cx),
+                        super::WorkspacePathSource::Tree,
+                        node.entry.mutation_revision.clone(),
+                    )
+                    // Dragging a selected row carries the whole selection.
+                    .with_selection(if selected && self.tree.selection_len() > 1 {
+                        self.tree_drag_items()
+                    } else {
+                        Vec::new()
+                    });
                 let drag_owner = cx.weak_entity();
                 let renaming = self
                     .tree_rename

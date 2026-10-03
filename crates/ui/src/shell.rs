@@ -3208,7 +3208,9 @@ impl Shell {
             });
         if valid {
             composer.update(cx, |composer, cx| {
-                composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
+                for item in payload.items() {
+                    composer.add_workspace_path(&item.path, item.is_directory, window, cx)
+                }
             });
         }
     }

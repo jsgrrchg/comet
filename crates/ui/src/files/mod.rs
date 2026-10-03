@@ -91,6 +91,17 @@ pub(crate) struct WorkspacePathDrag {
     pub revision: Option<String>,
     pub path: String,
     pub is_directory: bool,
+    /// Every dragged entry in visible order when a tree selection is
+    /// dragged; empty when only `path` moves. A selected child of a selected
+    /// folder travels with that folder, so `path` need not be listed.
+    pub selection: Vec<WorkspacePathItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspacePathItem {
+    pub path: String,
+    pub is_directory: bool,
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +119,27 @@ impl WorkspacePathDrag {
             origin: None,
             source: WorkspacePathSource::Search,
             revision: None,
+            selection: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_selection(mut self, selection: Vec<WorkspacePathItem>) -> Self {
+        self.selection = match selection.as_slice() {
+            [only] if only.path == self.path => Vec::new(),
+            _ => selection,
+        };
+        self
+    }
+
+    pub(crate) fn items(&self) -> Vec<WorkspacePathItem> {
+        if self.selection.is_empty() {
+            vec![WorkspacePathItem {
+                path: self.path.clone(),
+                is_directory: self.is_directory,
+                revision: self.revision.clone(),
+            }]
+        } else {
+            self.selection.clone()
         }
     }
 
@@ -124,8 +156,12 @@ impl WorkspacePathDrag {
     }
 
     fn title(&self) -> SharedString {
-        self.path
-            .trim_end_matches('/')
+        let path = match self.selection.as_slice() {
+            [] => &self.path,
+            [only] => &only.path,
+            items => return format!("{} items", items.len()).into(),
+        };
+        path.trim_end_matches('/')
             .rsplit('/')
             .next()
             .unwrap_or(&self.path)
@@ -158,10 +194,11 @@ impl Render for WorkspacePathDragGhost {
             .text_color(theme.text)
             .opacity(0.85)
             .child({
-                let identity = if self.payload.is_directory {
-                    crate::file_icons::FileIconIdentity::directory(&self.payload.path, false)
+                let first = self.payload.items().swap_remove(0);
+                let identity = if first.is_directory {
+                    crate::file_icons::FileIconIdentity::directory(&first.path, false)
                 } else {
-                    crate::file_icons::FileIconIdentity::file(&self.payload.path)
+                    crate::file_icons::FileIconIdentity::file(&first.path)
                 };
                 crate::file_icons::icon(identity, theme.appearance)
                     .size(px(14.0))

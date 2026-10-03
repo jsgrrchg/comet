@@ -358,12 +358,12 @@ impl VoiceController {
                 "This Codex voice format has not been verified."
             }
             Some(VoiceRejection::ChatgptRequired) => "Sign in to Codex with ChatGPT to use voice.",
-            // Remote calls run Zeron's bundled audio runtime, not the Codex CLI's.
+            // Remote calls still play audio here, through this device's Codex helper.
             Some(VoiceRejection::NativeRuntimeUnavailable) if self.remote => {
-                "This Zeron build's voice runtime couldn't start. Reinstall Zeron."
+                "Calls to another device use this device's Codex for audio. Install Codex here with its official installer (npm installs lack voice)."
             }
             Some(VoiceRejection::NativeRuntimeUnavailable) => {
-                "Update the standalone Codex installation to include its native voice runtime."
+                "Install or update Codex with its official installer to use voice. npm installs lack the voice runtime."
             }
             Some(VoiceRejection::DeviceUnavailable) => {
                 "Check microphone permission and your audio devices."

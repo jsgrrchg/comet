@@ -153,14 +153,21 @@ Native runtime dependencies: parakeet-rs 0.3.8 (MIT OR Apache-2.0), ort/ort-sys 
 `crates/orb/` and `crates/ui/src/orb/` were extracted from Bezel
 (https://github.com/clearloop/bezel), revision
 `6141af9c16f7353cdf36003f7404e0a94566a163`, `crates/agent/src/orbs/`.
-This code is compiled as part of Zeron; Bezel is not a dependency.
-The upstream module credits the MIT gpui-thinking-orbs port of Jakub
-Antalik's thinking-orbs. Original attribution comments are retained.
+This code is compiled into the desktop app and, through the mobile core,
+the iOS app; Bezel is not a dependency. The upstream module is a port of
+gpui-thinking-orbs (https://github.com/FrancoEscob/gpui-thinking-orbs), itself
+a port of Jakub Antalik's thinking-orbs
+(https://github.com/Jakubantalik/thinking-orbs); the orb algorithms and
+per-state tunings originate there. All three are MIT-licensed. Original
+attribution comments are retained. The iOS app carries this notice as
+`Voice/ThinkingOrbs-LICENSE.txt`.
 
 MIT License
 
 Copyright (c) 2026 clearloop
 Copyright (c) 2026 Wing (portions extracted from zeronsh/comet)
+Copyright (c) 2026 gpui-thinking-orbs contributors
+Copyright (c) 2026 Jakub Antalik
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -183,13 +190,23 @@ SOFTWARE.
 ## Codex native voice protocol
 
 The bounded helper control protocol and native runtime environment in
-`crates/harness/src/codex/realtime_host.rs` are adapted from OpenAI Codex
+`crates/voice-media/src/lib.rs` are adapted from OpenAI Codex
 `rust-v0.159.0` (`377f7f557a6bdea0f3a2d26d4d899c66db4789d0`),
 `codex-rs/realtime-webrtc/src/{protocol,client,linux_alsa}.rs`.
 Copyright 2025 OpenAI. Licensed under the Apache License, Version 2.0.
-Zeron uses the separately installed Codex helper; it does not redistribute its
-native audio runtime. This adaptation uses asynchronous bounded pipes and the
-Zeron engine's owner leases. The license text follows.
+Upstream NOTICE: "OpenAI Codex. Copyright 2025 OpenAI."
+Zeron runs the helper of the user's separately installed standalone Codex, on
+every platform; Zeron packages do not contain or redistribute Codex binaries or
+its native audio runtime. This adaptation uses asynchronous bounded pipes and
+the Zeron engine's owner leases. The iOS voice endpoint
+(`apps/ios/Zeron/Voice/CodexVoicePeer.swift`) implements the transport behavior
+described by `codex-rs/voice-host/src/transport.rs` at
+`a956835d020762cb2b570053af06f643a11c0ecc` without copying its code.
+
+Voice sessions use OpenAI's service under the user's own ChatGPT-authenticated
+Codex account and OpenAI's terms; this license covers the adapted code only.
+OpenAI, ChatGPT and Codex are trademarks of OpenAI. Zeron is not affiliated
+with or endorsed by OpenAI. The license text follows.
 
                                  Apache License
                            Version 2.0, January 2004
@@ -392,3 +409,17 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+## WebRTC for iOS voice
+
+The iOS app links the WebRTC XCFramework from the `stasel/WebRTC` Swift package,
+pinned to 150.0.0 (binary SHA-256
+`f9890492b0016e4c88ab20f07867b8b420054caedc8a692b2ec6ac041f3cf6b2`), a build of
+Google's WebRTC: https://github.com/stasel/WebRTC/tree/150.0.0. WebRTC is
+licensed under the BSD 3-Clause License, "Copyright (c) 2011, The WebRTC project
+authors. All rights reserved.", with Google's additional patent grant:
+https://webrtc.org/support/license. The full license text ships in the iOS app
+as `Voice/WebRTC-LICENSE.txt`. The binary also contains WebRTC's own bundled
+third-party components (such as BoringSSL, libsrtp, Opus, libyuv and Abseil)
+under their respective licenses; see the WebRTC source tree's `third_party/`
+for each license.

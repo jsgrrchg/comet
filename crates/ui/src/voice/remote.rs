@@ -45,7 +45,15 @@ pub(super) async fn run(
             .map_err(|_| VoiceRejection::Protocol)?,
     );
     let control = Arc::new(zeron_voice_session::RpcTransport { client, host });
-    let media = Arc::new(Media(zeron_voice_media::DesktopMedia::bundled()?));
+    // Audio runs here through this device's own standalone Codex helper; the
+    // call's app-server runs on `host`. Resolution may consult the login shell.
+    let codex = tokio::task::spawn_blocking(zeron_harness::codex::resolve_codex_executable)
+        .await
+        .ok()
+        .flatten();
+    let media = Arc::new(Media(zeron_voice_media::DesktopMedia::for_codex(
+        codex.as_deref(),
+    )?));
     let (mute_tx, muted) = watch::channel(false);
     let call =
         zeron_voice_session::run(control, media, config, voice, cancel.clone(), events, muted);

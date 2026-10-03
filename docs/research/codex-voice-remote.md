@@ -122,16 +122,17 @@ are recorded build inputs, not runtime libraries.
 Bundled notice files cover LGPL-2.1, Opus, PCRE2, libffi, proxy-libintl, sljit and
 zlib. The package's `NOTICE.md` identifies the upstream Codex
 `third_party/voice/` build/projection/package scripts and references
-`manifest.json` for the source commit. This inventories existing provenance;
-C02 now verifies the pinned input hashes, copies all runtime resources
-byte-for-byte into `Contents/Resources/codex-resources/voice` and adds the helper
-source license. The helper only initializes from a `codex-resources/voice`
-directory: anywhere else it exits with code 23 on `initializeRuntime`, which the
-client reports as an unavailable runtime. The runtime is not re-signed: upstream
-already signs the helper and libraries with OpenAI's Developer ID, hardened
-runtime and a secure timestamp, and the packager only verifies those signatures.
-This reuses the pinned upstream binary; it does not claim an independent rebuild
-of every dependency from source.
+`manifest.json` for the source commit. This inventories existing provenance.
+Zeron does not redistribute this runtime: the desktop client of a remote call
+runs the helper of its own standalone Codex installation, as local voice does.
+Redistributing it would make Zeron responsible for the LGPL source offer, the
+Apache NOTICE, the Windows Visual C++ runtime terms and security updates of the
+media stack. `scripts/package-voice-runtime.py` remains a development tool that
+projects a pinned package for `ZERON_VOICE_MEDIA_DIR`. The helper only
+initializes from a `codex-resources/voice` directory: anywhere else it exits
+with code 23 on `initializeRuntime`, which the client reports as an unavailable
+runtime. Projection never re-signs: upstream already signs the helper and
+libraries with OpenAI's Developer ID, hardened runtime and a secure timestamp.
 No binaries or credentials were copied into this repository.
 
 ## Remaining G0 evidence
@@ -151,8 +152,9 @@ and will run these checks after it):
    full orchestrator ID. The standalone no-tools diagnostic cannot establish
    this: it must be paired with a Zeron-hosted harness test. Do not interpret a
    generic promoted-item notification as proof of MCP success.
-5. Record any provider restriction and resolve runtime redistribution/build
-   requirements before committing the dependent product architecture.
+5. Record any provider restriction before committing the dependent product
+   architecture. Runtime redistribution is avoided: clients use their installed
+   standalone Codex helper.
 
 G0–G4 remain pending live validation. C02–C15 code is implemented,
 including the shared coordinator, remote engine control, desktop media runtime,

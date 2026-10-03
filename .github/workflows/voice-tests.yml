@@ -14,9 +14,6 @@ on:
       - 'apps/ios/ZeronTests/RemoteVoiceLifecycleTests.swift'
       - 'dist/voice/**'
       - 'scripts/package-voice-runtime.py'
-      - 'scripts/package-linux.sh'
-      - 'scripts/package-windows.ps1'
-      - 'dist/windows/zeron.iss'
       - 'crates/proto/src/voice.rs'
       - 'crates/harness/**'
       - 'crates/engine/**'
@@ -44,7 +41,7 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.12'
-      - name: Runtime packaging fixtures (no downloads or audio devices)
+      - name: Development runtime projection fixtures (no downloads or audio devices)
         run: python -m unittest discover -s scripts/tests -p 'test_voice_packaging.py' -v
 
   split-host-probe:
@@ -117,13 +114,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Compile subscription bridge without audio hardware or provider access
         run: cargo check --locked -p zeron-harness -p zeron-engine
-      - name: Runtime resource resolution and integrity
+      - name: Installed and development runtime resolution
         run: cargo test --locked -p zeron-voice-media --lib
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         if: runner.os == 'Windows'
         with:
           python-version: '3.12'
-      - name: Initialize packaged Windows runtime (no provider or audio devices)
+      - name: Initialize a projected Windows runtime (no provider or audio devices)
         if: runner.os == 'Windows'
         run: |
           $env:ZERON_VOICE_MEDIA_DIR = Join-Path $env:RUNNER_TEMP 'zeron-media/codex-resources/voice'

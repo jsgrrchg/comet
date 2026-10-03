@@ -73,7 +73,6 @@ Source: "{#PackageDir}\zeron-update.json"; DestDir: "{app}"; Flags: ignoreversio
 Source: "{#PackageDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PackageDir}\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#PackageDir}\licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#PackageDir}\codex-resources\voice\*"; DestDir: "{app}\codex-resources\voice"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{autoprograms}\Zeron"; Filename: "{app}\zeron.exe"

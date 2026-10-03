@@ -1,12 +1,8 @@
-"""Exercise relocatable runtime packages and reject incompatible or altered inputs."""
+"""Exercise development runtime projection and reject incompatible or altered inputs."""
 import importlib.util
 import io
 import json
 import os
-import shutil
-import subprocess
-import sys
-import tarfile
 from pathlib import Path
 import tempfile
 import unittest
@@ -59,52 +55,6 @@ def refresh_manifest(root, target):
 
 
 class RuntimePackagingTests(unittest.TestCase):
-    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux package/install integration')
-    def test_linux_tarball_and_install_preserve_runtime(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            project = root / 'project'
-            repository = Path(__file__).parents[2]
-            files = {
-                'Cargo.toml': 'version = "9.9.9"',
-                'dist/zeron.desktop': '[Desktop Entry]\nExec=zeron\nTryExec=zeron\nIcon=zeron\n',
-                'dist/zeron.png': 'icon',
-                'dist/voice/Codex-LICENSE.txt': 'helper license',
-                'crates/ui/assets/fonts/licenses/Font.txt': 'font license',
-                'crates/voice/NOTICE.md': 'dictation notice',
-                'target/debug/zeron': '#!/bin/sh\nexit 0\n',
-                'shim/cargo': '#!/bin/sh\nexit 0\n',
-            }
-            for name, content in files.items():
-                path = project / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content)
-            for name in ['target/debug/zeron', 'shim/cargo']:
-                (project / name).chmod(0o755)
-            (project / 'scripts').mkdir()
-            for script in ['package-linux.sh', 'package-voice-runtime.py']:
-                shutil.copy2(repository / 'scripts' / script, project / 'scripts' / script)
-            target = packager.host_target()
-            _, helper, library = fixture(root / 'source', target)
-            env = dict(os.environ, PROFILE='debug', ZERON_VOICE_RUNTIME_PACKAGE=str(root / 'source'))
-            env['PATH'] = str(project / 'shim') + os.pathsep + env['PATH']
-            subprocess.run(['bash', str(project / 'scripts/package-linux.sh')], env=env, check=True, capture_output=True)
-            archive = next((project / 'target/package').glob('*.tar.gz'))
-            with tarfile.open(archive) as package:
-                package.extractall(root / 'extracted', filter='data')
-            unpacked = next((root / 'extracted').iterdir())
-            runtime = unpacked / 'codex-resources/voice'
-            self.assertTrue((runtime / helper).is_file())
-            self.assertTrue((runtime / library).is_file())
-            env['HOME'] = str(root / 'isolated home')
-            env['XDG_DATA_HOME'] = str(root / 'isolated data')
-            subprocess.run(['bash', str(unpacked / 'install.sh')], env=env, check=True, capture_output=True)
-            installed = Path(env['HOME']) / '.zeron/app/current/codex-resources/voice'
-            manifest = json.loads((installed / 'zeron-runtime.json').read_text())
-            for name, digest in manifest['sha256'].items():
-                self.assertEqual(packager.checksum(installed / name), digest)
-            self.assertTrue((installed / helper).stat().st_mode & 0o111)
-
     def test_all_platforms_preserve_complete_runtime_without_copying_cli(self):
         for target in packager.PACKAGES:
             with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:

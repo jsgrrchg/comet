@@ -7,8 +7,6 @@
 #
 # Usage: scripts/package-linux.sh
 # Env:   PROFILE=debug for a fast unoptimized package (CI smoke); default release.
-#        ZERON_VOICE_RUNTIME_PACKAGE=<Codex 0.160.0 package> to use a local
-#        input; otherwise fetch the checksum-pinned package on the build machine.
 
 set -euo pipefail
 
@@ -35,16 +33,10 @@ mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/zeron"
 install -m 644 "$ROOT/dist/zeron.desktop" "$STAGE/zeron.desktop"
 install -m 644 "$ROOT/dist/zeron.png" "$STAGE/zeron.png"
+install -m 644 "$ROOT/LICENSE" "$ROOT/THIRD_PARTY_NOTICES.md" "$STAGE/"
 mkdir -p "$STAGE/licenses/fonts"
 cp "$ROOT/crates/ui/assets/fonts/licenses/"* "$STAGE/licenses/fonts/"
 cp "$ROOT/crates/voice/NOTICE.md" "$STAGE/licenses/parakeet-v3.txt"
-
-VOICE_ARGS=(--download)
-if [[ -n "${ZERON_VOICE_RUNTIME_PACKAGE:-}" ]]; then
-  VOICE_ARGS=(--package "$ZERON_VOICE_RUNTIME_PACKAGE")
-fi
-python3 "$ROOT/scripts/package-voice-runtime.py" "${VOICE_ARGS[@]}" \
-  --target "$ARCH-unknown-linux-gnu" --destination "$STAGE/codex-resources/voice"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash

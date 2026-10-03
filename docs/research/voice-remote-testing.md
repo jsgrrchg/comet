@@ -12,22 +12,22 @@ its environment. Codex must already be installed and authenticated through
 ChatGPT on that host. It needs no audio helper, microphone or speaker. Continue
 using the existing registered device and account; do not register another host.
 
-On macOS ARM64, build the client bundle with an explicit pinned runtime package:
+The client (the device with the microphone) needs its own standalone Codex
+installation, version 0.159 or later, from the official installer: audio runs
+through that installation's `codex-voice-host` helper, on macOS, Linux and
+Windows alike. The client's Codex is resolved like the harness's (`CODEX_EXECUTABLE`,
+PATH, the login shell's PATH, known install locations); its credentials are not
+read. npm installations do not include the helper. Zeron packages contain no
+Codex runtime.
 
 ```sh
-ZERON_REMOTE_VOICE=1 \
-ZERON_VOICE_RUNTIME_PACKAGE=/absolute/path/to/codex-0.160.0-package \
-ZERON_DEV_BUILD_ONLY=1 ./scripts/run-macos-dev.sh
+ZERON_REMOTE_VOICE=1 ZERON_DEV_BUILD_ONLY=1 ./scripts/run-macos-dev.sh
 ```
 
-The package directory contains `codex-package.json` and `codex-resources/voice`.
-The packaging script verifies the pinned artifact and copies the complete media
-subtree unmodified, with Codex's own signatures, to
-`Contents/Resources/codex-resources/voice` — the helper refuses to initialize
-from any directory not named `codex-resources/voice`. It does not put the Codex executable
-or credentials in the client bundle. For direct developer runs,
-`ZERON_VOICE_MEDIA_DIR` may explicitly point at a projected runtime containing
-`zeron-runtime.json`; it must also be a `codex-resources/voice` directory. There is no automatic PATH fallback.
+To test a client without Codex, or a specific helper build, set
+`ZERON_VOICE_MEDIA_DIR` to a runtime projected by
+`scripts/package-voice-runtime.py` (see [its notes](../../dist/voice/README.md)).
+It must be a `codex-resources/voice` directory containing `zeron-runtime.json`.
 
 Open `target/macos-dev/Zeron Dev.app`, select **Settings → Voice → Codex voice
 device**, choose the registered Fedora host and start voice from the sidebar orb.
@@ -37,25 +37,17 @@ remote gate is not eligible. Style is validated by the chosen host at Prepare.
 
 With the flag unset, desktop retains its existing local Codex voice path. Disable
 the flag and restart to roll back; no transcript migration or credential transfer
-is needed. Do not remove the user's CLI to test the new path: use an isolated
-client environment or copy the completed bundle to a test Mac without a CLI.
+is needed.
 
 ### Linux and Windows desktop clients
 
-`scripts/package-linux.sh` and `scripts/package-windows.ps1` now include the
-pinned media runtime beside the executable in `codex-resources/voice`. Both
-x86_64 and ARM64 inputs are supported. The Windows ZIP and per-user setup carry
-the whole runtime, including `bin/codex-voice-host.exe` and its DLLs. The Linux
-tarball carries `bin/codex-voice-host` and its `.so`/GStreamer libraries.
+They follow the same rule: the installed standalone Codex supplies the helper
+(`codex-voice-host` / `codex-voice-host.exe` with its `.so`/DLL tree). The Linux
+helper requires the host's glibc and ALSA libraries. On Windows, verify live that
+the `codex.exe` installed by `install.ps1` resolves inside its package (next to
+`codex-package.json`); otherwise voice reports `nativeRuntimeUnavailable`.
 
-Builds require Python 3.12 or later and either download the checksum-pinned
-official source package on the build machine or use an extracted complete
-package in `ZERON_VOICE_RUNTIME_PACKAGE`. See [packaging instructions](../../dist/voice/README.md).
-Installed clients do not download a runtime, search PATH or require a local
-Codex CLI for the remote media path. The selected execution host still needs
-authenticated Codex and `ZERON_REMOTE_VOICE=1`.
-
-Offline package checks:
+Offline checks:
 
 ```sh
 python3 -m unittest discover -s scripts/tests -p 'test_voice_packaging.py' -v
@@ -91,6 +83,23 @@ Record versions, anonymized platform/network labels, observed outcomes and
 monotonic durations. Do not record SDP, tokens, audio or private transcript text.
 A failed negotiation should be investigated using the opt-in split-host smoke
 and its sanitized stages; it does not imply trying an API-key fallback.
+
+### Legal and privacy (blocks a public release)
+
+Owner decisions, not code; see the privacy/legal section of
+[codex-voice.md](codex-voice.md).
+
+- [ ] iOS consent: App Review guideline 5.1.2(i) requires disclosing that audio
+  is shared with a third-party AI (OpenAI) and explicit permission before the
+  first call. The microphone string discloses it; add an in-app consent step.
+- [ ] iOS privacy manifest and App Store privacy labels: decide whether audio sent
+  to OpenAI and synced voice transcripts are declared in `PrivacyInfo.xcprivacy`,
+  and keep App Store Connect consistent with it.
+- [ ] Zeron's public privacy policy and terms (outside this repository) describe
+  the OpenAI audio flow and transcript sync.
+- [ ] WebRTC's embedded third-party licenses (BoringSSL, libsrtp, Opus, libyuv,
+  Abseil and others) are generated from the pinned XCFramework and shipped
+  with the iOS app.
 
 ## Automated coverage
 

@@ -134,8 +134,9 @@ only that preference is persisted. Devices use the operating system defaults.
 Codex's current helper protocol does not expose device selection.
 
 The native helper/runtime is supplied by the standalone Codex installation,
-not redistributed by Zeron. npm/CLI-only installations without those resources
-report `nativeRuntimeUnavailable`. macOS production/dev bundles declare microphone
+not redistributed by Zeron, on macOS, Linux and Windows; the desktop client of
+a remote call uses its own installation the same way. npm/CLI-only
+installations without those resources report `nativeRuntimeUnavailable`. macOS production/dev bundles declare microphone
 usage and audio-input entitlements. The viewport verifies microphone authorization
 and requests it when voice is explicitly started, before creating a provider
 session or opening devices. Denied access shows a settings hint. Cargo builds
@@ -147,6 +148,46 @@ signed development bundle; `ZERON_DEV_BUILD_ONLY=1` prepares it without launchin
 No new DSP DLLs or C++ build dependency are
 added to the production UI. Apache-2.0 attribution for the adapted native helper
 protocol is included in `THIRD_PARTY_NOTICES.md`.
+
+## Privacy, notices and legal
+
+Data flow:
+
+- Audio goes from the device with the microphone (Codex's helper on desktop,
+  WebRTC on iOS) directly to OpenAI, under the user's own ChatGPT-authenticated
+  Codex account and OpenAI's terms. It never transits Zeron servers.
+- Remote calls exchange SDP signaling and controls over the authenticated
+  owner-only device relay; they are ephemeral and never persisted.
+- Canonical final transcript text is stored in the orchestrator chat's session
+  document and syncs like any chat, through Zeron's relay. Orchestrator chats
+  are hidden from the sidebar but are not deleted when a call ends.
+- Usage is billed to the user's Codex plan or credits by OpenAI.
+
+The microphone purpose strings (`dist/macos/Info*.plist`,
+`apps/ios/Zeron/Info.plist`) state that voice sessions stream audio to OpenAI;
+dictation stays on device.
+
+Notices: `THIRD_PARTY_NOTICES.md` covers the Apache-2.0 Codex protocol
+adaptation (with its upstream NOTICE and an OpenAI trademark/non-affiliation
+statement), the MIT orb chain (Bezel, gpui-thinking-orbs, thinking-orbs) and
+WebRTC for iOS. macOS, Windows and Linux packages ship `LICENSE` and
+`THIRD_PARTY_NOTICES.md`; the iOS app ships `Voice/WebRTC-LICENSE.txt` and
+`Voice/ThinkingOrbs-LICENSE.txt`. No Codex binaries are redistributed.
+
+Pending before a public release (owner decisions, not code):
+
+- iOS: App Review guideline 5.1.2(i) requires disclosing that personal data is
+  shared with a third-party AI and obtaining explicit permission before doing
+  so. The permission string discloses it; an explicit in-app consent step
+  before the first call is not implemented.
+- iOS privacy manifest (`PrivacyInfo.xcprivacy`) and App Store privacy labels
+  declare no collected data. Decide whether audio sent to OpenAI and synced
+  voice transcripts must be declared.
+- Zeron's public privacy policy and terms (outside this repository) should
+  describe the OpenAI audio flow and transcript sync.
+- WebRTC's embedded third-party licenses (BoringSSL, libsrtp, Opus, libyuv,
+  Abseil and others) are referenced, not reproduced; generate the full list
+  from the pinned XCFramework before distribution.
 
 ## Validation and practical limits
 

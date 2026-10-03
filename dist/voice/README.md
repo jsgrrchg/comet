@@ -1,63 +1,29 @@
-# Pinned media runtime notices
+# Development media runtime
 
-`Codex-LICENSE.txt` is the unmodified OpenAI license at source commit
-`a956835d020762cb2b570053af06f643a11c0ecc`:
-https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/LICENSE
+Zeron packages do not contain the Codex voice runtime. On macOS, Linux and
+Windows, local and remote voice run the `codex-voice-host` helper of the user's
+own standalone Codex installation (layout 1, version 0.159 or later), resolved
+from the same `codex` executable the harness uses. npm installations do not
+include the runtime and report `nativeRuntimeUnavailable`.
 
-The packager retains the full voice subtree, dependency notices and sources
-manifest and adds this helper license. Binaries and libraries are copied
-byte-for-byte; macOS signatures are verified and preserved. It does not copy
-the Codex CLI or authentication files.
-
-Linux and Windows package builds download the checksum-pinned official Codex
-`0.160.0` package on the build machine, or use the explicit directory provided
-in `ZERON_VOICE_RUNTIME_PACKAGE`. Packaging requires Python 3.12 or later.
-No runtime download occurs on the user's device.
-
-| Zeron package | Media target | Runtime location |
-| --- | --- | --- |
-| Linux x86_64 | `x86_64-unknown-linux-gnu` | Beside `zeron`, in `codex-resources/voice` |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` | Beside `zeron`, in `codex-resources/voice` |
-| Windows x86_64 | `x86_64-pc-windows-msvc` | Beside `zeron.exe`, in `codex-resources/voice` |
-| Windows ARM64 | `aarch64-pc-windows-msvc` | Beside `zeron.exe`, in `codex-resources/voice` |
-| macOS ARM64 | `aarch64-apple-darwin` | `Contents/Resources/codex-resources/voice` |
-
-Linux's CLI source package has a `*-unknown-linux-musl` app target; its bundled
-audio helper has a `*-unknown-linux-gnu` target and requires the host's glibc
-and ALSA system libraries. The complete bundled `.so`/GStreamer tree is retained.
-Windows packages retain the `.exe`, DLLs and other runtime resources. The
-packager validates the source version, source commit, architecture, file hashes
-and library inventory; the client checks target and hashes before execution.
-
-The Linux tarball contains the runtime, so installing or updating that tarball
-retains it. On Windows the portable ZIP and per-user installer contain it; the
-standalone updater `.exe` is still executable-only and preserves an existing
-runtime. Older Windows installs without these resources need the ZIP or setup
-once to acquire them. This change does not replace the Windows updater.
-
-For an offline build, provide the already extracted **complete** official
-standalone package (including its `codex-package.json` and `codex-resources`):
-
-```sh
-ZERON_VOICE_RUNTIME_PACKAGE=/absolute/path/to/codex-package-x86_64-unknown-linux-musl \
-  scripts/package-linux.sh
-```
-
-```powershell
-$env:ZERON_VOICE_RUNTIME_PACKAGE = 'C:\build\codex-package-x86_64-pc-windows-msvc'
-.\scripts\package-windows.ps1 -ReleasesUrl 'https://github.com/zeronsh/comet/releases/latest/download'
-```
-
-The packager can also project a development runtime directly, without building
-Zeron, with `--package` or the pinned `--download` input:
+`scripts/package-voice-runtime.py` is a development tool only. It projects the
+voice subtree of a checksum-pinned official Codex `0.160.0` package into a
+`codex-resources/voice` directory (the helper refuses to initialize from any
+other directory name), for example to test a machine without Codex:
 
 ```sh
 python3 scripts/package-voice-runtime.py --download \
   --target x86_64-unknown-linux-gnu --destination /tmp/zeron/codex-resources/voice
 ```
 
-`ZERON_VOICE_MEDIA_DIR` may point at that projected `codex-resources/voice`
-directory for direct development runs. Remote voice remains opt-in through
-`ZERON_REMOTE_VOICE=1`; packaging does not change authentication, billing or
-the session gate. Physical microphone and live provider acceptance remain
-separate from package validation.
+macOS needs an explicit extracted package (`--package`). The projection keeps
+binaries and libraries byte-for-byte (macOS signatures are verified, not
+replaced), the dependency notices and sources manifest, and adds
+`Codex-LICENSE.txt`, the unmodified OpenAI license at source commit
+`a956835d020762cb2b570053af06f643a11c0ecc`:
+https://github.com/openai/codex/blob/a956835d020762cb2b570053af06f643a11c0ecc/LICENSE
+
+Point `ZERON_VOICE_MEDIA_DIR` at the projected directory to override the
+installed helper for remote voice. Do not ship a projected runtime: its
+GStreamer/GLib (LGPL-2.1), Opus, other native libraries and, on Windows, the
+Microsoft Visual C++ runtime carry their own redistribution obligations.

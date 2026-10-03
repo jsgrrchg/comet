@@ -2,7 +2,11 @@
 //! Audio, AEC, interruption and encrypted media stay inside that native process.
 //! Only bounded SDP signaling, controls and level meters cross this pipe.
 use serde_json::{Value, json};
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{ChildStdin, ChildStdout, Command},
@@ -233,24 +237,6 @@ impl NativeHost {
     }
 }
 
-/// Where the macOS bundle keeps the runtime, relative to `Contents/`. Codex's layout:
-/// the helper only initializes from a `codex-resources/voice` directory and
-/// exits (code 23) on `initializeRuntime` anywhere else.
-#[cfg(target_os = "macos")]
-pub const BUNDLED_RUNTIME: &str = "Resources/codex-resources/voice";
-/// Linux and Windows keep resources beside the application executable.
-#[cfg(not(target_os = "macos"))]
-pub const BUNDLED_RUNTIME: &str = "codex-resources/voice";
-
-fn runtime_root(executable: &Path, os: &str) -> Option<std::path::PathBuf> {
-    let directory = executable.parent()?;
-    Some(if os == "macos" {
-        directory.parent()?.join("Resources/codex-resources/voice")
-    } else {
-        directory.join("codex-resources/voice")
-    })
-}
-
 fn runtime_target() -> Result<&'static str, VoiceRejection> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
@@ -269,18 +255,44 @@ const HELPER: &str = if cfg!(windows) {
     "bin/codex-voice-host"
 };
 
-/// An explicit development runtime or the signed application's resources. Never
-/// searches PATH, resolves Codex, or reads its authentication directory.
-pub fn bundled_helper() -> Result<std::path::PathBuf, VoiceRejection> {
-    let root = if let Some(path) = std::env::var_os("ZERON_VOICE_MEDIA_DIR") {
-        std::path::PathBuf::from(path)
-    } else {
-        std::env::current_exe()
-            .ok()
-            .and_then(|p| runtime_root(&p, std::env::consts::OS))
-            .ok_or(VoiceRejection::NativeRuntimeUnavailable)?
-    };
-    verify_runtime(&root)
+/// The helper shipped inside the device's standalone Codex installation (layout
+/// 1, version 0.159 or later), resolved from its `codex` executable. Zeron never
+/// redistributes this runtime; npm installations do not contain it. The helper
+/// only initializes from a `codex-resources/voice` directory.
+pub fn installed_helper(codex_executable: &Path) -> Result<PathBuf, VoiceRejection> {
+    let binary = codex_executable
+        .canonicalize()
+        .map_err(|_| VoiceRejection::NativeRuntimeUnavailable)?;
+    let root = binary
+        .parent()
+        .and_then(Path::parent)
+        .ok_or(VoiceRejection::NativeRuntimeUnavailable)?;
+    let manifest: Value = std::fs::read(root.join("codex-package.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .ok_or(VoiceRejection::NativeRuntimeUnavailable)?;
+    let version = manifest["version"]
+        .as_str()
+        .and_then(|v| semver::Version::parse(v).ok())
+        .ok_or(VoiceRejection::Unsupported)?;
+    if manifest["layoutVersion"] != 1 || version < semver::Version::new(0, 159, 0) {
+        return Err(VoiceRejection::Unsupported);
+    }
+    let path = root.join("codex-resources/voice").join(HELPER);
+    if path.canonicalize().ok().as_ref() != Some(&path) || !path.is_file() {
+        return Err(VoiceRejection::NativeRuntimeUnavailable);
+    }
+    Ok(path)
+}
+
+/// Client media for a remote call: an explicit development runtime
+/// (`ZERON_VOICE_MEDIA_DIR`, see `scripts/package-voice-runtime.py`), otherwise
+/// this device's standalone Codex installation. Never reads Codex credentials.
+pub fn media_helper(codex_executable: Option<&Path>) -> Result<PathBuf, VoiceRejection> {
+    if let Some(path) = std::env::var_os("ZERON_VOICE_MEDIA_DIR") {
+        return verify_runtime(Path::new(&path));
+    }
+    installed_helper(codex_executable.ok_or(VoiceRejection::NativeRuntimeUnavailable)?)
 }
 
 pub const BUILD_COMMIT: &str = "a956835d020762cb2b570053af06f643a11c0ecc";
@@ -332,28 +344,60 @@ mod tests {
     use super::*;
     use sha2::{Digest, Sha256};
 
-    #[test]
-    fn runtime_is_resolved_inside_the_application_package() {
-        assert_eq!(
-            runtime_root(
-                Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
-                "macos"
-            ),
-            Some("/Applications/Zeron.app/Contents/Resources/codex-resources/voice".into())
-        );
-        for os in ["linux", "windows"] {
-            assert_eq!(
-                runtime_root(Path::new("/installed/zeron.exe"), os),
-                Some("/installed/codex-resources/voice".into())
-            );
+    fn codex_package(root: &Path, version: &str, helper: bool) -> PathBuf {
+        let codex = root.join(if cfg!(windows) {
+            "bin/codex.exe"
+        } else {
+            "bin/codex"
+        });
+        std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+        std::fs::write(&codex, "").unwrap();
+        std::fs::write(
+            root.join("codex-package.json"),
+            json!({"layoutVersion":1,"version":version}).to_string(),
+        )
+        .unwrap();
+        if helper {
+            let path = root.join("codex-resources/voice").join(HELPER);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
         }
+        codex
     }
 
-    /// An opt-in packaging check: no provider connection or audio devices.
+    #[test]
+    fn helper_is_resolved_from_the_installed_codex_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("release");
+        let codex = codex_package(&root, "0.160.0", true);
+        assert_eq!(
+            installed_helper(&codex).unwrap(),
+            root.join("codex-resources/voice").join(HELPER)
+        );
+        // Older layouts and npm-style installs without resources are unavailable.
+        codex_package(&root, "0.158.9", true);
+        assert_eq!(
+            installed_helper(&codex).unwrap_err(),
+            VoiceRejection::Unsupported
+        );
+        let npm = temp.path().join("npm");
+        let codex = codex_package(&npm, "0.160.0", false);
+        assert_eq!(
+            installed_helper(&codex).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+        std::fs::remove_file(npm.join("codex-package.json")).unwrap();
+        assert_eq!(
+            installed_helper(&codex).unwrap_err(),
+            VoiceRejection::NativeRuntimeUnavailable
+        );
+    }
+
+    /// An opt-in runtime check: no provider connection or audio devices.
     #[tokio::test]
-    #[ignore = "requires a packaged runtime in ZERON_VOICE_MEDIA_DIR"]
+    #[ignore = "requires a projected runtime in ZERON_VOICE_MEDIA_DIR"]
     async fn packaged_native_runtime_initializes_without_audio_devices() {
-        let path = bundled_helper().unwrap();
+        let path = media_helper(None).unwrap();
         let host = NativeHost::open(&path, Default::default()).await.unwrap();
         host.close();
     }
@@ -447,9 +491,11 @@ pub struct DesktopMedia {
     stop: tokio_util::sync::CancellationToken,
 }
 impl DesktopMedia {
-    pub fn bundled() -> Result<Self, VoiceRejection> {
+    /// See [`media_helper`]: the local standalone Codex unless a development
+    /// runtime is set explicitly.
+    pub fn for_codex(codex_executable: Option<&Path>) -> Result<Self, VoiceRejection> {
         Ok(Self {
-            path: bundled_helper()?,
+            path: media_helper(codex_executable)?,
             host: Default::default(),
             stop: Default::default(),
         })

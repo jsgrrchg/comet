@@ -41,20 +41,10 @@ function Wait-Until([scriptblock]$Condition, [string]$What) {
 $log = Join-Path $root 'zeron-setup.log'
 Invoke-Checked $Setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$dir`"", "/LOG=`"$log`"") 'Setup'
 $exe = Join-Path $dir 'zeron.exe'
-foreach ($file in @('zeron.exe', 'zeron-update.json', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'licenses/fonts', 'unins000.exe',
-    'codex-resources/voice/bin/codex-voice-host.exe', 'codex-resources/voice/zeron-runtime.json',
-    'codex-resources/voice/runtime.json', 'codex-resources/voice/NOTICE.md', 'codex-resources/voice/licenses/Codex-LICENSE.txt')) {
+foreach ($file in @('zeron.exe', 'zeron-update.json', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'licenses/fonts', 'unins000.exe')) {
     if (-not (Test-Path -LiteralPath (Join-Path $dir $file))) { throw "Installed file missing: $file" }
 }
 Write-Output 'PASS: installed files'
-
-$voiceRoot = Join-Path $dir 'codex-resources/voice'
-$voiceManifest = Get-Content -Raw -LiteralPath (Join-Path $voiceRoot 'zeron-runtime.json') | ConvertFrom-Json
-foreach ($file in $voiceManifest.sha256.PSObject.Properties) {
-    $hash = (Get-FileHash -LiteralPath (Join-Path $voiceRoot $file.Name) -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($hash -ne $file.Value) { throw "Installed voice runtime checksum mismatch: $($file.Name)" }
-}
-Write-Output 'PASS: installed voice helper, libraries and notices retain their checksums'
 
 # The update marker makes the in-app updater manage this install.
 $config = Get-Content -Raw -LiteralPath (Join-Path $dir 'zeron-update.json') | ConvertFrom-Json
@@ -99,7 +89,7 @@ Set-Content -LiteralPath (Join-Path $dir '.zeron-update-test/zeron.exe') -Value 
 Invoke-Checked (Join-Path $dir 'unins000.exe') @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') 'Uninstall'
 Wait-Until { -not (Test-Path -LiteralPath $uninstallKey) } 'the uninstall entry to disappear'
 Wait-Until { -not (Test-Path -LiteralPath $exe) } 'zeron.exe to be removed'
-foreach ($leftover in @('zeron.exe.old', '.zeron-update-test', 'zeron-update.json', 'licenses', 'codex-resources')) {
+foreach ($leftover in @('zeron.exe.old', '.zeron-update-test', 'zeron-update.json', 'licenses')) {
     Wait-Until { -not (Test-Path -LiteralPath (Join-Path $dir $leftover)) } "$leftover to be removed"
 }
 if (Test-Path -LiteralPath $protocolKey) { throw 'zeron:// handler survived uninstall' }

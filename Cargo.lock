@@ -13395,6 +13395,7 @@ name = "zeron-voice-media"
 version = "0.2.102"
 dependencies = [
  "async-trait",
+ "semver",
  "serde_json",
  "sha2",
  "tempfile",

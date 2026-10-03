@@ -1,7 +1,7 @@
-//! Window-owned voice orchestrator. Each session runs in a fresh projectless
-//! Codex chat on this device and survives navigation between threads; only an
-//! explicit end, an engine change or a provider failure closes it. No
-//! automatic reconnect or microphone resume.
+//! Window-owned voice orchestrator. Each session runs in the host's own
+//! projectless Codex chat, resumed across calls, and survives navigation
+//! between threads; only an explicit end, an engine change or a provider
+//! failure closes it. No automatic reconnect or microphone resume.
 use crate::orb::OrbState;
 use crate::state::EngineHandle;
 use gpui::{Context, Task};
@@ -14,9 +14,6 @@ mod session;
 pub enum VoiceControl {
     Mute(bool),
 }
-
-/// Sidebar title of each orchestrator chat; transcripts never trigger a titler.
-pub const VOICE_CHAT_TITLE: &str = ORCHESTRATOR_CHAT_TITLE;
 
 pub struct VoiceController {
     pub phase: VoicePhase,
@@ -82,24 +79,16 @@ impl VoiceController {
     ) {
         self.cancel(cx);
         self.remote = std::env::var("ZERON_REMOTE_VOICE").as_deref() == Ok("1");
-        // Hidden from every chat list; see `ORCHESTRATOR_CHAT_PREFIX`.
-        let chat_id = format!("{ORCHESTRATOR_CHAT_PREFIX}{}", uuid::Uuid::new_v4());
+        // The host names its orchestrator chat; the first snapshot carries it.
         let request = StartVoice {
-            chat_id: chat_id.clone(),
+            chat_id: String::new(),
             host_device_id: host_device_id.clone(),
             voice,
             worktree: None,
         };
-        // No spaceId: the engine mints a projectless chat whose cwd is `~`.
-        let create = serde_json::json!({
-            "op": "createChat",
-            "chatId": chat_id,
-            "deviceId": host_device_id,
-            "config": config,
-        });
         self.engine = Some(engine.clone());
         self.phase = VoicePhase::Checking;
-        self.chat_id = (!self.remote).then_some(chat_id);
+        self.chat_id = None;
         self.reason = None;
         let epoch = self.epoch;
         let cancellation = self.cancellation.clone();
@@ -120,7 +109,7 @@ impl VoiceController {
                 )
                 .await
             } else {
-                session::run(engine, create, request, cancellation, events, control_rx).await
+                session::run(engine, config, request, cancellation, events, control_rx).await
             }
         });
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -259,7 +248,7 @@ impl VoiceController {
                         snapshot.playing = previous.playing;
                     }
                 }
-                if self.remote && self.chat_id.is_none() {
+                if self.chat_id.is_none() {
                     self.chat_id = Some(snapshot.chat_id.clone());
                 }
 

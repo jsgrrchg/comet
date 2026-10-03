@@ -43,6 +43,7 @@ pub mod methods {
     pub const CANCEL_VOICE_ATTEMPT_V2: &str = "CancelVoiceAttemptV2";
     // Ephemeral local voice; never relay-forwardable.
     pub const VOICE_ELIGIBILITY: &str = "VoiceEligibility";
+    pub const OPEN_VOICE_CHAT: &str = "OpenVoiceChat";
     pub const START_VOICE: &str = "StartVoice";
     pub const OWN_VOICE: &str = "OwnVoice";
     pub const APPEND_VOICE: &str = "AppendVoice";

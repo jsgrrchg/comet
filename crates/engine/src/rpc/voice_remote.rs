@@ -54,19 +54,20 @@ impl EngineRpc {
                     let engine = self.clone();
                     tokio::spawn(async move {
                         let key = request.attempt_key.clone();
-                        let chat = format!(
-                            "{}{}",
-                            zeron_proto::voice::ORCHESTRATOR_CHAT_PREFIX,
-                            uuid::Uuid::new_v4()
-                        );
+                        let mut chat = None;
                         let result = tokio::select! {biased;
                             _=cancel.cancelled()=>Err(VoiceRejection::InvalidLease),
-                            r=tokio::time::timeout(Duration::from_secs(60),engine.prepare_remote_voice(request,chat.clone(),cancel.clone()))=>r.unwrap_or(Err(VoiceRejection::Protocol)),
+                            r=tokio::time::timeout(Duration::from_secs(60),engine.prepare_remote_voice(request,&mut chat,cancel.clone()))=>r.unwrap_or(Err(VoiceRejection::Protocol)),
                         };
-                        if result.is_err() && engine.workspace.chat(&chat).ok().flatten().is_some()
-                        {
+                        if let Some(chat) = chat.filter(|chat| {
+                            result.is_err() && engine.workspace.chat(chat).ok().flatten().is_some()
+                        }) {
                             engine.voice.retire_chat(&chat);
-                            let _ = engine.sessions.interrupt(&chat).await;
+                            // The chat outlives calls: delegated work it still
+                            // runs survives this failed start.
+                            if !engine.sessions.turn_in_flight(&chat) {
+                                let _ = engine.sessions.interrupt(&chat).await;
+                            }
                             // Preserve any actual activity; remove only this empty preparation.
                             if engine
                                 .doc_host
@@ -140,7 +141,7 @@ impl EngineRpc {
     async fn prepare_remote_voice(
         &self,
         p: wire::Prepare,
-        chat: String,
+        resolved: &mut Option<String>,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<wire::Prepared, VoiceRejection> {
         let _preparation = self.voice.preparation().await;
@@ -151,20 +152,8 @@ impl EngineRpc {
         if cancel.is_cancelled() {
             return Err(VoiceRejection::InvalidLease);
         }
-        self.workspace
-            .create_chat(
-                &chat,
-                None,
-                Some(&self.engine_info.device_id),
-                Some(p.config),
-                None,
-            )
-            .map_err(|_| VoiceRejection::Protocol)?;
-        // Same title as a local orchestrator: its transcript is reachable from
-        // every client's voice controls, never an untitled "New session".
-        self.workspace
-            .rename_chat(&chat, zeron_proto::voice::ORCHESTRATOR_CHAT_TITLE)
-            .map_err(|_| VoiceRejection::Protocol)?;
+        let chat = self.voice_chat(p.config).await?;
+        *resolved = Some(chat.clone());
         let (bridge, events, active) = self.prepare_voice_bridge(&chat).await?;
         let eligibility = bridge.probe_external().await?;
         if p.voice

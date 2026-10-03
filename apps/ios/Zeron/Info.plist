@@ -58,6 +58,8 @@
 	<array>
 		<string>audio</string>
 	</array>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>NSCameraUsageDescription</key>
 	<string>Take photos to attach to messages.</string>
 	<key>UILaunchScreen</key>

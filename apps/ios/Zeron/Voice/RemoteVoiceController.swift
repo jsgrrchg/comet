@@ -18,6 +18,8 @@ final class RemoteVoiceController {
     private var generation: UInt64 = 0
     private var observers: [UUID: () -> Void] = [:]
     private var proximity: NSObjectProtocol?
+    /// The call in the Dynamic Island and on the Lock Screen.
+    private let liveActivity = VoiceActivityController()
 
     private(set) var state: VoiceCallState?
     /// Why the last call ended on its own; cleared by the next start.
@@ -38,7 +40,10 @@ final class RemoteVoiceController {
     var active: Bool { state?.phase == .active }
     var orb: VoiceOrb { state?.orb ?? (live ? .connecting : .idle) }
 
-    init(app: AppModel) { self.app = app }
+    init(app: AppModel) {
+        self.app = app
+        liveActivity.attach(to: self)
+    }
 
     // MARK: Hosts and preferences
 

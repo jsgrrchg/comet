@@ -892,9 +892,11 @@ async fn remote_failed_prepare_after_rotation_preserves_thread_for_retry() {
         .unwrap();
     core.workspace
         .set_chat_harness_session(&previous, "remembered-thread", "");
+    // The engine's `ROTATE_AFTER`.
+    const ROTATE_AFTER: usize = 1000;
     let doc = core.doc_host.open(&previous).unwrap();
-    for i in 0..150 {
-        doc.write_user_message(&format!("m{i}"), "remember me", i)
+    for i in 0..ROTATE_AFTER {
+        doc.write_user_message(&format!("m{i}"), "remember me", i as i64)
             .unwrap();
     }
 
@@ -929,7 +931,7 @@ async fn remote_failed_prepare_after_rotation_preserves_thread_for_retry() {
         core.workspace.chat_harness_session(&previous).unwrap().0,
         "remembered-thread"
     );
-    assert_eq!(doc.doc().read_entries().unwrap().len(), 150);
+    assert_eq!(doc.doc().read_entries().unwrap().len(), ROTATE_AFTER);
 
     // A fresh attempt rotates again and resumes the original Codex thread.
     request.attempt_key = wire::AttemptKey::new();

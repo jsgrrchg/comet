@@ -9,7 +9,7 @@ use zeron_proto::voice::{ORCHESTRATOR_CHAT_PREFIX, ORCHESTRATOR_CHAT_TITLE, Voic
 use zeron_proto::{Chat, SessionStatus};
 
 /// Transcript entries after which the next call starts a new segment.
-pub(super) const ROTATE_AFTER: usize = 150;
+pub(super) const ROTATE_AFTER: usize = 1000;
 
 /// This device's current orchestrator chat: its newest one, if any.
 fn current<'a>(chats: &'a [Chat], device: &str) -> Option<&'a Chat> {

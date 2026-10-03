@@ -233,10 +233,41 @@ impl NativeHost {
     }
 }
 
-/// Where the bundle keeps the runtime, relative to `Contents/`. Codex's layout:
+/// Where the macOS bundle keeps the runtime, relative to `Contents/`. Codex's layout:
 /// the helper only initializes from a `codex-resources/voice` directory and
 /// exits (code 23) on `initializeRuntime` anywhere else.
+#[cfg(target_os = "macos")]
 pub const BUNDLED_RUNTIME: &str = "Resources/codex-resources/voice";
+/// Linux and Windows keep resources beside the application executable.
+#[cfg(not(target_os = "macos"))]
+pub const BUNDLED_RUNTIME: &str = "codex-resources/voice";
+
+fn runtime_root(executable: &Path, os: &str) -> Option<std::path::PathBuf> {
+    let directory = executable.parent()?;
+    Some(if os == "macos" {
+        directory.parent()?.join("Resources/codex-resources/voice")
+    } else {
+        directory.join("codex-resources/voice")
+    })
+}
+
+fn runtime_target() -> Result<&'static str, VoiceRejection> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("aarch64-apple-darwin"),
+        ("macos", "x86_64") => Ok("x86_64-apple-darwin"),
+        ("linux", "x86_64") => Ok("x86_64-unknown-linux-gnu"),
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-gnu"),
+        ("windows", "x86_64") => Ok("x86_64-pc-windows-msvc"),
+        ("windows", "aarch64") => Ok("aarch64-pc-windows-msvc"),
+        _ => Err(VoiceRejection::Unsupported),
+    }
+}
+
+const HELPER: &str = if cfg!(windows) {
+    "bin/codex-voice-host.exe"
+} else {
+    "bin/codex-voice-host"
+};
 
 /// An explicit development runtime or the signed application's resources. Never
 /// searches PATH, resolves Codex, or reads its authentication directory.
@@ -246,7 +277,7 @@ pub fn bundled_helper() -> Result<std::path::PathBuf, VoiceRejection> {
     } else {
         std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent()?.parent().map(|p| p.join(BUNDLED_RUNTIME)))
+            .and_then(|p| runtime_root(&p, std::env::consts::OS))
             .ok_or(VoiceRejection::NativeRuntimeUnavailable)?
     };
     verify_runtime(&root)
@@ -267,12 +298,14 @@ pub fn verify_runtime(root: &Path) -> Result<std::path::PathBuf, VoiceRejection>
         &std::fs::read(root.join("zeron-runtime.json")).map_err(|_| reject())?,
     )
     .map_err(|_| reject())?;
-    if manifest["buildCommit"] != BUILD_COMMIT || manifest["protocol"] != 1 {
+    if manifest["buildCommit"] != BUILD_COMMIT
+        || manifest["protocol"] != 1
+        || manifest["target"] != runtime_target()?
+    {
         return Err(VoiceRejection::Unsupported);
     }
     let files = manifest["sha256"].as_object().ok_or_else(reject)?;
-    let helper = "bin/codex-voice-host";
-    if !files.contains_key(helper)
+    if !files.contains_key(HELPER)
         || !files.contains_key("runtime.json")
         || !files.contains_key("NOTICE.md")
     {
@@ -291,7 +324,7 @@ pub fn verify_runtime(root: &Path) -> Result<std::path::PathBuf, VoiceRejection>
             return Err(reject());
         }
     }
-    Ok(root.join(helper))
+    Ok(root.join(HELPER))
 }
 
 #[cfg(test)]
@@ -300,13 +333,39 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[test]
+    fn runtime_is_resolved_inside_the_application_package() {
+        assert_eq!(
+            runtime_root(
+                Path::new("/Applications/Zeron.app/Contents/MacOS/zeron"),
+                "macos"
+            ),
+            Some("/Applications/Zeron.app/Contents/Resources/codex-resources/voice".into())
+        );
+        for os in ["linux", "windows"] {
+            assert_eq!(
+                runtime_root(Path::new("/installed/zeron.exe"), os),
+                Some("/installed/codex-resources/voice".into())
+            );
+        }
+    }
+
+    /// An opt-in packaging check: no provider connection or audio devices.
+    #[tokio::test]
+    #[ignore = "requires a packaged runtime in ZERON_VOICE_MEDIA_DIR"]
+    async fn packaged_native_runtime_initializes_without_audio_devices() {
+        let path = bundled_helper().unwrap();
+        let host = NativeHost::open(&path, Default::default()).await.unwrap();
+        host.close();
+    }
+
+    #[test]
     fn runtime_rejects_missing_tampered_misplaced_and_incompatible_resources() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("Resources/codex-resources/voice");
         std::fs::create_dir_all(&dir).unwrap();
         assert!(verify_runtime(&dir).is_err());
         let mut hashes = serde_json::Map::new();
-        for name in ["bin/codex-voice-host", "runtime.json", "NOTICE.md"] {
+        for name in [HELPER, "runtime.json", "NOTICE.md"] {
             let path = dir.join(name);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, name).unwrap();
@@ -315,7 +374,7 @@ mod tests {
                 json!(format!("{:x}", Sha256::digest(name.as_bytes()))),
             );
         }
-        let mut manifest = json!({"protocol":1,"buildCommit":BUILD_COMMIT,"sha256":hashes});
+        let mut manifest = json!({"protocol":1,"buildCommit":BUILD_COMMIT,"target":runtime_target().unwrap(),"sha256":hashes});
         let save = |m: &Value| {
             std::fs::write(
                 dir.join("zeron-runtime.json"),
@@ -324,10 +383,7 @@ mod tests {
             .unwrap()
         };
         save(&manifest);
-        assert_eq!(
-            verify_runtime(&dir).unwrap(),
-            dir.join("bin/codex-voice-host")
-        );
+        assert_eq!(verify_runtime(&dir).unwrap(), dir.join(HELPER));
         // The helper refuses to start outside `codex-resources/voice`.
         let elsewhere = temp.path().join("Resources/voice");
         std::fs::rename(temp.path().join("Resources/codex-resources"), &elsewhere).unwrap();
@@ -343,6 +399,17 @@ mod tests {
             VoiceRejection::Unsupported
         );
         manifest["protocol"] = json!(1);
+        manifest["target"] = json!("incompatible-platform");
+        save(&manifest);
+        assert_eq!(
+            verify_runtime(&dir).unwrap_err(),
+            VoiceRejection::Unsupported
+        );
+        manifest["target"] = json!(runtime_target().unwrap());
+        manifest["sha256"].as_object_mut().unwrap().remove(HELPER);
+        save(&manifest);
+        assert!(verify_runtime(&dir).is_err());
+        manifest["sha256"][HELPER] = json!(format!("{:x}", Sha256::digest(HELPER.as_bytes())));
         manifest["sha256"]["../escape"] = json!("digest");
         save(&manifest);
         assert!(verify_runtime(&dir).is_err());

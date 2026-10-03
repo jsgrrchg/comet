@@ -40,6 +40,41 @@ the flag and restart to roll back; no transcript migration or credential transfe
 is needed. Do not remove the user's CLI to test the new path: use an isolated
 client environment or copy the completed bundle to a test Mac without a CLI.
 
+### Linux and Windows desktop clients
+
+`scripts/package-linux.sh` and `scripts/package-windows.ps1` now include the
+pinned media runtime beside the executable in `codex-resources/voice`. Both
+x86_64 and ARM64 inputs are supported. The Windows ZIP and per-user setup carry
+the whole runtime, including `bin/codex-voice-host.exe` and its DLLs. The Linux
+tarball carries `bin/codex-voice-host` and its `.so`/GStreamer libraries.
+
+Builds require Python 3.12 or later and either download the checksum-pinned
+official source package on the build machine or use an extracted complete
+package in `ZERON_VOICE_RUNTIME_PACKAGE`. See [packaging instructions](../../dist/voice/README.md).
+Installed clients do not download a runtime, search PATH or require a local
+Codex CLI for the remote media path. The selected execution host still needs
+authenticated Codex and `ZERON_REMOTE_VOICE=1`.
+
+Offline package checks:
+
+```sh
+python3 -m unittest discover -s scripts/tests -p 'test_voice_packaging.py' -v
+cargo test --locked -p zeron-voice-media --lib
+```
+
+To check an actual projected runtime's initialization without opening audio
+devices or contacting a provider:
+
+```sh
+ZERON_VOICE_MEDIA_DIR=/absolute/path/to/codex-resources/voice \
+  cargo test --locked -p zeron-voice-media --lib \
+  packaged_native_runtime_initializes_without_audio_devices -- --ignored
+```
+
+On Windows set `$env:ZERON_VOICE_MEDIA_DIR` before the same Cargo command.
+Real microphone, playback, permissions, interruption and live-provider
+acceptance still need to be performed on each physical platform.
+
 ## Acceptance checklist
 
 - Mac audio and Fedora Codex, including a host without an audio device/helper.

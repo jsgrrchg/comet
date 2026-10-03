@@ -14,6 +14,9 @@ on:
       - 'apps/ios/ZeronTests/RemoteVoiceLifecycleTests.swift'
       - 'dist/voice/**'
       - 'scripts/package-voice-runtime.py'
+      - 'scripts/package-linux.sh'
+      - 'scripts/package-windows.ps1'
+      - 'dist/windows/zeron.iss'
       - 'crates/proto/src/voice.rs'
       - 'crates/harness/**'
       - 'crates/engine/**'
@@ -23,11 +26,27 @@ on:
       - 'Cargo.lock'
       - 'scripts/codex-voice-remote-smoke.py'
       - 'scripts/tests/*voice_remote*'
+      - 'scripts/tests/test_voice_packaging.py'
       - '.github/workflows/voice-tests.yml'
   workflow_dispatch:
 permissions:
   contents: read
 jobs:
+  runtime-packaging:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+      - name: Runtime packaging fixtures (no downloads or audio devices)
+        run: python -m unittest discover -s scripts/tests -p 'test_voice_packaging.py' -v
+
   split-host-probe:
     strategy:
       fail-fast: false
@@ -98,3 +117,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Compile subscription bridge without audio hardware or provider access
         run: cargo check --locked -p zeron-harness -p zeron-engine
+      - name: Runtime resource resolution and integrity
+        run: cargo test --locked -p zeron-voice-media --lib
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        if: runner.os == 'Windows'
+        with:
+          python-version: '3.12'
+      - name: Initialize packaged Windows runtime (no provider or audio devices)
+        if: runner.os == 'Windows'
+        run: |
+          $env:ZERON_VOICE_MEDIA_DIR = Join-Path $env:RUNNER_TEMP 'zeron-media/codex-resources/voice'
+          python scripts/package-voice-runtime.py --download --destination $env:ZERON_VOICE_MEDIA_DIR
+          if ($LASTEXITCODE -ne 0) { throw 'Voice runtime packaging failed' }
+          cargo test --locked -p zeron-voice-media --lib packaged_native_runtime_initializes_without_audio_devices -- --ignored

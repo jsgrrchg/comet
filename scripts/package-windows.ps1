@@ -70,6 +70,7 @@ try {
     $out = Join-Path $root 'target/package'
     $arch = Get-WindowsPackageArch $probe.FileName
     $stage = Join-Path $out "zeron-$version-windows-$arch"
+    if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $stage | Out-Null
     Copy-Item -LiteralPath './target/release/zeron.exe' -Destination (Join-Path $stage 'zeron.exe')
     @{ releases_url = $ReleasesUrl } | ConvertTo-Json | Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $stage 'zeron-update.json')
@@ -78,6 +79,13 @@ try {
     New-Item -ItemType Directory -Force -Path $licenses | Out-Null
     Copy-Item -Path 'crates/ui/assets/fonts/licenses/*' -Destination $licenses
     Copy-Item -LiteralPath 'crates/voice/NOTICE.md' -Destination (Join-Path $stage 'licenses/parakeet-v3.txt')
+    # Download only on the build machine, or use an explicit standalone package.
+    # The pinned runtime (including DLLs and notices) travels with the ZIP/setup.
+    $voiceArgs = @('--download')
+    if ($env:ZERON_VOICE_RUNTIME_PACKAGE) { $voiceArgs = @('--package', $env:ZERON_VOICE_RUNTIME_PACKAGE) }
+    & python (Join-Path $root 'scripts/package-voice-runtime.py') @voiceArgs `
+        --target "$arch-pc-windows-msvc" --destination (Join-Path $stage 'codex-resources/voice')
+    if ($LASTEXITCODE -ne 0) { throw 'Voice runtime packaging failed' }
     Compress-Archive -Path "$stage/*" -DestinationPath "$stage.zip" -Force
     Copy-Item -LiteralPath './target/release/zeron.exe' -Destination "$stage.exe"
     # The per-user installer wraps the same staged directory (zeron-update.json

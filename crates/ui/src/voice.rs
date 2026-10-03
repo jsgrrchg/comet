@@ -79,12 +79,14 @@ impl VoiceController {
     ) {
         self.cancel(cx);
         self.remote = std::env::var("ZERON_REMOTE_VOICE").as_deref() == Ok("1");
-        // The host names its orchestrator chat; the first snapshot carries it.
+        // The host resumes its own orchestrator chat with `config` and names
+        // it in the first snapshot.
         let request = StartVoice {
             chat_id: String::new(),
             host_device_id: host_device_id.clone(),
             voice,
             worktree: None,
+            config: Some(config.clone()),
         };
         self.engine = Some(engine.clone());
         self.phase = VoicePhase::Checking;
@@ -109,7 +111,7 @@ impl VoiceController {
                 )
                 .await
             } else {
-                session::run(engine, config, request, cancellation, events, control_rx).await
+                session::run(engine, request, cancellation, events, control_rx).await
             }
         });
         self.task = Some(cx.spawn(async move |this, cx| {

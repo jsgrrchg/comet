@@ -1762,7 +1762,6 @@ impl RpcService for EngineRpc {
         if matches!(
             method,
             methods::VOICE_ELIGIBILITY
-                | methods::OPEN_VOICE_CHAT
                 | methods::START_VOICE
                 | methods::OWN_VOICE
                 | methods::APPEND_VOICE
@@ -1794,27 +1793,30 @@ impl RpcService for EngineRpc {
                 .await;
         }
         match method {
-            methods::OPEN_VOICE_CHAT => {
-                use zeron_proto::voice::VoiceRejection;
-                let p: zeron_proto::voice::OpenVoiceChat = parse_params(params)?;
-                let unavailable =
-                    |reason| RpcError::Failed(format!("voice unavailable: {reason:?}"));
-                if p.host_device_id != self.engine_info.device_id {
-                    return Err(unavailable(VoiceRejection::RemoteHost));
-                }
-                if p.config.harness != HarnessId::Codex {
-                    return Err(unavailable(VoiceRejection::WrongHarness));
-                }
-                let _prepare = self.voice.preparation().await;
-                if self.voice.busy() {
-                    return Err(unavailable(VoiceRejection::Busy));
-                }
-                let chat_id = self.voice_chat(p.config).await.map_err(unavailable)?;
-                RpcReply::value(&zeron_proto::voice::VoiceChatOpened { chat_id })
-            }
             methods::VOICE_ELIGIBILITY | methods::START_VOICE => {
                 let identity_epoch = self.voice.identity_epoch();
-                let p: zeron_proto::voice::StartVoice = parse_params(params)?;
+                let mut p: zeron_proto::voice::StartVoice = parse_params(params)?;
+                // The host's own orchestrator: resolving it and reserving the
+                // call share one preparation lock, so a concurrent start can
+                // never swap its configuration in between.
+                let mut orchestrator = None;
+                if let Some(config) = p.config.take().filter(|_| method == methods::START_VOICE) {
+                    use zeron_proto::voice::VoiceRejection;
+                    let unavailable =
+                        |reason| RpcError::Failed(format!("voice unavailable: {reason:?}"));
+                    if p.host_device_id != self.engine_info.device_id {
+                        return Err(unavailable(VoiceRejection::RemoteHost));
+                    }
+                    if config.harness != HarnessId::Codex {
+                        return Err(unavailable(VoiceRejection::WrongHarness));
+                    }
+                    let lock = self.voice.preparation().await;
+                    if self.voice.busy() {
+                        return Err(unavailable(VoiceRejection::Busy));
+                    }
+                    p.chat_id = self.voice_chat(config).await.map_err(unavailable)?;
+                    orchestrator = Some(lock);
+                }
                 let chat = self
                     .workspace
                     .chat(&p.chat_id)
@@ -1843,7 +1845,10 @@ impl RpcService for EngineRpc {
                     }
                     return RpcReply::value(&crate::voice::VoiceManager::unavailable(reason));
                 }
-                let _prepare = self.voice.preparation().await;
+                let _prepare = match orchestrator {
+                    Some(lock) => lock,
+                    None => self.voice.preparation().await,
+                };
                 if method == methods::START_VOICE {
                     if let Some(spec) = p.worktree.as_ref() {
                         self.doc_host

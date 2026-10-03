@@ -2,7 +2,8 @@
 //! resumes it, so the orchestrator remembers earlier calls. Hosts never share
 //! it — another computer has its own. Once the synced transcript passes
 //! [`ROTATE_AFTER`] entries, the next call moves to a fresh chat that inherits
-//! the Codex thread: memory continues, the transcript starts small again.
+//! the Codex thread: memory continues, the transcript starts small again. The
+//! old segment is removed only once its successor holds a message.
 use super::*;
 use zeron_proto::voice::{ORCHESTRATOR_CHAT_PREFIX, ORCHESTRATOR_CHAT_TITLE, VoiceRejection};
 use zeron_proto::{Chat, SessionStatus};
@@ -54,6 +55,9 @@ impl EngineRpc {
             .read_entries()
             .map_err(|_| VoiceRejection::Protocol)?
             .len();
+        if entries > 0 {
+            self.prune_superseded(&chats, &chat).await;
+        }
         if entries < ROTATE_AFTER {
             if chat.config.as_ref() != Some(&config) {
                 // A warm process cannot take another configuration.
@@ -71,10 +75,35 @@ impl EngineRpc {
             .workspace
             .chat_harness_session(&chat.id)
             .filter(|(id, _)| !id.is_empty());
-        let next = self.new_voice_chat(config, thread)?;
-        let _ = self.workspace.delete_chat(&chat.id);
-        self.doc_host.purge_chat(&chat.id);
-        Ok(next)
+        // The old segment stays until the new one holds a message: a failed
+        // start may remove the empty successor, and then the next call
+        // rotates again from here instead of losing the thread.
+        self.new_voice_chat(config, thread)
+    }
+
+    /// Removes this device's earlier segments of `current`'s Codex thread.
+    /// Orchestrators from other threads (calls before segments) are kept.
+    async fn prune_superseded(&self, chats: &[Chat], current: &Chat) {
+        let Some(thread) = current
+            .harness_session_id
+            .as_deref()
+            .filter(|t| !t.is_empty())
+        else {
+            return;
+        };
+        for old in chats.iter().filter(|c| {
+            c.id != current.id
+                && c.device_id == current.device_id
+                && zeron_proto::voice::is_orchestrator_chat(&c.id)
+                && c.harness_session_id.as_deref() == Some(thread)
+        }) {
+            if self.sessions.turn_in_flight(&old.id) {
+                continue;
+            }
+            let _ = self.sessions.interrupt(&old.id).await;
+            let _ = self.workspace.delete_chat(&old.id);
+            self.doc_host.purge_chat(&old.id);
+        }
     }
 
     fn new_voice_chat(
@@ -152,15 +181,31 @@ mod tests {
             doc.write_user_message(&format!("m{i}"), "hi", i as i64)
                 .unwrap();
         }
+        let inherited = Some(("codex-thread".into(), Some("/home/me".into())));
         let next = rpc.voice_chat(config("b")).await.unwrap();
         assert_ne!(next, first);
+        assert_eq!(core.workspace.chat_harness_session(&next), inherited);
+
+        // A failed start removes its empty successor; the old segment is
+        // still there, so the next call rotates again on the same thread.
+        core.workspace.delete_chat(&next).unwrap();
+        core.doc_host.purge_chat(&next);
+        let retry = rpc.voice_chat(config("b")).await.unwrap();
+        assert!(retry != first && retry != next);
+        assert_eq!(core.workspace.chat_harness_session(&retry), inherited);
+
+        // An empty successor keeps its predecessor; one with a message
+        // supersedes it. Other orchestrators and threads are never touched.
+        assert_eq!(rpc.voice_chat(config("b")).await.unwrap(), retry);
+        assert!(core.workspace.chat(&first).unwrap().is_some());
+        core.doc_host
+            .open(&retry)
+            .unwrap()
+            .write_user_message("hello", "hi", 0)
+            .unwrap();
+        assert_eq!(rpc.voice_chat(config("b")).await.unwrap(), retry);
         assert!(core.workspace.chat(&first).unwrap().is_none());
-        assert_eq!(
-            core.workspace.chat_harness_session(&next),
-            Some(("codex-thread".into(), Some("/home/me".into())))
-        );
         assert!(core.workspace.chat(&foreign).unwrap().is_some());
-        assert_eq!(rpc.voice_chat(config("b")).await.unwrap(), next);
         core.sessions.shutdown().await;
     }
 }

@@ -219,19 +219,11 @@ pub struct StartVoice {
     pub voice: Option<String>,
     #[serde(default)]
     pub worktree: Option<crate::WorktreeSpec>,
-}
-/// Asks the host for the orchestrator chat a local call runs in: the host
-/// keeps one per device and resumes it across calls.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct OpenVoiceChat {
-    pub host_device_id: String,
-    pub config: crate::ChatConfig,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VoiceChatOpened {
-    pub chat_id: String,
+    /// Start in the host's own orchestrator chat with this configuration
+    /// instead of `chat_id`: the host keeps one per device, resumes it across
+    /// calls and names it in the first snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<crate::ChatConfig>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

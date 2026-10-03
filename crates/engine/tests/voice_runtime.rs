@@ -165,6 +165,47 @@ async fn initial_account_snapshot_does_not_invalidate_voice_eligibility() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn concurrent_orchestrator_starts_never_swap_configurations() {
+    use zeron_proto::voice::VoiceLease;
+    let temp = tempfile::tempdir().unwrap();
+    let core = native_core(&temp).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let start = |sandbox: &str| {
+        json!({"chatId":"", "hostDeviceId":core.device_id,
+            "config":{"harness":"codex","sandbox":sandbox}})
+    };
+    let (a, b) = tokio::join!(
+        client.call_as::<VoiceLease>(methods::START_VOICE, start("workspace-write")),
+        client.call_as::<VoiceLease>(methods::START_VOICE, start("danger-full-access")),
+    );
+    // One window reserves the host's orchestrator; the other is busy and
+    // never rewrites the configuration the winner asked for.
+    let (sandbox, lease) = match (a, b) {
+        (Ok(lease), Err(_)) => ("workspace-write", lease),
+        (Err(_), Ok(lease)) => ("danger-full-access", lease),
+        other => panic!("expected exactly one start: {other:?}"),
+    };
+    let orchestrators: Vec<_> = core
+        .workspace
+        .read_chats()
+        .unwrap()
+        .into_iter()
+        .filter(|c| zeron_proto::voice::is_orchestrator_chat(&c.id))
+        .collect();
+    assert_eq!(orchestrators.len(), 1);
+    assert_eq!(
+        serde_json::to_value(orchestrators[0].config.as_ref().unwrap()).unwrap()["sandbox"],
+        sandbox
+    );
+    client
+        .call(methods::STOP_VOICE, serde_json::to_value(&lease).unwrap())
+        .await
+        .unwrap();
+    core.sessions.shutdown().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn native_voice_signals_audio_owner_transcripts_stop_and_restart_on_same_runtime() {
     use zeron_proto::voice::{MuteVoice, VoiceEvent, VoiceLease, VoicePhase};
     let temp = tempfile::tempdir().unwrap();
@@ -814,6 +855,100 @@ async fn failed_start_or_mute_emits_one_requested_stop_barrier_before_immediate_
         drop(owner);
         core.sessions.shutdown().await;
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[ignore = "run with ZERON_REMOTE_VOICE=1; no provider or hardware access"]
+async fn remote_failed_prepare_after_rotation_preserves_thread_for_retry() {
+    use zeron_proto::voice::{ORCHESTRATOR_CHAT_PREFIX, remote as wire};
+    assert_eq!(std::env::var("ZERON_REMOTE_VOICE").as_deref(), Ok("1"));
+    let temp = tempfile::tempdir().unwrap();
+    let core = native_core(&temp).await;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let config =
+        serde_json::from_value(json!({"harness":"codex","sandbox":"danger-full-access"})).unwrap();
+    let mut request = wire::Prepare {
+        attempt_key: wire::AttemptKey::new(),
+        config,
+        voice: Some("invalid-voice".into()),
+    };
+    let envelope = |p: serde_json::Value| json!({"targetDeviceId":core.device_id,"payload":p});
+
+    // Seed a previous call at the rotation threshold with its native thread.
+    let previous = format!("{ORCHESTRATOR_CHAT_PREFIX}previous");
+    core.workspace
+        .create_chat(
+            &previous,
+            None,
+            Some(&core.device_id),
+            Some(request.config.clone()),
+            None,
+        )
+        .unwrap();
+    core.workspace
+        .set_chat_harness_session(&previous, "remembered-thread", "");
+    let doc = core.doc_host.open(&previous).unwrap();
+    for i in 0..150 {
+        doc.write_user_message(&format!("m{i}"), "remember me", i)
+            .unwrap();
+    }
+
+    // An unsupported voice fails after rotation and exercises the real
+    // preparation cleanup, rather than manually deleting the successor.
+    let failure = client
+        .call(methods::PREPARE_VOICE_V2, envelope(json!(request)))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(failure, zeron_rpc::RpcError::Failed(ref message)
+            if message == "voice unavailable: Unsupported"),
+        "unexpected preparation failure: {failure:?}"
+    );
+    let remaining: Vec<_> = core
+        .workspace
+        .read_chats()
+        .unwrap()
+        .into_iter()
+        .filter(|c| zeron_proto::voice::is_orchestrator_chat(&c.id))
+        .collect();
+    assert_eq!(
+        remaining.len(),
+        1,
+        "cleanup must remove the empty successor"
+    );
+    assert_eq!(
+        remaining[0].id, previous,
+        "cleanup must keep the predecessor"
+    );
+    assert_eq!(
+        core.workspace.chat_harness_session(&previous).unwrap().0,
+        "remembered-thread"
+    );
+    assert_eq!(doc.doc().read_entries().unwrap().len(), 150);
+
+    // A fresh attempt rotates again and resumes the original Codex thread.
+    request.attempt_key = wire::AttemptKey::new();
+    request.voice = None;
+    let prepared: wire::Prepared = client
+        .call_as(methods::PREPARE_VOICE_V2, envelope(json!(request)))
+        .await
+        .unwrap();
+    assert_ne!(prepared.chat_id, previous);
+    assert_eq!(
+        core.sessions
+            .last_request(&prepared.chat_id)
+            .unwrap()
+            .resume
+            .as_deref(),
+        Some("remembered-thread")
+    );
+    assert!(core.workspace.chat(&previous).unwrap().is_some());
+    client
+        .call(methods::STOP_VOICE_V2, envelope(json!(prepared.lease)))
+        .await
+        .unwrap();
+    core.sessions.shutdown().await;
 }
 
 #[cfg(unix)]

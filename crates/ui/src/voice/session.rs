@@ -29,8 +29,7 @@ impl Drop for ProviderGuard {
 }
 pub(super) async fn run(
     engine: EngineHandle,
-    config: zeron_proto::ChatConfig,
-    mut request: StartVoice,
+    request: StartVoice,
     cancel: CancellationToken,
     events: mpsc::Sender<VoiceEvent>,
     mut controls: mpsc::Receiver<super::VoiceControl>,
@@ -44,19 +43,6 @@ pub(super) async fn run(
         .media_client()
         .await
         .map_err(|_| VoiceRejection::Protocol)?;
-    // The host resumes its own orchestrator chat; the client never creates one.
-    let open = OpenVoiceChat {
-        host_device_id: request.host_device_id.clone(),
-        config,
-    };
-    let opened: VoiceChatOpened = tokio::select! {biased;
-        _ = cancel.cancelled() => return Ok(()),
-        result = tokio::time::timeout(
-            Duration::from_secs(30),
-            engine.client().call_as(methods::OPEN_VOICE_CHAT, serde_json::to_value(open).unwrap()),
-        ) => result.map_err(|_| VoiceRejection::Protocol)?.map_err(rejection)?,
-    };
-    request.chat_id = opened.chat_id;
     let lease: VoiceLease = tokio::select! {biased;_=cancel.cancelled()=>return Ok(()),result=tokio::time::timeout(Duration::from_secs(60),engine.client().call_as(methods::START_VOICE,serde_json::to_value(request).unwrap()))=>result.map_err(|_|VoiceRejection::Protocol)?.map_err(rejection)?};
     let _provider = ProviderGuard {
         engine: engine.clone(),

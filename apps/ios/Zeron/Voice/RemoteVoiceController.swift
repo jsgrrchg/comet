@@ -1,3 +1,4 @@
+import AudioToolbox
 import UIKit
 
 /// The app-wide voice orchestrator call. Audio runs on this phone; Codex, its
@@ -110,6 +111,8 @@ final class RemoteVoiceController {
         // A call keeps the screen awake, like the phone app.
         UIApplication.shared.isIdleTimerDisabled = true
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        // The call sounds as it is placed, well before the microphone opens.
+        CallSound.start.play()
         changed()
         return true
     }
@@ -142,8 +145,13 @@ final class RemoteVoiceController {
         previewTimer?.invalidate()
         #endif
         generation &+= 1
+        // A hang-up or a connected call ending sounds; a failure to connect
+        // only explains itself.
+        let sounds = call != nil && (activeSince != nil || reason == nil)
         media?.close()
         call?.stop()
+        // After close: the call's audio session no longer ducks it.
+        if sounds { CallSound.end.play() }
         call = nil; media = nil; state = nil; activeSince = nil
         endReason = reason
         setProximityMonitoring(false)
@@ -287,6 +295,24 @@ final class RemoteVoiceController {
         let cancel: () -> Void
         init(cancel: @escaping () -> Void) { self.cancel = cancel }
         deinit { cancel() }
+    }
+}
+
+/// The call's two sounds, as system sounds: they play beside the call's own
+/// audio session and follow the ringer switch, like the phone's.
+@MainActor
+private enum CallSound: String {
+    case start = "voice-start"
+    case end = "voice-end"
+
+    private static var loaded: [CallSound: SystemSoundID] = [:]
+
+    func play() {
+        if Self.loaded[self] == nil, let url = Bundle.main.url(forResource: rawValue, withExtension: "wav") {
+            var id: SystemSoundID = 0
+            if AudioServicesCreateSystemSoundID(url as CFURL, &id) == kAudioServicesNoError { Self.loaded[self] = id }
+        }
+        if let id = Self.loaded[self] { AudioServicesPlaySystemSound(id) }
     }
 }
 

@@ -42,6 +42,8 @@ pub struct VoiceController {
     /// The connection `codex_ready` was read from, and its read in flight.
     codex_engine: Option<EngineHandle>,
     codex_check: Option<Task<()>>,
+    /// This call played its start sound and owes its end sound.
+    cued: bool,
 }
 impl Default for VoiceController {
     fn default() -> Self {
@@ -67,6 +69,7 @@ impl Default for VoiceController {
             codex_ready: None,
             codex_engine: None,
             codex_check: None,
+            cued: false,
         }
     }
 }
@@ -135,6 +138,9 @@ impl VoiceController {
         cx: &mut Context<Self>,
     ) {
         self.cancel(cx);
+        // The call sounds as it is placed, well before the microphone opens.
+        crate::sound::play_voice(true);
+        self.cued = true;
         self.remote = std::env::var("ZERON_REMOTE_VOICE").as_deref() == Ok("1");
         // The host resumes its own orchestrator chat with `config` and names
         // it in the first snapshot.
@@ -210,7 +216,17 @@ impl VoiceController {
         cx.notify();
     }
 
+    /// Ending now sounds: a hang-up or a connected call ending. A failure to
+    /// connect only explains itself.
+    fn end_sounds(&self) -> bool {
+        self.cued && (self.active_since.is_some() || self.reason.is_none())
+    }
+
     fn reset_session(&mut self) {
+        if self.end_sounds() {
+            crate::sound::play_voice(false);
+        }
+        self.cued = false;
         self.snapshot = None;
         self.partial.clear();
         self.partial_item = None;
@@ -491,6 +507,18 @@ mod tests {
         voice.reason = None;
         voice.phase = VoicePhase::Checking;
         assert!(voice.offered(), "a call in progress keeps its trigger");
+    }
+
+    #[test]
+    fn only_a_hang_up_or_a_connected_call_sounds_its_end() {
+        let mut voice = VoiceController::default();
+        assert!(!voice.end_sounds(), "no call was placed");
+        voice.cued = true;
+        assert!(voice.end_sounds(), "hanging up while connecting");
+        voice.reason = Some(VoiceRejection::Busy);
+        assert!(!voice.end_sounds(), "a failure to connect stays quiet");
+        voice.active_since = Some(std::time::Instant::now());
+        assert!(voice.end_sounds(), "a connected call that drops");
     }
 
     #[gpui::test]

@@ -2571,7 +2571,7 @@ impl Shell {
         {
             // Reuse upstream's project-filter and device defaults for a new
             // canvas. Automatic capture on an existing canvas keeps its pick.
-            self.open_new_session(cx);
+            self.open_new_session(None, cx);
         } else {
             self.route = Route::Chat;
         }
@@ -6611,7 +6611,7 @@ impl Shell {
                         icons::PLUS,
                         ShortcutId::NewSession.label(),
                         &theme,
-                        cx.listener(|this, _, _, cx| this.open_new_session(cx)),
+                        cx.listener(|this, _, _, cx| this.open_new_session(None, cx)),
                     ))
             }))
             .into_any_element()
@@ -7558,6 +7558,12 @@ impl Shell {
                             cx.stop_propagation();
                             this.chat_hover_resync = true;
                             this.set_chat_archived(archive_id.clone(), !archived, cx);
+                        }))
+                        // Above the pill: below it the chip would cover the next row.
+                        .tooltip(crate::settings::widgets::text_tooltip_above(if archived {
+                            "Unarchive session"
+                        } else {
+                            ShortcutId::ArchiveSession.label()
                         }))
                 })
                 .child(corner_body)
@@ -12492,7 +12498,7 @@ impl Render for Shell {
                 WorkspaceCommand::Model => self
                     .composer
                     .update(cx, |c, cx| c.open_model_menu(window, cx)),
-                WorkspaceCommand::New => self.open_new_session(cx),
+                WorkspaceCommand::New => self.open_new_session(None, cx),
                 WorkspaceCommand::Resume => self.toggle_command_palette(window, cx),
                 WorkspaceCommand::Settings => self.open_last_settings(cx),
                 WorkspaceCommand::Diff if !self.active_chat.is_empty() => {
@@ -12791,7 +12797,7 @@ impl Render for Shell {
             }))
             // New session works from anywhere — `open_new_session` routes back
             // to chat itself, so Settings is not a dead spot.
-            .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
+            .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(None, cx)))
             // Native Settings menu item and the platform convention (Cmd+, on
             // macOS, Ctrl+, elsewhere) toggle the modal from any section.
             .on_action(cx.listener(|this, _: &OpenSettings, _, cx| this.toggle_settings(cx)))
@@ -14654,7 +14660,7 @@ mod exit_regressions {
                 });
                 shell.on_state_changed(&shell.state.clone(), cx);
                 shell.settings.space_filter = Some("b".into());
-                shell.open_new_session(cx);
+                shell.open_new_session(None, cx);
                 shell.on_state_changed(&shell.state.clone(), cx);
                 assert!(shell.active_chat.is_empty());
                 shell.settings.appshot_destination =
@@ -15380,7 +15386,7 @@ mod exit_regressions {
             window
                 .update(cx, |shell, _, cx| match destination {
                     "chat" => shell.open_chat("existing-session".into(), cx),
-                    "new" => shell.open_new_session(cx),
+                    "new" => shell.open_new_session(None, cx),
                     "back" => shell.apply_nav(NavEntry::Chat("existing-session".into()), cx),
                     "settings" => {
                         shell.open_settings(SettingsSection::Devices, cx);
@@ -15468,7 +15474,7 @@ mod exit_regressions {
                     state.no_project = false;
                 });
                 shell.settings.space_filter = None;
-                shell.open_new_session(cx);
+                shell.open_new_session(None, cx);
                 assert!(shell.state.read(cx).no_project);
                 assert!(shell.state.read(cx).selected_space.is_none());
                 assert_eq!(
@@ -15560,11 +15566,72 @@ mod exit_regressions {
                 shell.settings.space_filter = None;
                 shell.open_chat("elsewhere".into(), cx);
                 assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("other"));
-                shell.open_new_session(cx);
+                shell.open_new_session(None, cx);
                 let state = shell.state.read(cx);
                 assert!(state.selected_chat.is_none());
                 assert_eq!(state.selected_space.as_deref(), Some("mine"));
                 assert_eq!(state.effective_device_id().as_deref(), Some("local"));
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn new_session_in_project_homes_the_canvas_on_that_project(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        let space = |id: &str| zeron_proto::Space {
+            id: id.into(),
+            device_id: "local".into(),
+            path: format!("/{id}"),
+            name: None,
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: Utc::now(),
+        };
+        window
+            .update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.apply_spaces(vec![space("one"), space("two")]);
+                });
+                shell.settings.space_filter = None;
+                shell.open_new_session(Some("two".into()), cx);
+                let state = shell.state.read(cx);
+                assert!(state.selected_chat.is_none());
+                assert_eq!(state.selected_space.as_deref(), Some("two"));
+
+                // The explicit project wins over a standing filter.
+                shell.settings.space_filter = Some("one".into());
+                shell.open_new_session(Some("two".into()), cx);
+                assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("two"));
             })
             .unwrap();
     }

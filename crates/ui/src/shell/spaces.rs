@@ -2106,7 +2106,12 @@ pub(super) fn sidebar_separator(theme: &Theme) -> gpui::Div {
     div().h(px(1.0)).bg(theme.border.opacity(0.6))
 }
 
-fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyElement) -> gpui::Div {
+fn sidebar_disclosure_header(
+    theme: &Theme,
+    label: SharedString,
+    action: Option<AnyElement>,
+    chevron: AnyElement,
+) -> gpui::Div {
     div()
         .flex()
         .flex_row()
@@ -2125,6 +2130,7 @@ fn sidebar_disclosure_header(theme: &Theme, label: SharedString, chevron: AnyEle
                 .child(label),
         ))
         .child(div().flex_1())
+        .children(action)
         .child(chevron)
 }
 
@@ -2231,10 +2237,14 @@ fn device_glyph(platform: &str) -> &'static str {
 }
 
 /// Segment-aware "is `path` at or under `base`" (`/media/a` is not under
-/// `/media/ab`); a root base covers everything.
+/// `/media/ab`); a root base covers everything. Either separator counts, so
+/// Windows drive paths (`D:\` under `D:\`) work too.
 fn path_under(path: &str, base: &str) -> bool {
-    let base = base.trim_end_matches('/');
-    base.is_empty() || path == base || path.starts_with(&format!("{base}/"))
+    let base = base.trim_end_matches(['/', '\\']);
+    base.is_empty()
+        || path
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(['/', '\\']))
 }
 
 /// The space-row Rename dialog (same shape as [`RenameChatDialog`]).
@@ -4929,7 +4939,46 @@ impl Shell {
             let chevron = self.sidebar_disclosure_chevron(&motion_key, !collapsed, theme);
             let toggle_key = collapse_key.clone();
             let toggle_motion_key = motion_key.clone();
-            let header = sidebar_disclosure_header(theme, visible_label, chevron)
+            // A real project's group gets a hover-revealed `+` that opens a new
+            // chat homed on it.
+            let group_name = SharedString::from(format!("sidebar-group-hover-{collapse_key}"));
+            let new_chat_button = (self.settings.sidebar_organization
+                == SidebarOrganization::ByProject
+                && self.state.read(cx).space_row(&key).is_some())
+            .then(|| {
+                let project = key.clone();
+                div()
+                    .id(SharedString::from(format!(
+                        "sidebar-group-new-chat-{collapse_key}"
+                    )))
+                    .size(px(20.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .role(gpui::Role::Button)
+                    .aria_label("New chat in project")
+                    .opacity(0.0)
+                    .group_hover(group_name.clone(), |style| style.opacity(1.0))
+                    .hover(|el| el.bg(theme.glass_hover()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.open_new_session(Some(project.clone()), cx);
+                    }))
+                    .tooltip(crate::settings::widgets::text_tooltip_above(
+                        "New chat in project",
+                    ))
+                    .child(
+                        icon(icons::PLUS)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .into_any_element()
+            });
+            let header = sidebar_disclosure_header(theme, visible_label, new_chat_button, chevron)
+                .group(group_name)
                 .id(SharedString::from(format!("sidebar-group-{collapse_key}")))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     let was_open = !this.sidebar_collapsed_groups.contains(&toggle_key);
@@ -4989,7 +5038,7 @@ impl Shell {
             format!("Pinned ({})", items.len()).into()
         };
         let chevron = self.sidebar_disclosure_chevron("pinned", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
+        let header = sidebar_disclosure_header(theme, label, None, chevron)
             .id("pinned-toggle")
             .debug_selector(|| "pinned-toggle".into())
             .on_drag_move::<SidebarSessionDrag>(cx.listener(
@@ -5070,7 +5119,7 @@ impl Shell {
             format!("Sessions ({count})").into()
         };
         let chevron = self.sidebar_disclosure_chevron("sessions", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
+        let header = sidebar_disclosure_header(theme, label, None, chevron)
             .id("sessions-toggle")
             .debug_selector(|| "sessions-toggle".into())
             .on_drag_move::<SidebarSessionDrag>(cx.listener(
@@ -5209,7 +5258,7 @@ impl Shell {
             format!("Archived ({total})").into()
         };
         let chevron = self.sidebar_disclosure_chevron("archived", open, theme);
-        let header = sidebar_disclosure_header(theme, label, chevron)
+        let header = sidebar_disclosure_header(theme, label, None, chevron)
             .id("archived-toggle")
             .on_click(cx.listener(move |this, _, _, cx| {
                 let was_open = this.archived_open;
@@ -5565,11 +5614,8 @@ impl Shell {
         };
         if rows.is_empty() {
             let text = flow.search.read(cx).text().to_string();
-            if text.starts_with('/') || text.starts_with('~') {
-                if let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref())
-                {
-                    self.add_space_descend(target, false, cx);
-                }
+            if let Some(target) = crate::pickers::typed_path_target(&text, flow.home.as_deref()) {
+                self.add_space_descend(target, false, cx);
             }
             return;
         }
@@ -5603,16 +5649,17 @@ impl Shell {
         {
             return false;
         }
-        // A typed PATH jump: an absolute (`/disk2/`) or home-relative (`~/x/`)
-        // query browses that path directly — mounts at unconventional roots
-        // (and anywhere else) are reachable without a Locations row. Same
-        // trailing-`/` trigger as the folder-name descend below.
+        // A typed PATH jump: an absolute (`/disk2/`), drive-rooted (`D:\x\`)
+        // or home-relative (`~/x/`) query browses that path directly — mounts
+        // at unconventional roots (and anywhere else) are reachable without a
+        // Locations row. Same trailing-separator trigger as the folder-name
+        // descend below.
         {
             let Some(flow) = self.add_space.as_ref() else {
                 return false;
             };
             let text = flow.search.read(cx).text().to_string();
-            if text.ends_with('/') && (text.starts_with('/') || text.starts_with('~')) {
+            if crate::pickers::is_typed_path(&text) && text.ends_with(['/', '\\']) {
                 let target = crate::pickers::typed_path_target(&text, flow.home.as_deref());
                 let Some(target) = target else {
                     // Path-shaped but unresolvable (`~/…` before home is
@@ -6924,6 +6971,18 @@ mod project_flow_tests {
         let mut deep = vec!["a", "b", "c", "d", "e"];
         assert_eq!(fold_crumb_folders(&mut deep), ["a", "b", "c"]);
         assert_eq!(deep, ["d", "e"]);
+    }
+
+    #[test]
+    fn path_under_handles_posix_and_windows_drive_paths() {
+        assert!(path_under("/media/a", "/"));
+        assert!(path_under("/media/a", "/media"));
+        assert!(!path_under("/media/ab", "/media/a"));
+        // A drive-root crumb hides itself, not a sibling drive.
+        assert!(path_under(r"D:\", r"D:\"));
+        assert!(path_under(r"D:\Random", r"D:\"));
+        assert!(!path_under(r"D:\Random2", r"D:\Random"));
+        assert!(!path_under(r"C:\Random", r"D:\"));
     }
 
     #[gpui::test]

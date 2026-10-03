@@ -81,7 +81,7 @@ pub(super) fn set_root_entries(
     cx.run_until_parked();
 }
 
-pub(super) fn entry(path: &str, kind: WorkspaceEntryKind) -> WorkspaceEntry {
+pub(crate) fn entry(path: &str, kind: WorkspaceEntryKind) -> WorkspaceEntry {
     WorkspaceEntry {
         path: path.into(),
         name: path.rsplit('/').next().unwrap().into(),

@@ -3687,6 +3687,9 @@ impl Shell {
                     FilesEvent::Mutate(intent) => {
                         this.start_file_mutation(source.clone(), intent.clone(), cx)
                     }
+                    FilesEvent::MutateMany(intents) => {
+                        this.start_file_mutations(source.clone(), intents.clone(), cx)
+                    }
                     // Navigation from an editor stays in its own chat.
                     FilesEvent::OpenFile(path) => {
                         let owner = (source.read(cx).chat_id().to_owned(), owner_state.clone());

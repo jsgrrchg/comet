@@ -191,6 +191,8 @@ pub enum FilesEvent {
         path: Option<String>,
     },
     Mutate(mutations::MutationIntent),
+    /// A multi-entry move or delete, applied in order.
+    MutateMany(Vec<mutations::MutationIntent>),
     OpenFile(String),
     RevealFile(String),
     OpenWebLink(crate::markdown::render::LinkActivation),

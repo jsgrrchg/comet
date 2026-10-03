@@ -3658,7 +3658,7 @@ impl Shell {
                     return;
                 }
                 match event {
-                    FilesEvent::HoldMutation { origin, path } => {
+                    FilesEvent::HoldMutation { origin, paths } => {
                         let surfaces = this
                             .files
                             .values()
@@ -3667,7 +3667,7 @@ impl Shell {
                             .cloned()
                             .collect::<Vec<_>>();
                         for surface in surfaces {
-                            surface.update(cx, |files, cx| files.hold_mutation(path.clone(), cx));
+                            surface.update(cx, |files, cx| files.hold_mutation(paths.clone(), cx));
                         }
                     }
                     FilesEvent::AddToChat {

@@ -311,7 +311,7 @@ impl FilesSurface {
             if let Some(dialog) = self.tree_delete.take() {
                 cx.emit(FilesEvent::HoldMutation {
                     origin: dialog.origin,
-                    path: None,
+                    paths: Vec::new(),
                 });
             }
             cx.notify();

@@ -553,14 +553,11 @@ impl FilesSurface {
             return;
         }
         if matches!(event.keystroke.key.as_str(), "f2" | "delete") {
-            if let Some(path) = self.tree.selected().map(str::to_string) {
-                if event.keystroke.key == "f2" {
-                    if self.tree.selection_len() <= 1 {
-                        self.begin_tree_rename(path, window, cx);
-                    }
-                } else {
-                    self.begin_tree_delete(path, window, cx);
-                }
+            let paths = self.tree_action_paths();
+            if event.keystroke.key == "delete" {
+                self.begin_tree_delete(paths, window, cx);
+            } else if let [path] = paths.as_slice() {
+                self.begin_tree_rename(path.clone(), window, cx);
             }
             window.prevent_default();
             cx.stop_propagation();

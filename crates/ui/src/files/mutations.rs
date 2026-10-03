@@ -103,8 +103,8 @@ impl FilesSurface {
         })
     }
 
-    pub(crate) fn hold_mutation(&mut self, path: Option<String>, cx: &mut Context<Self>) {
-        self.mutation_hold = path;
+    pub(crate) fn hold_mutation(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        self.mutation_hold = paths;
         let paths = self.preview.documents.keys().cloned().collect::<Vec<_>>();
         for path in paths {
             if self.mutation_blocks_path(&path) {
@@ -117,8 +117,8 @@ impl FilesSurface {
     pub(super) fn mutation_blocks_path(&self, path: &str) -> bool {
         if self
             .mutation_hold
-            .as_deref()
-            .is_some_and(|hold| contains_path(hold, path))
+            .iter()
+            .any(|hold| contains_path(hold, path))
         {
             return true;
         }

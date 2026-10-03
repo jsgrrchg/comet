@@ -186,9 +186,11 @@ pub enum FilesEvent {
         is_directory: bool,
         origin: mutations::WorkspaceInteractionOrigin,
     },
+    /// Pause autosave under these paths while a confirmation is open; an
+    /// empty list releases the hold.
     HoldMutation {
         origin: mutations::WorkspaceInteractionOrigin,
-        path: Option<String>,
+        paths: Vec<String>,
     },
     Mutate(mutations::MutationIntent),
     /// A multi-entry move or delete, applied in order.
@@ -261,7 +263,7 @@ pub struct FilesSurface {
     deferred_file_changes: Vec<zeron_proto::WorkspaceFileChanges>,
     applied_mutations: std::collections::VecDeque<String>,
     mutation_error: Option<SharedString>,
-    mutation_hold: Option<String>,
+    mutation_hold: Vec<String>,
     tree_drag: drag::TreeDrag,
     tree_rename: Option<rename::TreeRename>,
     tree_delete: Option<rename::TreeDelete>,
@@ -641,7 +643,7 @@ impl FilesSurface {
             deferred_file_changes: Vec::new(),
             applied_mutations: std::collections::VecDeque::new(),
             mutation_error: None,
-            mutation_hold: None,
+            mutation_hold: Vec::new(),
             tree_drag: drag::TreeDrag::default(),
             tree_rename: None,
             tree_delete: None,
@@ -1116,12 +1118,12 @@ impl FilesSurface {
         if let Some(dialog) = self.tree_delete.take() {
             cx.emit(FilesEvent::HoldMutation {
                 origin: dialog.origin,
-                path: None,
+                paths: Vec::new(),
             });
         }
         self.tree_rename = None;
         self.tree_drag = drag::TreeDrag::default();
-        self.mutation_hold = None;
+        self.mutation_hold.clear();
         self.interaction_generation = self.interaction_generation.wrapping_add(1);
         self.effective_checkout_id = None;
         self.mutation_capabilities = None;

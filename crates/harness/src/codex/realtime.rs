@@ -379,13 +379,9 @@ async fn probe_details(
     {
         return Err(VoiceRejection::ChatgptRequired);
     }
-    let limits = client
-        .request("account/rateLimits/read", json!({}))
-        .await
-        .map_err(|_| VoiceRejection::Protocol)?;
-    let ordinary = limits["ordinaryUsageAllowed"].as_bool();
-    // Ordinary quota may be exhausted while permitted account credits remain.
-    // The native backend applies spend controls and the final usage decision.
+    // No account/rateLimits/read: it is a ~1 s backend round trip, and ordinary
+    // quota may be exhausted while permitted credits remain. The native backend
+    // applies spend controls and the final usage decision.
     let v = client
         .request("thread/realtime/listVoices", json!({}))
         .await
@@ -399,7 +395,7 @@ async fn probe_details(
     Ok(VoiceEligibility {
         available: true,
         reason: None,
-        ordinary_usage_allowed: ordinary,
+        ordinary_usage_allowed: None,
         credits_excluded: false,
         format: None,
         duplex_verified: true,

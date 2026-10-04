@@ -614,10 +614,13 @@ async fn exhausted_ordinary_quota_with_allowed_credits_uses_native_backend_decis
         .await
         .unwrap();
     assert!(eligible.available);
-    assert_eq!(eligible.ordinary_usage_allowed, Some(false));
+    assert_eq!(eligible.ordinary_usage_allowed, None);
     assert!(!eligible.credits_excluded);
     let (_, owner) = active_owner(&client, &core.device_id).await;
     drop(owner);
+    // The quota is the backend's decision: never a round trip before a call.
+    let wire = std::fs::read_to_string(package.join("voice-wire.jsonl")).unwrap();
+    assert!(!wire.contains("account/rateLimits/read"));
     core.sessions.shutdown().await;
 }
 

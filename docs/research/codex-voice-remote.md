@@ -2,9 +2,12 @@
 
 Status (2026-10-01): **G0 pending**. The diagnostic and its offline tests are
 implemented. No Mac/Fedora conversation, cross-network test, MCP roundtrip or
-iPhone test has been performed. Do not enable remote voice based on these tests.
-The V1 local path remains available. V2 desktop and iOS are now implemented
-behind a development gate; see [testing instructions](voice-remote-testing.md).
+iPhone test has been performed. These offline tests do not establish live
+subscription or audio compatibility.
+
+Current implementation: V2 client-owned audio is enabled by default in desktop
+apps and headless engines; the V1 RPC remains for compatibility. No environment
+flag is needed. See [testing instructions](voice-remote-testing.md).
 
 ## Run the diagnostic
 

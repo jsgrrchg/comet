@@ -1,14 +1,15 @@
 # Remote voice development testing
 
-The implementation is opt-in. Real Mac/Fedora and physical iPhone acceptance is
-pending and will be performed by the user. Compilation and fake-provider tests
+Remote voice is enabled by default in desktop apps and headless engines.
+Real Mac/Fedora and physical iPhone acceptance is pending and will be performed
+by the user. Compilation and fake-provider tests
 are not evidence of subscription/media compatibility. No production rollout or
 server deployment is part of this change.
 
 ## Desktop
 
-Start the execution host's new Zeron engine/app with `ZERON_REMOTE_VOICE=1` in
-its environment. Codex must already be installed and authenticated through
+Start the execution host's new Zeron engine/app normally. No environment flag
+is required. Codex must already be installed and authenticated through
 ChatGPT on that host. It needs no audio helper, microphone or speaker. Continue
 using the existing registered device and account; do not register another host.
 
@@ -21,7 +22,7 @@ read. npm installations do not include the helper. Zeron packages contain no
 Codex runtime.
 
 ```sh
-ZERON_REMOTE_VOICE=1 ZERON_DEV_BUILD_ONLY=1 ./scripts/run-macos-dev.sh
+ZERON_DEV_BUILD_ONLY=1 ./scripts/run-macos-dev.sh
 ```
 
 To test a client without Codex, or a specific helper build, set
@@ -32,11 +33,13 @@ It must be a `codex-resources/voice` directory containing `zeron-runtime.json`.
 Open `target/macos-dev/Zeron Dev.app`, select **Settings → Voice → Codex voice
 device**, choose the registered Fedora host and start voice from the sidebar orb.
 The microphone permission belongs to this Mac. Host choice is local to these UI
-settings and cannot change an active call. A host with an older build or disabled
-remote gate is not eligible. Style is validated by the chosen host at Prepare.
+settings and cannot change an active call. A host with an older build that does
+not advertise the remote voice capability is not eligible. Style is validated
+by the chosen host at Prepare.
 
-With the flag unset, desktop retains its existing local Codex voice path. Disable
-the flag and restart to roll back; no transcript migration or credential transfer
+Desktop uses client-owned audio for both this device and a remote execution
+host. Only an explicit call opens the microphone; advertising the capability
+does not start audio capture. No transcript migration or credential transfer
 is needed.
 
 ### Linux and Windows desktop clients
@@ -103,7 +106,7 @@ Owner decisions, not code; see the privacy/legal section of
 
 ## Automated coverage
 
-`voice-tests.yml` includes the new media/coordinator crates and explicit opt-in
+`voice-tests.yml` includes the new media/coordinator crates and default
 fake-provider remote-engine tests. These require no live provider or microphone.
 The new V2 controls travel over the existing relay and remain ephemeral; no audio
 frames or volume-meter stream are added to sync or the command ledger.
@@ -116,8 +119,9 @@ Sign a physical-device build using your existing development team. No Codex
 executable or OpenAI credentials are installed in the iOS app.
 
 Voice appears by itself once a registered execution host advertises
-`voice-client-media-v1` (the host needs `ZERON_REMOTE_VOICE=1` and authenticated
-Codex); the `-remote-voice` launch argument still forces it on for development.
+`voice-client-media-v1` (all current engines advertise it; calls require
+authenticated Codex on the host); the `-remote-voice` launch argument still
+forces it on for development.
 Tap the waveform at the end of the **New session** bar to call the chosen host —
 or the only one online — and hold it to pick the host and voice. On iPad it sits
 beside compose in the sidebar toolbar. **More → Settings → Voice** keeps the same
@@ -162,4 +166,5 @@ closing the owner releases the call without breaking the shared connection.
 
 Live sound, Wi-Fi/cellular behavior, Bluetooth, battery/CPU, latency, cross-network
 provider acceptance and real MCP delegation are still the user's acceptance tests.
-The development flag stays opt-in until those pass.
+These live checks remain pending; default enablement does not establish that
+all of those environments have been verified.

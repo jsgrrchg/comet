@@ -866,10 +866,8 @@ async fn failed_start_or_mute_emits_one_requested_stop_barrier_before_immediate_
 
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "run with ZERON_REMOTE_VOICE=1; no provider or hardware access"]
 async fn remote_failed_prepare_after_rotation_preserves_thread_for_retry() {
     use zeron_proto::voice::{ORCHESTRATOR_CHAT_PREFIX, remote as wire};
-    assert_eq!(std::env::var("ZERON_REMOTE_VOICE").as_deref(), Ok("1"));
     let temp = tempfile::tempdir().unwrap();
     let core = native_core(&temp).await;
     let client = zeron_rpc::memory_client(core.rpc_service());
@@ -962,10 +960,8 @@ async fn remote_failed_prepare_after_rotation_preserves_thread_for_retry() {
 
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "run with ZERON_REMOTE_VOICE=1; no provider or hardware access"]
 async fn remote_voice_full_control_flow_and_idempotent_prepare_without_host_audio() {
     use zeron_proto::voice::{VoiceEvent, remote as wire};
-    assert_eq!(std::env::var("ZERON_REMOTE_VOICE").as_deref(), Ok("1"));
     let temp = tempfile::tempdir().unwrap();
     let core = native_core(&temp).await;
     std::fs::remove_file(
@@ -981,6 +977,17 @@ async fn remote_voice_full_control_flow_and_idempotent_prepare_without_host_audi
         voice: None,
     };
     let envelope = |p: serde_json::Value| json!({"targetDeviceId":core.device_id,"payload":p});
+    let info: zeron_proto::EngineInfo = client
+        .call_as(methods::ENGINE_INFO, json!({}))
+        .await
+        .unwrap();
+    assert!(info.supports(wire::CAPABILITY));
+    let capabilities: wire::Capabilities = client
+        .call_as(methods::VOICE_CAPABILITIES_V2, envelope(json!({})))
+        .await
+        .unwrap();
+    assert_eq!(capabilities.protocol, wire::CAPABILITY);
+    assert!(capabilities.client_webrtc);
     let call = envelope(serde_json::to_value(&request).unwrap());
     let prepared: wire::Prepared = client
         .call_as(methods::PREPARE_VOICE_V2, call.clone())
@@ -1086,10 +1093,8 @@ async fn remote_voice_full_control_flow_and_idempotent_prepare_without_host_audi
 
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "run with ZERON_REMOTE_VOICE=1; no provider or hardware access"]
 async fn remote_cancel_before_prepare_and_owner_drop_preserve_other_calls() {
     use zeron_proto::voice::remote as wire;
-    assert_eq!(std::env::var("ZERON_REMOTE_VOICE").as_deref(), Ok("1"));
     let temp = tempfile::tempdir().unwrap();
     let core = native_core(&temp).await;
     let client = zeron_rpc::memory_client(core.rpc_service());
@@ -1160,12 +1165,10 @@ mod voice_relay;
 
 #[cfg(unix)]
 #[tokio::test]
-#[ignore = "run with ZERON_REMOTE_VOICE=1; no provider or hardware access"]
 async fn remote_voice_crosses_two_engines_and_owner_drop_releases_host() {
     use std::{sync::Arc, time::Duration};
     use zeron_proto::voice::{VoiceEvent, remote as wire};
     use zeron_rpc::{HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig, StaticToken};
-    assert_eq!(std::env::var("ZERON_REMOTE_VOICE").as_deref(), Ok("1"));
     let temp = tempfile::tempdir().unwrap();
     let host = native_core(&temp).await;
     std::fs::remove_file(

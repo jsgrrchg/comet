@@ -55,11 +55,7 @@ impl Shell {
                 sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
             });
         let saved = settings::current(cx);
-        let device = if std::env::var("ZERON_REMOTE_VOICE").as_deref() == Ok("1") {
-            saved.codex_voice_device.unwrap_or(device)
-        } else {
-            device
-        };
+        let device = saved.codex_voice_device.unwrap_or(device);
         let voice = saved.codex_voice;
         let host_name = state
             .device_name(&device)

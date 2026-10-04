@@ -24,15 +24,11 @@ pub mod capabilities {
         MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         HARNESS_UPDATES_V1,
+        crate::voice::remote::CAPABILITY,
     ];
 
     pub fn current() -> Vec<String> {
-        let mut capabilities: Vec<String> =
-            CURRENT.iter().map(|value| (*value).to_string()).collect();
-        if std::env::var("ZERON_REMOTE_VOICE").as_deref() == Ok("1") {
-            capabilities.push(crate::voice::remote::CAPABILITY.into());
-        }
-        capabilities
+        CURRENT.iter().map(|value| (*value).to_string()).collect()
     }
 }
 
@@ -108,7 +104,8 @@ mod tests {
                     "message-queue-attachments-v1",
                     "message-queue-clean-attachment-text-v1",
                     "message-queue-edit-lease-v1",
-                    "harness-updates-v1"
+                    "harness-updates-v1",
+                    "voice-client-media-v1"
                 ],
             })
         );

@@ -87,7 +87,6 @@ jobs:
           cargo test --locked -p zeron-doc voice --lib
           cargo test --locked -p zeron-engine --lib voice
           cargo test --locked -p zeron-engine --test voice_runtime
-          ZERON_REMOTE_VOICE=1 cargo test --locked -p zeron-engine --test voice_runtime remote_ -- --ignored
           cargo test --locked -p zeron-engine --test device_routing
           cargo test --locked -p zeron-rpc --test device_room
           cargo test --locked -p zeron-mcp --lib

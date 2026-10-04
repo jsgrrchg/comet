@@ -1,9 +1,6 @@
 use super::*;
 use zeron_proto::voice::{VoiceRejection, remote as wire};
 
-pub(super) fn enabled() -> bool {
-    std::env::var("ZERON_REMOTE_VOICE").as_deref() == Ok("1")
-}
 pub(super) fn handles(method: &str) -> bool {
     matches!(
         method,
@@ -27,9 +24,6 @@ impl EngineRpc {
         method: &str,
         params: serde_json::Value,
     ) -> Result<RpcReply, RpcError> {
-        if !enabled() {
-            return Err(failure(VoiceRejection::Disabled));
-        }
         let envelope: wire::Envelope<serde_json::Value> = parse_params(params)?;
         if envelope.target_device_id != self.engine_info.device_id {
             return Err(failure(VoiceRejection::RemoteHost));

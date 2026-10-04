@@ -348,7 +348,7 @@ impl Render for VoiceCard {
             cx.notify();
         })
         .render(&self.voice_select, cx);
-        let host_row = (std::env::var("ZERON_REMOTE_VOICE").as_deref() == Ok("1")).then(|| {
+        let host_row = {
             let selected = settings::current(cx).codex_voice_device;
             let mut hosts = self.hosts.clone();
             if selected.is_some() && !hosts.iter().any(|h| h.0 == selected) {
@@ -406,8 +406,8 @@ impl Render for VoiceCard {
                         )),
                 )
                 .child(control)
-        });
-        let conversation_card = widgets::section_card(&theme).children(host_row).child(
+        };
+        let conversation_card = widgets::section_card(&theme).child(host_row).child(
             widgets::card_row(&theme, true)
                 .child(
                     div()

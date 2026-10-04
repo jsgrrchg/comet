@@ -5039,7 +5039,7 @@ impl Shell {
                     let detail = if !online {
                         "Offline"
                     } else if !compatible {
-                        "Update Zeron / enable remote voice"
+                        "Update Zeron to use remote voice"
                     } else {
                         "Available"
                     };

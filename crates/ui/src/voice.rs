@@ -9,7 +9,6 @@ use gpui_tokio::Tokio;
 use zeron_proto::voice::*;
 mod permissions;
 mod remote;
-mod session;
 
 pub enum VoiceControl {
     Mute(bool),
@@ -26,7 +25,6 @@ pub struct VoiceController {
     /// The full-window stage is presented over the shell.
     pub stage_open: bool,
     pub host_name: Option<String>,
-    remote: bool,
     speaker_last_loud: Option<std::time::Instant>,
     /// When the session first became active; drives the stage's call timer.
     pub active_since: Option<std::time::Instant>,
@@ -57,7 +55,6 @@ impl Default for VoiceController {
             speaker_level: 0,
             stage_open: false,
             host_name: None,
-            remote: false,
             speaker_last_loud: None,
             active_since: None,
             partial_item: None,
@@ -141,16 +138,6 @@ impl VoiceController {
         // The call sounds as it is placed, well before the microphone opens.
         crate::sound::play_voice(true);
         self.cued = true;
-        self.remote = std::env::var("ZERON_REMOTE_VOICE").as_deref() == Ok("1");
-        // The host resumes its own orchestrator chat with `config` and names
-        // it in the first snapshot.
-        let request = StartVoice {
-            chat_id: String::new(),
-            host_device_id: host_device_id.clone(),
-            voice,
-            worktree: None,
-            config: Some(config.clone()),
-        };
         self.engine = Some(engine.clone());
         self.phase = VoicePhase::Checking;
         self.chat_id = None;
@@ -160,22 +147,19 @@ impl VoiceController {
         let (controls, control_rx) = tokio::sync::mpsc::channel(8);
         self.controls = Some(controls);
         let (events, mut event_rx) = tokio::sync::mpsc::channel(32);
-        let remote = self.remote;
         let query = Tokio::spawn(cx, async move {
-            if remote {
-                remote::run(
-                    engine,
-                    request.host_device_id,
-                    config,
-                    request.voice,
-                    cancellation,
-                    events,
-                    control_rx,
-                )
-                .await
-            } else {
-                session::run(engine, request, cancellation, events, control_rx).await
-            }
+            // Media belongs to this viewport, even when the chosen host is
+            // this device. The execution host never opens audio devices.
+            remote::run(
+                engine,
+                host_device_id,
+                config,
+                voice,
+                cancellation,
+                events,
+                control_rx,
+            )
+            .await
         });
         self.task = Some(cx.spawn(async move |this, cx| {
             let receive = async {
@@ -279,12 +263,10 @@ impl VoiceController {
     }
     pub fn toggle_mute(&mut self, cx: &mut Context<Self>) {
         let muted = self.muted();
-        if self.remote {
-            if let Some(snapshot) = &mut self.snapshot {
-                snapshot.muted = !muted;
-            }
-            cx.notify();
+        if let Some(snapshot) = &mut self.snapshot {
+            snapshot.muted = !muted;
         }
+        cx.notify();
         if let Some(controls) = &self.controls {
             if controls.try_send(VoiceControl::Mute(!muted)).is_err() {
                 self.cancel(cx);
@@ -318,10 +300,8 @@ impl VoiceController {
     pub fn reduce(&mut self, event: VoiceEvent, cx: &mut Context<Self>) {
         match event {
             VoiceEvent::Snapshot { mut snapshot } => {
-                if self.remote {
-                    if let Some(previous) = &self.snapshot {
-                        snapshot.playing = previous.playing;
-                    }
+                if let Some(previous) = &self.snapshot {
+                    snapshot.playing = previous.playing;
                 }
                 if self.chat_id.is_none() {
                     self.chat_id = Some(snapshot.chat_id.clone());
@@ -373,18 +353,16 @@ impl VoiceController {
             {
                 self.microphone_level = microphone;
                 self.speaker_level = speaker;
-                if self.remote {
-                    if let Some(snapshot) = &mut self.snapshot {
-                        let threshold = if snapshot.playing { 328 } else { 655 };
-                        if speaker >= threshold {
-                            snapshot.playing = true;
-                            self.speaker_last_loud = Some(std::time::Instant::now());
-                        } else if self
-                            .speaker_last_loud
-                            .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(250))
-                        {
-                            snapshot.playing = false;
-                        }
+                if let Some(snapshot) = &mut self.snapshot {
+                    let threshold = if snapshot.playing { 328 } else { 655 };
+                    if speaker >= threshold {
+                        snapshot.playing = true;
+                        self.speaker_last_loud = Some(std::time::Instant::now());
+                    } else if self
+                        .speaker_last_loud
+                        .is_none_or(|t| t.elapsed() >= std::time::Duration::from_millis(250))
+                    {
+                        snapshot.playing = false;
                     }
                 }
             }
@@ -432,11 +410,8 @@ impl VoiceController {
             }
             Some(VoiceRejection::ChatgptRequired) => "Sign in to Codex with ChatGPT to use voice.",
             // Remote calls still play audio here, through this device's Codex helper.
-            Some(VoiceRejection::NativeRuntimeUnavailable) if self.remote => {
-                "Calls to another device use this device's Codex for audio. Install Codex here with its official installer (npm installs lack voice)."
-            }
             Some(VoiceRejection::NativeRuntimeUnavailable) => {
-                "Install or update Codex with its official installer to use voice. npm installs lack the voice runtime."
+                "Install or update Codex on this device with its official installer to use voice. npm installs lack the voice runtime."
             }
             Some(VoiceRejection::DeviceUnavailable) => {
                 "Check microphone permission and your audio devices."

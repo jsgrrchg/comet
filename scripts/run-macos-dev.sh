@@ -35,10 +35,6 @@ if [[ -n "${CODEX_EXECUTABLE:-}" ]]; then
   plutil -insert LSEnvironment.CODEX_EXECUTABLE -string "$CODEX_EXECUTABLE" "$CONTENTS/Info.plist"
 fi
 
-if [[ "${ZERON_REMOTE_VOICE:-0}" == "1" ]]; then
-  plutil -insert LSEnvironment.ZERON_REMOTE_VOICE -string "1" "$CONTENTS/Info.plist"
-fi
-
 mkdir -p "$CONTENTS/Resources/licenses"
 cp "$ROOT/crates/voice/NOTICE.md" "$CONTENTS/Resources/licenses"/parakeet-v3.txt
 

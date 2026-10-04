@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -46,6 +46,17 @@ type StdoutObserver = Box<dyn Fn(&str) + Send>;
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, HarnessError>>>>>;
 
+/// Why stdout became unreadable, when it failed rather than reached EOF. The
+/// app server may still be alive, so callers must not be told it exited.
+type ReadFailure = Arc<OnceLock<String>>;
+
+fn closed_error(method: &str, failure: &ReadFailure) -> HarnessError {
+    HarnessError::Protocol(match failure.get() {
+        Some(cause) => format!("{method}: app-server stdout unreadable: {cause}"),
+        None => format!("{method}: app-server exited before responding"),
+    })
+}
+
 struct VoiceRouter {
     sender: mpsc::Sender<Incoming>,
     overflow: Arc<AtomicBool>,
@@ -59,6 +70,7 @@ pub(crate) struct RpcClient {
     writer: mpsc::Sender<String>,
     media_writer: mpsc::Sender<String>,
     closed: Arc<AtomicBool>,
+    read_failure: ReadFailure,
     voice_router: Arc<Mutex<Option<VoiceRouter>>>,
 }
 
@@ -79,6 +91,7 @@ impl RpcClient {
         let pending: Pending = Arc::default();
         let (incoming_tx, incoming_rx) = mpsc::channel(256);
         let closed = Arc::new(AtomicBool::new(false));
+        let read_failure = ReadFailure::default();
         let voice_router = Arc::default();
         tokio::spawn(write_loop(
             stdin,
@@ -92,6 +105,7 @@ impl RpcClient {
             Arc::clone(&pending),
             incoming_tx,
             closed.clone(),
+            read_failure.clone(),
             observer,
             Arc::clone(&voice_router),
         ));
@@ -102,6 +116,7 @@ impl RpcClient {
                 writer: writer_tx,
                 media_writer,
                 closed,
+                read_failure,
                 voice_router,
             },
             incoming_rx,
@@ -167,11 +182,8 @@ impl RpcClient {
             // Check under the same lock as EOF cleanup: a request racing the
             // reader exit must either be rejected here or cleared by it.
             if self.is_closed() || pending.len() >= 256 {
-                return Box::pin(async move {
-                    Err(HarnessError::Protocol(format!(
-                        "{method}: app-server exited before responding"
-                    )))
-                });
+                let error = closed_error(&method, &self.read_failure);
+                return Box::pin(async move { Err(error) });
             }
             pending.insert(id, tx);
         }
@@ -194,15 +206,14 @@ impl RpcClient {
             id,
             pending: self.pending.clone(),
         };
+        let read_failure = self.read_failure.clone();
         Box::pin(async move {
             let _cleanup = cleanup;
             match rx.await {
                 Ok(Ok(result)) => Ok(result),
                 Ok(Err(error)) => Err(error),
-                // Sender dropped: the reader hit EOF and failed all pending.
-                Err(_) => Err(HarnessError::Protocol(format!(
-                    "{method}: app-server exited before responding"
-                ))),
+                // Sender dropped: the reader stopped and failed all pending.
+                Err(_) => Err(closed_error(&method, &read_failure)),
             }
         })
     }
@@ -347,6 +358,7 @@ async fn read_loop(
     pending: Pending,
     tx: mpsc::Sender<Incoming>,
     closed: Arc<AtomicBool>,
+    read_failure: ReadFailure,
     observer: Option<StdoutObserver>,
     voice_router: Arc<Mutex<Option<VoiceRouter>>>,
 ) {
@@ -354,10 +366,12 @@ async fn read_loop(
         pending: pending.clone(),
         closed: closed.clone(),
     };
-    // Bound allocation before parsing, including a peer without a newline.
-    let mut lines = FramedRead::new(stdout, LinesCodec::new_with_max_length(8 * 1024 * 1024));
+    // No length cap: a resumed thread returns its whole history in one line,
+    // tens of MiB for a long chat. Voice bounds its own messages.
+    let mut lines = FramedRead::new(stdout, LinesCodec::new());
     // A read error ends the loop like EOF: either way the child's stdout is
     // unusable, pending requests must fail, and the session loop must know.
+    // Its cause is kept, since the child may well be alive.
     let mut health = tokio::time::interval(std::time::Duration::from_millis(100));
     loop {
         if closed.load(Ordering::Acquire) {
@@ -368,8 +382,14 @@ async fn read_loop(
             _ = health.tick() => continue,
             result = lines.next() => result,
         };
-        let Some(Ok(line)) = result else {
-            break;
+        let line = match result {
+            Some(Ok(line)) => line,
+            Some(Err(error)) => {
+                tracing::warn!(target: "zeron_harness::rpc", %error, "app-server stdout unreadable");
+                let _ = read_failure.set(error.to_string());
+                break;
+            }
+            None => break,
         };
         let line = line.trim();
         if let Some(url) =
@@ -497,6 +517,7 @@ mod tests {
             writer,
             media_writer: mpsc::channel(8).0,
             closed: Arc::new(AtomicBool::new(false)),
+            read_failure: Arc::default(),
             voice_router: Arc::default(),
         };
         client.notify("session/cancel", Some(json!({"sessionId": "parent"})));
@@ -518,6 +539,7 @@ mod tests {
             writer,
             media_writer: mpsc::channel(8).0,
             closed: Arc::new(AtomicBool::new(true)),
+            read_failure: Arc::default(),
             voice_router: Arc::default(),
         };
         let result = tokio::time::timeout(
@@ -540,6 +562,7 @@ mod tests {
             writer,
             media_writer: mpsc::channel(8).0,
             closed: Arc::new(AtomicBool::new(false)),
+            read_failure: Arc::default(),
             voice_router: Arc::default(),
         };
         let future = client.request_now("test", json!({}));
@@ -607,6 +630,81 @@ sys.stdin.read()
             .unwrap();
     }
 
+    #[cfg(unix)]
+    fn python_peer(script: &str) -> (crate::process::Child, RpcClient, mpsc::Receiver<Incoming>) {
+        use crate::process::{Command, Stdio};
+        let mut child = Command::new("python3")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (client, incoming) =
+            RpcClient::new(child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        (child, client, incoming)
+    }
+
+    /// A resumed long chat returns tens of MiB of history in one line.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_history_larger_than_any_small_message_cap_arrives_whole() {
+        let script = r#"import json, sys
+request = json.loads(sys.stdin.readline())
+print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{'history':'x'*(24*1024*1024)}}), flush=True)
+sys.stdin.read()
+"#;
+        let (_child, client, _incoming) = python_peer(script);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            client.request("thread/resume", json!({})),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result["history"].as_str().unwrap().len(), 24 * 1024 * 1024);
+        assert!(!client.is_closed());
+    }
+
+    /// Unreadable stdout is not an exit: callers learn the actual cause.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_stdout_reports_its_cause_rather_than_an_exit() {
+        let script = r#"import sys, time
+sys.stdin.readline()
+sys.stdout.buffer.write(b'\xff\xfe\n'); sys.stdout.flush()
+time.sleep(30)
+"#;
+        let (mut child, client, _incoming) = python_peer(script);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client.request("thread/resume", json!({})),
+        )
+        .await
+        .unwrap()
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("thread/resume: app-server stdout unreadable"),
+            "{error}"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the peer is still alive"
+        );
+        // A fallback request on the retired client keeps the same cause.
+        let error = client
+            .request("thread/start", json!({}))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("thread/start: app-server stdout unreadable"),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn control_overflow_retires_peer_and_fails_pending() {
         let (writer, _control) = mpsc::channel(1);
@@ -616,6 +714,7 @@ sys.stdin.read()
             writer,
             media_writer: mpsc::channel(8).0,
             closed: Arc::new(AtomicBool::new(false)),
+            read_failure: Arc::default(),
             voice_router: Arc::default(),
         };
         let pending = client.request_now("pending", json!({}));
@@ -636,6 +735,7 @@ sys.stdin.read()
             writer,
             media_writer,
             closed: Arc::new(AtomicBool::new(false)),
+            read_failure: Arc::default(),
             voice_router: Arc::default(),
         };
         let mut requests = Vec::new();

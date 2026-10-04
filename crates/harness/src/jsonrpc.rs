@@ -211,6 +211,16 @@ impl RpcClient {
             let _cleanup = cleanup;
             match rx.await {
                 Ok(Ok(result)) => Ok(result),
+                // The reader cannot know which request a rejection answers.
+                Ok(Err(HarnessError::Rpc {
+                    code,
+                    message,
+                    data,
+                })) => Err(HarnessError::Rpc {
+                    code,
+                    message: format!("{method}: {message}"),
+                    data,
+                }),
                 Ok(Err(error)) => Err(error),
                 // Sender dropped: the reader stopped and failed all pending.
                 Err(_) => Err(closed_error(&method, &read_failure)),

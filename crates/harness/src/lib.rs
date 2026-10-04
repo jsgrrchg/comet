@@ -30,7 +30,9 @@ pub enum HarnessError {
     NotInstalled(String),
     #[error("harness protocol error: {0}")]
     Protocol(String),
-    #[error("JSON-RPC rejection {code}: {message}")]
+    /// A peer's rejection. `message` names the request and already carries
+    /// the code and detail, so it renders exactly like a protocol error.
+    #[error("harness protocol error: {message}")]
     Rpc {
         code: i64,
         message: String,

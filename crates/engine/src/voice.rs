@@ -1,6 +1,6 @@
 //! Exclusive, local, ephemeral voice ownership. Native media remains in Codex's helper.
 pub(crate) mod remote;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -316,7 +316,7 @@ impl VoiceManager {
         voices: Vec<String>,
         bridge: RealtimeHandle,
         mut events: tokio::sync::broadcast::Receiver<VoiceEvent>,
-        active: Arc<AtomicUsize>,
+        active: Arc<crate::sessions::VoiceActivity>,
         doc: Arc<crate::doc_host::ChatDocHandle>,
         sessions: crate::sessions::SessionsEngine,
         workspace: crate::workspace_host::WorkspaceHost,
@@ -336,16 +336,10 @@ impl VoiceManager {
             s.snapshot.voices = voices;
             s.cancel.clone()
         };
-        active.fetch_add(1, Ordering::AcqRel);
+        let call = active.call();
         let manager = self.clone();
         tokio::spawn(async move {
-            struct Active(Arc<AtomicUsize>);
-            impl Drop for Active {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::AcqRel);
-                }
-            }
-            let _active = Active(active);
+            let _call = call;
             struct ChatGuard(tokio::task::JoinHandle<()>);
             impl Drop for ChatGuard {
                 fn drop(&mut self) {

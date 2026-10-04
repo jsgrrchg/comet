@@ -1101,7 +1101,7 @@ impl EngineRpc {
         (
             zeron_harness::codex::realtime::RealtimeHandle,
             tokio::sync::broadcast::Receiver<zeron_proto::voice::VoiceEvent>,
-            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            std::sync::Arc<crate::sessions::VoiceActivity>,
         ),
         zeron_proto::voice::VoiceRejection,
     > {

@@ -303,7 +303,7 @@ impl VoiceManager {
         voices: Vec<String>,
         bridge: RealtimeHandle,
         mut events: tokio::sync::broadcast::Receiver<VoiceEvent>,
-        active: Arc<AtomicUsize>,
+        active: Arc<crate::sessions::VoiceActivity>,
         doc: Arc<crate::doc_host::ChatDocHandle>,
         sessions: crate::sessions::SessionsEngine,
         workspace: crate::workspace_host::WorkspaceHost,
@@ -348,15 +348,9 @@ impl VoiceManager {
             lease_seconds: wire::LEASE_SECS,
         };
         let manager = self.clone();
-        active.fetch_add(1, Ordering::AcqRel);
+        let call = active.call();
         tokio::spawn(async move {
-            struct Active(Arc<AtomicUsize>);
-            impl Drop for Active {
-                fn drop(&mut self) {
-                    self.0.fetch_sub(1, Ordering::AcqRel);
-                }
-            }
-            let _active = Active(active);
+            let _call = call;
             let _lifecycle = lifecycle;
             let mut ticker = tokio::time::interval(Duration::from_millis(250));
             let mut statuses = sessions.watch_sessions();

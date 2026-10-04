@@ -104,9 +104,37 @@ impl RuntimeConfig {
     }
 }
 
+/// A run's live voice calls. They hold its idle reaper off, and each hang-up
+/// wakes the reaper to restart its window from there.
+#[derive(Default)]
+pub(crate) struct VoiceActivity {
+    calls: std::sync::atomic::AtomicUsize,
+    ended: tokio::sync::Notify,
+}
+impl VoiceActivity {
+    pub(crate) fn live(&self) -> bool {
+        self.calls.load(std::sync::atomic::Ordering::Acquire) > 0
+    }
+    /// A live call until the returned guard drops.
+    pub(crate) fn call(self: &Arc<Self>) -> VoiceCall {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        VoiceCall(self.clone())
+    }
+}
+pub(crate) struct VoiceCall(Arc<VoiceActivity>);
+impl Drop for VoiceCall {
+    fn drop(&mut self) {
+        self.0
+            .calls
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        // A stored permit: the reaper hears it even while busy elsewhere.
+        self.0.ended.notify_one();
+    }
+}
+
 struct RunHandle {
     voice: Option<zeron_harness::codex::realtime::RealtimeHandle>,
-    voice_active: Arc<std::sync::atomic::AtomicUsize>,
+    voice_active: Arc<VoiceActivity>,
     run_id: String,
     steerable: bool,
     runtime_config: RuntimeConfig,
@@ -318,7 +346,7 @@ impl SessionsEngine {
         lock(&self.inner.statuses).values().any(is_active)
             || lock(&self.inner.runs)
                 .values()
-                .any(|r| r.voice_active.load(std::sync::atomic::Ordering::Acquire) > 0)
+                .any(|r| r.voice_active.live())
     }
 
     /// A text prompt for `chat_id` would land in the mailbox of a live
@@ -402,11 +430,11 @@ impl SessionsEngine {
             let stale = lock(&self.inner.runs).get(chat_id).map(|run| {
                 (
                     run.voice.as_ref().is_some_and(|v| v.invalidated()),
-                    run.voice_active.load(std::sync::atomic::Ordering::Acquire),
+                    run.voice_active.live(),
                 )
             });
             match stale {
-                Some((true, 0)) => {
+                Some((true, false)) => {
                     if self.turn_in_flight(chat_id) {
                         return Err(EngineError::Other(
                             "identity changed during delegated work".into(),
@@ -434,7 +462,7 @@ impl SessionsEngine {
     ) -> Option<(
         zeron_harness::codex::realtime::RealtimeHandle,
         tokio::sync::broadcast::Receiver<zeron_proto::voice::VoiceEvent>,
-        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<VoiceActivity>,
     )> {
         let mut runs = lock(&self.inner.runs);
         let run = runs.get_mut(chat_id)?;
@@ -666,7 +694,7 @@ impl SessionsEngine {
         let interrupt_token = CancellationToken::new();
         let fork_history_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (voice_handle, realtime, _voice_events) = zeron_harness::codex::realtime::channel();
-        let voice_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let voice_active = Arc::new(VoiceActivity::default());
         let controls = RunControls {
             realtime: (harness_id == HarnessId::Codex).then_some(realtime),
             execution_lease: None,
@@ -1817,7 +1845,7 @@ fn finish_segment<'a>(
 /// and whether this run already IS the retry (one attempt only).
 struct RunResumeState {
     idle: bool,
-    voice_active: Arc<std::sync::atomic::AtomicUsize>,
+    voice_active: Arc<VoiceActivity>,
     user_message_id: String,
     resume_injected: bool,
     startup_retry: bool,
@@ -2090,13 +2118,21 @@ async fn drive_run(
     // its steering mailbox stay warm, and the next user message (dispatch
     // routes into a live run) starts the next turn with zero respawn/resume
     // latency. `Some(when)` = idle since then; the 30-min reaper below ends
-    // a session nobody comes back to (zeron SESSION_IDLE_MS).
-    // `ZERON_SESSION_IDLE_MS` overrides the window (tests).
+    // a session nobody comes back to (zeron SESSION_IDLE_MS). A voice
+    // orchestrator holds Codex and its MCP servers (~200 MB) for calls only,
+    // so it goes after 5 minutes. A call holds the reaper off, and the window
+    // restarts at hang-up. `ZERON_SESSION_IDLE_MS` overrides both (tests).
     let session_idle = std::env::var("ZERON_SESSION_IDLE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(std::time::Duration::from_millis)
-        .unwrap_or(std::time::Duration::from_secs(30 * 60));
+        .unwrap_or(std::time::Duration::from_secs(
+            if zeron_proto::voice::is_orchestrator_chat(&chat_id) {
+                5 * 60
+            } else {
+                30 * 60
+            },
+        ));
     // A live subagent stretches the window, but never unbounded: every
     // driver's subagent terminal is a best-effort vendor signal (claude's
     // untagged task_notification, grok's subagent_finished, codex thread
@@ -2202,12 +2238,19 @@ async fn drive_run(
                     inner.touch_session(&chat_id);
                     continue;
                 }
+                // A hang-up restarts the idle window, however long the call.
+                _ = resume_state.voice_active.ended.notified() => {
+                    if idle_since.is_some() {
+                        idle_since = Some(tokio::time::Instant::now());
+                    }
+                    continue;
+                }
                 // An accepted update must not wait behind a warm between-turn
                 // child for the full idle-reaper window. The completed turn is
                 // already durable, so retire the parked process cleanly and let
                 // the queued exclusive lease proceed.
                 _ = tokio::time::sleep_until(tokio::time::Instant::now()),
-                    if idle_since.is_some() && resume_state.voice_active.load(std::sync::atomic::Ordering::Acquire) == 0 && inner.registry.update_pending(harness_id) =>
+                    if idle_since.is_some() && !resume_state.voice_active.live() && inner.registry.update_pending(harness_id) =>
                 {
                     if let Some(token) = lock(&inner.runs)
                         .get(&chat_id)
@@ -2219,7 +2262,7 @@ async fn drive_run(
                     break SessionStatus::Idle;
                 }
                 // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
-                // nobody returned to in 30 minutes releases its child. The turn
+                // nobody returned to within its window releases its child. The turn
                 // was finalized at Done, so this end is clean — no aborted stamp.
                 // A live background subagent is somebody still using the child:
                 // the window counts from its last activity, and stretches to
@@ -2231,7 +2274,11 @@ async fn drive_run(
                                 + if subagents.is_empty() { session_idle } else { subagent_silence }
                         })
                         .unwrap_or_else(tokio::time::Instant::now)
-                ), if idle_since.is_some() && resume_state.voice_active.load(std::sync::atomic::Ordering::Acquire) == 0 => {
+                ), if idle_since.is_some() && !resume_state.voice_active.live() => {
+                    // A call that began after this wait was armed holds it off.
+                    if resume_state.voice_active.live() {
+                        continue;
+                    }
                     tracing::info!(
                         chat = %chat_id,
                         live_subagents = subagents.len(),

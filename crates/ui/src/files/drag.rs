@@ -180,13 +180,22 @@ impl FilesSurface {
                 };
             }
         }
+        drop(rows);
+        self.is_tree_empty_space(point).then(String::new)
+    }
+
+    /// The list area below the last painted row, which targets the
+    /// workspace root for drops and clears the selection when clicked.
+    pub(super) fn is_tree_empty_space(&self, point: Point<Pixels>) -> bool {
         let viewport = self.tree_list.viewport_bounds();
-        let last = rows.values().map(|(bounds, _)| bounds.bottom()).max();
-        if viewport.contains(&point) && last.is_none_or(|bottom| point.y >= bottom) {
-            Some(String::new())
-        } else {
-            None
-        }
+        let last = self
+            .tree_drag
+            .rows
+            .borrow()
+            .values()
+            .map(|(bounds, _)| bounds.bottom())
+            .max();
+        viewport.contains(&point) && last.is_none_or(|bottom| point.y >= bottom)
     }
 
     pub(super) fn on_tree_drag_move(

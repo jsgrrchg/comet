@@ -450,6 +450,16 @@ impl FileTreeModel {
         self.selected.as_deref()
     }
 
+    /// A click on empty space: nothing stays selected. The cursor goes too,
+    /// so Delete or F2 cannot act on a row that no longer looks selected.
+    pub fn clear_selection(&mut self) -> bool {
+        if self.selection.is_empty() && self.selected.is_none() {
+            return false;
+        }
+        self.set_single(None);
+        true
+    }
+
     /// Escape: keep only the cursor.
     pub fn collapse_selection(&mut self) -> bool {
         if self.selection.len() <= 1
@@ -1485,6 +1495,14 @@ mod tests {
         assert!(tree.collapse_selection());
         assert_eq!(tree.selected_paths(), ["src/lib.rs"]);
         assert!(!tree.collapse_selection());
+
+        assert!(tree.clear_selection());
+        assert!(tree.selected_paths().is_empty());
+        assert_eq!(tree.selected(), None);
+        assert!(!tree.clear_selection());
+        // With no cursor or anchor, the next Shift target selects only itself.
+        tree.select_range_to("b.txt", false);
+        assert_eq!(tree.selected_paths(), ["b.txt"]);
     }
 
     #[test]

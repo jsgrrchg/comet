@@ -205,7 +205,19 @@ impl FilesSurface {
             .on_hover(cx.listener(Self::on_tree_hovered))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.tree_focus.focus(window, cx)),
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    this.tree_focus.focus(window, cx);
+                    // Like other explorers, a plain click on empty space
+                    // deselects; a modified click there keeps the selection.
+                    let modifiers = event.modifiers;
+                    if !modifiers.shift
+                        && !modifiers.secondary()
+                        && this.is_tree_empty_space(event.position)
+                        && this.tree.clear_selection()
+                    {
+                        cx.notify();
+                    }
+                }),
             )
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_tree_key_down(event, window, cx)
@@ -803,6 +815,42 @@ mod tests {
         cx.simulate_click(b, gpui::Modifiers::default());
         files.read_with(cx, |files, _| {
             assert_eq!(files.tree.selected_paths(), ["b.txt"]);
+        });
+    }
+
+    #[gpui::test]
+    fn plain_click_on_empty_space_clears_the_selection(cx: &mut gpui::TestAppContext) {
+        let (files, cx) = super::super::test_support::setup(cx);
+        files.update(cx, |files, cx| {
+            files.tree.select("folder");
+            files.tree.toggle_selected("a.txt");
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let last = cx.debug_bounds("tree-entry:a.txt").unwrap();
+        let empty = gpui::point(last.center().x, last.bottom() + px(40.));
+        files.read_with(cx, |files, _| assert!(files.is_tree_empty_space(empty)));
+
+        // Modified clicks on empty space keep the selection.
+        cx.simulate_click(empty, gpui::Modifiers::secondary_key());
+        cx.simulate_click(empty, gpui::Modifiers::shift());
+        files.read_with(cx, |files, _| {
+            assert_eq!(files.tree.selected_paths(), ["folder", "a.txt"]);
+        });
+        // A click on a row is not empty space.
+        files.read_with(cx, |files, _| {
+            assert!(!files.is_tree_empty_space(last.center()));
+        });
+
+        cx.simulate_click(empty, gpui::Modifiers::default());
+        files.update_in(cx, |files, window, _| {
+            assert!(files.tree.selected_paths().is_empty());
+            assert_eq!(files.tree.selected(), None);
+            assert!(files.tree_focus.is_focused(window));
+        });
+        cx.simulate_keystrokes("down");
+        files.read_with(cx, |files, _| {
+            assert_eq!(files.tree.selected_paths(), ["folder"]);
         });
     }
 

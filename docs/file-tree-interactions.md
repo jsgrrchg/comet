@@ -49,7 +49,10 @@ Ctrl+click (Cmd+click on macOS) adds or removes one entry without opening it.
 Shift+click selects the visible range from the last plain or Ctrl/Cmd click;
 Shift+Ctrl/Cmd+click adds that range to the current selection. Shift+Up/Down
 extend the range from the keyboard, and Escape keeps only the cursor row. A
-plain click or arrow key returns to a single selection.
+plain click or arrow key returns to a single selection. A plain click on the
+empty space below the rows clears the selection; the tree keeps focus, and the
+next arrow key starts again from the first or last row. Clicking elsewhere in
+the app keeps the selection, shown dimmed while the tree is unfocused.
 
 Collapsing a folder removes its hidden children from the selection; if the
 cursor was inside, the folder takes its place. Right-clicking a selected row

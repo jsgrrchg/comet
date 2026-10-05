@@ -1870,17 +1870,22 @@ impl AppState {
     }
 
     /// Pick the composer's target device. Keeps the project pick consistent:
-    /// a project on another device can't survive the switch — fall back to
-    /// the first project on the new device, else "no project".
+    /// it moves to the project's checkout on the new device, else the first
+    /// project there, else "no project".
     pub fn select_device(&mut self, device_id: String, cx: &mut Context<Self>) {
-        let project_moves = self
+        let moving = self
             .selected_space_row()
-            .is_some_and(|s| s.device_id != device_id);
-        if project_moves {
+            .filter(|s| s.device_id != device_id);
+        if let Some(space) = moving {
             let first = self
-                .spaces_sorted()
-                .iter()
+                .project_members(space)
+                .into_iter()
                 .find(|s| s.device_id == device_id)
+                .or_else(|| {
+                    self.spaces_sorted()
+                        .into_iter()
+                        .find(|s| s.device_id == device_id)
+                })
                 .map(|s| s.id.clone());
             self.no_project = first.is_none();
             self.selected_space = first;
@@ -1904,6 +1909,35 @@ impl AppState {
 
     pub fn space_for_chat(&self, chat: &Chat) -> Option<&Space> {
         self.space_row(chat.space_id.as_deref()?)
+    }
+
+    /// The space whose name and color stand for `space`'s whole project
+    /// ([`zeron_proto::view::representative_space`]).
+    pub fn representative_space<'a>(&'a self, space: &'a Space) -> &'a Space {
+        zeron_proto::view::representative_space(&self.spaces, space)
+    }
+
+    /// Every space of `space`'s project ([`zeron_proto::view::project_key`]):
+    /// this device's first, then by device name and path.
+    pub fn project_members(&self, space: &Space) -> Vec<&Space> {
+        let key = zeron_proto::view::project_key(space);
+        let local = self.local_device_id.as_deref();
+        let mut members: Vec<&Space> = self
+            .spaces
+            .iter()
+            .filter(|s| zeron_proto::view::project_key(s) == key)
+            .collect();
+        members.sort_by_key(|s| {
+            (
+                local != Some(s.device_id.as_str()),
+                self.device_name(&s.device_id)
+                    .unwrap_or_default()
+                    .to_lowercase(),
+                s.path.clone(),
+                s.id.clone(),
+            )
+        });
+        members
     }
 
     /// Non-archived chats of a space in tab (creation) order. Chats with a
@@ -3732,6 +3766,7 @@ mod tests {
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
+            repository_id: None,
             created_at: base + TimeDelta::minutes(created_min),
         }
     }

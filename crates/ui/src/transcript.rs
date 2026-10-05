@@ -6430,7 +6430,10 @@ impl Transcript {
 
     fn render_working_trailer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let now = chrono::Utc::now();
-        let (sending, queued, elapsed_secs, seed) = if let Some(doc_id) = &self.doc_override {
+        // `turn` (the turn's start, ms) keys the rolling word and timer, so a
+        // new turn's labels appear fresh instead of rolling from the last
+        // turn's final values.
+        let (sending, queued, elapsed_secs, seed, turn) = if let Some(doc_id) = &self.doc_override {
             // A subagent doc has no Session row — `indicator_for` would read
             // the PARENT chat's live state into this tab. Liveness rides the
             // doc itself instead: the sink's assistant entry streams until
@@ -6448,7 +6451,7 @@ impl Transcript {
                 return None;
             }
             let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
-            (false, false, elapsed, flavour_seed(doc_id))
+            (false, false, elapsed, flavour_seed(doc_id), last.created_at)
         } else {
             let chat_id = self.chat_id.clone()?;
             // Failed-send state first: past the grace window the trailer IS
@@ -6471,7 +6474,7 @@ impl Transcript {
                         .into_any_element(),
                 );
             }
-            let (sending, queued, elapsed) = {
+            let (sending, queued, elapsed, turn) = {
                 let state = self.state.read(cx);
                 if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
                     return None;
@@ -6483,8 +6486,8 @@ impl Transcript {
                 // with no timer instead; the word + timer start with the
                 // turn.
                 let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
-                let sending =
-                    sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
+                let send_started = state.pending_send_started(&chat_id, now);
+                let sending = sending_bridge(send_started, turn_started);
                 // Degraded delivery path: the send is a durable local write
                 // waiting on connectivity — say so instead of faking
                 // progress. (The overlay holds while degraded, so this line
@@ -6493,9 +6496,14 @@ impl Transcript {
                 let elapsed = turn_started
                     .map(|t| now.signed_duration_since(t).num_seconds().max(0))
                     .unwrap_or(0);
-                (sending, queued, elapsed)
+                // While sending, the session row still carries the PREVIOUS
+                // turn: the bridge keys on its own send instead, so it never
+                // rolls out of that turn's word or an earlier send's.
+                let turn = if sending { send_started } else { turn_started }
+                    .map_or(0, |t| t.timestamp_millis());
+                (sending, queued, elapsed, turn)
             };
-            (sending, queued, elapsed, flavour_seed(&chat_id))
+            (sending, queued, elapsed, flavour_seed(&chat_id), turn)
         };
         if self.compact_mode && !sending && !queued && elapsed_secs > 0 {
             let entry_id = if let Some(doc_id) = &self.doc_override {
@@ -6541,6 +6549,7 @@ impl Transcript {
                     cx,
                 ))
                 .child(
+                    // The flavour word rotates every 7s; roll it as it turns.
                     div()
                         .text_size(crate::typography::ui_rems(12.0))
                         .text_color(if queued {
@@ -6548,19 +6557,29 @@ impl Transcript {
                         } else {
                             theme.text_muted
                         })
-                        .child(SharedString::from(if queued {
-                            word.to_string()
-                        } else {
-                            format!("{word}…")
-                        })),
+                        .child(crate::roll_text::roll_text(
+                            format!("working-word-{}-{turn}", cx.entity_id()),
+                            SharedString::from(if queued {
+                                word.to_string()
+                            } else {
+                                format!("{word}…")
+                            }),
+                            cx.reduce_motion(),
+                        )),
                 )
                 .when(!sending, |el| {
+                    // The timer ticks every second; its digits roll in place
+                    // (the unit suffix holds).
                     el.child(
                         div()
                             .relative()
                             .top(px(1.0))
                             .text_color(theme.text_faint)
-                            .child(SharedString::from(format_elapsed(elapsed_secs))),
+                            .child(crate::roll_text::roll_text(
+                                format!("working-timer-{}-{turn}", cx.entity_id()),
+                                SharedString::from(format_elapsed(elapsed_secs)),
+                                cx.reduce_motion(),
+                            )),
                     )
                 })
                 .into_any_element(),

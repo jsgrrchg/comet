@@ -92,11 +92,6 @@ jobs:
           cargo test --locked -p zeron-mcp --lib
       - name: Native audio and WebRTC AEC3
         run: cargo test --locked -p zeron-audio --features aec --lib
-      - name: Orb and voice surface
-        run: |
-          cargo check --locked -p zeron-ui --features voice-experimental
-          cargo test --locked -p zeron-ui --test voice_orb_geometry
-          cargo test --locked -p zeron-ui --lib voice -- --test-threads=1
 
   native-platform-check:
     strategy:

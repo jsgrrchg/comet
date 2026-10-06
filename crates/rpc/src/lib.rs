@@ -41,13 +41,6 @@ pub mod methods {
     pub const REPORT_VOICE_MEDIA_V2: &str = "ReportVoiceMediaV2";
     pub const STOP_VOICE_V2: &str = "StopVoiceV2";
     pub const CANCEL_VOICE_ATTEMPT_V2: &str = "CancelVoiceAttemptV2";
-    // Ephemeral local voice; never relay-forwardable.
-    pub const VOICE_ELIGIBILITY: &str = "VoiceEligibility";
-    pub const START_VOICE: &str = "StartVoice";
-    pub const OWN_VOICE: &str = "OwnVoice";
-    pub const APPEND_VOICE: &str = "AppendVoice";
-    pub const MUTE_VOICE: &str = "MuteVoice";
-    pub const STOP_VOICE: &str = "StopVoice";
     pub const WATCH_PREVIEWS: &str = "WatchPreviews";
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const CANCEL_INSTALL: &str = "CancelInstall";

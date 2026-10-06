@@ -5538,34 +5538,6 @@ impl DocHost {
             .await
     }
 
-    /// Create (or reuse) the isolated worktree a Run's [`zeron_proto::WorktreeSpec`]
-    /// asks for, returning the resolved cwd plus the fresh worktree when one was
-    /// actually created. Reuse guard: a chat whose row already points inside a
-    /// linked worktree of the same repo keeps it — a duplicate Run (client retry
-    /// after a lost ack, ledger reset) must not mint a second checkout.
-    pub(crate) async fn prepare_voice_worktree(
-        &self,
-        chat: &str,
-        spec: &zeron_proto::WorktreeSpec,
-    ) -> Result<(), EngineError> {
-        let (cwd, fresh) = self.materialize_worktree(chat, spec).await?;
-        if let Some(ws) = self.workspace() {
-            ws.set_chat_cwd(chat, &cwd)?;
-            if let Some(worktree) = fresh.as_ref() {
-                ws.set_chat_branch(chat, &worktree.branch)?;
-            }
-        }
-        if spec.space_id.is_some() {
-            self.complete_worktree_setup_handoff(
-                &format!("voice-prepare:{chat}"),
-                chat,
-                spec,
-                fresh.as_ref(),
-            );
-        }
-        Ok(())
-    }
-
     async fn materialize_worktree(
         &self,
         chat_id: &str,

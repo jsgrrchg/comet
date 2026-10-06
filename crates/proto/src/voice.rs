@@ -210,34 +210,6 @@ pub enum VoiceEvent {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct StartVoice {
-    pub chat_id: String,
-    pub host_device_id: String,
-    #[serde(default)]
-    pub voice: Option<String>,
-    #[serde(default)]
-    pub worktree: Option<crate::WorktreeSpec>,
-    /// Start in the host's own orchestrator chat with this configuration
-    /// instead of `chat_id`: the host keeps one per device, resumes it across
-    /// calls and names it in the first snapshot.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config: Option<crate::ChatConfig>,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AppendVoice {
-    pub lease: VoiceLease,
-    pub frame: VoiceFrame,
-}
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct MuteVoice {
-    pub lease: VoiceLease,
-    pub muted: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

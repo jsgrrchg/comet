@@ -9,27 +9,6 @@ use tokio_util::sync::CancellationToken;
 use zeron_harness::codex::realtime::{RealtimeHandle, VoiceCommand};
 use zeron_proto::{SessionStatus, voice::*};
 
-/// Visual speaker activity: hysteresis and a short hold bridge syllable gaps.
-#[derive(Default)]
-struct SpeakerActivity {
-    playing: bool,
-    last_loud: Option<Instant>,
-}
-impl SpeakerActivity {
-    fn update(&mut self, peak: u16, now: Instant) -> bool {
-        const ENTER: u16 = 655;
-        const EXIT: u16 = 328;
-        const HOLD: Duration = Duration::from_millis(250);
-        if peak >= if self.playing { EXIT } else { ENTER } {
-            self.playing = true;
-            self.last_loud = Some(now);
-        } else if self.last_loud.is_none_or(|last| now.duration_since(last) >= HOLD) {
-            self.playing = false;
-        }
-        self.playing
-    }
-}
-
 #[derive(Clone, Default)]
 pub struct VoiceManager {
     inner: Arc<Inner>,
@@ -44,7 +23,6 @@ struct Inner {
     // A successor waits until the old native stop completes, even after its owner is dropped.
     preparation: tokio::sync::Mutex<()>,
     native_lifecycle: Arc<tokio::sync::Mutex<()>>,
-    mute_order: tokio::sync::Mutex<()>,
 }
 struct Slot {
     lease: VoiceLease,
@@ -77,27 +55,12 @@ impl VoiceManager {
     pub(crate) async fn preparation(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.inner.preparation.lock().await
     }
-    pub fn unavailable(reason: VoiceRejection) -> VoiceEligibility {
-        VoiceEligibility {
-            available: false,
-            reason: Some(reason),
-            ordinary_usage_allowed: None,
-            credits_excluded: false,
-            format: None,
-            duplex_verified: false,
-            native_webrtc: false,
-            voices: Vec::new(),
-        }
-    }
     pub(crate) fn identity_epoch(&self) -> u64 {
         self.inner.identity_epoch.load(Ordering::Acquire)
     }
     #[cfg(test)]
     pub(crate) fn reserve(&self, chat: &str) -> Result<VoiceLease, VoiceRejection> {
-        self.reserve_at(chat, self.identity_epoch())
-    }
-    pub(crate) fn reserve_at(&self, chat: &str, epoch: u64) -> Result<VoiceLease, VoiceRejection> {
-        self.reserve_with_deadline(chat, epoch, 5)
+        self.reserve_with_deadline(chat, self.identity_epoch(), 5)
     }
     fn reserve_with_deadline(
         &self,
@@ -219,28 +182,6 @@ impl VoiceManager {
         };
         self.publish(lease, VoiceEvent::Snapshot { snapshot })
     }
-    pub async fn mute(&self, lease: &VoiceLease, muted: bool) -> Result<(), VoiceRejection> {
-        let _order = self.inner.mute_order.lock().await;
-        let provider = {
-            let state = self.inner.slot.lock().unwrap();
-            let s = state
-                .as_ref()
-                .filter(|s| Self::matches(s, lease))
-                .ok_or(VoiceRejection::InvalidLease)?;
-            if s.snapshot.phase == VoicePhase::Active {
-                s.provider.clone()
-            } else {
-                None
-            }
-        };
-        if let Some(provider) = provider {
-            if let Err(reason) = provider.mute(muted).await {
-                let _ = self.finish(lease, Some(reason));
-                return Err(reason);
-            }
-        }
-        self.update(lease, |s| s.muted = muted)
-    }
     pub fn stop(&self, lease: &VoiceLease) -> Result<(), VoiceRejection> {
         self.finish(lease, None)
     }
@@ -308,172 +249,12 @@ impl VoiceManager {
             Self::close_slot(slot, None);
         }
     }
-    pub(crate) fn connect(
-        &self,
-        lease: VoiceLease,
-        chat: String,
-        voice: Option<String>,
-        voices: Vec<String>,
-        bridge: RealtimeHandle,
-        mut events: tokio::sync::broadcast::Receiver<VoiceEvent>,
-        active: Arc<crate::sessions::VoiceActivity>,
-        doc: Arc<crate::doc_host::ChatDocHandle>,
-        sessions: crate::sessions::SessionsEngine,
-        workspace: crate::workspace_host::WorkspaceHost,
-        expected_chat: zeron_proto::Chat,
-    ) -> Result<(), VoiceRejection> {
-        if bridge.invalidated() {
-            return Err(VoiceRejection::InvalidLease);
-        }
-        let cancel = {
-            let mut state = self.inner.slot.lock().unwrap();
-            let s = state
-                .as_mut()
-                .filter(|s| Self::matches(s, &lease))
-                .ok_or(VoiceRejection::InvalidLease)?;
-            s.provider = Some(bridge.clone());
-            s.snapshot.voice = voice.clone();
-            s.snapshot.voices = voices;
-            s.cancel.clone()
-        };
-        let call = active.call();
-        let manager = self.clone();
-        tokio::spawn(async move {
-            let _call = call;
-            struct ChatGuard(tokio::task::JoinHandle<()>);
-            impl Drop for ChatGuard {
-                fn drop(&mut self) {
-                    self.0.abort();
-                }
-            }
-            let watch_manager = manager.clone();
-            let watch_lease = lease.clone();
-            let watch_cancel = cancel.clone();
-            let watched_workspace = workspace.clone();
-            let mut rows = workspace.watch_chats();
-            let _chat_guard = ChatGuard(tokio::spawn(async move {
-                loop {
-                    let invalid = match watched_workspace.chat(&expected_chat.id) {
-                        Ok(Some(row)) if row.device_id != watched_workspace.device_id() => {
-                            Some(VoiceRejection::RemoteHost)
-                        }
-                        Ok(Some(row))
-                            if row.config.as_ref().map(|c| c.harness)
-                                != Some(zeron_proto::HarnessId::Codex) =>
-                        {
-                            Some(VoiceRejection::WrongHarness)
-                        }
-                        Ok(Some(row))
-                            if row.config != expected_chat.config
-                                || row.cwd != expected_chat.cwd =>
-                        {
-                            Some(VoiceRejection::InvalidLease)
-                        }
-                        Ok(Some(_)) => None,
-                        _ => Some(VoiceRejection::Unsupported),
-                    };
-                    if let Some(reason) = invalid {
-                        let _ = watch_manager.finish(&watch_lease, Some(reason));
-                        return;
-                    }
-                    tokio::select! { biased;
-                        _ = watch_cancel.cancelled() => return,
-                        changed = rows.changed() => if changed.is_err() { let _ = watch_manager.finish(&watch_lease, Some(VoiceRejection::Protocol)); return; },
-                    }
-                }
-            }));
-            let result=async {
-                let _serial=tokio::select!{biased;_=cancel.cancelled()=>return Ok(()),lock=manager.inner.native_lifecycle.lock()=>lock};
-                loop {
-                    let owner=manager.inner.slot.lock().unwrap().as_ref().filter(|s|Self::matches(s,&lease)).is_some_and(|s|s.owner_attached);
-                    if owner{break;}tokio::select!{biased;_=cancel.cancelled()=>return Ok(()),_=tokio::time::sleep(Duration::from_millis(10))=>{}}
-                }
-                let (reply,rx)=tokio::sync::oneshot::channel();
-                tokio::select!{biased;
-                    _=cancel.cancelled()=>return Ok(()),
-                    sent=tokio::time::timeout(Duration::from_secs(8),bridge.commands.send(VoiceCommand::Start{voice,session_id:lease.session_id.clone(),generation:lease.generation,reply}))=>sent.map_err(|_|VoiceRejection::Protocol)?.map_err(|_|VoiceRejection::Protocol)?,
-                }
-                let startup=async {
-                    tokio::time::timeout(Duration::from_secs(110),rx).await.map_err(|_|VoiceRejection::Protocol)?.map_err(|_|VoiceRejection::Protocol)??;
-                    loop {
-                        let owner=manager.inner.slot.lock().unwrap().as_ref().filter(|s|Self::matches(s,&lease)).is_some_and(|s|s.owner_attached);
-                        if owner{break;}tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    let _order=manager.inner.mute_order.lock().await;
-                    let muted=manager.inner.slot.lock().unwrap().as_ref().filter(|s|Self::matches(s,&lease)).ok_or(VoiceRejection::InvalidLease)?.snapshot.muted;
-                    let work=match sessions.session_status(&chat).map(|s|s.status){Some(SessionStatus::AwaitingInput)=>VoiceWork::AwaitingInput,Some(SessionStatus::Working)=>VoiceWork::Working,_=>VoiceWork::Idle};
-                    if work==VoiceWork::AwaitingInput{return Err(VoiceRejection::Busy);}
-                    bridge.mute(muted).await?;manager.update(&lease,|s|{s.phase=VoicePhase::Active;s.work=work;})?;Ok::<_,VoiceRejection>(())
-                };
-                // Startup cancellation includes the helper and late native signaling requests.
-                let started=tokio::select!{biased;_=cancel.cancelled()=>Ok(()),r=startup=>r};
-                if started.is_err()||cancel.is_cancelled(){let _=bridge.stop().await;return started;}
-                let mut statuses=sessions.watch_sessions();
-                let mut last_partial:Option<String>=None;
-                let mut speaker_activity = SpeakerActivity::default();
-                let run=async {loop{tokio::select!{biased;
-                    _=cancel.cancelled()=>return Ok(()),
-                    changed=statuses.changed()=>{
-                        changed.map_err(|_|VoiceRejection::Protocol)?;
-                        let status=statuses.borrow().iter().find(|s|s.chat_id==chat).map(|s|s.status);
-                        let work=match status{Some(SessionStatus::AwaitingInput)=>VoiceWork::AwaitingInput,Some(SessionStatus::Working)=>VoiceWork::Working,_=>VoiceWork::Idle};
-                        // The orchestrator outlives navigation: a pending question is
-                        // surfaced on the voice stage instead of ending the session.
-                        manager.update(&lease,|s|s.work=work)?;
-                    },
-                    event=events.recv()=>{
-                        let event=event.map_err(|_|VoiceRejection::Overflow)?;
-                        match &event {
-                            VoiceEvent::Final{transcript}=>{
-                                if transcript.session_id!=lease.session_id{continue;}
-                                if doc.commit_voice(transcript).map_err(|_|VoiceRejection::Protocol)?.is_some() {
-                                    workspace.note_message(&chat, &transcript.text);
-                                }
-                                last_partial=None;
-                            },
-                            VoiceEvent::Partial{generation,item_id,..}=>{if *generation!=lease.generation{continue;}if item_id!=&last_partial{last_partial=item_id.clone();}},
-                            VoiceEvent::Levels{generation,speaker,..}=>{if *generation!=lease.generation{continue;}
-                                let playing=speaker_activity.update(*speaker, Instant::now());
-                                let changed=manager.inner.slot.lock().unwrap().as_ref().is_some_and(|s|s.snapshot.playing!=playing);
-                                if changed{manager.update(&lease,|s|s.playing=playing)?;}
-                            },
-                            VoiceEvent::Closed{generation,reason}=>{if *generation!=lease.generation{continue;}return reason.map_or(Ok(()),Err);},
-                            VoiceEvent::Audio{..}=>return Err(VoiceRejection::Protocol), // Never route API PCM into the subscription session.
-                            _=>{},
-                        }
-                        manager.publish(&lease,event)?;
-                    }
-                }}}.await;
-                let _=bridge.stop().await;run
-            }.await;
-            let _ = manager.finish(&lease, result.err());
-        });
-        Ok(())
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn speaker_activity_ignores_noise_and_holds_through_syllable_gaps() {
-        let now = Instant::now();
-        let mut activity = SpeakerActivity::default();
-        assert!(!activity.update(100, now));
-        assert!(!activity.update(500, now));
-        assert!(activity.update(1024, now));
-        assert!(activity.update(0, now + Duration::from_millis(100)));
-        assert!(activity.update(0, now + Duration::from_millis(249)));
-        assert!(!activity.update(0, now + Duration::from_millis(250)));
-        // The lower exit threshold keeps quiet speech active, but does not
-        // let the same background level start a new speaking interval.
-        assert!(!activity.update(500, now + Duration::from_millis(300)));
-        assert!(activity.update(1024, now + Duration::from_millis(400)));
-        assert!(activity.update(500, now + Duration::from_millis(600)));
-        assert!(activity.update(0, now + Duration::from_millis(800)));
-        assert!(!activity.update(0, now + Duration::from_millis(850)));
-    }
     #[tokio::test]
     async fn exclusive_owner_drop_and_stale_guards() {
         let manager = VoiceManager::default();
@@ -513,10 +294,10 @@ mod tests {
         let epoch = manager.identity_epoch();
         manager.retire();
         assert_eq!(
-            manager.reserve_at("chat", epoch).unwrap_err(),
+            manager.reserve_with_deadline("chat", epoch, 5).unwrap_err(),
             VoiceRejection::InvalidLease
         );
-        assert!(manager.reserve_at("chat", manager.identity_epoch()).is_ok());
+        assert!(manager.reserve("chat").is_ok());
     }
 
     #[tokio::test]

@@ -76,7 +76,8 @@ class RuntimePackagingTests(unittest.TestCase):
                     self.assertNotIn('\\', name)
                     self.assertEqual(packager.checksum(destination / name), digest)
                 self.assertFalse((destination / 'bin/codex').exists())
-                if not target.endswith('windows-msvc'):
+                # Windows hosts cannot represent POSIX execute bits.
+                if os.name != 'nt' and not target.endswith('windows-msvc'):
                     self.assertTrue((destination / helper).stat().st_mode & 0o111)
 
     def test_platform_and_version_mismatches_do_not_replace_existing_runtime(self):

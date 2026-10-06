@@ -9,13 +9,16 @@
 //! listener. Outward deltas always propagate — at an end the container clamps
 //! them to a no-op and its scroll handler still fires (transcript pin/anchor
 //! release, file-tree rail) exactly as without the band. Only inward deltas
-//! that unwind an active stretch stop propagation, so the content returns to
-//! the edge before the container scrolls again.
+//! that the band absorbs stop propagation, so the content returns to the edge
+//! before the container scrolls again; a delta larger than the band collapses
+//! it and reaches the container whole.
 //!
 //! GPUI maps NSEvent `phase` but not `momentumPhase`, so inertia is inferred:
-//! after `Ended`, phase-less `Moved` events are the fling's momentum. A fling
-//! that reaches an end bounces once (an impulse sized from its velocity); the
-//! rest of it is clamped as usual. A touch that never scrolls arrives as
+//! the phase-less `Moved` events that follow `Ended` without a pause are the
+//! fling's momentum. A fling that reaches an end bounces once (an impulse
+//! sized from its velocity); the rest of it is clamped as usual. Phase-less
+//! streams that follow no touch (precise mouse wheels, synthetic input) are
+//! not momentum and never bounce. A touch that never scrolls arrives as
 //! `Started` then a zero `Moved` (NSEventPhaseCancelled is unmapped) and is
 //! treated as a cancel.
 //!
@@ -129,6 +132,14 @@ fn rubber_band_inverse(offset: f32, viewport: f32) -> f32 {
     (viewport / RUBBER_BAND_COEFFICIENT * (1.0 / (1.0 - shown / viewport) - 1.0)).copysign(offset)
 }
 
+/// Move a nonzero `stretch` by `dy`. `None` when the delta is larger than the
+/// band: it collapses, and the whole delta belongs to the container — a big
+/// reverse swipe scrolls instead of vanishing into a few px of band.
+fn travel(stretch: f32, dy: f32) -> Option<f32> {
+    let next = stretch + dy;
+    (next.signum() == stretch.signum()).then_some(next)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Spring {
     from: f32,
@@ -157,6 +168,8 @@ struct Band {
     viewport: f32,
     touching: bool,
     touch_moved: bool,
+    /// Phase-less events now are the momentum of a released touch.
+    momentum: bool,
     fling_bounced: bool,
     fling_velocity: f32,
     last_event: Option<Instant>,
@@ -175,6 +188,7 @@ impl Band {
             TouchPhase::Started => {
                 self.touching = true;
                 self.touch_moved = false;
+                self.momentum = false;
                 self.fling_bounced = false;
                 return false;
             }
@@ -190,6 +204,8 @@ impl Band {
             return false;
         }
         if !self.touching && gap.is_none_or(|gap| gap > FLING_GAP) {
+            // A pause ends the fling; what follows is not its momentum.
+            self.momentum = false;
             self.fling_bounced = false;
             self.fling_velocity = 0.0;
         }
@@ -206,6 +222,7 @@ impl Band {
         };
         if phase == TouchPhase::Ended {
             self.release(now);
+            self.momentum = true;
         }
         consumed
     }
@@ -222,13 +239,13 @@ impl Band {
         self.spring = None;
         if self.stretch != 0.0 {
             let inward = dy.signum() != self.stretch.signum();
-            let next = self.stretch + dy;
-            self.stretch = if next.signum() == self.stretch.signum() {
-                next
-            } else {
-                0.0
+            let Some(next) = travel(self.stretch, dy) else {
+                self.stretch = 0.0;
+                self.offset = 0.0;
+                return false;
             };
-            self.offset = rubber_band(self.stretch, self.viewport);
+            self.stretch = next;
+            self.offset = rubber_band(next, self.viewport);
             return inward;
         }
         // The container takes the room it has; the rest stretches the band.
@@ -245,9 +262,25 @@ impl Band {
             return false;
         }
         if self.offset != 0.0 || self.spring.is_some() {
-            // Momentum is spent against the end while the band settles; an
-            // inward tail would scroll the container under displaced content.
-            return self.offset != 0.0 && dy.signum() != self.offset.signum();
+            if self.offset == 0.0 || dy.signum() == self.offset.signum() {
+                // Momentum is spent against the end while the band settles.
+                return false;
+            }
+            // Inward input unwinds the settling band like a drag would,
+            // restarting the return from where it leaves the content.
+            let stretch = rubber_band_inverse(self.offset, self.viewport);
+            let Some(next) = travel(stretch, dy) else {
+                self.offset = 0.0;
+                self.spring = None;
+                return false;
+            };
+            self.offset = rubber_band(next, self.viewport);
+            self.spring = Some(Spring {
+                from: self.offset,
+                velocity: 0.0,
+                start: now,
+            });
+            return true;
         }
         let dt = gap
             .map_or(1.0 / 60.0, |gap| gap.as_secs_f32())
@@ -259,7 +292,7 @@ impl Band {
             } else {
                 velocity
             };
-        if self.fling_bounced || dy.abs() <= room.toward(dy) {
+        if !self.momentum || self.fling_bounced || dy.abs() <= room.toward(dy) {
             return false;
         }
         self.fling_bounced = true;
@@ -490,11 +523,50 @@ mod tests {
         // Inward while stretched: unwinds the band, never reaches the list.
         assert!(band.wheel(TouchPhase::Moved, dy(-20.0), AT_TOP, now));
         assert!(band.offset > 0.0 && band.offset < stretched);
-        assert!(band.wheel(TouchPhase::Moved, dy(-100.0), AT_TOP, now));
+        // Larger than the band: it collapses and the list gets the delta.
+        assert!(!band.wheel(TouchPhase::Moved, dy(-100.0), AT_TOP, now));
         assert_eq!(band.offset, 0.0);
         // At rest again, inward travel scrolls the container normally.
         assert!(!band.wheel(TouchPhase::Moved, dy(-20.0), AT_TOP, now));
         assert_eq!(band.offset, 0.0);
+    }
+
+    #[test]
+    fn phase_less_input_without_a_touch_never_bounces() {
+        // Precise wheels and synthetic input: no Started/Ended around them.
+        let mut now = Instant::now();
+        let mut band = band();
+        for _ in 0..20 {
+            now += Duration::from_millis(8);
+            assert!(!band.wheel(TouchPhase::Moved, dy(-60.0), AT_TOP, now));
+            assert!(!band.wheel(TouchPhase::Moved, dy(60.0), AT_TOP, now));
+        }
+        assert!(band.spring.is_none());
+        assert_eq!(band.offset, 0.0);
+    }
+
+    #[test]
+    fn reverse_input_during_a_bounce_reaches_the_container() {
+        let mut now = Instant::now();
+        let mut band = band();
+        band.wheel(TouchPhase::Started, dy(0.0), AT_TOP, now);
+        band.wheel(TouchPhase::Moved, dy(-10.0), AT_TOP, now);
+        band.wheel(TouchPhase::Ended, dy(0.0), AT_TOP, now);
+        now += Duration::from_millis(8);
+        band.wheel(TouchPhase::Moved, dy(40.0), AT_TOP, now);
+        now += Duration::from_millis(40);
+        band.tick(now);
+        let bounced = band.offset;
+        assert!(bounced > 1.0);
+        // A small inward nudge is absorbed and restarts the return there.
+        now += Duration::from_millis(8);
+        assert!(band.wheel(TouchPhase::Moved, dy(-0.5), AT_TOP, now));
+        assert!(band.offset > 0.0 && band.offset < bounced);
+        // A real reverse swipe collapses the band and scrolls.
+        now += Duration::from_millis(8);
+        assert!(!band.wheel(TouchPhase::Moved, dy(-300.0), AT_TOP, now));
+        assert_eq!(band.offset, 0.0);
+        assert!(band.spring.is_none());
     }
 
     #[test]
@@ -637,8 +709,13 @@ mod tests {
         assert_eq!(scroll.offset().y, px(0.0), "unwinding must not scroll");
         assert!(*top.borrow() < stretched);
         wheel(-100.0, TouchPhase::Moved);
-        assert_eq!(*top.borrow(), 0.0);
+        assert_eq!(
+            scroll.offset().y,
+            px(-100.0),
+            "a swipe past the band scrolls"
+        );
+        assert_eq!(*top.borrow(), -100.0);
         wheel(-30.0, TouchPhase::Moved);
-        assert_eq!(scroll.offset().y, px(-30.0));
+        assert_eq!(scroll.offset().y, px(-130.0));
     }
 }

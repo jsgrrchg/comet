@@ -3191,11 +3191,7 @@ async fn new_session(
 
 /// acp reserves -32000 for auth_required.
 fn is_auth_required(error: &HarnessError) -> bool {
-    match error {
-        HarnessError::Rpc { code: -32000, .. } => true,
-        HarnessError::Protocol(message) => message.contains("(code -32000)"),
-        _ => false,
-    }
+    matches!(error, HarnessError::Protocol(message) if message.contains("(code -32000)"))
 }
 
 const EFFORT_SUFFIXES: [(&str, &str, ReasoningLevel); 3] = [

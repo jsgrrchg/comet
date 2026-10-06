@@ -154,6 +154,18 @@ impl Drop for BridgeTask {
     }
 }
 
+/// Stops routing realtime notifications once the bridge ends, so a text-only
+/// runtime goes back to plain stdout handling.
+struct VoiceSubscription {
+    client: RpcClient,
+    overflow: Arc<std::sync::atomic::AtomicBool>,
+}
+impl Drop for VoiceSubscription {
+    fn drop(&mut self) {
+        self.client.unsubscribe_voice(&self.overflow);
+    }
+}
+
 pub(super) fn attach(
     client: RpcClient,
     thread: String,
@@ -169,7 +181,13 @@ pub(super) fn attach(
             cancel.cancel();
         }
     });
+    // Moved into the task so it unsubscribes even when aborted before polling.
+    let subscription = VoiceSubscription {
+        client: client.clone(),
+        overflow: overflow.clone(),
+    };
     BridgeTask(tokio::spawn(async move {
+        let _subscription = subscription;
         let RealtimeControls {
             audio_abort,
             invalidated,

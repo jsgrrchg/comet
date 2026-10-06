@@ -1395,7 +1395,9 @@ fn surface_label(surface: SurfacePreference) -> &'static str {
 
 fn reduce_motion_helper(preference: ReduceMotion, system: bool) -> &'static str {
     match (preference, system) {
-        (ReduceMotion::System, true) => "Following the system, which currently reduces motion.",
+        (ReduceMotion::System, true) => {
+            "Following reduced system motion. Activity indicators use a gentle brightness pulse."
+        }
         (ReduceMotion::System, false) => "Following the system, which currently allows motion.",
         (ReduceMotion::On, _) => "Animations skip straight to their final state.",
         (ReduceMotion::Off, _) => "Animations play even if the system asks for less motion.",

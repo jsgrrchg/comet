@@ -45,7 +45,7 @@ ACP, Claude, Codex, and opencode search PATH and known native installation
 directories. Discovery is PATHEXT-aware: npm's `.cmd` shims (and any `.bat`)
 resolve like `cmd.exe` would — per directory, extensions in PATHEXT order —
 and spawn through `cmd.exe /e:ON /v:OFF /d /c` inside the same Job Object, so npm-
-installed agents (`codex`, `opencode`, `pi-acp`, a bare `npm i -g grok`)
+installed agents (`codex`, `opencode`, `pi`, a bare `npm i -g grok`)
 work without following `node_modules` payloads. Batch arguments containing
 CR/LF and batch executable paths containing percent expansion syntax are rejected.
 GUI launches additionally
@@ -68,6 +68,12 @@ Personalization > Colors > Transparency effects**. Content cards and popovers
 remain opaque because in-app backdrop blur is not supported. The pinned
 [Zui DirectX fix](https://github.com/zeronsh/zui/pull/7) supplies the renderer
 layout and edge-fade corrections.
+
+When Windows disables **Animation effects**, Zeron's **Reduce motion: System**
+setting skips transitions and gives activity grids a gentle 2.4-second brightness
+pulse. **Reduce motion: On** keeps those indicators still; **Off** restores the
+usual travelling wave. **Pause animations in background** also pauses activity
+grids when the main window loses focus.
 
 ## Verification
 

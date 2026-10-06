@@ -87,7 +87,7 @@ final class CoreSessionSource: SessionSource {
         // Working state is shown at the transcript tail (layout engine), not here.
         if let input = c.openInput {
             next.questions = (input.requestId, input.questions.map {
-                SessionChrome.Question(id: $0.id, header: $0.header, text: $0.question, options: $0.options, multiSelect: $0.multiSelect)
+                SessionChrome.Question(id: $0.id, header: $0.header, text: $0.question, options: $0.options, multiSelect: $0.multiSelect, prefill: $0.prefill, multiline: $0.multiline)
             })
         }
         next.queue = c.queue.map { q in
@@ -246,6 +246,15 @@ final class CoreSessionSource: SessionSource {
     }
 
     private static let images = NSCache<NSString, UIImage>()
+
+    func image(_ reference: String) async -> UIImage? {
+        if let hit = Self.images.object(forKey: reference as NSString) { return hit }
+        guard let data = try? await client.readAttachment(deviceId: hostDevice, path: reference),
+              let image = await UIImage(data: data)?.byPreparingForDisplay()
+        else { return nil }
+        Self.images.setObject(image, forKey: reference as NSString)
+        return image
+    }
 
     func loadImage(_ reference: String, into view: UIImageView) {
         // Claim the view first: a slower load for a row it used to show

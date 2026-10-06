@@ -28,10 +28,13 @@ pub mod composer;
 mod composer_dock;
 mod composer_markdown;
 mod context_usage;
+mod dictation;
 pub mod edge_fade;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
+mod glass;
+mod haptics;
 pub mod history;
 pub mod icons;
 pub(crate) mod image_media;
@@ -50,6 +53,7 @@ pub mod popover;
 pub mod project_actions;
 pub mod queue;
 pub mod rail;
+mod roll_text;
 pub mod settings;
 pub mod shell;
 pub mod sound;
@@ -57,6 +61,7 @@ pub mod state;
 pub(crate) mod surface_chrome;
 pub mod syntax_cache;
 pub mod terminal;
+mod todo_panel;
 pub mod theme;
 pub mod theme_library;
 pub mod transcript;
@@ -179,6 +184,11 @@ pub fn run_app(config: UiConfig) {
             ui_settings.git_history_column_widths,
             ui_settings.git_history_column_order,
             ui_settings.git_history_author_display,
+            cx,
+        );
+        motion::init(
+            ui_settings.reduce_motion,
+            ui_settings.pause_animations_in_background,
             cx,
         );
         composer::init(cx, ui_settings.composer_send_behavior);

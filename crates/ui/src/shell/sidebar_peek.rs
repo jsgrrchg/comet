@@ -93,8 +93,7 @@ impl Shell {
         // while the window still reports hovered and its last position is stale.
         let hovered = self.sidebar_peek.pointer_inside;
         let in_height = y >= 0.0 && y < f32::from(window.viewport_size().height);
-        let modal = self.rename_dialog.is_some()
-            || self.rename_space_dialog.is_some()
+        let modal = self.rename_space_dialog.is_some()
             || self.delete_confirm.is_some()
             || self.delete_space_confirm.is_some()
             || self.add_space.is_some()
@@ -116,6 +115,10 @@ impl Shell {
                 && x >= 0.0
                 && x <= self.sidebar_peek_right_edge() + LEAVE_SLOP,
             held: self.sidebar_peek_menu_open()
+                || self
+                    .chat_rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.surface == ChatRenameSurface::Sidebar)
                 || (self.sidebar_peek_focus.contains_focused(window, cx)
                     && (self.sidebar_peek.keyboard_focus
                         || window

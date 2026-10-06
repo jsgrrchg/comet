@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-pub use view::{SpeakerActivity, VoiceView, orb_state};
+pub use view::{Caption, SpeakerActivity, VoiceView, orb_state};
 use zeron_proto::voice::{remote as wire, *};
 use zeron_rpc::{RpcClient, methods};
 

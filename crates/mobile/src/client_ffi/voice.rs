@@ -155,8 +155,8 @@ fn call_state(view: &VoiceView) -> VoiceCallState {
         },
         muted: view.muted(),
         speaking: view.playing(),
-        caption: view.caption.clone(),
-        caption_speaker: view.caption_role.map(|role| match role {
+        caption: view.caption().to_owned(),
+        caption_speaker: view.caption_role().map(|role| match role {
             VoiceRole::User => VoiceSpeaker::User,
             VoiceRole::Assistant => VoiceSpeaker::Assistant,
         }),

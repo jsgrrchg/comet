@@ -19,7 +19,8 @@ pub struct VoiceController {
     pub chat_id: Option<String>,
     pub reason: Option<VoiceRejection>,
     pub snapshot: Option<VoiceSnapshot>,
-    pub partial: String,
+    /// The newest speaker turn's live text, then its final.
+    pub caption: zeron_voice_session::Caption,
     pub microphone_level: u16,
     pub speaker_level: u16,
     /// The full-window stage is presented over the shell.
@@ -28,7 +29,6 @@ pub struct VoiceController {
     speaker_last_loud: Option<std::time::Instant>,
     /// When the session first became active; drives the stage's call timer.
     pub active_since: Option<std::time::Instant>,
-    partial_item: Option<String>,
     engine: Option<EngineHandle>,
     controls: Option<tokio::sync::mpsc::Sender<VoiceControl>>,
     epoch: u64,
@@ -50,14 +50,13 @@ impl Default for VoiceController {
             chat_id: None,
             reason: None,
             snapshot: None,
-            partial: String::new(),
+            caption: Default::default(),
             microphone_level: 0,
             speaker_level: 0,
             stage_open: false,
             host_name: None,
             speaker_last_loud: None,
             active_since: None,
-            partial_item: None,
             engine: None,
             controls: None,
             epoch: 0,
@@ -212,8 +211,7 @@ impl VoiceController {
         }
         self.cued = false;
         self.snapshot = None;
-        self.partial.clear();
-        self.partial_item = None;
+        self.caption.clear();
         self.microphone_level = 0;
         self.speaker_level = 0;
         self.controls = None;
@@ -277,7 +275,7 @@ impl VoiceController {
 
     /// The utterance the caption shows (a speaker turn), if the provider names it.
     pub fn caption_item(&self) -> Option<&str> {
-        self.partial_item.as_deref()
+        self.caption.item()
     }
 
     pub fn orb_state(&self) -> OrbState {
@@ -330,13 +328,7 @@ impl VoiceController {
                 .as_ref()
                 .is_some_and(|s| s.generation == generation) =>
             {
-                if self.partial_item != item_id {
-                    self.partial.clear();
-                    self.partial_item = item_id;
-                }
-                if self.partial.len() + text.len() <= MAX_TRANSCRIPT_BYTES {
-                    self.partial.push_str(&text);
-                } else {
+                if !self.caption.partial(item_id, &text) {
                     self.cancel(cx);
                     self.phase = VoicePhase::Failed;
                     self.reason = Some(VoiceRejection::Overflow);
@@ -374,8 +366,7 @@ impl VoiceController {
                     .as_ref()
                     .is_some_and(|s| s.session_id == transcript.session_id) =>
             {
-                self.partial = transcript.text;
-                self.partial_item = Some(transcript.item_id);
+                self.caption.complete(&transcript);
             }
             VoiceEvent::Closed { generation, reason }
                 if self
@@ -516,7 +507,7 @@ mod tests {
                 },
                 cx,
             );
-            assert!(voice.partial.is_empty());
+            assert!(voice.caption.text().is_empty());
             voice.reduce(
                 VoiceEvent::Partial {
                     generation: 2,
@@ -543,10 +534,48 @@ mod tests {
             voice.cancel(cx);
             assert!(!voice.is_live());
             assert!(!voice.stage_open);
-            assert!(voice.partial.is_empty());
+            assert!(voice.caption.text().is_empty());
             // A closed session never reopens the stage.
             voice.set_stage_open(true, cx);
             assert!(!voice.stage_open);
+        });
+    }
+
+    /// Codex delivers the user's final after the answer started streaming:
+    /// the caption stays on the answer and keeps every streamed word.
+    #[gpui::test]
+    fn late_user_final_keeps_the_streaming_answer_captioned(cx: &mut gpui::TestAppContext) {
+        let voice = cx.new(|_| VoiceController::default());
+        voice.update(cx, |voice, cx| {
+            voice.chat_id = Some("chat".into());
+            voice.reduce(
+                VoiceEvent::Snapshot {
+                    snapshot: snapshot(),
+                },
+                cx,
+            );
+            let partial = |item: &str, text: &str| VoiceEvent::Partial {
+                generation: 2,
+                item_id: Some(item.into()),
+                text: text.into(),
+            };
+            voice.reduce(partial("user", "Open the test"), cx);
+            voice.reduce(partial("answer", "Sure, "), cx);
+            voice.reduce(
+                VoiceEvent::Final {
+                    transcript: VoiceTranscript {
+                        session_id: "one".into(),
+                        item_id: "user".into(),
+                        role: VoiceRole::User,
+                        text: "Open the test.".into(),
+                        promoted_message_id: None,
+                    },
+                },
+                cx,
+            );
+            voice.reduce(partial("answer", "opening it."), cx);
+            assert_eq!(voice.caption.text(), "Sure, opening it.");
+            assert_eq!(voice.caption_item(), Some("answer"));
         });
     }
 

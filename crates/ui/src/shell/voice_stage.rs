@@ -365,7 +365,7 @@ impl Shell {
         );
         let (caption_item, partial) = (
             voice.caption_item().map(str::to_owned),
-            voice.partial.clone(),
+            voice.caption.text().to_owned(),
         );
         let snapshot = voice.snapshot.clone();
         let chat_id = voice.chat_id.clone();

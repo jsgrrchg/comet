@@ -13132,6 +13132,13 @@ impl Render for Shell {
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
                 // Full-window voice stage: above the page chrome, below dialogs.
                 let voice_stage = self.render_voice_stage(window, cx);
+                // A glass stage has no fill: fade out what it covers so only
+                // the window frost shows through.
+                let under_stage = if Theme::of(cx).is_glass() {
+                    1.0 - self.voice_stage_reveal(cx)
+                } else {
+                    1.0
+                };
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
                 // No inset cards (user request): the conversation column sits
@@ -13155,6 +13162,7 @@ impl Render for Shell {
                     .flex()
                     .flex_row()
                     .overflow_hidden()
+                    .opacity(under_stage)
                     .child(main)
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (zeron
@@ -13220,6 +13228,7 @@ impl Render for Shell {
                                     .h_full()
                                     .flex_none()
                                     .relative()
+                                    .opacity(under_stage)
                                     .child(
                                         div()
                                             .h_full()
@@ -13231,7 +13240,15 @@ impl Render for Shell {
                                     .child(right_seam),
                             ),
                     )
-                    .child(div().absolute().top_0().left_0().right_0().child(title_bar))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .opacity(under_stage)
+                            .child(title_bar),
+                    )
                     // The stage covers the conversation's titlebar but never
                     // the cluster: the sidebar toggle and navigation stay live.
                     .children(voice_stage)

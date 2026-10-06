@@ -326,6 +326,14 @@ impl Shell {
         )
     }
 
+    /// How far the stage has arrived: 0 hidden, 1 fully covering the page.
+    pub(super) fn voice_stage_reveal(&self, cx: &App) -> f32 {
+        let elapsed = self
+            .voice_stage_changed_at
+            .map_or(f32::INFINITY, |at| at.elapsed().as_secs_f32() * 1000.0);
+        stage_reveal(self.voice.read(cx).stage_open, elapsed, self.reduced_motion)
+    }
+
     /// Full-window stage: the session's orb over the new-thread hero artwork,
     /// live caption, and the session controls. Escape returns to the chats
     /// without ending voice.
@@ -335,10 +343,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let open = self.voice.read(cx).stage_open;
-        let elapsed = self
-            .voice_stage_changed_at
-            .map_or(f32::INFINITY, |at| at.elapsed().as_secs_f32() * 1000.0);
-        let reveal = stage_reveal(open, elapsed, self.reduced_motion);
+        let reveal = self.voice_stage_reveal(cx);
         if reveal > 0.0 && reveal < 1.0 {
             self.motion_active.set(true);
         }
@@ -499,7 +504,9 @@ impl Shell {
                 .left(px(left))
                 .occlude()
                 .opacity(reveal)
-                .bg(theme.bg)
+                // On glass the stage shows the window frost like the new-thread
+                // page; the page beneath fades out instead (see `render`).
+                .when(!theme.is_glass(), |stage| stage.bg(theme.bg))
                 .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                     let key = event.keystroke.key.as_str();
                     let plain = !event.keystroke.modifiers.modified();

@@ -7123,6 +7123,7 @@ impl Shell {
                     // carries the titlebar clearance inside the scroll.
                     .flex()
                     .flex_col()
+                    .opacity(self.voice_stage_underlay_opacity(cx))
                     .child(div().flex_1().min_h_0().child(outlet)),
             )
             .child(
@@ -13012,6 +13013,8 @@ impl Render for Shell {
                 // for the return trip.
                 if let Route::Settings(section) = self.route {
                     let settings_page = self.render_settings_page(section, window, cx);
+                    // A call started from Settings opens its stage here too.
+                    let voice_stage = self.render_voice_stage(window, cx);
                     let overlays = self.render_overlays(window.viewport_size(), window, cx);
                     let border_color = Theme::of(cx).border;
                     let sidebar_tone =
@@ -13030,6 +13033,7 @@ impl Render for Shell {
                         .size_full()
                         .relative()
                         .child(settings_page)
+                        .children(voice_stage)
                         .child(drag)
                         .children(overlays);
                     break 'ready root
@@ -13132,13 +13136,7 @@ impl Render for Shell {
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
                 // Full-window voice stage: above the page chrome, below dialogs.
                 let voice_stage = self.render_voice_stage(window, cx);
-                // A glass stage has no fill: fade out what it covers so only
-                // the window frost shows through.
-                let under_stage = if Theme::of(cx).is_glass() {
-                    1.0 - self.voice_stage_reveal(cx)
-                } else {
-                    1.0
-                };
+                let under_stage = self.voice_stage_underlay_opacity(cx);
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
                 // No inset cards (user request): the conversation column sits
@@ -17255,6 +17253,38 @@ mod settings_modal_regressions {
                 );
             })
             .unwrap();
+    }
+
+    #[gpui::test]
+    fn voice_stage_opens_over_settings(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
+        shell.update(cx, |shell, cx| {
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.reduced_motion = true;
+            shell.open_settings(SettingsSection::Voice, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("voice-stage").is_none());
+
+        shell.update(cx, |shell, cx| {
+            shell.voice.update(cx, |voice, _| {
+                voice.phase = zeron_proto::voice::VoicePhase::Active
+            });
+            shell.set_voice_stage_open(true, cx);
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let stage = cx
+            .debug_bounds("voice-stage")
+            .expect("stage renders in Settings");
+        shell.read_with(cx, |shell, cx| {
+            assert!(matches!(shell.route, Route::Settings(_)));
+            assert!(shell.voice.read(cx).stage_open);
+            // The settings sidebar stays usable beside the stage.
+            assert_eq!(f32::from(stage.origin.x), shell.settings.sidebar_width);
+        });
     }
 
     #[gpui::test]

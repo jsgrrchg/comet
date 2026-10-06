@@ -334,6 +334,16 @@ impl Shell {
         stage_reveal(self.voice.read(cx).stage_open, elapsed, self.reduced_motion)
     }
 
+    /// Opacity for the page the stage covers. A glass stage has no fill, so
+    /// what it covers fades out and only the window frost shows through.
+    pub(super) fn voice_stage_underlay_opacity(&self, cx: &App) -> f32 {
+        if Theme::of(cx).is_glass() {
+            1.0 - self.voice_stage_reveal(cx)
+        } else {
+            1.0
+        }
+    }
+
     /// Full-window stage: the session's orb over the new-thread hero artwork,
     /// live caption, and the session controls. Escape returns to the chats
     /// without ending voice.
@@ -390,8 +400,12 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let viewport = window.viewport_size();
         // The sidebar stays usable beside the stage; collapsed, the stage
-        // spans the whole window.
-        let left = self.sidebar_now();
+        // spans the whole window. Settings always shows its own sidebar.
+        let left = if matches!(self.route, Route::Settings(_)) {
+            self.settings.sidebar_width
+        } else {
+            self.sidebar_now()
+        };
         let width = (f32::from(viewport.width) - left).max(0.0);
         let ui_settings = settings::current(cx);
         let artwork = ui_settings

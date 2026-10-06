@@ -361,7 +361,7 @@ pub fn compact_model_picker(cx: &App) -> bool {
 /// the new-thread canvas background. A unique file name avoids stale image
 /// caches when the background is replaced.
 pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Result<(), String> {
-    let staged = crate::attachments::stage_file(source)?;
+    let staged = crate::attachments::stage_file_verbatim(source)?;
     // Do not persist the candidate or retire the old managed file until the
     // renderer's decoder has accepted the exact bytes we are about to save.
     let image = crate::new_thread_background_image::decode(staged.bytes()).map_err(|_| {

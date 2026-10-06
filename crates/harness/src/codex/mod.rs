@@ -87,6 +87,21 @@ pub fn resolve_codex_executable() -> Option<PathBuf> {
     crate::executable::find_on_paths("codex", extra)
 }
 
+/// `canonicalize` yields `\\?\`-prefixed verbatim paths on Windows, which
+/// cmd.exe cannot launch batch shims through; keep the plain drive/UNC form.
+fn plain_executable(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = path.to_str().and_then(|p| p.strip_prefix(r"\\?\")) {
+            return match rest.strip_prefix(r"UNC\") {
+                Some(share) => PathBuf::from(format!(r"\\{share}")),
+                None => PathBuf::from(rest),
+            };
+        }
+    }
+    path
+}
+
 /// Dotted `thread/start` config overrides that add an injected MCP server
 /// to the user's `mcp_servers` table.
 fn codex_mcp_overrides(mcp: &zeron_proto::McpServer) -> Vec<(String, Value)> {
@@ -704,10 +719,11 @@ impl CodexHarness {
         }
         // Pin the physical release for this process and its voice helper: an
         // installer may move the current symlink while this runtime stays warm.
-        let exe = self
-            .resolve_executable()?
-            .canonicalize()
-            .map_err(HarnessError::Io)?;
+        let exe = plain_executable(
+            self.resolve_executable()?
+                .canonicalize()
+                .map_err(HarnessError::Io)?,
+        );
         // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
         // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
         // Parity with the Claude adapter, which auto-approves every

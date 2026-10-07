@@ -53,6 +53,7 @@ mod new_thread_background_mask;
 mod notice;
 mod notification_service;
 pub mod notify;
+pub mod orb;
 pub mod pickers;
 pub mod popover;
 pub mod project_actions;
@@ -74,6 +75,7 @@ pub mod typography;
 #[cfg(feature = "multi-window-fixture")]
 mod window_fixture;
 mod window_manager;
+pub mod voice;
 mod workspace_links;
 
 use std::path::PathBuf;

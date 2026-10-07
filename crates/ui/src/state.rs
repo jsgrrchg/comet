@@ -125,12 +125,16 @@ pub enum EngineMode {
 trait EngineBackend: Send + Sync {
     fn client(&self) -> &RpcClient;
     fn mode(&self) -> EngineMode;
+    async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        Err(RpcError::Failed("voice media unavailable".into()))
+    }
     /// Graceful teardown (drains runs / flushes docs for the in-process engine).
     async fn shutdown(&self);
 }
 
 /// Embedded engine: owns the [`EngineCore`] and an in-memory RPC loop.
 struct InProcessEngine {
+    service: Arc<dyn RpcService>,
     runtime: Arc<tokio::sync::Mutex<Option<EngineRuntime>>>,
     boot_task: tokio::task::JoinHandle<()>,
     refresh_task: tokio::task::JoinHandle<()>,
@@ -142,6 +146,9 @@ struct InProcessEngine {
 
 #[async_trait]
 impl EngineBackend for InProcessEngine {
+    async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        Ok(memory_client(self.service.clone()))
+    }
     fn client(&self) -> &RpcClient {
         &self.client
     }
@@ -246,6 +253,9 @@ struct RemoteEngine {
 
 #[async_trait]
 impl EngineBackend for RemoteEngine {
+    async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        connect_ws(&self.url).await
+    }
     fn client(&self) -> &RpcClient {
         &self.client
     }
@@ -347,7 +357,8 @@ impl EngineHandle {
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
-        let ipc_task = match zeron_engine::serve_ipc(engine_config.ipc_port, service).await {
+        let ipc_task = match zeron_engine::serve_ipc(engine_config.ipc_port, service.clone()).await
+        {
             Ok(task) => Some(task),
             Err(err) => {
                 tracing::warn!(
@@ -419,6 +430,7 @@ impl EngineHandle {
         });
         let handle = EngineHandle {
             inner: Arc::new(InProcessEngine {
+                service,
                 runtime,
                 boot_task,
                 refresh_task,
@@ -530,6 +542,10 @@ impl EngineHandle {
 
     pub fn mode(&self) -> EngineMode {
         self.inner.mode()
+    }
+
+    pub async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        self.inner.media_client().await
     }
 
     pub fn engine_info(&self) -> &EngineInfo {
@@ -1459,8 +1475,7 @@ impl AppState {
         if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
             return false;
         }
-        if self.connectivity.state == S::Offline
-            || !self.device_online(&chat.device_id, Utc::now())
+        if self.connectivity.state == S::Offline || !self.device_online(&chat.device_id, Utc::now())
         {
             return true;
         }
@@ -2024,10 +2039,11 @@ impl AppState {
     /// another chat (`parent_chat_id`, the Zeron MCP's orchestration link)
     /// are the parent's workers, not sessions the user started: they stay
     /// reachable by id/deep link but never take a sidebar row or jump slot.
+    /// Voice orchestrator chats are hidden the same way.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
         self.chats
             .iter()
-            .filter(|c| !c.archived && c.parent_chat_id.is_none())
+            .filter(|c| !c.archived && c.is_top_level())
     }
 
     pub(crate) fn restore_composer_target(
@@ -3008,7 +3024,10 @@ impl AppState {
         cx.spawn(async move |_, _| {
             if let Err(error) = handle
                 .client()
-                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
+                .call(
+                    methods::FOCUS_CHAT,
+                    serde_json::json!({ "chatId": chat_id }),
+                )
                 .await
             {
                 tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");

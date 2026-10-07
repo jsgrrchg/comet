@@ -181,10 +181,10 @@ impl Detector {
             if let Some(sound) = previous.and_then(|previous| {
                 status.sound_since(&previous, state.send_pending(&session.chat_id, now))
             }) {
-                // Child chats are surfaced inside their parent and should not
-                // generate separate notifications. Keep their detector baseline.
+                // Child chats and voice orchestrators have their own surfaces.
+                // Keep their baselines without separate session notifications.
                 let chat = state.chats.iter().find(|chat| chat.id == session.chat_id);
-                if !chat.is_some_and(|chat| chat.parent_chat_id.is_none()) {
+                if !chat.is_some_and(|chat| chat.is_top_level()) {
                     continue;
                 }
                 let audio = settings.session_sound_enabled(sound)
@@ -419,6 +419,35 @@ mod tests {
                 .collect(&state, &settings, false, now, instant)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn voice_orchestrator_completion_does_not_emit_a_session_notification() {
+        let mut state = AppState::new();
+        state.connection = crate::state::ConnectionStatus::Ready;
+        let id = format!("{}shared", zeron_proto::voice::ORCHESTRATOR_CHAT_PREFIX);
+        let mut voice_chat = chat(None);
+        voice_chat.id = id.clone();
+        let mut voice_session = session();
+        voice_session.chat_id = id.clone();
+        state.chats = vec![voice_chat];
+        state.sessions = vec![voice_session];
+        let mut detector = Detector::default();
+        let settings = UiSettings::default();
+        let now = Utc::now();
+        let instant = Instant::now();
+        assert!(
+            detector
+                .collect(&state, &settings, false, now, instant)
+                .is_empty()
+        );
+        state.sessions[0].last_completed_turn = Some("voice-turn-1".into());
+        assert!(
+            detector
+                .collect(&state, &settings, false, now, instant)
+                .is_empty()
+        );
+        assert!(detector.sessions.contains_key(&id));
     }
 
     #[gpui::test]

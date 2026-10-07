@@ -205,6 +205,45 @@ final class SessionFlowTests: XCTestCase {
         snapshot(app, "notification-opened")
     }
 
+    /// Characterization of the reported bug, not the desired behavior:
+    /// an unknown chat opens the layout fixture under "Unavailable".
+    /// `-route` calls the same AppRouter.openSession entry point as a push
+    /// tap, without needing APNs or a host-side sender. This reproduces the
+    /// failed-open fallback, not the original notification's delivery or
+    /// the sync timing that may have made its chat unavailable.
+    /// Replace the fixture assertions with the intended error/retry state
+    /// when fixing the fallback.
+    func testUnknownChatRouteReproducesFixtureFallback() {
+        let chatId = "missing-notification-chat-\(UUID().uuidString)"
+        let app = launch(["-route", "chat:\(chatId)"])
+        let transcript = app.scrollViews["transcript"]
+        XCTAssertTrue(transcript.waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["Unavailable"].waitForExistence(timeout: 5))
+
+        let prompt = transcript.staticTexts.matching(NSPredicate(
+            format: "label == %@",
+            "You: How does the layout engine avoid measuring text on the main thread?"
+        )).firstMatch
+        // The transcript opens at the bottom and virtualizes its rows.
+        // Reveal the first fixture turn before inspecting its text.
+        XCTAssertTrue(transcript.staticTexts.firstMatch.waitForExistence(timeout: 10))
+        for _ in 0..<30 {
+            if prompt.isHittable { break }
+            transcript.swipeDown(velocity: .fast)
+        }
+        XCTAssertTrue(prompt.isHittable, "unknown chat displayed the fixture's first prompt")
+        transcript.swipeDown()
+        let reply = transcript.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@", "Plan for the rewrite"
+        )).firstMatch
+        XCTAssertTrue(reply.waitForExistence(timeout: 5), "unknown chat displayed the fixture's reply")
+        snapshot(app, "unknown-chat-fixture-fallback")
+
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.buttons["new-session"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.cells["session-\(chatId)"].exists, "fallback did not create a session-list entry")
+    }
+
     func testTabsAndSearch() {
         let app = launch()
         XCTAssertTrue(app.staticTexts["Sessions"].waitForExistence(timeout: 10))

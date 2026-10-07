@@ -48,6 +48,7 @@ mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
 pub mod notify;
+pub mod orb;
 pub mod pickers;
 pub mod popover;
 pub mod project_actions;
@@ -66,6 +67,7 @@ pub mod theme;
 pub mod theme_library;
 pub mod transcript;
 pub mod typography;
+pub mod voice;
 mod workspace_links;
 
 use std::path::PathBuf;

@@ -662,6 +662,20 @@ impl ChatDocHandle {
         &self.chat_id
     }
 
+    pub(crate) fn commit_voice(
+        &self,
+        transcript: &zeron_proto::voice::VoiceTranscript,
+    ) -> Result<Option<String>, EngineError> {
+        let _owner = lock(&self.transcript_import);
+        zeron_doc::voice::commit_voice_transcript(
+            &self.doc,
+            transcript,
+            &self.device_id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(EngineError::from)
+    }
+
     pub fn doc(&self) -> &SessionDoc {
         &self.doc
     }
@@ -5525,11 +5539,6 @@ impl DocHost {
             .await
     }
 
-    /// Create (or reuse) the isolated worktree a Run's [`zeron_proto::WorktreeSpec`]
-    /// asks for, returning the resolved cwd plus the fresh worktree when one was
-    /// actually created. Reuse guard: a chat whose row already points inside a
-    /// linked worktree of the same repo keeps it — a duplicate Run (client retry
-    /// after a lost ack, ledger reset) must not mint a second checkout.
     async fn materialize_worktree(
         &self,
         chat_id: &str,

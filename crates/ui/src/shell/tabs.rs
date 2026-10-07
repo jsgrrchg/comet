@@ -205,6 +205,9 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.command_palette = None;
+        // Opening any session steps the voice stage aside — including the one
+        // already selected under it. The call keeps running in the background.
+        self.set_voice_stage_open(false, cx);
         self.route = Route::Chat;
         self.focus_composer(cx);
         self.state
@@ -219,8 +222,12 @@ impl Shell {
     /// A new chat always starts with the terminal hidden: when the drawer is
     /// open it just hides (detach, not close — the source chat's tabs and
     /// PTYs survive for the return trip).
-    pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `project` (the per-project `+` on a sidebar group header) homes the
+    /// canvas on that project and wins over the sidebar filter.
+    pub(super) fn open_new_session(&mut self, project: Option<String>, cx: &mut Context<Self>) {
         self.command_palette = None;
+        self.set_voice_stage_open(false, cx);
         self.route = Route::Chat;
         self.focus_composer(cx);
         // Pre-hide before the selection flips so the state change can't
@@ -239,9 +246,8 @@ impl Shell {
         }
         let target = {
             let state = self.state.read(cx);
-            self.settings
-                .space_filter
-                .clone()
+            project
+                .or_else(|| self.settings.space_filter.clone())
                 .filter(|id| state.space_row(id).is_some())
         };
         let defaults = crate::settings::composer::ComposerDefaults::load(&self.data_dir);
@@ -501,11 +507,20 @@ impl Shell {
                                     button.bg(crate::theme::wash(0.09))
                                 }),
                             )
-                            .child(header_icon_button(
+                            .child(header_icon_button_with(
                                 "toggle-changes",
-                                icons::SIDEBAR_MINIMALISTIC,
+                                icons::sidebar_glyph(
+                                    motion::state_t(
+                                        "toggle-changes",
+                                        right_pane_open,
+                                        motion::GLYPH_STATE,
+                                        self.reduced_motion,
+                                    ),
+                                    true,
+                                    16.0,
+                                    theme.text_muted,
+                                ),
                                 ShortcutId::ToggleChanges.label(),
-                                &theme,
                                 cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
                             )),
                     )
@@ -540,7 +555,7 @@ impl Shell {
                 .child(
                     header_icon_button(
                         "session-fork",
-                        icons::GIT_BRANCH,
+                        icons::FORK,
                         "Fork this session",
                         &theme,
                         cx.listener(|this, _, _, cx| this.create_side_chat(cx)),

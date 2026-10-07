@@ -850,7 +850,9 @@ async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capt
         .take()
         .ok_or_else(|| EngineError::Other("git stdout unavailable".into()))?;
     let mut out: Vec<u8> = Vec::new();
-    let mut buf = [0u8; 64 * 1024];
+    // Keep the read buffer out of nested async state: inline storage grows
+    // every caller's future and can overflow a standard RPC worker's stack.
+    let mut buf = vec![0u8; 64 * 1024];
     let mut truncated = false;
     loop {
         let n = stdout

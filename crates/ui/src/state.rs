@@ -123,12 +123,16 @@ pub enum EngineMode {
 trait EngineBackend: Send + Sync {
     fn client(&self) -> &RpcClient;
     fn mode(&self) -> EngineMode;
+    async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        Err(RpcError::Failed("voice media unavailable".into()))
+    }
     /// Graceful teardown (drains runs / flushes docs for the in-process engine).
     async fn shutdown(&self);
 }
 
 /// Embedded engine: owns the [`EngineCore`] and an in-memory RPC loop.
 struct InProcessEngine {
+    service: Arc<dyn RpcService>,
     runtime: Arc<tokio::sync::Mutex<Option<EngineRuntime>>>,
     boot_task: tokio::task::JoinHandle<()>,
     refresh_task: tokio::task::JoinHandle<()>,
@@ -140,6 +144,9 @@ struct InProcessEngine {
 
 #[async_trait]
 impl EngineBackend for InProcessEngine {
+    async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        Ok(memory_client(self.service.clone()))
+    }
     fn client(&self) -> &RpcClient {
         &self.client
     }
@@ -244,6 +251,9 @@ struct RemoteEngine {
 
 #[async_trait]
 impl EngineBackend for RemoteEngine {
+    async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        connect_ws(&self.url).await
+    }
     fn client(&self) -> &RpcClient {
         &self.client
     }
@@ -345,7 +355,8 @@ impl EngineHandle {
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
-        let ipc_task = match zeron_engine::serve_ipc(engine_config.ipc_port, service).await {
+        let ipc_task = match zeron_engine::serve_ipc(engine_config.ipc_port, service.clone()).await
+        {
             Ok(task) => Some(task),
             Err(err) => {
                 tracing::warn!(
@@ -417,6 +428,7 @@ impl EngineHandle {
         });
         let handle = EngineHandle {
             inner: Arc::new(InProcessEngine {
+                service,
                 runtime,
                 boot_task,
                 refresh_task,
@@ -528,6 +540,10 @@ impl EngineHandle {
 
     pub fn mode(&self) -> EngineMode {
         self.inner.mode()
+    }
+
+    pub async fn media_client(&self) -> Result<RpcClient, RpcError> {
+        self.inner.media_client().await
     }
 
     pub fn engine_info(&self) -> &EngineInfo {
@@ -1779,10 +1795,11 @@ impl AppState {
     /// another chat (`parent_chat_id`, the Zeron MCP's orchestration link)
     /// are the parent's workers, not sessions the user started: they stay
     /// reachable by id/deep link but never take a sidebar row or jump slot.
+    /// Voice orchestrator chats are hidden the same way.
     pub fn visible_chats(&self) -> impl Iterator<Item = &Chat> {
         self.chats
             .iter()
-            .filter(|c| !c.archived && c.parent_chat_id.is_none())
+            .filter(|c| !c.archived && c.is_top_level())
     }
 
     pub(crate) fn restore_composer_target(
@@ -1853,17 +1870,22 @@ impl AppState {
     }
 
     /// Pick the composer's target device. Keeps the project pick consistent:
-    /// a project on another device can't survive the switch — fall back to
-    /// the first project on the new device, else "no project".
+    /// it moves to the project's checkout on the new device, else the first
+    /// project there, else "no project".
     pub fn select_device(&mut self, device_id: String, cx: &mut Context<Self>) {
-        let project_moves = self
+        let moving = self
             .selected_space_row()
-            .is_some_and(|s| s.device_id != device_id);
-        if project_moves {
+            .filter(|s| s.device_id != device_id);
+        if let Some(space) = moving {
             let first = self
-                .spaces_sorted()
-                .iter()
+                .project_members(space)
+                .into_iter()
                 .find(|s| s.device_id == device_id)
+                .or_else(|| {
+                    self.spaces_sorted()
+                        .into_iter()
+                        .find(|s| s.device_id == device_id)
+                })
                 .map(|s| s.id.clone());
             self.no_project = first.is_none();
             self.selected_space = first;
@@ -1887,6 +1909,35 @@ impl AppState {
 
     pub fn space_for_chat(&self, chat: &Chat) -> Option<&Space> {
         self.space_row(chat.space_id.as_deref()?)
+    }
+
+    /// The space whose name and color stand for `space`'s whole project
+    /// ([`zeron_proto::view::representative_space`]).
+    pub fn representative_space<'a>(&'a self, space: &'a Space) -> &'a Space {
+        zeron_proto::view::representative_space(&self.spaces, space)
+    }
+
+    /// Every space of `space`'s project ([`zeron_proto::view::project_key`]):
+    /// this device's first, then by device name and path.
+    pub fn project_members(&self, space: &Space) -> Vec<&Space> {
+        let key = zeron_proto::view::project_key(space);
+        let local = self.local_device_id.as_deref();
+        let mut members: Vec<&Space> = self
+            .spaces
+            .iter()
+            .filter(|s| zeron_proto::view::project_key(s) == key)
+            .collect();
+        members.sort_by_key(|s| {
+            (
+                local != Some(s.device_id.as_str()),
+                self.device_name(&s.device_id)
+                    .unwrap_or_default()
+                    .to_lowercase(),
+                s.path.clone(),
+                s.id.clone(),
+            )
+        });
+        members
     }
 
     /// Non-archived chats of a space in tab (creation) order. Chats with a
@@ -1975,13 +2026,86 @@ impl AppState {
         now: DateTime<Utc>,
         space_filter: Option<&str>,
     ) -> Vec<(ChatIndicator, &Chat)> {
+        let in_filter = self.project_filter(space_filter);
         self.overview_chats(now)
             .into_iter()
-            .filter(|(_, chat)| match space_filter {
-                Some(space_id) => chat.space_id.as_deref() == Some(space_id),
-                None => true,
-            })
+            .filter(|(_, chat)| in_filter(chat))
             .collect()
+    }
+
+    /// The sidebar's project filter matches by repository: it stores one
+    /// checkout's space id, and a chat in ANY checkout of that repository
+    /// (clones and worktrees on every device, [`zeron_proto::view::project_key`])
+    /// matches. A filter naming a space not synced here matches its own id.
+    pub fn project_filter<'a>(&'a self, filter: Option<&str>) -> impl Fn(&Chat) -> bool + 'a {
+        let filter = filter.map(|id| {
+            (
+                id.to_owned(),
+                self.space_row(id).map(zeron_proto::view::project_key),
+            )
+        });
+        move |chat| {
+            let Some((id, key)) = &filter else {
+                return true;
+            };
+            match chat.space_id.as_deref() {
+                Some(space_id) if space_id == id => true,
+                Some(space_id) => key.as_ref().is_some_and(|key| {
+                    self.space_row(space_id)
+                        .is_some_and(|space| zeron_proto::view::project_key(space) == *key)
+                }),
+                None => false,
+            }
+        }
+    }
+
+    /// Every project — one per repository across devices — as its checkouts
+    /// in [`Self::project_members`] order (this device's first), ordered by
+    /// the project's name.
+    pub fn projects(&self) -> Vec<Vec<&Space>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut projects: Vec<Vec<&Space>> = self
+            .spaces
+            .iter()
+            .filter(|space| seen.insert(zeron_proto::view::project_key(space)))
+            .map(|space| self.project_members(space))
+            .collect();
+        projects.sort_by_key(|members| {
+            let representative = self.representative_space(members[0]);
+            (
+                representative.display_name().to_lowercase(),
+                representative.id.clone(),
+            )
+        });
+        projects
+    }
+
+    /// A project's host tag: its one device as in [`Self::space_device_tag`],
+    /// else the devices holding a checkout. Offline only when every one is.
+    pub fn project_device_tag(&self, members: &[&Space], now: DateTime<Utc>) -> (String, bool) {
+        let mut devices: Vec<&str> = Vec::new();
+        for member in members {
+            if !devices.contains(&member.device_id.as_str()) {
+                devices.push(member.device_id.as_str());
+            }
+        }
+        match devices.as_slice() {
+            [] => (String::new(), false),
+            [_] => self.space_device_tag(members[0], now),
+            _ => {
+                let offline = devices.iter().all(|d| !self.device_online(d, now));
+                let tag = if devices.len() == 2 {
+                    devices
+                        .iter()
+                        .map(|d| self.device_name(d).unwrap_or("Unknown device"))
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                } else {
+                    format!("{} devices", devices.len())
+                };
+                (format!("@ {tag}"), offline)
+            }
+        }
     }
 
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
@@ -3715,6 +3839,7 @@ mod tests {
             git_detected: false,
             git_checked_at: None,
             checkout_id: None,
+            repository_id: None,
             created_at: base + TimeDelta::minutes(created_min),
         }
     }
@@ -4617,6 +4742,64 @@ mod tests {
             .map(|(_, c)| c.id.as_str())
             .collect();
         assert_eq!(overview, ["old", "new", "dangling"]);
+    }
+
+    #[test]
+    fn project_filter_and_projects_span_a_repository_across_devices() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("laptop".into());
+        let mut remote = space("remote", "metal", "/w/anara", 1);
+        remote.repository_id = Some("commit:abc".into());
+        let mut local = space("local", "laptop", "/h/anara", 2);
+        local.repository_id = Some("commit:abc".into());
+        let other = space("other", "laptop", "/h/notes", 3);
+        state.apply_spaces(vec![remote, local, other]);
+        let in_space = |id: &str, space: &str| {
+            let mut chat = chat(id, 0, None);
+            chat.space_id = Some(space.into());
+            chat
+        };
+        state.apply_chats(vec![
+            in_space("on-remote", "remote"),
+            in_space("on-local", "local"),
+            in_space("on-other", "other"),
+        ]);
+
+        // One project per repository, its checkouts local-first.
+        let projects: Vec<Vec<&str>> = state
+            .projects()
+            .iter()
+            .map(|members| members.iter().map(|s| s.id.as_str()).collect())
+            .collect();
+        assert_eq!(projects, vec![vec!["local", "remote"], vec!["other"]]);
+
+        // Filtering on either checkout shows the whole repository's chats.
+        for filter in ["remote", "local"] {
+            let mut ids: Vec<&str> = state
+                .sidebar_chats(Utc::now(), Some(filter))
+                .iter()
+                .map(|(_, c)| c.id.as_str())
+                .collect();
+            ids.sort();
+            assert_eq!(ids, ["on-local", "on-remote"], "filter {filter}");
+        }
+        let other_only: Vec<&str> = state
+            .sidebar_chats(Utc::now(), Some("other"))
+            .iter()
+            .map(|(_, c)| c.id.as_str())
+            .collect();
+        assert_eq!(other_only, ["on-other"]);
+
+        // A two-device project tags both hosts; a one-device one keeps the
+        // plain host tag.
+        let anara = state.projects().into_iter().next().unwrap();
+        let (tag, _) = state.project_device_tag(&anara, Utc::now());
+        assert!(tag.starts_with("@ ") && tag.contains(" · "), "{tag}");
+        let notes = state.projects().into_iter().nth(1).unwrap();
+        assert_eq!(
+            state.project_device_tag(&notes, Utc::now()).0,
+            state.space_device_tag(notes[0], Utc::now()).0
+        );
     }
 
     #[test]

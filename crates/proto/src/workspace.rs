@@ -28,6 +28,7 @@ pub mod capabilities {
         HARNESS_UPDATES_V1,
         NATIVE_MESSAGE_FORK_V1,
         NATIVE_MESSAGE_FORK_MAIN_V1,
+        crate::voice::remote::CAPABILITY,
     ];
 
     pub fn current() -> Vec<String> {
@@ -109,7 +110,8 @@ mod tests {
                     "message-queue-edit-lease-v1",
                     "harness-updates-v1",
                     "native-message-fork-v1",
-                    "native-message-fork-main-v1"
+                    "native-message-fork-main-v1",
+                    "voice-client-media-v1"
                 ],
             })
         );

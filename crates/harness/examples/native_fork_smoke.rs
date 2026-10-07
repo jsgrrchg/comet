@@ -28,6 +28,7 @@ async fn turn(
         .run(
             request,
             RunControls {
+                realtime: None,
                 execution_lease: None,
                 interrupt: interrupt.clone(),
                 steering,

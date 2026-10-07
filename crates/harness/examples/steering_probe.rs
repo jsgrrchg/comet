@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
         resume_policy: Default::default(),
     };
     let controls = RunControls {
+        realtime: None,
         execution_lease: None,
         steering,
         interrupt: interrupt.clone(),

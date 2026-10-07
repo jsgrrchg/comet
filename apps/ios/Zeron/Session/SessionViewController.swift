@@ -20,10 +20,11 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     private let openedAt = CACurrentMediaTime()
     private var reportedOpen = false
 
-    init(app: AppModel, chatId: String) {
+    init?(app: AppModel, chatId: String) {
+        guard let source = app.sessionSource(chatId) else { return nil }
         self.app = app
         self.chatId = chatId
-        self.source = app.sessionSource(chatId)
+        self.source = source
         super.init(nibName: nil, bundle: nil)
         hidesBottomBarWhenPushed = true
     }

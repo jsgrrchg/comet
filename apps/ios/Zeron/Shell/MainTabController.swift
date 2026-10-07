@@ -144,7 +144,9 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
         else { return openSession(chatId) }
         selectedTab = tab
         guard let nav = tab.viewController as? UINavigationController else { return openSession(chatId) }
-        let session = SessionViewController(app: app, chatId: chatId)
+        guard let session = SessionViewController(app: app, chatId: chatId) else {
+            return showSessionOpenError()
+        }
         UIView.performWithoutAnimation {
             nav.popToRootViewController(animated: false)
             nav.pushViewController(session, animated: false)
@@ -175,14 +177,27 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
         nav.popToRootViewController(animated: false)
     }
 
+    func showSessionOpenError() {
+        if presentedViewController != nil { dismiss(animated: false) }
+        view.endEditing(true)
+        selectedTab = tabs.first { $0.identifier == "sessions" }
+        popToFrontPage()
+        syncAccessory()
+        view.layoutIfNeeded()
+        Toast.show("Couldn't open session. Try again.", in: view.window)
+    }
+
     /// Push a session on the Sessions tab (from new-session, deep links, search).
     func openSession(_ chatId: String) {
-        if presentedViewController != nil { dismiss(animated: true) }
         guard let tab = tabs.first(where: { $0.identifier == "sessions" }) else { return }
         selectedTab = tab
         guard let nav = tab.viewController as? UINavigationController else { return }
+        guard let session = SessionViewController(app: app, chatId: chatId) else {
+            return showSessionOpenError()
+        }
+        if presentedViewController != nil { dismiss(animated: true) }
         nav.popToRootViewController(animated: false)
-        nav.pushViewController(SessionViewController(app: app, chatId: chatId), animated: true)
+        nav.pushViewController(session, animated: true)
     }
 }
 

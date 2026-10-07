@@ -436,11 +436,15 @@ final class AppModel {
 
     // MARK: Sessions
 
-    func sessionSource(_ chatId: String) -> SessionSource {
-        guard let client, let handle = try? client.openSession(chatId: chatId) else {
-            return FixtureSessionSource(title: "Unavailable", subtitle: "")
+    func sessionSource(_ chatId: String) -> SessionSource? {
+        guard let client else { return nil }
+        do {
+            let handle = try client.openSession(chatId: chatId)
+            return CoreSessionSource(app: self, client: client, handle: handle, chatId: chatId)
+        } catch {
+            NSLog("open session failed: \(error)")
+            return nil
         }
-        return CoreSessionSource(app: self, client: client, handle: handle, chatId: chatId)
     }
 
     // MARK: New session

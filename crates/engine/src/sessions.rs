@@ -1413,36 +1413,55 @@ impl Inner {
     /// The last harness session id named anywhere in the chat's journal, with
     /// the cwd of the `SessionStarted` that governs it. `Done.session_id`
     /// inherits the cwd of the most recent `SessionStarted` (same run).
+    ///
+    /// Walks the journal newest-first and stops at the answer, so boot recovery
+    /// doesn't load whole multi-MB journals: the newest non-empty id wins, and a
+    /// `Done` id takes the cwd of the nearest earlier `SessionStarted` (any id).
     fn journal_harness_session(&self, chat_id: &str) -> Option<(String, String)> {
-        let events = match self.journal.replay(chat_id, 0) {
+        let warn = |err: crate::run_journal::JournalError| {
+            tracing::warn!(chat = %chat_id, error = %err, "journal scan for harness session failed");
+        };
+        let events = match self.journal.events_rev(chat_id) {
             Ok(events) => events,
             Err(err) => {
-                tracing::warn!(chat = %chat_id, error = %err, "journal scan for harness session failed");
+                warn(err);
                 return None;
             }
         };
-        let mut current_cwd = String::new();
-        let mut found: Option<(String, String)> = None;
-        for (_, event) in events {
+        // A `Done` id seen first, still waiting for its run's `SessionStarted` cwd.
+        let mut done_id: Option<String> = None;
+        for item in events {
+            let (seq, event) = match item {
+                Ok(item) => item,
+                Err(err) => {
+                    warn(err);
+                    return None;
+                }
+            };
+            if seq == 0 {
+                continue; // `replay(_, 0)` (the old full scan) never yielded seq 0
+            }
             match event {
                 AgentEvent::SessionStarted {
                     session_id, cwd, ..
                 } => {
-                    current_cwd = cwd;
+                    if let Some(id) = done_id {
+                        return Some((id, cwd));
+                    }
                     if !session_id.is_empty() {
-                        found = Some((session_id, current_cwd.clone()));
+                        return Some((session_id, cwd));
                     }
                 }
                 AgentEvent::Done {
                     session_id: Some(session_id),
                     ..
-                } if !session_id.is_empty() => {
-                    found = Some((session_id, current_cwd.clone()));
+                } if done_id.is_none() && !session_id.is_empty() => {
+                    done_id = Some(session_id);
                 }
                 _ => {}
             }
         }
-        found
+        done_id.map(|id| (id, String::new()))
     }
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
@@ -3241,6 +3260,148 @@ mod tests {
             serde_json::to_string(&sessions.inner.journal.replay("chat", 0).unwrap()).unwrap();
         assert!(!journal.contains(source));
         assert!(!journal.contains("secret"));
+    }
+
+    /// The backwards journal scan must answer exactly what the old full forward
+    /// replay did: newest non-empty id, cwd from the governing `SessionStarted`.
+    #[tokio::test]
+    async fn journal_harness_session_matches_forward_scan() {
+        fn started(id: &str, cwd: &str) -> AgentEvent {
+            AgentEvent::SessionStarted {
+                harness: zeron_proto::HarnessId::ClaudeCode,
+                model: "m".into(),
+                tools: Vec::new(),
+                cwd: cwd.into(),
+                session_id: id.into(),
+                assistant_message_id: "a".into(),
+            }
+        }
+        fn done(id: Option<&str>) -> AgentEvent {
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: id.map(Into::into),
+            }
+        }
+        fn text() -> AgentEvent {
+            AgentEvent::TextDelta { text: "t".into() }
+        }
+        /// The pre-change implementation, verbatim, over a forward replay.
+        fn forward(events: Vec<(u64, AgentEvent)>) -> Option<(String, String)> {
+            let mut current_cwd = String::new();
+            let mut found: Option<(String, String)> = None;
+            for (_, event) in events {
+                match event {
+                    AgentEvent::SessionStarted {
+                        session_id, cwd, ..
+                    } => {
+                        current_cwd = cwd;
+                        if !session_id.is_empty() {
+                            found = Some((session_id, current_cwd.clone()));
+                        }
+                    }
+                    AgentEvent::Done {
+                        session_id: Some(session_id),
+                        ..
+                    } if !session_id.is_empty() => {
+                        found = Some((session_id, current_cwd.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            found
+        }
+
+        /// (chat id, journaled events, expected `(session id, cwd)`).
+        type Case = (
+            &'static str,
+            Vec<AgentEvent>,
+            Option<(&'static str, &'static str)>,
+        );
+        let cases: Vec<Case> = vec![
+            ("empty", vec![], None),
+            ("no-ids", vec![text(), done(None), done(Some(""))], None),
+            (
+                "started-only",
+                vec![started("s1", "/a"), text()],
+                Some(("s1", "/a")),
+            ),
+            (
+                "done-inherits-run-cwd",
+                vec![started("s1", "/a"), text(), done(Some("s2"))],
+                Some(("s2", "/a")),
+            ),
+            (
+                "done-before-any-started",
+                vec![text(), done(Some("s1"))],
+                Some(("s1", "")),
+            ),
+            (
+                "empty-started-sets-cwd-for-later-done",
+                vec![started("s1", "/a"), started("", "/b"), done(Some("s2"))],
+                Some(("s2", "/b")),
+            ),
+            (
+                "later-empty-started-does-not-override",
+                vec![
+                    started("s1", "/a"),
+                    done(Some("s2")),
+                    started("", "/b"),
+                    text(),
+                ],
+                Some(("s2", "/a")),
+            ),
+            (
+                "newest-run-wins",
+                vec![
+                    started("s1", "/a"),
+                    done(Some("s1")),
+                    started("s3", "/c"),
+                    text(),
+                ],
+                Some(("s3", "/c")),
+            ),
+            (
+                "empty-done-ids-ignored",
+                vec![started("s1", "/a"), done(Some("")), done(None)],
+                Some(("s1", "/a")),
+            ),
+            (
+                "only-empty-started-then-done-from-older-run",
+                vec![
+                    started("s1", "/a"),
+                    done(Some("s9")),
+                    started("", "/b"),
+                    done(None),
+                ],
+                Some(("s9", "/a")),
+            ),
+        ];
+
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = SessionsEngine::new(
+            "host".into(),
+            Arc::new(RunJournal::open(dir.path().join("journals")).unwrap()),
+            Arc::new(HarnessRegistry::new()),
+        );
+        for (chat, events, want) in cases {
+            for event in &events {
+                sessions.inner.journal.append(chat, event).unwrap();
+            }
+            let want = want.map(|(id, cwd)| (id.to_string(), cwd.to_string()));
+            let replayed = sessions.inner.journal.replay(chat, 0).unwrap();
+            assert_eq!(forward(replayed), want, "{chat}: reference");
+            assert_eq!(sessions.inner.journal_harness_session(chat), want, "{chat}");
+        }
+        // Torn tail: the last complete SessionStarted still governs.
+        let path = dir.path().join("journals").join("started-only.jsonl");
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut f, b"{\"seq\":3,\"event\":{\"type\":\"done\"").unwrap();
+        assert_eq!(
+            sessions.inner.journal_harness_session("started-only"),
+            Some(("s1".into(), "/a".into()))
+        );
     }
 
     fn request() -> RunRequest {

@@ -77,6 +77,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        turn: Default::default(),
     };
     (controls, steer_tx, token)
 }
@@ -160,6 +161,8 @@ async fn delayed_turn(scenario: &str) {
         .send(SteerMessage {
             message_id: None,
             prompt: "second".into(),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -167,6 +170,8 @@ async fn delayed_turn(scenario: &str) {
         .send(SteerMessage {
             message_id: None,
             prompt: "third".into(),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -209,6 +214,8 @@ async fn delayed_turn(scenario: &str) {
         .send(SteerMessage {
             message_id: None,
             prompt: "fourth".into(),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -273,6 +280,8 @@ async fn cancel_quiet(scenario: &str) {
         .send(SteerMessage {
             message_id: None,
             prompt: "must not run".into(),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();

@@ -29,6 +29,7 @@ async fn turn(
             request,
             RunControls {
                 realtime: None,
+                turn: Default::default(),
                 execution_lease: None,
                 interrupt: interrupt.clone(),
                 steering,

@@ -63,6 +63,7 @@ pub(crate) mod surface_chrome;
 pub mod syntax_cache;
 pub mod terminal;
 mod todo_panel;
+pub(crate) mod tool_images;
 pub mod theme;
 pub mod theme_library;
 pub mod transcript;
@@ -200,7 +201,11 @@ pub fn run_app(config: UiConfig) {
         app_update::AppUpdate::init(config.boot().edge_url, data_dir.clone(), cx);
         cx.register_url_scheme("zeron").detach();
 
-        let state = cx.new(|_| state::AppState::new());
+        let state = cx.new(|cx| {
+            let mut state = state::AppState::new();
+            state.watch_clock_transitions(cx);
+            state
+        });
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {

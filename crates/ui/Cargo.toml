@@ -10,7 +10,9 @@ voice-experimental = [] # Compatibility flag; native subscription voice uses Cod
 project-palette-fixture = []
 compact-picker-fixture = ["gpui_platform/test-support"]
 
-browser-fixture = []
+# Native captures explicitly present the freshly drawn scene, including when
+# a nested Wayland compositor has stopped requesting idle frames.
+browser-fixture = ["gpui/bench"]
 windows-render-fixture = []
 remote-desktop-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]

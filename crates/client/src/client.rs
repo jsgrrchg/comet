@@ -236,46 +236,23 @@ impl ClientInner {
         live.relay.reconcile_watches(self, targets);
     }
 
-    /// Best-effort durable wake for the chat's host (`POST /device/{id}/nudge`).
-    /// Waits (briefly) for our own pending registry writes — e.g. a fresh
-    /// chat's CreateChat row — to reach the edge first, so the host never
-    /// wakes for a chat it can't see yet.
-    pub(crate) fn nudge_host(self: &Arc<Self>, host: &str, chat_id: &str) {
+    /// Durable wake: retry until the edge accepts it, including after relaunch.
+    pub(crate) fn nudge_host(self: &Arc<Self>, chat_id: &str) {
         let Some(live) = self.live() else { return };
-        let url = crate::live::urls::nudge(&live.edge, host);
-        let inner = Arc::downgrade(self);
-        let chat_id = chat_id.to_owned();
-        crate::runtime::shared().spawn(async move {
-            for _ in 0..50 {
-                let Some(inner) = inner.upgrade() else { return };
-                if inner.workspace.mutate(|doc| doc.pending_len()) == 0 {
-                    break;
-                }
-                drop(inner);
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            let Some(inner) = inner.upgrade() else { return };
-            let Ok(token) = inner.tokens.bearer().await else {
-                return;
-            };
-            drop(inner);
-            for attempt in 0..3u64 {
-                let sent = crate::auth::http()
-                    .post(&url)
-                    .bearer_auth(&token)
-                    .json(&serde_json::json!({ "chatId": chat_id }))
-                    .timeout(Duration::from_secs(10))
-                    .send()
-                    .await;
-                match sent {
-                    // 503 nudge_queue_full is retryable.
-                    Ok(response) if response.status().as_u16() == 503 => {
-                        tokio::time::sleep(Duration::from_millis(500 * (attempt + 1))).await;
-                    }
-                    _ => return,
-                }
-            }
-        });
+        if let Err(err) = live
+            .store
+            .schedule_sync_job(chat_id, crate::live::delivery::JOB)
+        {
+            tracing::warn!(chat = %chat_id, error = %err, "host wake persistence failed");
+        }
+        live.delivery_wake.notify_one();
+    }
+
+    pub(crate) fn resume_delivery(self: &Arc<Self>, chat_id: &str) -> Result<SessionHandle> {
+        Client {
+            inner: self.clone(),
+        }
+        .open_session(chat_id)
     }
 
     pub(crate) fn registry_write<R>(
@@ -467,9 +444,8 @@ impl ClientInner {
                 if has_attachments {
                     live.escorts.respawn_chat(self, &core.chat_id);
                 }
-                if let Some(host) = self.workspace.chat(&core.chat_id).map(|c| c.device_id) {
-                    self.nudge_host(&host, &core.chat_id);
-                }
+                // SessionCore::write already persisted the wake receipt.
+                live.delivery_wake.notify_one();
             }
         }
     }
@@ -1080,6 +1056,18 @@ impl Client {
         core.ensure_room(&self.inner);
         core.touch();
         core.refresh();
+        // Upgrade recovery: older clients could persist an ACKed command
+        // without its wake. Opening that chat must re-arm host discovery.
+        if let Some(live) = self.inner.live()
+            && core.send_state().is_some()
+            && live
+                .store
+                .sync_job_version(chat_id, crate::live::delivery::JOB)
+                .ok()
+                == Some(None)
+        {
+            self.inner.nudge_host(chat_id);
+        }
         if let Some(demo) = self.inner.demo() {
             demo.session_opened(&core);
         }
@@ -1199,7 +1187,9 @@ impl Client {
         environment: &str,
         prefs: PushPrefs,
     ) -> Result<()> {
-        let Some(live) = self.inner.live() else { return Ok(()) };
+        let Some(live) = self.inner.live() else {
+            return Ok(());
+        };
         let url = crate::live::urls::registry_push_target(
             &live.edge,
             self.inner.credentials.org_id(),
@@ -1219,14 +1209,19 @@ impl Client {
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
         if !response.status().is_success() {
-            return Err(ClientError::HostError(format!("push registration http {}", response.status())));
+            return Err(ClientError::HostError(format!(
+                "push registration http {}",
+                response.status()
+            )));
         }
         Ok(())
     }
 
     /// Stop notifications to this device (sign-out, turned off).
     pub async fn unregister_push_target(&self) -> Result<()> {
-        let Some(live) = self.inner.live() else { return Ok(()) };
+        let Some(live) = self.inner.live() else {
+            return Ok(());
+        };
         let url = crate::live::urls::registry_push_target(
             &live.edge,
             self.inner.credentials.org_id(),
@@ -1240,7 +1235,10 @@ impl Client {
             .await
             .map_err(|e| ClientError::Network(e.to_string()))?;
         if !response.status().is_success() {
-            return Err(ClientError::HostError(format!("push removal http {}", response.status())));
+            return Err(ClientError::HostError(format!(
+                "push removal http {}",
+                response.status()
+            )));
         }
         Ok(())
     }

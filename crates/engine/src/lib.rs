@@ -44,6 +44,7 @@ pub mod uploads;
 pub mod voice;
 pub mod workspace_files;
 pub mod workspace_host;
+pub mod workspace_search;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
@@ -75,6 +76,7 @@ pub use workspace_files::WorkspaceFiles;
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
+pub use workspace_search::WorkspaceSearch;
 
 pub(crate) const LEGACY_UNKNOWN_DEVICE_NAME: &str = "unknown-device";
 

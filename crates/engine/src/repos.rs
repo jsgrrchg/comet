@@ -25,6 +25,7 @@ use zeron_proto::{
 };
 
 use crate::EngineError;
+use crate::WorkspaceSearch;
 
 /// Existence probe timeout for user-chosen / remembered paths, which can point at
 /// dead network mounts where a bare `stat` hangs for minutes.
@@ -138,6 +139,8 @@ struct ReposInner {
     github_avatars: std::sync::Mutex<HashMap<String, String>>,
     github_avatar_pages: std::sync::Mutex<HashSet<String>>,
     file_index: FileIndexCache,
+    /// The engine's one workspace search index set (`@`, file tree, cmd+K).
+    workspace_search: WorkspaceSearch,
     /// HEAD commit → its trunk's root commit. History behind a commit never
     /// changes, so the full first-parent walk runs once per HEAD, not on
     /// every spaces repair pass.
@@ -167,6 +170,10 @@ impl Repos {
         &self.inner.data_dir
     }
 
+    pub fn workspace_search(&self) -> &WorkspaceSearch {
+        &self.inner.workspace_search
+    }
+
     /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
     /// comes from `$ZERON_WORKTREES_DIR` or `~/.zeron/worktrees`.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
@@ -190,6 +197,7 @@ impl Repos {
                 trunk_roots: std::sync::Mutex::new(HashMap::new()),
                 github_avatar_pages: std::sync::Mutex::new(HashSet::new()),
                 file_index: std::sync::Mutex::new(HashMap::new()),
+                workspace_search: WorkspaceSearch::new(),
             }),
         }
     }

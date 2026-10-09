@@ -3,6 +3,8 @@
 //! sections; tabs narrow them to one kind.
 use super::*;
 use crate::appearance::AppearanceMode;
+use crate::files::client::{FilesClientError, FilesRequestContext, WorkspaceFilesClient};
+use zeron_proto::{SearchWorkspaceFilesRequest, WorkspaceEntryKind, WorkspaceFileSearchMatch};
 
 /// Key context of the palette card: its mod-1…4 tab bindings live here.
 pub(super) const KEY_CONTEXT: &str = "CommandPalette";
@@ -10,6 +12,8 @@ pub(super) const KEY_CONTEXT: &str = "CommandPalette";
 const ALL_TAB_LIMIT: usize = 5;
 const THREADS_TAB_LIMIT: usize = 50;
 const FILES_TAB_LIMIT: usize = 50;
+/// Shorter file-name queries match nearly every path; they are not sent.
+const MIN_FILE_QUERY_CHARS: usize = 2;
 const RESULTS_FADE_BAND: f32 = 18.0;
 
 pub(super) struct CommandPalette {
@@ -26,7 +30,70 @@ pub(super) struct CommandPalette {
     // while this input is still absent from the dispatch tree.
     focus_pending: bool,
     scroll: gpui::ScrollHandle,
+    /// File-name matches in the focused chat's workspace.
+    files: WorkspaceQuery<Vec<WorkspaceFileSearchMatch>>,
     _search_events: Subscription,
+}
+
+/// An asynchronous workspace section's request state. Rows from the last
+/// answer stay up while a newer query runs.
+#[derive(Default)]
+struct WorkspaceQuery<T> {
+    /// Bumped per request; an answer to an older one is dropped.
+    generation: u64,
+    loading: bool,
+    error: Option<SharedString>,
+    results: T,
+    task: Option<Task<()>>,
+}
+
+impl<T: Default> WorkspaceQuery<T> {
+    /// Forget everything, cancelling any request in flight.
+    fn clear(&mut self) {
+        self.generation += 1;
+        *self = Self {
+            generation: self.generation,
+            ..Self::default()
+        };
+    }
+
+    /// Start a request; the returned generation identifies its answer.
+    fn begin(&mut self) -> u64 {
+        self.generation += 1;
+        self.loading = true;
+        self.generation
+    }
+
+    /// Header status while loading or after a failure.
+    fn status(&self) -> Option<SharedString> {
+        if self.loading {
+            Some("Searching…".into())
+        } else {
+            self.error.clone()
+        }
+    }
+}
+
+/// The focused chat's workspace connection, when it has one.
+fn palette_workspace(shell: &Shell, cx: &App) -> Option<WorkspaceFilesClient> {
+    if shell.active_chat.is_empty() {
+        return None;
+    }
+    let state = shell.state.read(cx);
+    let context = FilesRequestContext::for_chat(state, &shell.active_chat)?;
+    Some(WorkspaceFilesClient::new(state.engine()?.clone(), context))
+}
+
+fn search_error_message(error: &FilesClientError) -> SharedString {
+    match error {
+        FilesClientError::Unsupported(_) => {
+            "The session's device runs an older zeron — update it to search its files".into()
+        }
+        FilesClientError::Transport(_) => "The session's device is unreachable".into(),
+        FilesClientError::Encode(_)
+        | FilesClientError::Decode(_)
+        | FilesClientError::Request(_) => "File search failed".into(),
+    }
 }
 
 // X11 suppresses synthetic repeat releases but sends repeated keydowns with
@@ -91,6 +158,7 @@ enum Section {
     RecentThreads,
     Threads,
     Commands,
+    Files,
 }
 
 impl Section {
@@ -101,6 +169,7 @@ impl Section {
             Self::RecentThreads => "Recent Threads",
             Self::Threads => "Threads",
             Self::Commands => "Commands",
+            Self::Files => "Files",
         }
     }
 }
@@ -179,6 +248,8 @@ impl PaletteRow {
 struct PaletteSection {
     section: Section,
     rows: Vec<PaletteRow>,
+    /// Shown beside the title: "Searching…", or why the search failed.
+    status: Option<SharedString>,
 }
 
 impl PaletteSection {
@@ -189,7 +260,17 @@ impl PaletteSection {
                 .into_iter()
                 .map(|kind| PaletteRow::new(section, kind))
                 .collect(),
+            status: None,
         }
+    }
+
+    fn with_status(mut self, status: Option<SharedString>) -> Self {
+        self.status = status;
+        self
+    }
+
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty() && self.status.is_none()
     }
 }
 
@@ -281,7 +362,7 @@ impl Shell {
         }
         self.add_space = None;
         let search = cx.new(|cx| {
-            ComposerInput::with_context("Search commands and chats…", "PaletteSearch", cx)
+            ComposerInput::with_context("Search threads, commands and files…", "PaletteSearch", cx)
         });
         let events = cx.subscribe(&search, |this, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
@@ -289,6 +370,7 @@ impl Shell {
                     palette.reset_active();
                     palette.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
                 }
+                this.search_palette_files(cx);
                 cx.notify();
             }
         });
@@ -303,6 +385,7 @@ impl Shell {
             enter_press: EnterPress::default(),
             focus_pending: true,
             scroll: gpui::ScrollHandle::new(),
+            files: WorkspaceQuery::default(),
             _search_events: events,
         });
         cx.notify();
@@ -327,6 +410,54 @@ impl Shell {
             }
             cx.notify();
         }
+    }
+
+    /// Look the query up among the focused workspace's file names.
+    fn search_palette_files(&mut self, cx: &mut Context<Self>) {
+        let workspace = palette_workspace(self, cx);
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        let query = palette.search.read(cx).text().trim().to_owned();
+        let Some(client) = workspace.filter(|_| query.chars().count() >= MIN_FILE_QUERY_CHARS)
+        else {
+            palette.files.clear();
+            return;
+        };
+        let generation = palette.files.begin();
+        let request = SearchWorkspaceFilesRequest {
+            target: client.target().clone(),
+            query,
+            include_ignored: false,
+            limit: Some(FILES_TAB_LIMIT as u16),
+        };
+        palette.files.task = Some(cx.spawn(async move |this, cx| {
+            let result = client.search(request).await;
+            this.update(cx, |shell, cx| {
+                let Some(files) = shell
+                    .command_palette
+                    .as_mut()
+                    .map(|palette| &mut palette.files)
+                    .filter(|files| files.generation == generation)
+                else {
+                    return;
+                };
+                files.loading = false;
+                match result {
+                    Ok(results) => {
+                        files.error = None;
+                        files.results = results;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "palette file search failed");
+                        files.error = Some(search_error_message(&error));
+                        files.results.clear();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// The open palette's sections for its tab and query.
@@ -371,23 +502,42 @@ impl Shell {
                     }),
             )
         };
+        let files = |limit| {
+            PaletteSection::new(
+                Section::Files,
+                palette
+                    .files
+                    .results
+                    .iter()
+                    .take(limit)
+                    .map(|found| RowKind::File {
+                        path: found.path.clone(),
+                        is_dir: found.kind == WorkspaceEntryKind::Directory,
+                    }),
+            )
+            .with_status(palette.files.status())
+        };
         let sections = match (palette.tab, query.is_empty()) {
             (Tab::All, true) => vec![
                 recent_files(ALL_TAB_LIMIT),
                 commands(Section::QuickActions),
                 recent_threads(ALL_TAB_LIMIT),
             ],
-            (Tab::All, false) => vec![threads(ALL_TAB_LIMIT), commands(Section::Commands)],
+            (Tab::All, false) => vec![
+                threads(ALL_TAB_LIMIT),
+                commands(Section::Commands),
+                files(ALL_TAB_LIMIT),
+            ],
             (Tab::Threads, true) => vec![recent_threads(THREADS_TAB_LIMIT)],
             (Tab::Threads, false) => vec![threads(THREADS_TAB_LIMIT)],
             (Tab::Commands, true) => vec![commands(Section::QuickActions)],
             (Tab::Commands, false) => vec![commands(Section::Commands)],
             (Tab::Files, true) => vec![recent_files(FILES_TAB_LIMIT)],
-            (Tab::Files, false) => Vec::new(),
+            (Tab::Files, false) => vec![files(FILES_TAB_LIMIT)],
         };
         sections
             .into_iter()
-            .filter(|section| !section.rows.is_empty())
+            .filter(|section| !section.is_empty())
             .collect()
     }
 
@@ -745,7 +895,11 @@ impl Shell {
             }
             children.push(
                 header
-                    .child(palette_section_header(&theme, section.section.title()))
+                    .child(palette_section_header(
+                        &theme,
+                        section.section.title(),
+                        section.status.clone(),
+                    ))
                     .into_any_element(),
             );
             for row in &section.rows {
@@ -886,15 +1040,26 @@ impl Shell {
     }
 }
 
-/// A section's title, in the sidebar's secondary text style.
-fn palette_section_header(theme: &Theme, title: &'static str) -> gpui::Div {
+/// A section's title, in the sidebar's secondary text style, with its
+/// search status trailing.
+fn palette_section_header(
+    theme: &Theme,
+    title: &'static str,
+    status: Option<SharedString>,
+) -> gpui::Div {
     div()
         .px(px(16.0))
         .pt(px(2.0))
         .pb(px(4.0))
+        .flex()
+        .items_center()
+        .gap(px(8.0))
         .text_size(crate::typography::ui_rems(11.0))
         .text_color(theme.text_muted)
         .child(title)
+        .when_some(status, |header, status| {
+            header.child(div().min_w_0().truncate().opacity(0.7).child(status))
+        })
 }
 
 /// The results list's max height; shared so every palette sits at one size.
@@ -1319,6 +1484,250 @@ mod tests {
         );
         assert_eq!(split_path("README.md"), ("README.md", ""));
         assert_eq!(split_path("crates/ui/"), ("ui", "crates"));
+    }
+
+    /// The engine side of a shell under test: requests out, replies in.
+    struct FakeEngine {
+        runtime: tokio::runtime::Runtime,
+        requests: tokio::sync::mpsc::Receiver<String>,
+        replies: tokio::sync::mpsc::Sender<String>,
+    }
+
+    impl FakeEngine {
+        /// Every request sent so far for `method`; other methods are
+        /// answered with an empty object.
+        fn take(&mut self, method: &str, cx: &mut TestAppContext) -> Vec<serde_json::Value> {
+            let mut found = Vec::new();
+            loop {
+                cx.run_until_parked();
+                let Ok(request) = self.requests.try_recv() else {
+                    return found;
+                };
+                let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+                if request["method"] == method {
+                    found.push(request);
+                } else {
+                    self.reply(&request, serde_json::json!({}));
+                }
+            }
+        }
+
+        fn reply(&self, request: &serde_json::Value, ok: serde_json::Value) {
+            let reply = serde_json::json!({ "id": request["id"], "ok": ok });
+            // The client's reader task runs on this runtime: let it drain.
+            self.runtime.block_on(async {
+                self.replies.send(reply.to_string()).await.unwrap();
+                while self.replies.capacity() < self.replies.max_capacity() {
+                    tokio::task::yield_now().await;
+                }
+            });
+        }
+    }
+
+    /// A palette over chat "focused" (plus "deploy-thread"), wired to a fake
+    /// engine. `focused: false` leaves no chat in focus.
+    fn engine_palette(
+        cx: &mut TestAppContext,
+        focused: bool,
+    ) -> (gpui::WindowHandle<Shell>, tempfile::TempDir, FakeEngine) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (out, requests) = tokio::sync::mpsc::channel(64);
+        let (replies, inbound) = tokio::sync::mpsc::channel(64);
+        let engine = {
+            let _guard = runtime.enter();
+            crate::state::EngineHandle::from_test_client(zeron_rpc::RpcClient::new(out, inbound))
+        };
+        let (window, dir) = palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.local_device_id = Some("local".into());
+                    state.apply_chats(vec![
+                        chat("focused", None, false, 0),
+                        titled("deploy-thread", "Deploy the docs", false, 1),
+                    ]);
+                    state.set_test_engine(engine);
+                    if focused {
+                        state.select_chat(Some("focused".into()), cx);
+                    }
+                });
+                if focused {
+                    shell.active_chat = "focused".into();
+                }
+                shell.toggle_command_palette(window, cx);
+            })
+            .unwrap();
+        let fake = FakeEngine {
+            runtime,
+            requests,
+            replies,
+        };
+        (window, dir, fake)
+    }
+
+    fn type_query(window: gpui::WindowHandle<Shell>, query: &str, cx: &mut TestAppContext) {
+        window
+            .update(cx, |shell, _, cx| {
+                shell
+                    .command_palette
+                    .as_ref()
+                    .unwrap()
+                    .search
+                    .update(cx, |input, cx| input.set_text(query, cx));
+            })
+            .unwrap();
+    }
+
+    fn palette_section(
+        window: gpui::WindowHandle<Shell>,
+        section: Section,
+        cx: &mut TestAppContext,
+    ) -> Option<PaletteSection> {
+        window
+            .read_with(cx, |shell, cx| {
+                shell
+                    .palette_sections(cx)
+                    .into_iter()
+                    .find(|found| found.section == section)
+            })
+            .unwrap()
+    }
+
+    fn name_match(path: &str, kind: &str) -> serde_json::Value {
+        serde_json::json!({ "path": path, "name": path, "kind": kind, "score": 1 })
+    }
+
+    #[gpui::test]
+    fn file_names_need_a_focused_chat_and_two_characters(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, false);
+        type_query(window, "co", cx);
+        assert!(engine.take(methods::SEARCH_WORKSPACE_FILES, cx).is_empty());
+        assert!(palette_section(window, Section::Files, cx).is_none());
+
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "c", cx);
+        assert!(engine.take(methods::SEARCH_WORKSPACE_FILES, cx).is_empty());
+        type_query(window, "co", cx);
+        let requests = engine.take(methods::SEARCH_WORKSPACE_FILES, cx);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["params"]["chatId"], "focused");
+        assert_eq!(requests[0]["params"]["query"], "co");
+        let searching = palette_section(window, Section::Files, cx).unwrap();
+        assert!(searching.rows.is_empty());
+        assert_eq!(searching.status.as_deref(), Some("Searching…"));
+
+        engine.reply(
+            &requests[0],
+            serde_json::json!([
+                name_match("src/composer.rs", "file"),
+                name_match("src", "directory")
+            ]),
+        );
+        cx.run_until_parked();
+        let files = palette_section(window, Section::Files, cx).unwrap();
+        assert_eq!(files.status, None);
+        assert_eq!(
+            files
+                .rows
+                .into_iter()
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            [
+                RowKind::File {
+                    path: "src/composer.rs".into(),
+                    is_dir: false
+                },
+                RowKind::File {
+                    path: "src".into(),
+                    is_dir: true
+                },
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn stale_file_answers_are_dropped(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "ab", cx);
+        let first = engine.take(methods::SEARCH_WORKSPACE_FILES, cx);
+        type_query(window, "abc", cx);
+        let second = engine.take(methods::SEARCH_WORKSPACE_FILES, cx);
+        engine.reply(
+            &second[0],
+            serde_json::json!([name_match("abc.rs", "file")]),
+        );
+        cx.run_until_parked();
+        engine.reply(&first[0], serde_json::json!([name_match("ab.rs", "file")]));
+        cx.run_until_parked();
+        let files = palette_section(window, Section::Files, cx).unwrap();
+        assert_eq!(
+            files
+                .rows
+                .into_iter()
+                .map(|row| row.kind)
+                .collect::<Vec<_>>(),
+            [RowKind::File {
+                path: "abc.rs".into(),
+                is_dir: false
+            }]
+        );
+    }
+
+    #[gpui::test]
+    fn arriving_files_keep_the_selected_row(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "deploy", cx);
+        let requests = engine.take(methods::SEARCH_WORKSPACE_FILES, cx);
+        // Select the thread; the Files section then lands below it.
+        window
+            .update(cx, |shell, _, cx| shell.move_palette_selection(false, cx))
+            .unwrap();
+        let selected = |cx: &mut TestAppContext| {
+            window
+                .read_with(cx, |shell, _| {
+                    shell.command_palette.as_ref().unwrap().active.clone()
+                })
+                .unwrap()
+        };
+        let before = selected(cx);
+        engine.reply(
+            &requests[0],
+            serde_json::json!([name_match("deploy.md", "file")]),
+        );
+        cx.run_until_parked();
+        assert_eq!(selected(cx), before);
+        assert!(before.is_some());
+    }
+
+    #[gpui::test]
+    fn activating_a_file_row_opens_it_for_the_focused_chat(cx: &mut TestAppContext) {
+        let (window, _dir, _engine) = engine_palette(cx, true);
+        window
+            .update(cx, |shell, window, cx| {
+                let row = PaletteRow::new(
+                    Section::Files,
+                    RowKind::File {
+                        path: "src/composer.rs".into(),
+                        is_dir: false,
+                    },
+                );
+                shell.activate_palette_row(row, window, cx);
+                assert!(shell.command_palette.is_none());
+                assert!(
+                    shell
+                        .file_surface_paths
+                        .values()
+                        .any(|path| path == "src/composer.rs")
+                );
+                assert_eq!(
+                    shell.recent_files("focused").next().map(String::as_str),
+                    Some("src/composer.rs")
+                );
+            })
+            .unwrap();
     }
 
     /// A shell with the real app keymap and two sidebar sessions.

@@ -12,7 +12,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::{StreamExt, stream};
@@ -26,6 +25,7 @@ use zeron_proto::{
 
 use crate::EngineError;
 use crate::WorkspaceSearch;
+use crate::workspace_search::NameKinds;
 
 /// Existence probe timeout for user-chosen / remembered paths, which can point at
 /// dead network mounts where a bare `stat` hangs for minutes.
@@ -43,9 +43,6 @@ const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
 const GITHUB_AVATAR_TIMEOUT: Duration = Duration::from_secs(6);
-const FILE_INDEX_TTL: Duration = Duration::from_secs(10);
-const FILE_INDEX_MAX_ENTRIES: usize = 250_000;
-const RANK_BUFFER: usize = 1_024;
 pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
 pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
 
@@ -134,11 +131,9 @@ struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
     worktrees_root: PathBuf,
-    file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
     http: reqwest::Client,
     github_avatars: std::sync::Mutex<HashMap<String, String>>,
     github_avatar_pages: std::sync::Mutex<HashSet<String>>,
-    file_index: FileIndexCache,
     /// The engine's one workspace search index set (`@`, file tree, cmd+K).
     workspace_search: WorkspaceSearch,
     /// HEAD commit → its trunk's root commit. History behind a commit never
@@ -146,19 +141,6 @@ struct ReposInner {
     /// every spaces repair pass.
     trunk_roots: std::sync::Mutex<HashMap<String, String>>,
 }
-
-struct IndexedPath {
-    path: String,
-    haystack: nucleo_matcher::Utf32String,
-    is_dir: bool,
-}
-
-struct FileIndex {
-    entries: Vec<IndexedPath>,
-    built: std::time::Instant,
-}
-
-type FileIndexCache = std::sync::Mutex<HashMap<PathBuf, std::sync::Arc<FileIndex>>>;
 
 #[derive(Clone)]
 pub struct Repos {
@@ -187,7 +169,6 @@ impl Repos {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
                 worktrees_root,
-                file_searches: std::sync::Mutex::new(HashMap::new()),
                 http: reqwest::Client::builder()
                     .timeout(GITHUB_AVATAR_TIMEOUT)
                     .user_agent("Comet-Git-History")
@@ -196,7 +177,6 @@ impl Repos {
                 github_avatars: std::sync::Mutex::new(HashMap::new()),
                 trunk_roots: std::sync::Mutex::new(HashMap::new()),
                 github_avatar_pages: std::sync::Mutex::new(HashSet::new()),
-                file_index: std::sync::Mutex::new(HashMap::new()),
                 workspace_search: WorkspaceSearch::new(),
             }),
         }
@@ -1429,54 +1409,23 @@ impl Repos {
             .await
     }
 
-    /// Search a checkout's files and directories by fuzzy relative path. The
-    /// `ignore` walker honors `.gitignore`, `.ignore`, and global git excludes.
-    /// Dotfiles remain searchable; only repository metadata is always pruned.
+    /// Search a checkout's files and directories by fuzzy relative path,
+    /// from the workspace search index (fff), which honors `.gitignore`,
+    /// `.ignore`, and global git excludes. An empty query lists the chat's
+    /// featured paths first, then recently changed files.
     pub async fn search_files(
         &self,
         root: PathBuf,
         query: String,
         featured_paths: Vec<String>,
     ) -> Result<Vec<FileSearchMatch>, EngineError> {
-        let deadline = tokio::time::Instant::now() + FILE_SEARCH_TIMEOUT;
-        let gate = {
-            let mut searches = self
-                .inner
-                .file_searches
-                .lock()
-                .map_err(|_| EngineError::Other("file search registry poisoned".into()))?;
-            if let Some(gate) = searches.get(&root).and_then(std::sync::Weak::upgrade) {
-                gate
-            } else {
-                let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-                searches.insert(root.clone(), std::sync::Arc::downgrade(&gate));
-                gate
-            }
-        };
-        let gate = tokio::time::timeout_at(deadline, gate.lock_owned())
-            .await
-            .map_err(|_| EngineError::Other("file search timed out".into()))?;
-        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
-        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-        let worker_cancelled = cancelled.clone();
-        let cache = self.inner.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        std::thread::Builder::new()
-            .name("file-search".into())
-            .spawn(move || {
-                let _gate = gate;
-                let _ = tx.send(search_files_cached(
-                    &cache.file_index,
-                    &root,
-                    &query,
-                    &featured_paths,
-                    || worker_cancelled.load(Ordering::Relaxed),
-                ));
-            })
-            .map_err(|e| EngineError::Other(format!("file search failed: {e}")))?;
-        match tokio::time::timeout_at(deadline, rx).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(EngineError::Other("file search worker exited".into())),
+        let search = self.inner.workspace_search.clone();
+        let worker = disposable_worker("file-search", move || {
+            search_files_blocking(&search, &root, &query, &featured_paths)
+        });
+        match tokio::time::timeout(FILE_SEARCH_TIMEOUT, worker).await {
+            Ok(Some(result)) => result,
+            Ok(None) => Err(EngineError::Other("file search worker exited".into())),
             Err(_) => Err(EngineError::Other("file search timed out".into())),
         }
     }
@@ -1537,14 +1486,6 @@ impl Repos {
                 "drive listing timed out on the device".into(),
             )),
         }
-    }
-}
-
-struct CancelOnDrop(std::sync::Arc<AtomicBool>);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -1928,246 +1869,75 @@ fn compact_history_commits(
         .collect()
 }
 
-type RankedFileMatch = (Option<usize>, u32, String, bool);
-
-fn compare_file_matches(
-    query: &str,
-    (featured_a, score_a, path_a, dir_a): &RankedFileMatch,
-    (featured_b, score_b, path_b, dir_b): &RankedFileMatch,
-) -> std::cmp::Ordering {
-    let empty_query = query.trim().is_empty();
-    featured_a
-        .is_none()
-        .cmp(&featured_b.is_none())
-        .then_with(|| featured_a.cmp(featured_b))
-        .then_with(|| score_b.cmp(score_a))
-        .then_with(|| {
-            empty_query
-                .then(|| path_a.split('/').count().cmp(&path_b.split('/').count()))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .then_with(|| {
-            empty_query
-                .then(|| dir_a.cmp(dir_b))
-                .unwrap_or_else(|| dir_b.cmp(dir_a))
-        })
-        .then_with(|| path_a.len().cmp(&path_b.len()))
-        .then_with(|| path_a.cmp(path_b))
-}
-
-#[cfg(test)]
 fn search_files_blocking(
+    search: &WorkspaceSearch,
     root: &Path,
     query: &str,
     featured_paths: &[String],
-) -> Result<Vec<FileSearchMatch>, EngineError> {
-    search_files_blocking_with_cancel(root, query, featured_paths, || false)
-}
-
-#[cfg(test)]
-fn search_files_blocking_with_cancel<F: Fn() -> bool + Sync>(
-    root: &Path,
-    query: &str,
-    featured_paths: &[String],
-    cancelled: F,
 ) -> Result<Vec<FileSearchMatch>, EngineError> {
     let root = canonical_search_root(root)?;
-    let index = walk_file_index(&root, &cancelled)?;
-    Ok(rank_file_matches(&index, &root, query, featured_paths))
-}
-
-fn search_files_cached<F: Fn() -> bool + Sync>(
-    cache: &FileIndexCache,
-    root: &Path,
-    query: &str,
-    featured_paths: &[String],
-    cancelled: F,
-) -> Result<Vec<FileSearchMatch>, EngineError> {
-    let root = canonical_search_root(root)?;
-    let fresh = cache
-        .lock()
-        .ok()
-        .and_then(|indexes| indexes.get(&root).cloned())
-        .filter(|index| index.built.elapsed() < FILE_INDEX_TTL);
-    let index = match fresh {
-        Some(index) => index,
-        None => {
-            let index = std::sync::Arc::new(FileIndex {
-                entries: walk_file_index(&root, &cancelled)?,
-                built: std::time::Instant::now(),
-            });
-            if let Ok(mut indexes) = cache.lock() {
-                indexes.retain(|_, index| index.built.elapsed() < FILE_INDEX_TTL);
-                indexes.insert(root.clone(), index.clone());
+    let mut matches: Vec<FileSearchMatch> = Vec::with_capacity(FILE_SEARCH_MAX_RESULTS);
+    if query.trim().is_empty() {
+        for path in featured_paths {
+            if matches.len() == FILE_SEARCH_MAX_RESULTS {
+                break;
             }
-            index
-        }
-    };
-    if cancelled() {
-        return Err(EngineError::Other("file search cancelled".into()));
-    }
-    Ok(rank_file_matches(
-        &index.entries,
-        &root,
-        query,
-        featured_paths,
-    ))
-}
-
-fn canonical_search_root(root: &Path) -> Result<PathBuf, EngineError> {
-    std::fs::canonicalize(root)
-        .map_err(|e| EngineError::Other(format!("could not search workspace: {e}")))
-}
-
-fn walk_file_index<F: Fn() -> bool + Sync>(
-    root: &Path,
-    cancelled: &F,
-) -> Result<Vec<IndexedPath>, EngineError> {
-    if cancelled() {
-        return Err(EngineError::Other("file search cancelled".into()));
-    }
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(12))
-        .unwrap_or(4);
-    let collected: std::sync::Mutex<Vec<IndexedPath>> = std::sync::Mutex::new(Vec::new());
-    let was_cancelled = AtomicBool::new(false);
-    ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .threads(threads)
-        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
-        .build_parallel()
-        .run(|| {
-            const BATCH: usize = 512;
-            struct Batch<'a> {
-                items: Vec<IndexedPath>,
-                sink: &'a std::sync::Mutex<Vec<IndexedPath>>,
-            }
-            impl Drop for Batch<'_> {
-                fn drop(&mut self) {
-                    if self.items.is_empty() {
-                        return;
-                    }
-                    if let Ok(mut all) = self.sink.lock() {
-                        all.append(&mut self.items);
-                    }
-                }
-            }
-            let mut batch = Batch {
-                items: Vec::with_capacity(BATCH),
-                sink: &collected,
-            };
-            let was_cancelled = &was_cancelled;
-            Box::new(move |entry| {
-                if was_cancelled.load(Ordering::Relaxed) {
-                    return ignore::WalkState::Quit;
-                }
-                if cancelled() {
-                    was_cancelled.store(true, Ordering::Relaxed);
-                    return ignore::WalkState::Quit;
-                }
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(err) => {
-                        tracing::debug!(%err, "file mention index skipped entry");
-                        return ignore::WalkState::Continue;
-                    }
-                };
-                let path = entry.path();
-                if path == root {
-                    return ignore::WalkState::Continue;
-                }
-                let Ok(relative) = path.strip_prefix(root) else {
-                    return ignore::WalkState::Continue;
-                };
-                let relative = relative.to_string_lossy().replace('\\', "/");
-                if relative == ".git" || relative.starts_with(".git/") {
-                    return ignore::WalkState::Continue;
-                }
-                batch.items.push(IndexedPath {
-                    haystack: nucleo_matcher::Utf32String::from(relative.as_str()),
-                    path: relative,
-                    is_dir: entry.file_type().is_some_and(|kind| kind.is_dir()),
-                });
-                if batch.items.len() >= BATCH
-                    && let Ok(mut all) = batch.sink.lock()
-                {
-                    all.append(&mut batch.items);
-                    if all.len() >= FILE_INDEX_MAX_ENTRIES {
-                        return ignore::WalkState::Quit;
-                    }
-                }
-                ignore::WalkState::Continue
-            })
-        });
-    if was_cancelled.load(Ordering::Relaxed) || cancelled() {
-        return Err(EngineError::Other("file search cancelled".into()));
-    }
-    let mut entries = collected
-        .into_inner()
-        .map_err(|_| EngineError::Other("file index poisoned".into()))?;
-    entries.truncate(FILE_INDEX_MAX_ENTRIES);
-    Ok(entries)
-}
-
-fn rank_file_matches(
-    entries: &[IndexedPath],
-    root: &Path,
-    query: &str,
-    featured_paths: &[String],
-) -> Vec<FileSearchMatch> {
-    let featured: HashMap<String, usize> = featured_paths
-        .iter()
-        .filter_map(|path| {
             let path = Path::new(path);
             let full = if path.is_absolute() {
                 path.to_path_buf()
             } else {
                 root.join(path)
             };
-            let canonical = std::fs::canonicalize(full).ok()?;
-            let relative = canonical.strip_prefix(root).ok()?;
-            Some(relative.to_string_lossy().replace('\\', "/"))
-        })
-        .enumerate()
-        .fold(HashMap::new(), |mut paths, (rank, path)| {
-            paths.entry(path).or_insert(rank);
-            paths
-        });
-    let mut matcher = nucleo_matcher::Matcher::new({
-        let mut config = nucleo_matcher::Config::DEFAULT;
-        config.set_match_paths();
-        config
-    });
-    let pattern = nucleo_matcher::pattern::Pattern::parse(
-        query,
-        nucleo_matcher::pattern::CaseMatching::Smart,
-        nucleo_matcher::pattern::Normalization::Smart,
-    );
-    let mut matches: Vec<RankedFileMatch> = Vec::new();
-    for entry in entries {
-        let Some(score) = pattern.score(entry.haystack.slice(..), &mut matcher) else {
-            continue;
-        };
-        matches.push((
-            featured.get(&entry.path).copied(),
-            score,
-            entry.path.clone(),
-            entry.is_dir,
-        ));
-        if matches.len() >= RANK_BUFFER {
-            matches.sort_by(|a, b| compare_file_matches(query, a, b));
-            matches.truncate(FILE_SEARCH_MAX_RESULTS);
+            let Ok(canonical) = std::fs::canonicalize(full) else {
+                continue;
+            };
+            let Ok(relative) = canonical.strip_prefix(&root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if relative.is_empty()
+                || is_git_metadata(&relative)
+                || matches.iter().any(|found| found.path == relative)
+            {
+                continue;
+            }
+            matches.push(FileSearchMatch {
+                is_dir: canonical.is_dir(),
+                path: relative,
+            });
         }
     }
-    matches.sort_by(|a, b| compare_file_matches(query, a, b));
-    matches.truncate(FILE_SEARCH_MAX_RESULTS);
-    matches
-        .into_iter()
-        .map(|(_, _, path, is_dir)| FileSearchMatch { path, is_dir })
-        .collect()
+    let found = search
+        .search_names(
+            &root,
+            query,
+            FILE_SEARCH_MAX_RESULTS + matches.len(),
+            NameKinds::FilesAndDirectories,
+        )
+        .map_err(|e| EngineError::Other(e.to_string()))?;
+    for found in found.matches {
+        if matches.len() == FILE_SEARCH_MAX_RESULTS {
+            break;
+        }
+        if is_git_metadata(&found.path) || matches.iter().any(|known| known.path == found.path) {
+            continue;
+        }
+        matches.push(FileSearchMatch {
+            path: found.path,
+            is_dir: found.is_dir,
+        });
+    }
+    Ok(matches)
+}
+
+/// Repository metadata is never offered, even if an index surfaced it.
+fn is_git_metadata(relative: &str) -> bool {
+    relative.split('/').any(|component| component == ".git")
+}
+
+fn canonical_search_root(root: &Path) -> Result<PathBuf, EngineError> {
+    std::fs::canonicalize(root)
+        .map_err(|e| EngineError::Other(format!("could not search workspace: {e}")))
 }
 
 /// Turn a generated chat title into the semantic portion of a Zeron branch
@@ -2379,23 +2149,6 @@ mod tests {
         }
     }
 
-    fn score(query: &str, candidate: &str) -> Option<u32> {
-        let mut matcher = nucleo_matcher::Matcher::new({
-            let mut config = nucleo_matcher::Config::DEFAULT;
-            config.set_match_paths();
-            config
-        });
-        nucleo_matcher::pattern::Pattern::parse(
-            query,
-            nucleo_matcher::pattern::CaseMatching::Smart,
-            nucleo_matcher::pattern::Normalization::Smart,
-        )
-        .score(
-            nucleo_matcher::Utf32String::from(candidate).slice(..),
-            &mut matcher,
-        )
-    }
-
     #[test]
     fn expand_home_rewrites_tilde_and_leaves_other_paths() {
         let home = session_home_dir().unwrap();
@@ -2545,13 +2298,6 @@ tmpfs /run tmpfs rw 0 0
     }
 
     #[test]
-    fn fuzzy_score_matches_a_path_subsequence() {
-        assert!(score("cmp rs", "crates/ui/src/composer.rs").is_some());
-        assert!(score("composer crates", "crates/ui/src/composer.rs").is_some());
-        assert!(score("xyzq", "crates/ui/src/composer.rs").is_none());
-    }
-
-    #[test]
     fn git_history_matches_unicode_case_insensitively() {
         let mut candidate = history_commit("a1b2c3d4".into(), None);
         candidate.subject = "RÉPARER la recherche".into();
@@ -2584,10 +2330,24 @@ tmpfs /run tmpfs rw 0 0
         assert!(compact[1].parent_shas.is_empty());
     }
 
+    fn search_files_blocking(
+        root: &Path,
+        query: &str,
+        featured_paths: &[String],
+    ) -> Result<Vec<FileSearchMatch>, EngineError> {
+        super::search_files_blocking(&WorkspaceSearch::new(), root, query, featured_paths)
+    }
+
     #[test]
     fn search_files_obeys_gitignore_and_returns_directories() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join(".git")).unwrap();
+        // Dotfiles are indexed only inside a real repository.
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
         std::fs::create_dir(root.path().join("src")).unwrap();
         std::fs::write(root.path().join("src/composer.rs"), "").unwrap();
         std::fs::write(root.path().join(".secret"), "").unwrap();
@@ -2649,33 +2409,6 @@ tmpfs /run tmpfs rw 0 0
             .position(|entry| entry.path == "composer/docs/readme.md")
             .unwrap();
         assert!(composer < path_only);
-    }
-
-    #[test]
-    fn cached_search_reuses_one_walk_within_the_ttl() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("alpha.rs"), "").unwrap();
-        let cache: FileIndexCache = std::sync::Mutex::new(HashMap::new());
-
-        let first = search_files_cached(&cache, root.path(), "alpha", &[], || false).unwrap();
-        assert_eq!(first.first().map(|m| m.path.as_str()), Some("alpha.rs"));
-        std::fs::write(root.path().join("beta.rs"), "").unwrap();
-        let second = search_files_cached(&cache, root.path(), "beta", &[], || false).unwrap();
-        assert!(second.is_empty(), "{second:?}");
-    }
-
-    #[test]
-    fn cancelled_search_stops_before_walking() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("README.md"), "").unwrap();
-        let cancelled = AtomicBool::new(true);
-
-        let err = search_files_blocking_with_cancel(root.path(), "", &[], || {
-            cancelled.load(Ordering::Relaxed)
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("cancelled"));
     }
 
     #[tokio::test]

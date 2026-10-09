@@ -555,6 +555,45 @@ pub struct WorkspaceFileSearchMatch {
     pub score: i64,
 }
 
+/// Plain-text search over a workspace's file contents (smart case). Binary
+/// and oversized files are skipped.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchWorkspaceContentRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_file_limit: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceContentMatch {
+    /// Workspace-relative, `/`-separated.
+    pub path: String,
+    /// 1-based.
+    pub line: u64,
+    /// 0-based byte column of the first match in the original line.
+    pub column: u64,
+    /// The matched line, leading whitespace trimmed, at most 512 bytes.
+    pub preview: String,
+    /// `[start, end)` byte ranges of the matches within `preview`.
+    pub ranges: Vec<(u32, u32)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceContentSearchResult {
+    pub matches: Vec<WorkspaceContentMatch>,
+    /// More matches exist, or the host's time budget ran out.
+    pub truncated: bool,
+    /// The host's index was still scanning; results may be incomplete.
+    pub indexing: bool,
+}
+
 /// Start (or keep alive) the host's search index for a workspace. `pin`
 /// marks it as the focused chat's: the UI renews it every minute, and a
 /// pinned index is the last to be evicted. `pin: false` releases the pin.

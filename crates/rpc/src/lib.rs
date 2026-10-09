@@ -171,6 +171,8 @@ pub mod methods {
     pub const SEARCH_WORKSPACE_FILES: &str = "SearchWorkspaceFiles";
     /// Start or keep alive a workspace's search index (fire-and-forget warm).
     pub const WARM_WORKSPACE_SEARCH: &str = "WarmWorkspaceSearch";
+    /// Plain-text search over a workspace's file contents.
+    pub const SEARCH_WORKSPACE_CONTENT: &str = "SearchWorkspaceContent";
     pub const READ_WORKSPACE_IMAGE: &str = "ReadWorkspaceImage";
     pub const READ_WORKSPACE_FILE: &str = "ReadWorkspaceFile";
     pub const MOVE_WORKSPACE_ENTRY: &str = "MoveWorkspaceEntry";

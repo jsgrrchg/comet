@@ -1,5 +1,6 @@
-//! Workspace search benchmark: the `SearchFiles` (`@`) and
-//! `SearchWorkspaceFiles` (file tree) paths against one folder.
+//! Workspace search benchmark: the `SearchFiles` (`@`),
+//! `SearchWorkspaceFiles` (file tree) and `SearchWorkspaceContent` (cmd+K)
+//! paths against one folder.
 //!
 //! ```text
 //! BENCH_ROOT=/path/to/checkout cargo run --release -p zeron-engine \
@@ -48,14 +49,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("root: {}", root.display());
     print_rss("baseline");
 
+    let search = repos.workspace_search();
     let started = Instant::now();
-    let first = runtime.block_on(repos.search_files(root.clone(), "a".into(), Vec::new()))?;
+    search.warm(&root, false)?;
+    if !search.wait_until_indexed(&root, Duration::from_secs(600)) {
+        return Err("index did not finish within 10 minutes".into());
+    }
     println!(
-        "SearchFiles first query (builds the index): {:?}, {} results",
-        started.elapsed(),
-        first.len()
+        "index scanned and content-indexed in {:?}",
+        started.elapsed()
     );
-    print_rss("after SearchFiles index");
+    print_rss("after index");
 
     println!();
     println!(
@@ -77,6 +81,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for query in &queries {
         let (timings, results) = measure(runs, || tree_search(&repos, &root, query, true))?;
         report(&format!("…including ignored {query}"), &timings, results);
+    }
+    for query in &queries {
+        let (timings, results) = measure(runs, || {
+            search
+                .search_content(&root, query, 100, 3)
+                .map(|found| found.matches.len())
+        })?;
+        report(
+            &format!("SearchWorkspaceContent {query}"),
+            &timings,
+            results,
+        );
     }
     print_rss("after all queries");
     Ok(())

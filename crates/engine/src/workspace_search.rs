@@ -271,6 +271,15 @@ impl WorkspaceSearch {
         })
     }
 
+    /// Block until `root`'s index finished its scan and content indexing
+    /// (benchmarks); `false` on timeout or when `root` has no index.
+    pub fn wait_until_indexed(&self, root: &Path, timeout: Duration) -> bool {
+        let picker = lock(&self.inner.entries)
+            .get(root)
+            .map(|entry| entry.picker.clone());
+        picker.is_some_and(|picker| picker.wait_for_indexing_complete(timeout))
+    }
+
     /// Number of live indexes.
     pub fn live(&self) -> usize {
         lock(&self.inner.entries).len()

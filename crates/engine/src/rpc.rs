@@ -1441,6 +1441,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_WORKSPACE_DIRECTORY
             | methods::SEARCH_WORKSPACE_FILES
             | methods::WARM_WORKSPACE_SEARCH
+            | methods::SEARCH_WORKSPACE_CONTENT
             | methods::READ_WORKSPACE_IMAGE
             | methods::READ_WORKSPACE_FILE
             | methods::DELETE_WORKSPACE_ENTRY
@@ -3087,6 +3088,17 @@ impl RpcService for EngineRpc {
                 .map_err(RpcError::from)?;
                 RpcReply::value(&matches)
             }
+            methods::SEARCH_WORKSPACE_CONTENT => {
+                let request: zeron_proto::SearchWorkspaceContentRequest = parse_params(params)?;
+                let result = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.search_content(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace content search timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&result)
+            }
             methods::WARM_WORKSPACE_SEARCH => {
                 let request: zeron_proto::WarmWorkspaceSearchRequest = parse_params(params)?;
                 let result = tokio::time::timeout(
@@ -4045,6 +4057,8 @@ mod tests {
         assert!(!is_stream_method(methods::SEARCH_WORKSPACE_FILES));
         assert!(forwardable(methods::WARM_WORKSPACE_SEARCH));
         assert!(!is_stream_method(methods::WARM_WORKSPACE_SEARCH));
+        assert!(forwardable(methods::SEARCH_WORKSPACE_CONTENT));
+        assert!(!is_stream_method(methods::SEARCH_WORKSPACE_CONTENT));
         assert!(!is_stream_method(methods::READ_WORKSPACE_FILE));
         assert!(!is_stream_method(methods::WRITE_WORKSPACE_FILE));
         assert!(is_stream_method(methods::WATCH_WORKSPACE_FILES));

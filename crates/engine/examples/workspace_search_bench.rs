@@ -71,11 +71,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         report(&format!("SearchFiles {query}"), &timings, results);
     }
     for query in &queries {
-        let (timings, results) = measure(runs, || tree_search(&root, query, false))?;
+        let (timings, results) = measure(runs, || tree_search(&repos, &root, query, false))?;
         report(&format!("SearchWorkspaceFiles {query}"), &timings, results);
     }
     for query in &queries {
-        let (timings, results) = measure(runs, || tree_search(&root, query, true))?;
+        let (timings, results) = measure(runs, || tree_search(&repos, &root, query, true))?;
         report(&format!("…including ignored {query}"), &timings, results);
     }
     print_rss("after all queries");
@@ -83,11 +83,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn tree_search(
+    repos: &Repos,
     root: &Path,
     query: &str,
     include_ignored: bool,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     Ok(zeron_engine::workspace_files::bench_search_root(
+        repos.workspace_search(),
         root,
         query,
         include_ignored,

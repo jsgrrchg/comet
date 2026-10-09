@@ -1,4 +1,6 @@
-//! Global action and conversation search, using the sidebar's conversation rows.
+//! Global search over actions, conversations and the focused chat's
+//! workspace, using the sidebar's conversation rows. Results are grouped in
+//! sections; tabs narrow them to one kind.
 use super::*;
 use crate::appearance::AppearanceMode;
 
@@ -9,7 +11,11 @@ pub(super) struct CommandPalette {
     search: Entity<ComposerInput>,
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
-    active: usize,
+    tab: Tab,
+    /// The highlighted row, kept by identity so results arriving around it
+    /// never move it; `active_index` is where it was, for when it vanishes.
+    active: Option<RowKey>,
+    active_index: usize,
     enter_press: EnterPress,
     // Claim focus during mount so the shell does not restore the composer
     // while this input is still absent from the dispatch tree.
@@ -36,30 +42,107 @@ impl EnterPress {
     }
 }
 
+// Selected from the tab row (next commit).
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Tab {
+    #[default]
+    All,
+    Threads,
+    Commands,
+    Files,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Threads,
+    Commands,
+}
+
+impl Section {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Threads => "Threads",
+            Self::Commands => "Commands",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
-enum Entry {
+enum Command {
     NewChat,
     NewProject,
     Settings,
     Theme(AppearanceMode),
+}
+
+impl Command {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::NewChat => "New chat",
+            Self::NewProject => "New project",
+            Self::Settings => "Open settings",
+            Self::Theme(AppearanceMode::System) => "Switch to system theme",
+            Self::Theme(AppearanceMode::Light) => "Switch to light theme",
+            Self::Theme(AppearanceMode::Dark) => "Switch to dark theme",
+        }
+    }
+
+    fn icon(&self) -> &'static str {
+        match self {
+            Self::NewChat => icons::PEN_NEW_SQUARE,
+            Self::NewProject => icons::FOLDER,
+            Self::Settings => icons::SETTINGS,
+            Self::Theme(mode) => mode.icon(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RowKind {
+    Command(Command),
     Chat(String),
 }
 
-impl Entry {
-    fn action(&self) -> Option<(&'static str, &'static str)> {
-        match self {
-            Self::NewChat => Some(("New chat", icons::PEN_NEW_SQUARE)),
-            Self::NewProject => Some(("New project", icons::FOLDER)),
-            Self::Settings => Some(("Open settings", icons::SETTINGS)),
-            Self::Theme(mode) => Some((
-                match mode {
-                    AppearanceMode::System => "Switch to system theme",
-                    AppearanceMode::Light => "Switch to light theme",
-                    AppearanceMode::Dark => "Switch to dark theme",
-                },
-                mode.icon(),
-            )),
-            Self::Chat(_) => None,
+#[derive(Clone, Debug, PartialEq)]
+struct PaletteRow {
+    section: Section,
+    kind: RowKind,
+}
+
+/// A row's identity across result refreshes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RowKey(Section, String);
+
+impl PaletteRow {
+    fn new(section: Section, kind: RowKind) -> Self {
+        Self { section, kind }
+    }
+
+    fn key(&self) -> RowKey {
+        let id = match &self.kind {
+            RowKind::Command(command) => format!("command:{}", command.label()),
+            RowKind::Chat(id) => format!("chat:{id}"),
+        };
+        RowKey(self.section, id)
+    }
+}
+
+/// One titled group of rows, already limited for the tab.
+#[derive(Clone, Debug, PartialEq)]
+struct PaletteSection {
+    section: Section,
+    rows: Vec<PaletteRow>,
+}
+
+impl PaletteSection {
+    fn new(section: Section, kinds: impl IntoIterator<Item = RowKind>) -> Self {
+        Self {
+            section,
+            rows: kinds
+                .into_iter()
+                .map(|kind| PaletteRow::new(section, kind))
+                .collect(),
         }
     }
 }
@@ -69,20 +152,62 @@ fn matches_query(query: &str, text: &str) -> bool {
     query.split_whitespace().all(|word| text.contains(word))
 }
 
-fn actions_for(query: &str, is_dark: bool) -> Vec<Entry> {
+fn commands_for(query: &str, is_dark: bool) -> Vec<Command> {
     [
-        Entry::NewChat,
-        Entry::NewProject,
-        Entry::Settings,
-        Entry::Theme(if is_dark {
+        Command::NewChat,
+        Command::NewProject,
+        Command::Settings,
+        Command::Theme(if is_dark {
             AppearanceMode::Light
         } else {
             AppearanceMode::Dark
         }),
     ]
     .into_iter()
-    .filter(|entry| matches_query(query, entry.action().unwrap().0))
+    .filter(|command| matches_query(query, command.label()))
     .collect()
+}
+
+/// The scroll container's child index of flat row `row_ix`: each section
+/// mounts a header before its rows.
+fn child_index(sections: &[PaletteSection], row_ix: usize) -> usize {
+    let mut rows_before = 0;
+    for (section_ix, section) in sections.iter().enumerate() {
+        if row_ix < rows_before + section.rows.len() {
+            return row_ix + section_ix + 1;
+        }
+        rows_before += section.rows.len();
+    }
+    row_ix + sections.len()
+}
+
+/// Navigation order: every row of every section, headers skipped.
+fn flat_rows(sections: &[PaletteSection]) -> Vec<&PaletteRow> {
+    sections.iter().flat_map(|section| &section.rows).collect()
+}
+
+/// Where the row `active` sits in `rows`: found by identity when still
+/// listed, else `fallback` clamped.
+fn row_position(active: Option<&RowKey>, fallback: usize, rows: &[&PaletteRow]) -> usize {
+    active
+        .and_then(|key| rows.iter().position(|row| &row.key() == key))
+        .unwrap_or_else(|| fallback.min(rows.len().saturating_sub(1)))
+}
+
+impl CommandPalette {
+    fn active_position(&self, rows: &[&PaletteRow]) -> usize {
+        row_position(self.active.as_ref(), self.active_index, rows)
+    }
+
+    fn set_active(&mut self, rows: &[&PaletteRow], index: usize) {
+        self.active_index = index;
+        self.active = rows.get(index).map(|row| row.key());
+    }
+
+    fn reset_active(&mut self) {
+        self.active = None;
+        self.active_index = 0;
+    }
 }
 
 impl Shell {
@@ -104,7 +229,7 @@ impl Shell {
         let events = cx.subscribe(&search, |this, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
                 if let Some(palette) = this.command_palette.as_mut() {
-                    palette.active = 0;
+                    palette.reset_active();
                     palette.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
                 }
                 cx.notify();
@@ -115,7 +240,9 @@ impl Shell {
             search,
             focus: cx.focus_handle(),
             previous_focus,
-            active: 0,
+            tab: Tab::All,
+            active: None,
+            active_index: 0,
             enter_press: EnterPress::default(),
             focus_pending: true,
             scroll: gpui::ScrollHandle::new(),
@@ -133,12 +260,42 @@ impl Shell {
         }
     }
 
-    fn command_entries(&self, cx: &App) -> Vec<Entry> {
+    /// The open palette's sections for its tab and query.
+    fn palette_sections(&self, cx: &App) -> Vec<PaletteSection> {
         let Some(palette) = &self.command_palette else {
             return Vec::new();
         };
         let query = palette.search.read(cx).text().trim().to_lowercase();
-        let mut entries = actions_for(&query, Theme::of(cx).appearance.is_dark());
+        let commands = || {
+            PaletteSection::new(
+                Section::Commands,
+                commands_for(&query, Theme::of(cx).appearance.is_dark())
+                    .into_iter()
+                    .map(RowKind::Command),
+            )
+        };
+        let threads = |limit| {
+            PaletteSection::new(
+                Section::Threads,
+                self.thread_matches(&query, limit, cx)
+                    .into_iter()
+                    .map(RowKind::Chat),
+            )
+        };
+        let sections = match palette.tab {
+            Tab::All => vec![commands(), threads(HISTORY_RESULT_LIMIT)],
+            Tab::Threads => vec![threads(HISTORY_RESULT_LIMIT)],
+            Tab::Commands => vec![commands()],
+            Tab::Files => Vec::new(),
+        };
+        sections
+            .into_iter()
+            .filter(|section| !section.rows.is_empty())
+            .collect()
+    }
+
+    /// Top-level chats matching `query`, in sidebar order.
+    fn thread_matches(&self, query: &str, limit: usize, cx: &App) -> Vec<String> {
         let state = self.state.read(cx);
         // Global history deliberately ignores the sidebar's project filter and
         // collapsed groups. Archived conversations remain searchable too.
@@ -165,7 +322,7 @@ impl Shell {
                     })
                     .unwrap_or_default();
                 matches_query(
-                    &query,
+                    query,
                     &format!(
                         "{} {project} {device} {branch} {pr}",
                         chat.title.as_deref().unwrap_or("New session")
@@ -175,99 +332,114 @@ impl Shell {
             .collect();
         chats.sort_by(|a, b| spaces::compare_sidebar_chats(self.settings.sidebar_sort, a, b));
         // Limit after filtering and sorting so every chat remains searchable.
-        entries.extend(
-            chats
-                .into_iter()
-                .take(HISTORY_RESULT_LIMIT)
-                .map(|chat| Entry::Chat(chat.id.clone())),
-        );
-        entries
+        chats
+            .into_iter()
+            .take(limit)
+            .map(|chat| chat.id.clone())
+            .collect()
     }
 
     /// Pointer motion moves the highlight, so hover and keyboard never light
     /// two rows. Motion only: rows scrolling under a resting pointer must not
     /// steal the keyboard's place.
-    fn hover_command(&mut self, ix: usize, cx: &mut Context<Self>) {
+    fn hover_command(&mut self, key: RowKey, ix: usize, cx: &mut Context<Self>) {
         if let Some(palette) = self.command_palette.as_mut()
-            && palette.active != ix
+            && palette.active.as_ref() != Some(&key)
         {
-            palette.active = ix;
+            palette.active = Some(key);
+            palette.active_index = ix;
             cx.notify();
         }
     }
 
-    fn activate_command(&mut self, entry: Entry, window: &mut Window, cx: &mut Context<Self>) {
-        if let Entry::Theme(mode) = entry {
+    fn move_palette_selection(&mut self, down: bool, cx: &mut Context<Self>) {
+        let sections = self.palette_sections(cx);
+        let rows = flat_rows(&sections);
+        let count = rows.len();
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        if count == 0 {
+            return;
+        }
+        let current = palette.active_position(&rows);
+        let next = if down {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+        palette.set_active(&rows, next);
+        palette.scroll.scroll_to_item(child_index(&sections, next));
+        cx.notify();
+    }
+
+    fn activate_palette_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sections = self.palette_sections(cx);
+        let rows = flat_rows(&sections);
+        let Some(row) = self
+            .command_palette
+            .as_ref()
+            .and_then(|palette| rows.get(palette.active_position(&rows)))
+            .map(|row| (*row).clone())
+        else {
+            return;
+        };
+        self.activate_palette_row(row, window, cx);
+    }
+
+    fn activate_palette_row(
+        &mut self,
+        row: PaletteRow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let RowKind::Command(Command::Theme(mode)) = row.kind {
             // Keep the palette open so this ordinary action updates to its next state.
             crate::appearance::set_mode(mode, cx);
             cx.notify();
             return;
         }
         self.close_command_palette(window, cx);
-        match entry {
-            Entry::NewChat => self.open_new_session(None, cx),
-            Entry::NewProject => self.open_add_space(cx),
-            Entry::Settings => self.open_last_settings(cx),
-            Entry::Theme(_) => unreachable!(),
-            Entry::Chat(id) => self.open_chat(id, cx),
+        match row.kind {
+            RowKind::Command(Command::NewChat) => self.open_new_session(None, cx),
+            RowKind::Command(Command::NewProject) => self.open_add_space(cx),
+            RowKind::Command(Command::Settings) => self.open_last_settings(cx),
+            RowKind::Command(Command::Theme(_)) => unreachable!(),
+            RowKind::Chat(id) => self.open_chat(id, cx),
         }
     }
 
-    pub(super) fn render_command_palette(
+    fn command_shortcut(&self, command: &Command) -> Option<String> {
+        let id = match command {
+            Command::NewChat => ShortcutId::NewSession,
+            Command::NewProject => ShortcutId::NewProject,
+            Command::Settings => return Some(crate::settings::badge_combo("mod-,")),
+            Command::Theme(_) => return None,
+        };
+        let combo = self.settings.keymap.get(id);
+        let valid = Keystroke::parse(&platform_combo(combo)).is_ok();
+        Some(crate::settings::badge_combo(if valid {
+            combo
+        } else {
+            id.default_combo()
+        }))
+    }
+
+    fn render_palette_row(
         &mut self,
-        viewport: gpui::Size<Pixels>,
-        window: &mut Window,
+        row: &PaletteRow,
+        ix: usize,
+        active: bool,
+        query: &str,
+        theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let entries = self.command_entries(cx);
-        let palette = self.command_palette.as_mut()?;
-        if std::mem::take(&mut palette.focus_pending) {
-            window.focus(&palette.search.focus_handle(cx), cx);
-        }
-        palette.active = palette.active.min(entries.len().saturating_sub(1));
-        let active = palette.active;
-        let search = palette.search.clone();
-        let query = search.read(cx).text().to_string();
-        let focus = palette.focus.clone();
-        let scroll = palette.scroll.clone();
-        let theme = Theme::of(cx).for_popup();
-        let action_count = entries.iter().take_while(|e| e.action().is_some()).count();
-        let mut rows = Vec::new();
-        for (ix, entry) in entries.iter().enumerate() {
-            // End spacing belongs to the content, so it scrolls out of the
-            // fade instead of leaving a permanent gutter beside the chrome.
-            let mut row = div()
-                .id(("command-result", ix))
-                .flex_none()
-                .on_mouse_move(cx.listener(move |this, _: &gpui::MouseMoveEvent, _, cx| {
-                    this.hover_command(ix, cx)
-                }))
-                .when(ix == 0, |row| row.pt(px(8.0)))
-                .when(ix + 1 == entries.len(), |row| row.pb(px(8.0)));
-            if ix == action_count && action_count > 0 {
-                row = row.child(spaces::sidebar_separator(&theme).w_full().my(px(8.0)));
-            }
-            let content = if let Some((label, glyph)) = entry.action() {
-                let shortcut = match entry {
-                    Entry::NewChat | Entry::NewProject => {
-                        let id = if *entry == Entry::NewChat {
-                            ShortcutId::NewSession
-                        } else {
-                            ShortcutId::NewProject
-                        };
-                        let combo = self.settings.keymap.get(id);
-                        let valid = Keystroke::parse(&platform_combo(combo)).is_ok();
-                        Some(crate::settings::badge_combo(if valid {
-                            combo
-                        } else {
-                            id.default_combo()
-                        }))
-                    }
-                    Entry::Settings => Some(crate::settings::badge_combo("mod-,")),
-                    _ => None,
-                };
-                let entry = entry.clone();
-                popover::menu_row(&theme, ix == active, format!("command-action-{ix}"))
+        Some(match &row.kind {
+            RowKind::Command(command) => {
+                let label = command.label();
+                let shortcut = self.command_shortcut(command);
+                let target = row.clone();
+                popover::menu_row(theme, active, format!("command-action-{ix}"))
                     .id(("command-action", ix))
                     .rounded(px(popover::PALETTE_ITEM_RADIUS))
                     .role(gpui::Role::Button)
@@ -275,24 +447,25 @@ impl Shell {
                     .min_h(px(30.0))
                     .py(px(4.0))
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.activate_command(entry.clone(), window, cx)
+                        this.activate_palette_row(target.clone(), window, cx)
                     }))
                     .child(
-                        icon(glyph)
+                        icon(command.icon())
                             .size(px(16.0))
                             .flex_none()
                             .text_color(theme.text_muted),
                     )
                     .child(div().flex_1().min_w_0().child(popover::search_highlight(
                         label.into(),
-                        Some(&query),
-                        &theme,
+                        Some(query),
+                        theme,
                     )))
                     .when_some(shortcut, |row, shortcut| {
-                        row.child(popover::kbd_hint(&theme, &shortcut))
+                        row.child(popover::kbd_hint(theme, &shortcut))
                     })
                     .into_any_element()
-            } else if let Entry::Chat(id) = entry {
+            }
+            RowKind::Chat(id) => {
                 let state = self.state.read(cx);
                 let chat = state.chats.iter().find(|chat| &chat.id == id)?;
                 let project = match (state.space_for_chat(chat), chat.space_id.as_deref()) {
@@ -332,20 +505,77 @@ impl Shell {
                     pr,
                     harness,
                     state.display_status_for(chat, Utc::now()),
-                    ix == active,
+                    active,
                     chat.archived,
                     false,
                     None,
                     None,
                     false,
-                    Some(&query),
-                    &theme,
+                    Some(query),
+                    theme,
                     cx,
                 )
-            } else {
-                unreachable!()
-            };
-            rows.push(row.child(div().px(px(8.0)).child(content)));
+            }
+        })
+    }
+
+    pub(super) fn render_command_palette(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let sections = self.palette_sections(cx);
+        let palette = self.command_palette.as_mut()?;
+        if std::mem::take(&mut palette.focus_pending) {
+            window.focus(&palette.search.focus_handle(cx), cx);
+        }
+        let row_count = sections
+            .iter()
+            .map(|section| section.rows.len())
+            .sum::<usize>();
+        let active = palette.active_position(&flat_rows(&sections));
+        let search = palette.search.clone();
+        let query = search.read(cx).text().to_string();
+        let focus = palette.focus.clone();
+        let scroll = palette.scroll.clone();
+        let theme = Theme::of(cx).for_popup();
+        let mut children = Vec::new();
+        let mut ix = 0;
+        for (section_ix, section) in sections.iter().enumerate() {
+            // End spacing belongs to the content, so it scrolls out of the
+            // fade instead of leaving a permanent gutter beside the chrome.
+            let mut header = div()
+                .flex_none()
+                .when(section_ix == 0, |header| header.pt(px(8.0)));
+            if section_ix > 0 {
+                header = header.child(spaces::sidebar_separator(&theme).w_full().my(px(8.0)));
+            }
+            children.push(
+                header
+                    .child(palette_section_header(&theme, section.section.title()))
+                    .into_any_element(),
+            );
+            for row in &section.rows {
+                let key = row.key();
+                let content = self.render_palette_row(row, ix, ix == active, &query, &theme, cx);
+                let Some(content) = content else {
+                    ix += 1;
+                    continue;
+                };
+                children.push(
+                    div()
+                        .id(("command-result", ix))
+                        .flex_none()
+                        .on_mouse_move(cx.listener(move |this, _: &gpui::MouseMoveEvent, _, cx| {
+                            this.hover_command(key.clone(), ix, cx)
+                        }))
+                        .when(ix + 1 == row_count, |row| row.pb(px(8.0)))
+                        .child(div().px(px(8.0)).child(content))
+                        .into_any_element(),
+                );
+                ix += 1;
+            }
         }
         let body = div()
             .id("command-results")
@@ -356,8 +586,8 @@ impl Shell {
             .flex()
             .flex_col()
             .gap(px(SIDEBAR_LIST_GAP))
-            .children(rows)
-            .when(entries.is_empty(), |el| {
+            .children(children)
+            .when(sections.is_empty(), |el| {
                 el.child(palette_empty(
                     &theme,
                     "No results",
@@ -370,18 +600,7 @@ impl Shell {
                 cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
                     match event.keystroke.key.as_str() {
                         "up" | "down" => {
-                            let count = this.command_entries(cx).len();
-                            if count > 0
-                                && let Some(palette) = this.command_palette.as_mut()
-                            {
-                                palette.active = if event.keystroke.key == "down" {
-                                    (palette.active + 1) % count
-                                } else {
-                                    (palette.active + count - 1) % count
-                                };
-                                palette.scroll.scroll_to_item(palette.active);
-                                cx.notify();
-                            }
+                            this.move_palette_selection(event.keystroke.key == "down", cx)
                         }
                         "enter" => {
                             let activate = this
@@ -392,15 +611,7 @@ impl Shell {
                                 cx.stop_propagation();
                                 return;
                             }
-                            let entries = this.command_entries(cx);
-                            if let Some(entry) = this
-                                .command_palette
-                                .as_ref()
-                                .and_then(|p| entries.get(p.active))
-                                .cloned()
-                            {
-                                this.activate_command(entry, window, cx);
-                            }
+                            this.activate_palette_selection(window, cx);
                         }
                         "escape" => this.close_command_palette(window, cx),
                         _ => return,
@@ -433,6 +644,17 @@ impl Shell {
             );
         Some(palette_overlay(viewport, card))
     }
+}
+
+/// A section's title, in the sidebar's secondary text style.
+fn palette_section_header(theme: &Theme, title: &'static str) -> gpui::Div {
+    div()
+        .px(px(16.0))
+        .pt(px(2.0))
+        .pb(px(4.0))
+        .text_size(crate::typography::ui_rems(11.0))
+        .text_color(theme.text_muted)
+        .child(title)
 }
 
 /// The results list's max height; shared so every palette sits at one size.
@@ -616,10 +838,11 @@ mod tests {
                 input.set_text(query, cx);
             });
         shell
-            .command_entries(cx)
+            .palette_sections(cx)
             .into_iter()
-            .filter_map(|entry| match entry {
-                Entry::Chat(id) => Some(id),
+            .flat_map(|section| section.rows)
+            .filter_map(|row| match row.kind {
+                RowKind::Chat(id) => Some(id),
                 _ => None,
             })
             .collect()
@@ -696,6 +919,29 @@ mod tests {
     }
 
     #[test]
+    fn selection_follows_its_row_when_rows_arrive_above_it() {
+        let chats = |ids: &[&str]| {
+            PaletteSection::new(
+                Section::Threads,
+                ids.iter().map(|id| RowKind::Chat((*id).into())),
+            )
+        };
+        let before = [chats(&["a", "b", "c"])];
+        let active = flat_rows(&before)[2].key();
+        let after = [
+            PaletteSection::new(Section::Commands, [RowKind::Command(Command::NewChat)]),
+            chats(&["a", "b", "c"]),
+        ];
+        assert_eq!(row_position(Some(&active), 2, &flat_rows(&after)), 3);
+        // A vanished row falls back to its old place, clamped.
+        let shorter = [chats(&["a"])];
+        assert_eq!(row_position(Some(&active), 2, &flat_rows(&shorter)), 0);
+        // Two headers precede the fourth row in the scroll container.
+        assert_eq!(child_index(&after, 3), 5);
+        assert_eq!(child_index(&after, 0), 1);
+    }
+
+    #[test]
     fn x11_unflagged_enter_repeats_activate_once_until_release() {
         let mut enter = EnterPress::default();
         // The pinned X11 backend drops synthetic repeat releases and emits
@@ -721,43 +967,43 @@ mod tests {
     #[test]
     fn action_search_hides_empty_section_and_preserves_order() {
         assert_eq!(
-            actions_for("", true),
+            commands_for("", true),
             vec![
-                Entry::NewChat,
-                Entry::NewProject,
-                Entry::Settings,
-                Entry::Theme(AppearanceMode::Light)
+                Command::NewChat,
+                Command::NewProject,
+                Command::Settings,
+                Command::Theme(AppearanceMode::Light)
             ]
         );
         assert_eq!(
-            actions_for("new", true),
-            vec![Entry::NewChat, Entry::NewProject]
+            commands_for("new", true),
+            vec![Command::NewChat, Command::NewProject]
         );
-        assert_eq!(actions_for("settings", true), vec![Entry::Settings]);
+        assert_eq!(commands_for("settings", true), vec![Command::Settings]);
         assert_eq!(
-            actions_for("theme", true),
-            vec![Entry::Theme(AppearanceMode::Light)]
+            commands_for("theme", true),
+            vec![Command::Theme(AppearanceMode::Light)]
         );
-        assert!(actions_for("deployment", true).is_empty());
+        assert!(commands_for("deployment", true).is_empty());
     }
 
     #[test]
     fn theme_action_targets_the_opposite_resolved_appearance() {
         assert_eq!(
-            actions_for("theme", true),
-            vec![Entry::Theme(AppearanceMode::Light)]
+            commands_for("theme", true),
+            vec![Command::Theme(AppearanceMode::Light)]
         );
         assert_eq!(
-            actions_for("theme", false),
-            vec![Entry::Theme(AppearanceMode::Dark)]
+            commands_for("theme", false),
+            vec![Command::Theme(AppearanceMode::Dark)]
         );
         assert_eq!(
-            actions_for("light", true),
-            vec![Entry::Theme(AppearanceMode::Light)]
+            commands_for("light", true),
+            vec![Command::Theme(AppearanceMode::Light)]
         );
         assert_eq!(
-            actions_for("dark", false),
-            vec![Entry::Theme(AppearanceMode::Dark)]
+            commands_for("dark", false),
+            vec![Command::Theme(AppearanceMode::Dark)]
         );
     }
 

@@ -95,6 +95,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     print_rss("after all queries");
+    search.release_all();
+    // Release runs off-thread; give it and the allocator a moment.
+    std::thread::sleep(Duration::from_secs(2));
+    println!("live indexes after release: {}", search.live());
+    print_rss("after evicting the index");
     Ok(())
 }
 

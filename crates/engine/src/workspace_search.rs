@@ -280,6 +280,15 @@ impl WorkspaceSearch {
         picker.is_some_and(|picker| picker.wait_for_indexing_complete(timeout))
     }
 
+    /// Drop every index now (benchmarks measuring memory after eviction).
+    #[doc(hidden)]
+    pub fn release_all(&self) {
+        let entries: Vec<_> = lock(&self.inner.entries).drain().collect();
+        for (root, entry) in entries {
+            release(&root, entry, "explicit");
+        }
+    }
+
     /// Number of live indexes.
     pub fn live(&self) -> usize {
         lock(&self.inner.entries).len()
@@ -449,6 +458,14 @@ fn release(root: &Path, entry: Entry, reason: &'static str) {
                 let arena_bytes = fff.arena_bytes().0;
                 fff.stop_background_monitor();
                 drop(fff);
+                drop(guard);
+                // An index frees tens of MB in small blocks; glibc keeps them
+                // mapped unless asked to give them back.
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                // SAFETY: malloc_trim only walks the allocator's own arenas.
+                unsafe {
+                    libc::malloc_trim(0);
+                }
                 tracing::info!(
                     root = %root.display(),
                     reason,

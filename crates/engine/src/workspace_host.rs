@@ -1905,6 +1905,7 @@ mod tests {
             last_completed_turn: None,
             started_at: None,
             updated_at: at,
+            running_subagents: 0,
         }
     }
 

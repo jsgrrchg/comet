@@ -36,6 +36,7 @@ sha2.workspace = true
 reqwest.workspace = true
 ignore.workspace = true
 nucleo-matcher.workspace = true
+fff-search.workspace = true
 
 tempfile.workspace = true
 

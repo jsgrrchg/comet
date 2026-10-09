@@ -1515,7 +1515,7 @@ enum EditKind {
 }
 
 const GENERIC_COMPOSER_CONTEXT: &str = "Composer";
-const MESSAGE_COMPOSER_CONTEXT: &str = "MessageComposer";
+pub(crate) const MESSAGE_COMPOSER_CONTEXT: &str = "MessageComposer";
 const PALETTE_SEARCH_CONTEXT: &str = "PaletteSearch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2135,8 +2135,22 @@ impl ComposerInput {
     }
 
     /// Keep compact fields on one row and reveal the caret horizontally.
+    /// Bound a standalone multiline composer while preserving caret scrolling.
+    pub(crate) fn with_viewport_height(mut self, height: f32) -> Self {
+        let height = height.max(self.configured_line_height);
+        self.viewport_height = Some(height);
+        self.settled_viewport_height = Some(height);
+        self
+    }
+
     pub fn with_single_line(mut self) -> Self {
         self.single_line = true;
+        self
+    }
+
+    /// Join the window's Tab order, for a field the keyboard must reach.
+    pub(crate) fn with_tab_stop(mut self) -> Self {
+        self.focus_handle = self.focus_handle.tab_stop(true);
         self
     }
 
@@ -5359,9 +5373,9 @@ pub enum ComposerEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct MentionToken {
-    range: Range<usize>,
-    query: String,
+pub(crate) struct MentionToken {
+    pub(crate) range: Range<usize>,
+    pub(crate) query: String,
 }
 
 /// Refine a locally identified token using Markdown source ranges. This is
@@ -5481,7 +5495,7 @@ fn completion_markdown_end(
 
 /// The `@` must begin a token. This intentionally excludes `name@example.com`
 /// and ordinary words while allowing punctuation such as `(@src`.
-fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
+pub(crate) fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     if cursor > text.len() || !text.is_char_boundary(cursor) {
         return None;
     }
@@ -5833,7 +5847,9 @@ fn mention_error_message(err: &RpcError) -> SharedString {
             "The session's device runs an older zeron — update it to search its files".into()
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
-        RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
+        RpcError::BadParams(_) | RpcError::Capability(_) | RpcError::Failed(_) => {
+            "File search failed".into()
+        }
     }
 }
 
@@ -5938,7 +5954,7 @@ fn slash_error_message(err: &RpcError, skill: bool) -> SharedString {
             }
         }
         RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
-        RpcError::BadParams(_) | RpcError::Failed(_) => {
+        RpcError::BadParams(_) | RpcError::Capability(_) | RpcError::Failed(_) => {
             if skill {
                 "Couldn't load this agent's skills".into()
             } else {
@@ -8365,7 +8381,9 @@ impl Composer {
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
         {
             let state = self.state.read(cx);
-            let now = chrono::Utc::now();
+            // AppState also notifies at clock-only transitions, so a run that
+            // goes stale drops its interrupt at the cutoff.
+            let now = crate::state::clock_now();
             retain_live_interrupts(&mut self.interrupting, |chat_id| {
                 matches!(
                     state.indicator_for(chat_id, now),
@@ -9745,6 +9763,24 @@ impl Composer {
         let Some(question) = wizard.current().cloned() else {
             return gpui::Empty.into_any_element();
         };
+        // The answer borrows the composer's editor, but the composer's own
+        // sizing does not run while the panel shows. Without a limit of its
+        // own the editor kept a stale one-line viewport, so new lines painted
+        // below the card instead of growing it. Grow up to the composer's cap.
+        let answer_cap = TEXTAREA_MAX - TEXTAREA_PAD_V;
+        self.input.update(cx, |input, cx| {
+            if input.viewport_height != Some(answer_cap)
+                || input.settled_viewport_height != Some(answer_cap)
+                || input.resizing
+                || input.overflow_top_padding != 0.0
+            {
+                input.viewport_height = Some(answer_cap);
+                input.settled_viewport_height = Some(answer_cap);
+                input.resizing = false;
+                input.overflow_top_padding = 0.0;
+                cx.notify();
+            }
+        });
         let page = wizard.page;
         let last = page + 1 >= wizard.questions.len();
         let typed_empty = self.input.read(cx).is_empty();
@@ -10480,21 +10516,9 @@ impl Composer {
                 // Share the submission guard with Enter, including pending
                 // edits and the new-session runnable-agent check.
                 let blocked = self.send_blocked(cx);
-                div()
-                    .id("composer-send")
-                    .debug_selector(|| "composer-send".into())
-                    .size(px(28.0))
-                    .flex_none()
-                    .rounded_full()
-                    .bg(theme.text)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(blocked, |el| el.opacity(0.35))
+                send_circle("composer-send", blocked, theme)
                     .when(!blocked, |el| {
-                        el.cursor_pointer()
-                            .hover(|s| s.opacity(0.85))
-                            .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
+                        el.on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
                     })
                     .tooltip(crate::settings::widgets::text_tooltip(
                         if mode == SendButtonMode::Queue {
@@ -10503,15 +10527,39 @@ impl Composer {
                             "Send message"
                         },
                     ))
-                    .child(
-                        crate::icons::icon(crate::icons::ARROW_UP)
-                            .size(px(14.0))
-                            .text_color(theme.bg),
-                    )
                     .into_any_element()
             }
         }
     }
+}
+
+/// The composer's send control: a size-7 filled circle with an up arrow,
+/// dimmed and inert while `blocked`. Other message composers reuse it so
+/// sending looks the same everywhere.
+pub(crate) fn send_circle(
+    id: &'static str,
+    blocked: bool,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .size(px(28.0))
+        .flex_none()
+        .rounded_full()
+        .bg(theme.text)
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(blocked, |el| el.opacity(0.35))
+        .when(!blocked, |el| {
+            el.cursor_pointer().hover(|s| s.opacity(0.85))
+        })
+        .child(
+            crate::icons::icon(crate::icons::ARROW_UP)
+                .size(px(14.0))
+                .text_color(theme.bg),
+        )
 }
 
 /// The completion popups' floating rails run through
@@ -12543,6 +12591,48 @@ mod tests {
         // written its frame into the channel by the time the executor parks.
         cx.run_until_parked();
         assert!(server_in.try_recv().is_err());
+    }
+
+    /// A run that goes stale purely by the clock (no state frame) drops its
+    /// pending interrupt at the staleness cutoff, not at some later
+    /// unrelated state change.
+    #[gpui::test]
+    fn interrupt_drops_when_its_run_goes_stale_by_clock_alone(cx: &mut gpui::TestAppContext) {
+        use chrono::TimeDelta;
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
+            .unwrap()
+            .to_utc();
+        let clock = crate::state::TestClock::start(now);
+        let updated = now - TimeDelta::seconds(10);
+        let state = cx.new(|cx| {
+            let mut state = AppState::new();
+            state.sessions = vec![zeron_proto::Session {
+                last_completed_turn: None,
+                chat_id: "c".into(),
+                device_id: "remote".into(),
+                status: zeron_proto::SessionStatus::Working,
+                started_at: Some(updated),
+                updated_at: updated,
+                running_subagents: 0,
+            }];
+            state.selected_chat = Some("c".into());
+            state.watch_clock_transitions(cx);
+            state
+        });
+        let composer = cx.new(|cx| Composer::new(state, cx));
+        composer.update(cx, |composer, _| {
+            assert!(begin_interrupt(&mut composer.interrupting, "c"));
+        });
+        let cutoff = updated + TimeDelta::milliseconds(crate::state::SESSION_STALE_MS + 1);
+        let before = cutoff - TimeDelta::milliseconds(1);
+        clock.set(before);
+        cx.executor()
+            .advance_clock((before - now).to_std().unwrap());
+        assert!(composer.read_with(cx, |composer, _| composer.is_interrupting("c")));
+        clock.set(cutoff);
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(1));
+        assert!(!composer.read_with(cx, |composer, _| composer.is_interrupting("c")));
     }
 
     #[gpui::test]

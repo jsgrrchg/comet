@@ -17,6 +17,7 @@ pub mod app_menus;
 pub mod app_update;
 pub mod appearance;
 pub mod appshots;
+mod asset_http;
 pub mod attachments;
 pub mod badges;
 pub mod browser;
@@ -30,6 +31,7 @@ mod composer_markdown;
 mod context_usage;
 mod dictation;
 pub mod edge_fade;
+pub mod rounded_clip;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
@@ -52,9 +54,16 @@ pub mod orb;
 pub mod pickers;
 pub mod popover;
 pub mod project_actions;
+pub mod pull_request_detail;
+mod pull_request_media;
+mod pull_request_skeleton;
+#[cfg(test)]
+mod pull_request_test_support;
+pub mod pull_requests;
 pub mod queue;
 pub mod rail;
 mod roll_text;
+pub mod running_pill;
 pub mod settings;
 pub mod shell;
 pub mod sound;
@@ -63,6 +72,7 @@ pub(crate) mod surface_chrome;
 pub mod syntax_cache;
 pub mod terminal;
 mod todo_panel;
+pub(crate) mod tool_images;
 pub mod theme;
 pub mod theme_library;
 pub mod transcript;
@@ -132,7 +142,9 @@ pub fn run_app(config: UiConfig) {
     // default runtime has only two workers, insufficient for a desktop engine.
     let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
     let runtime_handle = runtime.handle().clone();
-    let app = gpui_platform::application().with_assets(icons::Assets);
+    let app = gpui_platform::application()
+        .with_assets(icons::Assets)
+        .with_http_client(asset_http::AssetHttpClient::new(runtime_handle.clone()));
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
     let callback_tx = url_tx.clone();
     app.on_open_urls(move |urls| {
@@ -200,7 +212,11 @@ pub fn run_app(config: UiConfig) {
         app_update::AppUpdate::init(config.boot().edge_url, data_dir.clone(), cx);
         cx.register_url_scheme("zeron").detach();
 
-        let state = cx.new(|_| state::AppState::new());
+        let state = cx.new(|cx| {
+            let mut state = state::AppState::new();
+            state.watch_clock_transitions(cx);
+            state
+        });
         let url_state = state.clone();
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {

@@ -1196,6 +1196,18 @@ fn filtered_directory_paths(root: &Path, target: &Path) -> HashSet<String> {
         .collect()
 }
 
+/// `SearchWorkspaceFiles` against an already-resolved root, for
+/// `examples/workspace_search_bench.rs`.
+#[doc(hidden)]
+pub fn bench_search_root(
+    root: &Path,
+    query: &str,
+    include_ignored: bool,
+    limit: usize,
+) -> Result<Vec<WorkspaceFileSearchMatch>, WorkspaceFilesError> {
+    search_workspace_blocking(root, query, include_ignored, limit, &AtomicBool::new(false))
+}
+
 fn search_workspace_blocking(
     root: &Path,
     query: &str,

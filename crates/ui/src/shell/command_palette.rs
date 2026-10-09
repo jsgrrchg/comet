@@ -4,7 +4,10 @@
 use super::*;
 use crate::appearance::AppearanceMode;
 use crate::files::client::{FilesClientError, FilesRequestContext, WorkspaceFilesClient};
-use zeron_proto::{SearchWorkspaceFilesRequest, WorkspaceEntryKind, WorkspaceFileSearchMatch};
+use zeron_proto::{
+    SearchWorkspaceContentRequest, SearchWorkspaceFilesRequest, WorkspaceContentMatch,
+    WorkspaceEntryKind, WorkspaceFileSearchMatch,
+};
 
 /// Key context of the palette card: its mod-1…4 tab bindings live here.
 pub(super) const KEY_CONTEXT: &str = "CommandPalette";
@@ -12,8 +15,12 @@ pub(super) const KEY_CONTEXT: &str = "CommandPalette";
 const ALL_TAB_LIMIT: usize = 5;
 const THREADS_TAB_LIMIT: usize = 50;
 const FILES_TAB_LIMIT: usize = 50;
-/// Shorter file-name queries match nearly every path; they are not sent.
-const MIN_FILE_QUERY_CHARS: usize = 2;
+const CONTENT_TAB_LIMIT: usize = 100;
+const CONTENT_MATCHES_PER_FILE: usize = 3;
+/// Shorter workspace queries match nearly everything; they are not sent.
+const MIN_WORKSPACE_QUERY_CHARS: usize = 2;
+/// Content search waits for typing to pause; name search does not.
+const CONTENT_DEBOUNCE: Duration = Duration::from_millis(80);
 const RESULTS_FADE_BAND: f32 = 18.0;
 
 pub(super) struct CommandPalette {
@@ -32,6 +39,8 @@ pub(super) struct CommandPalette {
     scroll: gpui::ScrollHandle,
     /// File-name matches in the focused chat's workspace.
     files: WorkspaceQuery<Vec<WorkspaceFileSearchMatch>>,
+    /// Content matches in the focused chat's workspace.
+    content: WorkspaceQuery<Vec<WorkspaceContentMatch>>,
     _search_events: Subscription,
 }
 
@@ -42,6 +51,8 @@ struct WorkspaceQuery<T> {
     /// Bumped per request; an answer to an older one is dropped.
     generation: u64,
     loading: bool,
+    /// The host's index was still scanning at the last answer.
+    indexing: bool,
     error: Option<SharedString>,
     results: T,
     task: Option<Task<()>>,
@@ -64,13 +75,44 @@ impl<T: Default> WorkspaceQuery<T> {
         self.generation
     }
 
-    /// Header status while loading or after a failure.
+    /// Header status while loading, while the host indexes, or after a
+    /// failure.
     fn status(&self) -> Option<SharedString> {
-        if self.loading {
+        if self.indexing {
+            Some("Indexing…".into())
+        } else if self.loading {
             Some("Searching…".into())
         } else {
             self.error.clone()
         }
+    }
+
+    /// Settle the request `generation` with its answer; `false` when a newer
+    /// request superseded it.
+    fn finish(
+        &mut self,
+        generation: u64,
+        result: Result<(T, bool), FilesClientError>,
+        what: &str,
+    ) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.loading = false;
+        match result {
+            Ok((results, indexing)) => {
+                self.error = None;
+                self.indexing = indexing;
+                self.results = results;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "palette {what} search failed");
+                self.error = Some(search_error_message(&error, what));
+                self.indexing = false;
+                self.results = T::default();
+            }
+        }
+        true
     }
 }
 
@@ -84,15 +126,22 @@ fn palette_workspace(shell: &Shell, cx: &App) -> Option<WorkspaceFilesClient> {
     Some(WorkspaceFilesClient::new(state.engine()?.clone(), context))
 }
 
-fn search_error_message(error: &FilesClientError) -> SharedString {
+/// `what` ("file" or "content") names the search in the message.
+fn search_error_message(error: &FilesClientError, what: &str) -> SharedString {
     match error {
         FilesClientError::Unsupported(_) => {
-            "The session's device runs an older zeron — update it to search its files".into()
+            let subject = if what == "content" {
+                "file contents"
+            } else {
+                "files"
+            };
+            format!("The session's device runs an older zeron — update it to search its {subject}")
+                .into()
         }
         FilesClientError::Transport(_) => "The session's device is unreachable".into(),
         FilesClientError::Encode(_)
         | FilesClientError::Decode(_)
-        | FilesClientError::Request(_) => "File search failed".into(),
+        | FilesClientError::Request(_) => "Search failed".into(),
     }
 }
 
@@ -159,6 +208,7 @@ enum Section {
     Threads,
     Commands,
     Files,
+    InFiles,
 }
 
 impl Section {
@@ -170,6 +220,7 @@ impl Section {
             Self::Threads => "Threads",
             Self::Commands => "Commands",
             Self::Files => "Files",
+            Self::InFiles => "In Files",
         }
     }
 }
@@ -216,6 +267,8 @@ enum RowKind {
         path: String,
         is_dir: bool,
     },
+    /// A line of a file in the focused chat's workspace.
+    Content(WorkspaceContentMatch),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -238,6 +291,9 @@ impl PaletteRow {
             RowKind::Command(command) => format!("command:{}", command.label()),
             RowKind::Chat(id) => format!("chat:{id}"),
             RowKind::File { path, .. } => format!("file:{path}"),
+            RowKind::Content(found) => {
+                format!("content:{}:{}:{}", found.path, found.line, found.column)
+            }
         };
         RowKey(self.section, id)
     }
@@ -370,7 +426,7 @@ impl Shell {
                     palette.reset_active();
                     palette.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
                 }
-                this.search_palette_files(cx);
+                this.search_palette_workspace(cx);
                 cx.notify();
             }
         });
@@ -386,6 +442,7 @@ impl Shell {
             focus_pending: true,
             scroll: gpui::ScrollHandle::new(),
             files: WorkspaceQuery::default(),
+            content: WorkspaceQuery::default(),
             _search_events: events,
         });
         cx.notify();
@@ -412,49 +469,60 @@ impl Shell {
         }
     }
 
-    /// Look the query up among the focused workspace's file names.
-    fn search_palette_files(&mut self, cx: &mut Context<Self>) {
+    /// Look the query up in the focused workspace: file names at once,
+    /// contents once typing pauses.
+    fn search_palette_workspace(&mut self, cx: &mut Context<Self>) {
         let workspace = palette_workspace(self, cx);
         let Some(palette) = self.command_palette.as_mut() else {
             return;
         };
         let query = palette.search.read(cx).text().trim().to_owned();
-        let Some(client) = workspace.filter(|_| query.chars().count() >= MIN_FILE_QUERY_CHARS)
+        let Some(client) = workspace.filter(|_| query.chars().count() >= MIN_WORKSPACE_QUERY_CHARS)
         else {
             palette.files.clear();
+            palette.content.clear();
             return;
         };
+
         let generation = palette.files.begin();
         let request = SearchWorkspaceFilesRequest {
             target: client.target().clone(),
-            query,
+            query: query.clone(),
             include_ignored: false,
             limit: Some(FILES_TAB_LIMIT as u16),
         };
+        let names = client.clone();
         palette.files.task = Some(cx.spawn(async move |this, cx| {
-            let result = client.search(request).await;
+            let result = names.search(request).await.map(|found| (found, false));
             this.update(cx, |shell, cx| {
-                let Some(files) = shell
-                    .command_palette
-                    .as_mut()
-                    .map(|palette| &mut palette.files)
-                    .filter(|files| files.generation == generation)
-                else {
-                    return;
-                };
-                files.loading = false;
-                match result {
-                    Ok(results) => {
-                        files.error = None;
-                        files.results = results;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "palette file search failed");
-                        files.error = Some(search_error_message(&error));
-                        files.results.clear();
-                    }
+                if let Some(palette) = shell.command_palette.as_mut()
+                    && palette.files.finish(generation, result, "file")
+                {
+                    cx.notify();
                 }
-                cx.notify();
+            })
+            .ok();
+        }));
+
+        let generation = palette.content.begin();
+        let request = SearchWorkspaceContentRequest {
+            target: client.target().clone(),
+            query,
+            limit: Some(CONTENT_TAB_LIMIT as u16),
+            per_file_limit: Some(CONTENT_MATCHES_PER_FILE as u16),
+        };
+        palette.content.task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONTENT_DEBOUNCE).await;
+            let result = client
+                .search_content(request)
+                .await
+                .map(|found| (found.matches, found.indexing));
+            this.update(cx, |shell, cx| {
+                if let Some(palette) = shell.command_palette.as_mut()
+                    && palette.content.finish(generation, result, "content")
+                {
+                    cx.notify();
+                }
             })
             .ok();
         }));
@@ -517,6 +585,19 @@ impl Shell {
             )
             .with_status(palette.files.status())
         };
+        let in_files = |limit| {
+            PaletteSection::new(
+                Section::InFiles,
+                palette
+                    .content
+                    .results
+                    .iter()
+                    .take(limit)
+                    .cloned()
+                    .map(RowKind::Content),
+            )
+            .with_status(palette.content.status())
+        };
         let sections = match (palette.tab, query.is_empty()) {
             (Tab::All, true) => vec![
                 recent_files(ALL_TAB_LIMIT),
@@ -527,13 +608,14 @@ impl Shell {
                 threads(ALL_TAB_LIMIT),
                 commands(Section::Commands),
                 files(ALL_TAB_LIMIT),
+                in_files(ALL_TAB_LIMIT),
             ],
             (Tab::Threads, true) => vec![recent_threads(THREADS_TAB_LIMIT)],
             (Tab::Threads, false) => vec![threads(THREADS_TAB_LIMIT)],
             (Tab::Commands, true) => vec![commands(Section::QuickActions)],
             (Tab::Commands, false) => vec![commands(Section::Commands)],
             (Tab::Files, true) => vec![recent_files(FILES_TAB_LIMIT)],
-            (Tab::Files, false) => vec![files(FILES_TAB_LIMIT)],
+            (Tab::Files, false) => vec![files(FILES_TAB_LIMIT), in_files(CONTENT_TAB_LIMIT)],
         };
         sections
             .into_iter()
@@ -671,6 +753,11 @@ impl Shell {
             RowKind::File { path, is_dir } => {
                 self.open_palette_path(path, is_dir, None, window, cx)
             }
+            RowKind::Content(found) => {
+                let line = u32::try_from(found.line).unwrap_or(u32::MAX);
+                let column = u32::try_from(found.column + 1).ok();
+                self.open_palette_path(found.path, false, Some((line, column)), window, cx)
+            }
         }
     }
 
@@ -803,6 +890,56 @@ impl Shell {
                                         .child(SharedString::from(parent.to_owned())),
                                 )
                             }),
+                    )
+                    .into_any_element()
+            }
+            RowKind::Content(found) => {
+                let target = row.clone();
+                let ranges = found
+                    .ranges
+                    .iter()
+                    .map(|(start, end)| *start as usize..*end as usize)
+                    .collect();
+                popover::menu_row(theme, active, format!("command-content-{ix}"))
+                    .id(("command-content", ix))
+                    .rounded(px(popover::PALETTE_ITEM_RADIUS))
+                    .role(gpui::Role::Button)
+                    .aria_label(SharedString::from(format!(
+                        "{}:{} {}",
+                        found.path, found.line, found.preview
+                    )))
+                    .min_h(px(30.0))
+                    .py(px(4.0))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_palette_row(target.clone(), window, cx)
+                    }))
+                    .child(
+                        crate::file_icons::icon(
+                            crate::file_icons::FileIconIdentity::file(&found.path),
+                            theme.appearance,
+                        )
+                        .size(px(16.0)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(200.0))
+                            .truncate()
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(format!("{}:{}", found.path, found.line))),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .font_family(theme.font_mono.clone())
+                            .child(popover::search_highlight_ranges(
+                                SharedString::from(found.preview.clone()),
+                                ranges,
+                                theme,
+                            )),
                     )
                     .into_any_element()
             }
@@ -1499,6 +1636,7 @@ mod tests {
         fn take(&mut self, method: &str, cx: &mut TestAppContext) -> Vec<serde_json::Value> {
             let mut found = Vec::new();
             loop {
+                cx.executor().advance_clock(CONTENT_DEBOUNCE);
                 cx.run_until_parked();
                 let Ok(request) = self.requests.try_recv() else {
                     return found;
@@ -1513,7 +1651,14 @@ mod tests {
         }
 
         fn reply(&self, request: &serde_json::Value, ok: serde_json::Value) {
-            let reply = serde_json::json!({ "id": request["id"], "ok": ok });
+            self.send(serde_json::json!({ "id": request["id"], "ok": ok }));
+        }
+
+        fn fail(&self, request: &serde_json::Value, err: &str) {
+            self.send(serde_json::json!({ "id": request["id"], "err": err }));
+        }
+
+        fn send(&self, reply: serde_json::Value) {
             // The client's reader task runs on this runtime: let it drain.
             self.runtime.block_on(async {
                 self.replies.send(reply.to_string()).await.unwrap();
@@ -1725,6 +1870,113 @@ mod tests {
                 assert_eq!(
                     shell.recent_files("focused").next().map(String::as_str),
                     Some("src/composer.rs")
+                );
+            })
+            .unwrap();
+    }
+
+    fn content_match(path: &str, line: u64) -> serde_json::Value {
+        serde_json::json!({
+            "path": path, "line": line, "column": 4,
+            "preview": "let needle = 1;", "ranges": [[4, 10]],
+        })
+    }
+
+    fn content_answer(matches: Vec<serde_json::Value>, indexing: bool) -> serde_json::Value {
+        serde_json::json!({ "matches": matches, "truncated": false, "indexing": indexing })
+    }
+
+    #[gpui::test]
+    fn content_matches_arrive_after_the_debounce(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "needle", cx);
+        let requests = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        assert_eq!(requests.len(), 1);
+        let params = &requests[0]["params"];
+        assert_eq!(params["chatId"], "focused");
+        assert_eq!(params["query"], "needle");
+        assert_eq!(params["limit"], CONTENT_TAB_LIMIT);
+        assert_eq!(params["perFileLimit"], CONTENT_MATCHES_PER_FILE);
+
+        let matches = (1..=8)
+            .map(|line| content_match("src/lib.rs", line))
+            .collect();
+        engine.reply(&requests[0], content_answer(matches, false));
+        cx.run_until_parked();
+        let in_files = palette_section(window, Section::InFiles, cx).unwrap();
+        assert_eq!(in_files.status, None);
+        assert_eq!(in_files.rows.len(), ALL_TAB_LIMIT);
+        let RowKind::Content(first) = &in_files.rows[0].kind else {
+            panic!("content row expected");
+        };
+        assert_eq!((first.line, first.ranges.as_slice()), (1, &[(4, 10)][..]));
+        window
+            .update(cx, |shell, _, cx| shell.select_palette_tab(Tab::Files, cx))
+            .unwrap();
+        assert_eq!(
+            palette_section(window, Section::InFiles, cx)
+                .unwrap()
+                .rows
+                .len(),
+            8
+        );
+    }
+
+    #[gpui::test]
+    fn content_search_reports_indexing_and_hides_when_empty(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "needle", cx);
+        let requests = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        engine.reply(&requests[0], content_answer(Vec::new(), true));
+        cx.run_until_parked();
+        assert_eq!(
+            palette_section(window, Section::InFiles, cx)
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("Indexing…")
+        );
+
+        type_query(window, "needles", cx);
+        let requests = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        engine.reply(&requests[0], content_answer(Vec::new(), false));
+        cx.run_until_parked();
+        assert!(palette_section(window, Section::InFiles, cx).is_none());
+    }
+
+    #[gpui::test]
+    fn content_search_on_an_older_host_explains_itself(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "needle", cx);
+        let requests = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        engine.fail(&requests[0], "unknown method: SearchWorkspaceContent");
+        cx.run_until_parked();
+        let in_files = palette_section(window, Section::InFiles, cx).unwrap();
+        assert!(in_files.rows.is_empty());
+        assert!(
+            in_files
+                .status
+                .is_some_and(|status| status.contains("update it to search its file contents"))
+        );
+    }
+
+    #[gpui::test]
+    fn activating_a_content_row_opens_its_file(cx: &mut TestAppContext) {
+        let (window, _dir, _engine) = engine_palette(cx, true);
+        window
+            .update(cx, |shell, window, cx| {
+                let found: WorkspaceContentMatch =
+                    serde_json::from_value(content_match("src/lib.rs", 42)).unwrap();
+                shell.activate_palette_row(
+                    PaletteRow::new(Section::InFiles, RowKind::Content(found)),
+                    window,
+                    cx,
+                );
+                assert!(
+                    shell
+                        .file_surface_paths
+                        .values()
+                        .any(|path| path == "src/lib.rs")
                 );
             })
             .unwrap();

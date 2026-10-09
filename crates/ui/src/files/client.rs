@@ -5,7 +5,8 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use zeron_proto::{
-    ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
+    ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceContentRequest,
+    SearchWorkspaceFilesRequest, WorkspaceContentSearchResult,
     WarmWorkspaceSearchRequest, WarmWorkspaceSearchResult, WatchWorkspaceFilesRequest,
     WorkspaceDirectoryPage, WorkspaceFileSearchMatch,
     WorkspaceFileText, WorkspaceTarget, WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
@@ -187,6 +188,13 @@ impl WorkspaceFilesClient {
         request: SearchWorkspaceFilesRequest,
     ) -> Result<Vec<WorkspaceFileSearchMatch>, FilesClientError> {
         self.call(methods::SEARCH_WORKSPACE_FILES, &request).await
+    }
+
+    pub async fn search_content(
+        &self,
+        request: SearchWorkspaceContentRequest,
+    ) -> Result<WorkspaceContentSearchResult, FilesClientError> {
+        self.call(methods::SEARCH_WORKSPACE_CONTENT, &request).await
     }
 
     /// Start or keep alive the host's search index for this workspace.

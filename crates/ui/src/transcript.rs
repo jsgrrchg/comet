@@ -15591,6 +15591,7 @@ mod tests {
             call: ToolCall::ReadFile { path: path.into() },
             is_error: false,
             resolved: true,
+            images: Arc::new([]),
             detail: None,
             invocation: None,
             output_ref: None,

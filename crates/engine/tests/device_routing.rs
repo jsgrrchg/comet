@@ -1442,6 +1442,19 @@ async fn workspace_file_surface_proxies_over_the_relay() {
         .expect("remote search");
     assert_eq!(matches[0]["path"], "src/remote.rs");
 
+    let warm = client
+        .call(
+            methods::WARM_WORKSPACE_SEARCH,
+            serde_json::json!({
+                "chatId": "chat-files",
+                "pin": true,
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("remote search warm-up");
+    assert!(matches!(warm["state"].as_str(), Some("building" | "ready")));
+
     let read = client
         .call(
             methods::READ_WORKSPACE_FILE,

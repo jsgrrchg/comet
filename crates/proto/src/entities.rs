@@ -555,6 +555,32 @@ pub struct WorkspaceFileSearchMatch {
     pub score: i64,
 }
 
+/// Start (or keep alive) the host's search index for a workspace. `pin`
+/// marks it as the focused chat's: the UI renews it every minute, and a
+/// pinned index is the last to be evicted. `pin: false` releases the pin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarmWorkspaceSearchRequest {
+    #[serde(flatten)]
+    pub target: WorkspaceTarget,
+    #[serde(default)]
+    pub pin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkspaceSearchIndexState {
+    /// The initial scan is still running; searches may be incomplete.
+    Building,
+    Ready,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarmWorkspaceSearchResult {
+    pub state: WorkspaceSearchIndexState,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadWorkspaceFileRequest {
@@ -1374,6 +1400,21 @@ mod tests {
             .unwrap(),
         ];
         assert!(requests.iter().all(|value| value["chatId"] == "chat-1"));
+    }
+
+    #[test]
+    fn warm_workspace_search_flattens_its_target() {
+        let request: WarmWorkspaceSearchRequest =
+            serde_json::from_value(serde_json::json!({ "chatId": "chat-1" })).unwrap();
+        assert_eq!(request.target.chat_id.as_deref(), Some("chat-1"));
+        assert!(!request.pin);
+        assert_eq!(
+            serde_json::to_value(WarmWorkspaceSearchResult {
+                state: WorkspaceSearchIndexState::Building,
+            })
+            .unwrap(),
+            serde_json::json!({ "state": "building" })
+        );
     }
 
     #[test]

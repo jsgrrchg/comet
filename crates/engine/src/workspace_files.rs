@@ -15,16 +15,17 @@ use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use zeron_proto::{
     ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
-    WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind,
-    WorkspaceFileChange, WorkspaceFileChangeKind, WorkspaceFileChanges,
-    WorkspaceFileConflictReason, WorkspaceFileSearchMatch, WorkspaceFileText,
-    WorkspaceFileWriteResult, WorkspaceLineEnding, WorkspaceReadOnlyReason, WorkspaceTarget,
-    WorkspaceTextEncoding, WorkspaceWritableEncoding, WorkspaceWritableLineEnding,
-    WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
+    WarmWorkspaceSearchRequest, WarmWorkspaceSearchResult, WatchWorkspaceFilesRequest,
+    WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind, WorkspaceFileChange,
+    WorkspaceFileChangeKind, WorkspaceFileChanges, WorkspaceFileConflictReason,
+    WorkspaceFileSearchMatch, WorkspaceFileText, WorkspaceFileWriteResult, WorkspaceLineEnding,
+    WorkspaceReadOnlyReason, WorkspaceSearchIndexState, WorkspaceTarget, WorkspaceTextEncoding,
+    WorkspaceWritableEncoding, WorkspaceWritableLineEnding, WriteWorkspaceFileOutcome,
+    WriteWorkspaceFileRequest,
 };
 use zeron_rpc::RpcError;
 
-use crate::workspace_search::NameKinds;
+use crate::workspace_search::{IndexState, NameKinds};
 use crate::{Repos, WorkspaceHost, WorkspaceSearch};
 
 mod mutations;
@@ -432,6 +433,24 @@ impl WorkspaceFiles {
         .map_err(|error| WorkspaceFilesError::Io(format!("search worker failed: {error}")))?;
         cancel_on_drop.disarm();
         result
+    }
+
+    pub async fn warm_search(
+        &self,
+        request: WarmWorkspaceSearchRequest,
+    ) -> Result<WarmWorkspaceSearchResult, WorkspaceFilesError> {
+        let workspace = self.resolve_target(&request.target).await?;
+        let search = self.inner.repos.workspace_search().clone();
+        let state = tokio::task::spawn_blocking(move || search.warm(&workspace.root, request.pin))
+            .await
+            .map_err(|error| WorkspaceFilesError::Io(format!("search worker failed: {error}")))?
+            .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
+        Ok(WarmWorkspaceSearchResult {
+            state: match state {
+                IndexState::Building => WorkspaceSearchIndexState::Building,
+                IndexState::Ready => WorkspaceSearchIndexState::Ready,
+            },
+        })
     }
 
     pub async fn read_file(
@@ -2497,7 +2516,11 @@ mod tests {
         let root = std::fs::canonicalize(root.path()).unwrap();
 
         let indexed = search_workspace_blocking(&root, "build", false, 200, &no_cancel()).unwrap();
-        assert!(indexed.iter().all(|entry| !entry.path.starts_with("target")));
+        assert!(
+            indexed
+                .iter()
+                .all(|entry| !entry.path.starts_with("target"))
+        );
         let walked = search_workspace_blocking(&root, "build", true, 200, &no_cancel()).unwrap();
         assert_eq!(walked[0].path, "target/debug/build.log");
         assert_eq!(walked[0].name, "build.log");

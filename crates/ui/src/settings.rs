@@ -287,6 +287,24 @@ pub enum SavePolicy {
     Immediate,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PullRequestDestination {
+    #[default]
+    Native,
+    External,
+}
+
+impl PullRequestDestination {
+    pub const ALL: [Self; 2] = [Self::Native, Self::External];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Native => "Pull request view",
+            Self::External => "Default browser",
+        }
+    }
+}
+
 /// The sole in-process owner and writer of `ui-settings.json`.
 ///
 /// Mutations land in `current` before any timer starts. Replacing a pending
@@ -938,6 +956,13 @@ pub struct UiSettings {
     /// the narration between them) fold into one collapsed accordion, so only
     /// the reply text stays visible.
     pub transcript_compact_mode: bool,
+    /// Destination shared by PR badges and the pull-request board.
+    pub pull_request_destination: PullRequestDestination,
+    /// Last explicitly selected PR scope, restored when no project is selected.
+    pub last_pull_request_repository: Option<String>,
+    pub last_pull_request_device: Option<String>,
+    /// Device-local bookmarks, keyed by provider/repository/PR, never GitHub mutations.
+    pub pull_request_stars: Vec<String>,
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
@@ -966,6 +991,12 @@ pub struct UiSettings {
     pub reduce_motion: crate::motion::ReduceMotion,
     /// Also snap animations while the main window is not focused.
     pub pause_animations_in_background: bool,
+    /// Stable native Codex voice id only; devices and microphone state are never persisted.
+    #[serde(default)]
+    pub codex_voice: Option<String>,
+    /// Local preference: never transfers an active call or credentials.
+    #[serde(default)]
+    pub codex_voice_device: Option<String>,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -1038,6 +1069,10 @@ impl Default for UiSettings {
             transcript_width: TRANSCRIPT_WIDTH_DEFAULT,
             open_web_links_in_zeron: true,
             transcript_compact_mode: false,
+            pull_request_destination: PullRequestDestination::Native,
+            last_pull_request_repository: None,
+            last_pull_request_device: None,
+            pull_request_stars: Vec::new(),
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
@@ -1053,6 +1088,8 @@ impl Default for UiSettings {
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             reduce_motion: crate::motion::ReduceMotion::System,
             pause_animations_in_background: false,
+            codex_voice: None,
+            codex_voice_device: None,
             legacy_accent_color: None,
         }
     }
@@ -1692,7 +1729,13 @@ impl UiSettings {
             new_thread_background_effect,
             reduce_motion,
             pause_animations_in_background,
+            codex_voice,
+            codex_voice_device,
             legacy_accent_color,
+            pull_request_destination,
+            last_pull_request_repository,
+            last_pull_request_device,
+            pull_request_stars,
         );
         current
     }
@@ -1966,6 +2009,25 @@ mod tests {
         let saved = serde_json::to_string(&settings).unwrap();
         let loaded: UiSettings = serde_json::from_str(&saved).unwrap();
         assert!(!loaded.compact_model_picker);
+    }
+
+    #[test]
+    fn pull_request_destination_defaults_to_the_native_view_and_round_trips() {
+        let existing: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
+        assert_eq!(
+            existing.pull_request_destination,
+            PullRequestDestination::Native
+        );
+        for destination in PullRequestDestination::ALL {
+            let settings = UiSettings {
+                pull_request_destination: destination,
+                ..existing.clone()
+            };
+            let loaded: UiSettings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(loaded.pull_request_destination, destination);
+            assert_eq!(loaded.sidebar_width, 300.0);
+        }
     }
 
     #[test]
@@ -2619,6 +2681,8 @@ mod tests {
             dictation_enabled: false,
             dictation_input: Some("coreaudio:usb-mic".into()),
             window_geometry: None,
+            codex_voice: Some("ember".into()),
+            codex_voice_device: Some("fedora".into()),
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,
@@ -2715,6 +2779,10 @@ mod tests {
             transcript_width: 960.0,
             open_web_links_in_zeron: false,
             transcript_compact_mode: true,
+            pull_request_destination: PullRequestDestination::External,
+            last_pull_request_repository: Some("acme/zeron".into()),
+            last_pull_request_device: Some("remote-device".into()),
+            pull_request_stars: vec!["https://github.com/acme/zeron/pull/123".into()],
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,

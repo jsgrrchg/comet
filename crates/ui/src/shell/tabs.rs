@@ -205,8 +205,12 @@ impl Shell {
     /// Open a session from the sidebar: select it, the main area follows.
     pub(crate) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.command_palette = None;
-        self.route = Route::Chat;
+        // Opening any session steps the voice stage aside — including the one
+        // already selected under it. The call keeps running in the background.
+        self.set_voice_stage_open(false, cx);
+        self.set_route(Route::Chat, cx);
         self.focus_composer(cx);
+        self.nav.push(NavEntry::Chat(chat_id.clone()));
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         cx.notify();
@@ -224,7 +228,8 @@ impl Shell {
     /// canvas on that project and wins over the sidebar filter.
     pub(super) fn open_new_session(&mut self, project: Option<String>, cx: &mut Context<Self>) {
         self.command_palette = None;
-        self.route = Route::Chat;
+        self.set_voice_stage_open(false, cx);
+        self.set_route(Route::Chat, cx);
         self.focus_composer(cx);
         // Pre-hide before the selection flips so the state change can't
         // auto-create a canvas tab (the panel's observer runs on the same
@@ -240,6 +245,7 @@ impl Shell {
                 panel.update(cx, |panel, cx| panel.set_open(false, cx));
             }
         }
+        self.nav.push(NavEntry::Chat(String::new()));
         let target = {
             let state = self.state.read(cx);
             project
@@ -401,6 +407,13 @@ impl Shell {
         let available_titlebar_width =
             (self.viewport_width - row_left - right_pad - trailing_width - row_gap * 3.0).max(0.0);
 
+        let running_subagents = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat
+                .as_deref()
+                .map_or(0, |chat| state.running_subagents_for(chat, Utc::now()))
+        };
         let trailing: Option<gpui::AnyElement> = if on_canvas {
             None
         } else {
@@ -501,6 +514,15 @@ impl Shell {
                                 .aria_label(files_panel_label)
                                 .when(self.files_panel_open(cx), |button| {
                                     button.bg(crate::theme::wash(0.09))
+                                })
+                                // Running subagents live in this panel: mark the
+                                // button so they are findable while it is closed.
+                                .when(running_subagents > 0, |button| {
+                                    crate::running_pill::mark_files_button(
+                                        button,
+                                        running_subagents,
+                                        &theme,
+                                    )
                                 }),
                             )
                             .child(header_icon_button_with(

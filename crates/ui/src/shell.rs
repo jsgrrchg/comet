@@ -75,6 +75,7 @@ mod project_icon;
 mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
+mod search_warm;
 pub(crate) mod spaces;
 use side_chats::SideChatTab;
 mod tabs;
@@ -2031,6 +2032,8 @@ pub struct Shell {
     /// The New project palette's collapsed-breadcrumbs (`…`) menu.
     project_crumb_menu: popover::Popup<()>,
     command_palette: Option<command_palette::CommandPalette>,
+    /// The focused chat's pinned workspace search index (see `search_warm`).
+    search_warm: Option<search_warm::SearchWarm>,
     pending_workspace_command: Option<crate::composer::WorkspaceCommand>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
@@ -2477,6 +2480,7 @@ impl Shell {
             add_space: None,
             project_crumb_menu: popover::Popup::default(),
             command_palette: None,
+            search_warm: None,
             pending_workspace_command: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),
@@ -2642,6 +2646,7 @@ impl Shell {
         }
         self.prune_file_explorers(cx);
         self.refresh_harness_update_watch(cx);
+        self.sync_search_warm(cx);
         if state.read(cx).engine().is_none() {
             self.side_chats.clear();
             self.side_chat_creating = false;

@@ -6,7 +6,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use zeron_proto::{
     ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
-    WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceFileSearchMatch,
+    WarmWorkspaceSearchRequest, WarmWorkspaceSearchResult, WatchWorkspaceFilesRequest,
+    WorkspaceDirectoryPage, WorkspaceFileSearchMatch,
     WorkspaceFileText, WorkspaceTarget, WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
 };
 use zeron_rpc::{RpcError, methods};
@@ -55,6 +56,9 @@ pub enum FilesClientError {
     Transport(String),
     #[error("workspace request failed: {0}")]
     Request(String),
+    /// The host predates this method.
+    #[error("workspace host does not support {0}")]
+    Unsupported(String),
 }
 
 impl FilesClientError {
@@ -68,6 +72,7 @@ impl From<RpcError> for FilesClientError {
         match error {
             RpcError::Transport(message) => Self::Transport(message),
             RpcError::Closed => Self::Transport("connection closed".into()),
+            RpcError::UnknownMethod(method) => Self::Unsupported(method),
             other => Self::Request(other.to_string()),
         }
     }
@@ -177,6 +182,31 @@ impl WorkspaceFilesClient {
         request: SearchWorkspaceFilesRequest,
     ) -> Result<Vec<WorkspaceFileSearchMatch>, FilesClientError> {
         self.call(methods::SEARCH_WORKSPACE_FILES, &request).await
+    }
+
+    /// Start or keep alive the host's search index for this workspace.
+    pub async fn warm_search(
+        &self,
+        pin: bool,
+    ) -> Result<WarmWorkspaceSearchResult, FilesClientError> {
+        let request = WarmWorkspaceSearchRequest {
+            target: self.context.target.clone(),
+            pin,
+        };
+        self.call(methods::WARM_WORKSPACE_SEARCH, &request).await
+    }
+
+    /// [`Self::warm_search`] as a hint: failures are logged, never surfaced.
+    /// `false` once the host turns out not to support it.
+    pub async fn hint_search_warm(&self, pin: bool) -> bool {
+        match self.warm_search(pin).await {
+            Ok(_) => true,
+            Err(FilesClientError::Unsupported(_)) => false,
+            Err(error) => {
+                tracing::debug!(%error, "workspace search warm-up failed");
+                true
+            }
+        }
     }
 
     pub async fn read_file(

@@ -7,6 +7,10 @@ use crate::appearance::AppearanceMode;
 /// Key context of the palette card: its mod-1…4 tab bindings live here.
 pub(super) const KEY_CONTEXT: &str = "CommandPalette";
 const HISTORY_RESULT_LIMIT: usize = 30;
+/// Rows a section shows under All; its own tab shows the long limit.
+const ALL_TAB_LIMIT: usize = 5;
+const THREADS_TAB_LIMIT: usize = 50;
+const FILES_TAB_LIMIT: usize = 50;
 const RESULTS_FADE_BAND: f32 = 18.0;
 
 pub(super) struct CommandPalette {
@@ -83,6 +87,9 @@ impl Tab {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Section {
+    RecentFiles,
+    QuickActions,
+    RecentThreads,
     Threads,
     Commands,
 }
@@ -90,6 +97,9 @@ enum Section {
 impl Section {
     fn title(self) -> &'static str {
         match self {
+            Self::RecentFiles => "Recent Files",
+            Self::QuickActions => "Quick Actions",
+            Self::RecentThreads => "Recent Threads",
             Self::Threads => "Threads",
             Self::Commands => "Commands",
         }
@@ -102,6 +112,7 @@ enum Command {
     NewProject,
     Settings,
     Theme(AppearanceMode),
+    ArchiveThread,
 }
 
 impl Command {
@@ -113,6 +124,7 @@ impl Command {
             Self::Theme(AppearanceMode::System) => "Switch to system theme",
             Self::Theme(AppearanceMode::Light) => "Switch to light theme",
             Self::Theme(AppearanceMode::Dark) => "Switch to dark theme",
+            Self::ArchiveThread => "Archive thread",
         }
     }
 
@@ -122,6 +134,7 @@ impl Command {
             Self::NewProject => icons::FOLDER,
             Self::Settings => icons::SETTINGS,
             Self::Theme(mode) => mode.icon(),
+            Self::ArchiveThread => icons::ARCHIVE_MINIMALISTIC,
         }
     }
 }
@@ -130,6 +143,11 @@ impl Command {
 enum RowKind {
     Command(Command),
     Chat(String),
+    /// A path in the focused chat's workspace.
+    File {
+        path: String,
+        is_dir: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -151,6 +169,7 @@ impl PaletteRow {
         let id = match &self.kind {
             RowKind::Command(command) => format!("command:{}", command.label()),
             RowKind::Chat(id) => format!("chat:{id}"),
+            RowKind::File { path, .. } => format!("file:{path}"),
         };
         RowKey(self.section, id)
     }
@@ -180,7 +199,8 @@ fn matches_query(query: &str, text: &str) -> bool {
     query.split_whitespace().all(|word| text.contains(word))
 }
 
-fn commands_for(query: &str, is_dark: bool) -> Vec<Command> {
+/// `can_archive`: a focused, unarchived chat exists for Archive thread.
+fn commands_for(query: &str, is_dark: bool, can_archive: bool) -> Vec<Command> {
     [
         Command::NewChat,
         Command::NewProject,
@@ -192,8 +212,18 @@ fn commands_for(query: &str, is_dark: bool) -> Vec<Command> {
         }),
     ]
     .into_iter()
+    .chain(can_archive.then_some(Command::ArchiveThread))
     .filter(|command| matches_query(query, command.label()))
     .collect()
+}
+
+/// A path's last segment and the folder holding it (empty at the root).
+fn split_path(path: &str) -> (&str, &str) {
+    let trimmed = path.trim_end_matches('/');
+    match trimmed.rsplit_once('/') {
+        Some((parent, name)) => (name, parent),
+        None => (trimmed, ""),
+    }
 }
 
 /// The scroll container's child index of flat row `row_ix`: each section
@@ -306,10 +336,11 @@ impl Shell {
             return Vec::new();
         };
         let query = palette.search.read(cx).text().trim().to_lowercase();
-        let commands = || {
+        let can_archive = self.state.read(cx).archivable_selected_chat().is_some();
+        let commands = |section| {
             PaletteSection::new(
-                Section::Commands,
-                commands_for(&query, Theme::of(cx).appearance.is_dark())
+                section,
+                commands_for(&query, Theme::of(cx).appearance.is_dark(), can_archive)
                     .into_iter()
                     .map(RowKind::Command),
             )
@@ -322,15 +353,59 @@ impl Shell {
                     .map(RowKind::Chat),
             )
         };
-        let sections = match palette.tab {
-            Tab::All => vec![commands(), threads(HISTORY_RESULT_LIMIT)],
-            Tab::Threads => vec![threads(HISTORY_RESULT_LIMIT)],
-            Tab::Commands => vec![commands()],
-            Tab::Files => Vec::new(),
+        let recent_threads = |limit| {
+            PaletteSection::new(
+                Section::RecentThreads,
+                self.recent_threads(limit, cx)
+                    .into_iter()
+                    .map(RowKind::Chat),
+            )
+        };
+        let recent_files = |limit| {
+            PaletteSection::new(
+                Section::RecentFiles,
+                self.recent_files(&self.active_chat)
+                    .take(limit)
+                    .map(|path| RowKind::File {
+                        path: path.clone(),
+                        is_dir: false,
+                    }),
+            )
+        };
+        let sections = match (palette.tab, query.is_empty()) {
+            (Tab::All, true) => vec![
+                recent_files(ALL_TAB_LIMIT),
+                commands(Section::QuickActions),
+                recent_threads(ALL_TAB_LIMIT),
+            ],
+            (Tab::All, false) => vec![commands(Section::Commands), threads(HISTORY_RESULT_LIMIT)],
+            (Tab::Threads, true) => vec![recent_threads(THREADS_TAB_LIMIT)],
+            (Tab::Threads, false) => vec![threads(HISTORY_RESULT_LIMIT)],
+            (Tab::Commands, true) => vec![commands(Section::QuickActions)],
+            (Tab::Commands, false) => vec![commands(Section::Commands)],
+            (Tab::Files, true) => vec![recent_files(FILES_TAB_LIMIT)],
+            (Tab::Files, false) => Vec::new(),
         };
         sections
             .into_iter()
             .filter(|section| !section.rows.is_empty())
+            .collect()
+    }
+
+    /// Unarchived top-level chats by latest activity, the focused one aside.
+    fn recent_threads(&self, limit: usize, cx: &App) -> Vec<String> {
+        let state = self.state.read(cx);
+        let mut chats: Vec<_> = state
+            .chats
+            .iter()
+            .filter(|chat| chat.is_top_level() && !chat.archived && chat.id != self.active_chat)
+            .collect();
+        chats
+            .sort_by_key(|chat| std::cmp::Reverse(chat.last_message_at.unwrap_or(chat.created_at)));
+        chats
+            .into_iter()
+            .take(limit)
+            .map(|chat| chat.id.clone())
             .collect()
     }
 
@@ -445,8 +520,43 @@ impl Shell {
             RowKind::Command(Command::NewProject) => self.open_add_space(cx),
             RowKind::Command(Command::Settings) => self.open_last_settings(cx),
             RowKind::Command(Command::Theme(_)) => unreachable!(),
+            RowKind::Command(Command::ArchiveThread) => self.archive_selected_chat(cx),
             RowKind::Chat(id) => self.open_chat(id, cx),
+            RowKind::File { path, is_dir } => {
+                self.open_palette_path(path, is_dir, None, window, cx)
+            }
         }
+    }
+
+    /// Open a workspace path of the focused chat: a file in an editor tab
+    /// (at `location`, when given), a folder revealed in the files tree.
+    fn open_palette_path(
+        &mut self,
+        path: String,
+        is_dir: bool,
+        location: Option<(u32, Option<u32>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        if is_dir {
+            self.add_files_surface(window, cx);
+            if let Some(files) = self.files.get(&self.panel_key(cx)).cloned() {
+                files.update(cx, |files, cx| files.reveal_file_explicit(path, cx));
+            }
+            return;
+        }
+        let key = self.panel_key(cx);
+        let was_open = self.panels.get(&key).changes_open;
+        let from = self.right_target(cx);
+        self.panels.update(&key, |panel| panel.changes_open = true);
+        if !was_open {
+            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        }
+        let owner = (self.active_chat.clone(), self.state.clone());
+        self.add_file_surface_at(owner, path, location, window, cx);
     }
 
     fn command_shortcut(&self, command: &Command) -> Option<String> {
@@ -454,6 +564,7 @@ impl Shell {
             Command::NewChat => ShortcutId::NewSession,
             Command::NewProject => ShortcutId::NewProject,
             Command::Settings => return Some(crate::settings::badge_combo("mod-,")),
+            Command::ArchiveThread => ShortcutId::ArchiveSession,
             Command::Theme(_) => return None,
         };
         let combo = self.settings.keymap.get(id);
@@ -503,6 +614,50 @@ impl Shell {
                     .when_some(shortcut, |row, shortcut| {
                         row.child(popover::kbd_hint(theme, &shortcut))
                     })
+                    .into_any_element()
+            }
+            RowKind::File { path, is_dir } => {
+                let (name, parent) = split_path(path);
+                let identity = if *is_dir {
+                    crate::file_icons::FileIconIdentity::directory(path, false)
+                } else {
+                    crate::file_icons::FileIconIdentity::file(path)
+                };
+                let target = row.clone();
+                popover::menu_row(theme, active, format!("command-file-{ix}"))
+                    .id(("command-file", ix))
+                    .rounded(px(popover::PALETTE_ITEM_RADIUS))
+                    .role(gpui::Role::Button)
+                    .aria_label(SharedString::from(path.clone()))
+                    .min_h(px(30.0))
+                    .py(px(4.0))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.activate_palette_row(target.clone(), window, cx)
+                    }))
+                    .child(crate::file_icons::icon(identity, theme.appearance).size(px(16.0)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .overflow_hidden()
+                            .child(div().flex_none().child(popover::search_highlight(
+                                SharedString::from(name.to_owned()),
+                                Some(query),
+                                theme,
+                            )))
+                            .when(!parent.is_empty(), |row| {
+                                row.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(parent.to_owned())),
+                                )
+                            }),
+                    )
                     .into_any_element()
             }
             RowKind::Chat(id) => {
@@ -953,10 +1108,8 @@ mod tests {
                     ]);
                 });
                 shell.toggle_command_palette(window, cx);
-                assert_eq!(
-                    search_chats(shell, "", cx),
-                    ["main-session", "archived-session"]
-                );
+                // Recent Threads leaves archived threads to search.
+                assert_eq!(search_chats(shell, "", cx), ["main-session"]);
                 for query in [
                     "manual-sidechat",
                     "mcp-worker",
@@ -983,28 +1136,133 @@ mod tests {
         window
             .update(cx, |shell, window, cx| {
                 shell.state.update(cx, |state, _| {
-                    let children = (0..HISTORY_RESULT_LIMIT).map(|ix| {
+                    let children = (0..THREADS_TAB_LIMIT).map(|ix| {
                         chat(&format!("child-{ix}"), Some("session-0"), false, ix as i64)
                     });
-                    let sessions = (0..=HISTORY_RESULT_LIMIT).map(|ix| {
+                    let sessions = (0..=THREADS_TAB_LIMIT).map(|ix| {
                         chat(
                             &format!("session-{ix}"),
                             None,
                             false,
-                            (HISTORY_RESULT_LIMIT + ix) as i64,
+                            (THREADS_TAB_LIMIT + ix) as i64,
                         )
                     });
                     state.apply_chats(children.chain(sessions).collect());
                 });
                 shell.toggle_command_palette(window, cx);
-                let expected: Vec<_> = (0..HISTORY_RESULT_LIMIT)
+                shell.select_palette_tab(Tab::Threads, cx);
+                let expected: Vec<_> = (0..THREADS_TAB_LIMIT)
                     .map(|ix| format!("session-{ix}"))
                     .collect();
                 assert_eq!(search_chats(shell, "", cx), expected);
-                let oldest = format!("session-{HISTORY_RESULT_LIMIT}");
+                let oldest = format!("session-{THREADS_TAB_LIMIT}");
                 assert_eq!(search_chats(shell, &oldest, cx), [oldest]);
             })
             .unwrap();
+    }
+
+    fn sections(shell: &Shell, cx: &App) -> Vec<(Section, Vec<RowKind>)> {
+        shell
+            .palette_sections(cx)
+            .into_iter()
+            .map(|section| {
+                (
+                    section.section,
+                    section.rows.into_iter().map(|row| row.kind).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn empty_state_without_a_focused_chat_has_no_files_or_archive(cx: &mut TestAppContext) {
+        let (window, _dir) = palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.apply_chats(vec![chat("only", None, false, 0)]);
+                });
+                shell.toggle_command_palette(window, cx);
+                let sections = sections(shell, cx);
+                assert_eq!(
+                    sections
+                        .iter()
+                        .map(|(section, _)| *section)
+                        .collect::<Vec<_>>(),
+                    [Section::QuickActions, Section::RecentThreads]
+                );
+                assert!(
+                    !sections[0]
+                        .1
+                        .contains(&RowKind::Command(Command::ArchiveThread))
+                );
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn empty_state_lists_recent_files_actions_and_threads(cx: &mut TestAppContext) {
+        let (window, _dir) = palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.state.update(cx, |state, cx| {
+                    state.apply_chats(vec![
+                        chat("focused", None, false, 0),
+                        chat("side", Some("focused"), false, 1),
+                        chat("older", None, false, 3),
+                        chat("newer", None, false, 2),
+                        chat("archived", None, true, 1),
+                    ]);
+                    state.select_chat(Some("focused".into()), cx);
+                });
+                shell.active_chat = "focused".into();
+                for path in ["src/a.rs", "README.md", "src/a.rs", "docs/b.md"] {
+                    shell.note_recent_file("focused", path);
+                }
+                shell.note_recent_file("newer", "elsewhere.rs");
+                shell.toggle_command_palette(window, cx);
+                let sections = sections(shell, cx);
+                let file = |path: &str| RowKind::File {
+                    path: path.into(),
+                    is_dir: false,
+                };
+                assert_eq!(sections[0].0, Section::RecentFiles);
+                assert_eq!(
+                    sections[0].1,
+                    [file("docs/b.md"), file("src/a.rs"), file("README.md")]
+                );
+                assert_eq!(sections[1].0, Section::QuickActions);
+                assert!(
+                    sections[1]
+                        .1
+                        .contains(&RowKind::Command(Command::ArchiveThread))
+                );
+                assert_eq!(sections[2].0, Section::RecentThreads);
+                assert_eq!(
+                    sections[2].1,
+                    [RowKind::Chat("newer".into()), RowKind::Chat("older".into())]
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn archive_is_offered_only_with_a_focused_chat() {
+        assert!(!commands_for("archive", true, false).contains(&Command::ArchiveThread));
+        assert_eq!(
+            commands_for("archive", true, true),
+            vec![Command::ArchiveThread]
+        );
+    }
+
+    #[test]
+    fn file_rows_split_name_and_parent_folder() {
+        assert_eq!(
+            split_path("src/shell/palette.rs"),
+            ("palette.rs", "src/shell")
+        );
+        assert_eq!(split_path("README.md"), ("README.md", ""));
+        assert_eq!(split_path("crates/ui/"), ("ui", "crates"));
     }
 
     /// A shell with the real app keymap and two sidebar sessions.
@@ -1167,7 +1425,7 @@ mod tests {
     #[test]
     fn action_search_hides_empty_section_and_preserves_order() {
         assert_eq!(
-            commands_for("", true),
+            commands_for("", true, false),
             vec![
                 Command::NewChat,
                 Command::NewProject,
@@ -1176,33 +1434,36 @@ mod tests {
             ]
         );
         assert_eq!(
-            commands_for("new", true),
+            commands_for("new", true, false),
             vec![Command::NewChat, Command::NewProject]
         );
-        assert_eq!(commands_for("settings", true), vec![Command::Settings]);
         assert_eq!(
-            commands_for("theme", true),
+            commands_for("settings", true, false),
+            vec![Command::Settings]
+        );
+        assert_eq!(
+            commands_for("theme", true, false),
             vec![Command::Theme(AppearanceMode::Light)]
         );
-        assert!(commands_for("deployment", true).is_empty());
+        assert!(commands_for("deployment", true, false).is_empty());
     }
 
     #[test]
     fn theme_action_targets_the_opposite_resolved_appearance() {
         assert_eq!(
-            commands_for("theme", true),
+            commands_for("theme", true, false),
             vec![Command::Theme(AppearanceMode::Light)]
         );
         assert_eq!(
-            commands_for("theme", false),
+            commands_for("theme", false, false),
             vec![Command::Theme(AppearanceMode::Dark)]
         );
         assert_eq!(
-            commands_for("light", true),
+            commands_for("light", true, false),
             vec![Command::Theme(AppearanceMode::Light)]
         );
         assert_eq!(
-            commands_for("dark", false),
+            commands_for("dark", false, false),
             vec![Command::Theme(AppearanceMode::Dark)]
         );
     }

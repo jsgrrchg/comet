@@ -2059,6 +2059,8 @@ pub struct Shell {
     command_palette: Option<command_palette::CommandPalette>,
     /// The focused chat's pinned workspace search index (see `search_warm`).
     search_warm: Option<search_warm::SearchWarm>,
+    /// Per chat, the files opened in editor tabs, most recent first.
+    recent_files: std::collections::HashMap<String, std::collections::VecDeque<String>>,
     pending_workspace_command: Option<crate::composer::WorkspaceCommand>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
@@ -2506,6 +2508,7 @@ impl Shell {
             project_crumb_menu: popover::Popup::default(),
             command_palette: None,
             search_warm: None,
+            recent_files: std::collections::HashMap::new(),
             pending_workspace_command: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),
@@ -3437,6 +3440,10 @@ impl Shell {
             RightSurface::File(id) => {
                 if let Some(file) = self.file_surfaces.get(&id).cloned() {
                     file.update(cx, |file, cx| file.ensure_loaded(cx));
+                    if let Some(path) = self.file_surface_paths.get(&id).cloned() {
+                        let chat_id = file.read(cx).chat_id().to_owned();
+                        self.note_recent_file(&chat_id, &path);
+                    }
                 }
             }
             RightSurface::Terminal(tab) => {

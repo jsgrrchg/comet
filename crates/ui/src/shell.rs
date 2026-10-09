@@ -77,8 +77,6 @@ mod sidebar_pins;
 mod sidebar_sections;
 mod search_warm;
 pub(crate) mod spaces;
-// Adopted by the command palette's Threads section.
-#[cfg_attr(not(test), allow(dead_code))]
 mod thread_search;
 use side_chats::SideChatTab;
 mod tabs;

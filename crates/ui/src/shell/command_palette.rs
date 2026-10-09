@@ -6,7 +6,6 @@ use crate::appearance::AppearanceMode;
 
 /// Key context of the palette card: its mod-1…4 tab bindings live here.
 pub(super) const KEY_CONTEXT: &str = "CommandPalette";
-const HISTORY_RESULT_LIMIT: usize = 30;
 /// Rows a section shows under All; its own tab shows the long limit.
 const ALL_TAB_LIMIT: usize = 5;
 const THREADS_TAB_LIMIT: usize = 50;
@@ -378,9 +377,9 @@ impl Shell {
                 commands(Section::QuickActions),
                 recent_threads(ALL_TAB_LIMIT),
             ],
-            (Tab::All, false) => vec![commands(Section::Commands), threads(HISTORY_RESULT_LIMIT)],
+            (Tab::All, false) => vec![threads(ALL_TAB_LIMIT), commands(Section::Commands)],
             (Tab::Threads, true) => vec![recent_threads(THREADS_TAB_LIMIT)],
-            (Tab::Threads, false) => vec![threads(HISTORY_RESULT_LIMIT)],
+            (Tab::Threads, false) => vec![threads(THREADS_TAB_LIMIT)],
             (Tab::Commands, true) => vec![commands(Section::QuickActions)],
             (Tab::Commands, false) => vec![commands(Section::Commands)],
             (Tab::Files, true) => vec![recent_files(FILES_TAB_LIMIT)],
@@ -409,25 +408,20 @@ impl Shell {
             .collect()
     }
 
-    /// Top-level chats matching `query`, in sidebar order.
+    /// Top-level chats matching every word of `query`, best match first
+    /// (see `thread_search`).
     fn thread_matches(&self, query: &str, limit: usize, cx: &App) -> Vec<String> {
         let state = self.state.read(cx);
+        let terms = thread_search::search_terms(query);
         // Global history deliberately ignores the sidebar's project filter and
         // collapsed groups. Archived conversations remain searchable too.
         // Like the sidebar, only list top-level sessions, not side chats or MCP workers.
-        let mut chats: Vec<_> = state
+        let scored = state
             .chats
             .iter()
             .filter(|chat| chat.is_top_level())
-            .filter(|chat| {
-                let project = state
-                    .space_for_chat(chat)
-                    .map(|s| s.display_name())
-                    .unwrap_or("~");
-                let device = state.device_name(&chat.device_id).unwrap_or("");
-                let branch =
-                    crate::change_requests::conversation_branch(chat, &state.spaces).unwrap_or("");
-                let pr = state
+            .filter_map(|chat| {
+                let pull_request = state
                     .change_request_for_chat(chat)
                     .map(|pr| {
                         format!(
@@ -436,22 +430,24 @@ impl Shell {
                         )
                     })
                     .unwrap_or_default();
-                matches_query(
-                    query,
-                    &format!(
-                        "{} {project} {device} {branch} {pr}",
-                        chat.title.as_deref().unwrap_or("New session")
-                    ),
-                )
+                let fields = thread_search::ThreadFields {
+                    title: chat.title.as_deref().unwrap_or("New session"),
+                    project: state
+                        .space_for_chat(chat)
+                        .map(|s| s.display_name())
+                        .unwrap_or("~"),
+                    branch: crate::change_requests::conversation_branch(chat, &state.spaces)
+                        .unwrap_or(""),
+                    device: state.device_name(&chat.device_id).unwrap_or(""),
+                    pull_request: &pull_request,
+                    archived: chat.archived,
+                };
+                let score = thread_search::score_thread(&fields, &terms)?;
+                let active = chat.last_message_at.unwrap_or(chat.created_at);
+                Some((chat.id.clone(), score, active.timestamp_millis()))
             })
             .collect();
-        chats.sort_by(|a, b| spaces::compare_sidebar_chats(self.settings.sidebar_sort, a, b));
-        // Limit after filtering and sorting so every chat remains searchable.
-        chats
-            .into_iter()
-            .take(limit)
-            .map(|chat| chat.id.clone())
-            .collect()
+        thread_search::rank(scored, limit)
     }
 
     /// Pointer motion moves the highlight, so hover and keyboard never light
@@ -1172,6 +1168,66 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn titled(id: &str, title: &str, archived: bool, age: i64) -> zeron_proto::Chat {
+        let mut chat = chat(id, None, archived, age);
+        chat.title = Some(title.into());
+        chat
+    }
+
+    #[gpui::test]
+    fn thread_search_ranks_by_score_with_archived_below(cx: &mut TestAppContext) {
+        let (window, _dir) = palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.apply_chats(vec![
+                        titled("mid-word", "Redeploy the edge", false, 0),
+                        titled("archived", "Deploy notes", true, 1),
+                        titled("older", "Deploy staging", false, 3),
+                        titled("newer", "Deploy production", false, 2),
+                        titled("unrelated", "Fix the composer", false, 0),
+                    ]);
+                });
+                shell.toggle_command_palette(window, cx);
+                assert_eq!(
+                    search_chats(shell, "deploy", cx),
+                    ["newer", "older", "mid-word", "archived"]
+                );
+                shell.select_palette_tab(Tab::Threads, cx);
+                assert_eq!(search_chats(shell, "deploy staging", cx), ["older"]);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn all_tab_lists_threads_before_commands_and_caps_them(cx: &mut TestAppContext) {
+        let (window, _dir) = palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.apply_chats(
+                        (0..8)
+                            .map(|ix| titled(&format!("t{ix}"), "New project idea", false, ix))
+                            .collect(),
+                    );
+                });
+                shell.toggle_command_palette(window, cx);
+                shell
+                    .command_palette
+                    .as_ref()
+                    .unwrap()
+                    .search
+                    .update(cx, |input, cx| input.set_text("new", cx));
+                let sections = sections(shell, cx);
+                assert_eq!(sections[0].0, Section::Threads);
+                assert_eq!(sections[0].1.len(), ALL_TAB_LIMIT);
+                assert_eq!(sections[1].0, Section::Commands);
+                shell.select_palette_tab(Tab::Threads, cx);
+                assert_eq!(search_chats(shell, "new", cx).len(), 8);
+            })
+            .unwrap();
     }
 
     #[gpui::test]

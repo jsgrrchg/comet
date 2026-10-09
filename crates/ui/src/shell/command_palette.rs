@@ -4,6 +4,8 @@
 use super::*;
 use crate::appearance::AppearanceMode;
 
+/// Key context of the palette card: its mod-1…4 tab bindings live here.
+pub(super) const KEY_CONTEXT: &str = "CommandPalette";
 const HISTORY_RESULT_LIMIT: usize = 30;
 const RESULTS_FADE_BAND: f32 = 18.0;
 
@@ -42,8 +44,6 @@ impl EnterPress {
     }
 }
 
-// Selected from the tab row (next commit).
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Tab {
     #[default]
@@ -51,6 +51,34 @@ pub(super) enum Tab {
     Threads,
     Commands,
     Files,
+}
+
+impl Tab {
+    pub(super) const ALL: [Tab; 4] = [Tab::All, Tab::Threads, Tab::Commands, Tab::Files];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Threads => "Threads",
+            Self::Commands => "Commands",
+            Self::Files => "Files",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    }
+
+    /// The neighbouring tab, wrapping (tab / shift-tab).
+    fn step(self, forward: bool) -> Self {
+        let count = Self::ALL.len();
+        let next = if forward {
+            self.index() + 1
+        } else {
+            self.index() + count - 1
+        };
+        Self::ALL[next % count]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -249,6 +277,18 @@ impl Shell {
             _search_events: events,
         });
         cx.notify();
+    }
+
+    pub(super) fn select_palette_tab(&mut self, tab: Tab, cx: &mut Context<Self>) {
+        let Some(palette) = self.command_palette.as_mut() else {
+            return;
+        };
+        if palette.tab != tab {
+            palette.tab = tab;
+            palette.reset_active();
+            palette.scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+            cx.notify();
+        }
     }
 
     pub(super) fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -539,6 +579,7 @@ impl Shell {
         let query = search.read(cx).text().to_string();
         let focus = palette.focus.clone();
         let scroll = palette.scroll.clone();
+        let current_tab = palette.tab;
         let theme = Theme::of(cx).for_popup();
         let mut children = Vec::new();
         let mut ix = 0;
@@ -595,7 +636,43 @@ impl Shell {
                 ))
             });
         let body = palette_results_fade(body, &scroll);
+        let tabs = div()
+            .flex_none()
+            .px(px(12.0))
+            .py(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .border_b_1()
+            .border_color(crate::theme::hairline(0.06))
+            .children(Tab::ALL.into_iter().map(|tab| {
+                let combo = crate::settings::badge_combo(&format!("mod-{}", tab.index() + 1));
+                popover::menu_row(
+                    &theme,
+                    tab == current_tab,
+                    format!("command-tab-{}", tab.index()),
+                )
+                .id(("command-tab", tab.index()))
+                .role(gpui::Role::Tab)
+                .aria_label(tab.label())
+                .gap(px(6.0))
+                .py(px(3.0))
+                .on_click(cx.listener(move |this, _, _, cx| this.select_palette_tab(tab, cx)))
+                .child(tab.label())
+                .child(popover::kbd_hint(&theme, &combo))
+            }));
+        let tab_keys = format!(
+            "{}…{}",
+            crate::settings::badge_combo("mod-1"),
+            Tab::ALL.len()
+        );
         let card = palette_card("command-palette", &focus, viewport, &theme)
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(|this, action: &SelectPaletteTab, _, cx| {
+                if let Some(tab) = Tab::ALL.get(action.0) {
+                    this.select_palette_tab(*tab, cx);
+                }
+            }))
             .on_key_down(
                 cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
                     match event.keystroke.key.as_str() {
@@ -612,6 +689,16 @@ impl Shell {
                                 return;
                             }
                             this.activate_palette_selection(window, cx);
+                        }
+                        "tab" => {
+                            let forward = !event.keystroke.modifiers.shift;
+                            if let Some(tab) = this
+                                .command_palette
+                                .as_ref()
+                                .map(|palette| palette.tab.step(forward))
+                            {
+                                this.select_palette_tab(tab, cx);
+                            }
                         }
                         "escape" => this.close_command_palette(window, cx),
                         _ => return,
@@ -635,11 +722,13 @@ impl Shell {
                 search.into_any_element(),
                 popover::kbd_hint(&theme, &crate::settings::badge_combo("mod-k")),
             ))
+            .child(tabs)
             .child(body)
             .child(
                 palette_footer()
                     .child(command_key_hint(&theme, "↑ ↓", "Navigate"))
-                    .child(command_key_hint(&theme, "↵", "Select"))
+                    .child(command_key_hint(&theme, "↵", "Open"))
+                    .child(command_key_hint(&theme, &tab_keys, "Tabs"))
                     .child(command_key_hint(&theme, "Esc", "Close")),
             );
         Some(palette_overlay(viewport, card))
@@ -916,6 +1005,117 @@ mod tests {
                 assert_eq!(search_chats(shell, &oldest, cx), [oldest]);
             })
             .unwrap();
+    }
+
+    /// A shell with the real app keymap and two sidebar sessions.
+    fn keyed_palette_window(
+        cx: &mut TestAppContext,
+    ) -> (gpui::WindowHandle<Shell>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            crate::composer::init(cx, ComposerSendBehavior::default());
+            apply_keymap(
+                cx,
+                &KeymapConfig::default(),
+                ComposerSendBehavior::default(),
+            );
+        });
+        let (window, _) = palette_window(cx);
+        window
+            .update(cx, |shell, _, cx| {
+                shell.settings.sidebar_organization = SidebarOrganization::InOneList;
+                shell.state.update(cx, |state, _| {
+                    state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                    state.workspace_scope = Some(WorkspaceScope::Local);
+                    state.local_device_id = Some("local".into());
+                    state.apply_chats(vec![
+                        chat("first", None, false, 0),
+                        chat("second", None, false, 1),
+                    ]);
+                    state.selected_chat = Some("first".into());
+                });
+            })
+            .unwrap();
+        (window, dir)
+    }
+
+    fn palette_tab(window: gpui::WindowHandle<Shell>, cx: &mut TestAppContext) -> Option<Tab> {
+        window
+            .read_with(cx, |shell, _| shell.command_palette.as_ref().map(|p| p.tab))
+            .unwrap()
+    }
+
+    fn selected_chat(window: gpui::WindowHandle<Shell>, cx: &mut TestAppContext) -> Option<String> {
+        window
+            .read_with(cx, |shell, cx| shell.state.read(cx).selected_chat.clone())
+            .unwrap()
+    }
+
+    #[gpui::test]
+    fn digit_shortcuts_switch_tabs_while_the_palette_is_open(cx: &mut TestAppContext) {
+        let (window, _dir) = keyed_palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.toggle_command_palette(window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+
+        cx.simulate_keystrokes(window.into(), &platform_combo("mod-2"));
+        assert_eq!(palette_tab(window, cx), Some(Tab::Threads));
+        assert_eq!(selected_chat(window, cx).as_deref(), Some("first"));
+        cx.simulate_keystrokes(window.into(), &platform_combo("mod-4"));
+        assert_eq!(palette_tab(window, cx), Some(Tab::Files));
+        cx.simulate_keystrokes(window.into(), &platform_combo("mod-1"));
+        assert_eq!(palette_tab(window, cx), Some(Tab::All));
+    }
+
+    #[gpui::test]
+    fn digit_shortcuts_jump_to_sessions_once_the_palette_closes(cx: &mut TestAppContext) {
+        let (window, _dir) = keyed_palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.toggle_command_palette(window, cx);
+                shell.close_command_palette(window, cx);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+
+        cx.simulate_keystrokes(window.into(), &platform_combo("mod-2"));
+        assert_eq!(palette_tab(window, cx), None);
+        assert_eq!(selected_chat(window, cx).as_deref(), Some("second"));
+    }
+
+    #[gpui::test]
+    fn tab_rotates_the_palette_tabs(cx: &mut TestAppContext) {
+        let (window, _dir) = keyed_palette_window(cx);
+        window
+            .update(cx, |shell, window, cx| {
+                shell.toggle_command_palette(window, cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+
+        for expected in [Tab::Threads, Tab::Commands, Tab::Files, Tab::All] {
+            cx.simulate_keystrokes(window.into(), "tab");
+            assert_eq!(palette_tab(window, cx), Some(expected));
+        }
+        cx.simulate_keystrokes(window.into(), "shift-tab");
+        assert_eq!(palette_tab(window, cx), Some(Tab::Files));
     }
 
     #[test]

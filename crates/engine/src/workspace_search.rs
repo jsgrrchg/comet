@@ -27,7 +27,7 @@ pub const IDLE_EVICT: Duration = Duration::from_secs(5 * 60);
 /// Live indexes at once; creating one more evicts the least recently used.
 pub const MAX_LIVE: usize = 3;
 /// Per-index cap on cached file contents (fff defaults to up to 512 MB).
-pub const CACHE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+pub const CACHE_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 /// A pin outlives the UI's 60 s warm heartbeat by a comfortable margin, so a
 /// client that disappears cannot keep its index alive forever.
 pub const PIN_TTL: Duration = Duration::from_secs(3 * 60);

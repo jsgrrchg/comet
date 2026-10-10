@@ -2301,6 +2301,8 @@ pub(super) struct AddSpaceFlow {
 /// Shorter queries match nearly every folder under home; they are not sent.
 const HOME_FOLDER_MIN_QUERY_CHARS: usize = 2;
 const HOME_FOLDER_RESULTS: u16 = 20;
+const HOME_FOLDER_INDEX_RETRY: Duration = Duration::from_millis(500);
+const HOME_FOLDER_INDEX_RETRY_MAX: Duration = Duration::from_secs(2);
 
 /// The new-project picker's search over the device's home, answered by the
 /// host's home search index (the one projectless chats use). Entering Home
@@ -2323,9 +2325,9 @@ struct HomeFolderSearch {
     warm_task: Option<Task<()>>,
 }
 
-/// Send one `SearchHomeFolders`. `generation` identifies a search whose
-/// answer fills the section; `None` is the warm-up, whose answer only tells
-/// whether the host supports the method.
+/// Refresh `SearchHomeFolders` until indexing finishes, backing off between
+/// replies. `generation` identifies the query; `None` is a one-shot warm-up
+/// whose answer only tells whether the host supports the method.
 fn request_home_folders(
     engine: crate::state::EngineHandle,
     device_id: Option<String>,
@@ -2344,41 +2346,84 @@ fn request_home_folders(
             _ => return,
         };
         add_space_target(&mut params, device_id.as_deref(), local.as_deref());
-        let result = engine
-            .client()
-            .call(
-                methods::SEARCH_HOME_FOLDERS,
-                serde_json::Value::Object(params),
-            )
-            .await;
-        this.update(cx, |shell, cx| {
-            let Some(search) = shell.add_space.as_mut().map(|flow| &mut flow.home_search) else {
-                return;
-            };
-            if let Err(zeron_rpc::RpcError::UnknownMethod(_)) = &result {
-                search.unsupported = true;
-                search.started = false;
-                search.loading = false;
-                cx.notify();
-                return;
+        let params = serde_json::Value::Object(params);
+        let mut delay = HOME_FOLDER_INDEX_RETRY;
+        loop {
+            let result = engine
+                .client()
+                .call(methods::SEARCH_HOME_FOLDERS, params.clone())
+                .await;
+            let retry = this
+                .update(cx, |shell, cx| {
+                    let selected = shell
+                        .add_space
+                        .as_ref()
+                        .and_then(|flow| shell.add_space_folder_rows(cx).get(flow.active).cloned());
+                    let Some(search) = shell.add_space.as_mut().map(|flow| &mut flow.home_search)
+                    else {
+                        return false;
+                    };
+                    if generation.is_some() && generation != Some(search.generation) {
+                        return false;
+                    }
+                    if let Err(zeron_rpc::RpcError::UnknownMethod(_)) = &result {
+                        search.unsupported = true;
+                        search.started = false;
+                        search.loading = false;
+                        search.indexing = false;
+                        cx.notify();
+                        return false;
+                    }
+                    if generation.is_none() || search.unsupported {
+                        return false;
+                    }
+                    search.loading = false;
+                    search.indexing = false;
+                    match result.map(serde_json::from_value::<HomeFolderSearchResult>) {
+                        Ok(Ok(found)) => {
+                            search.indexing = found.indexing;
+                            search.results = found.matches;
+                        }
+                        Ok(Err(error)) => {
+                            tracing::debug!(%error, "home folder search answer did not decode");
+                        }
+                        Err(error) => tracing::debug!(%error, "home folder search failed"),
+                    }
+                    let retry = search.indexing;
+                    // New partial results may reorder the rows under the cursor.
+                    if let Some(selected) = selected
+                        && let Some(active) = shell
+                            .add_space_folder_rows(cx)
+                            .iter()
+                            .position(|row| row == &selected)
+                        && let Some(flow) = shell.add_space.as_mut()
+                    {
+                        flow.active = active;
+                    }
+                    cx.notify();
+                    retry
+                })
+                .unwrap_or(false);
+            if !retry {
+                break;
             }
-            if generation != Some(search.generation) {
-                return;
+            // The stored task is dropped on edits, navigation or close. Wait
+            // after the reply so slow hosts never accumulate parallel calls.
+            cx.background_executor().timer(delay).await;
+            delay = (delay * 2).min(HOME_FOLDER_INDEX_RETRY_MAX);
+            let current = this
+                .update(cx, |shell, _| {
+                    shell.add_space_in_home()
+                        && shell.add_space.as_ref().is_some_and(|flow| {
+                            generation == Some(flow.home_search.generation)
+                                && !flow.home_search.unsupported
+                        })
+                })
+                .unwrap_or(false);
+            if !current {
+                break;
             }
-            search.loading = false;
-            match result.map(serde_json::from_value::<HomeFolderSearchResult>) {
-                Ok(Ok(found)) => {
-                    search.indexing = found.indexing;
-                    search.results = found.matches;
-                }
-                Ok(Err(error)) => {
-                    tracing::debug!(%error, "home folder search answer did not decode");
-                }
-                Err(error) => tracing::debug!(%error, "home folder search failed"),
-            }
-            cx.notify();
-        })
-        .ok();
+        }
     })
 }
 
@@ -5767,6 +5812,7 @@ impl Shell {
         let search = &mut flow.home_search;
         search.generation += 1;
         search.loading = false;
+        search.indexing = false;
         search.task = None;
         search.results.clear();
         let Some(engine) = engine.filter(|_| in_home && !search.unsupported) else {
@@ -7719,6 +7765,215 @@ mod home_folder_search_tests {
 
     fn found(path: &str, relative: &str, is_repo: bool) -> serde_json::Value {
         serde_json::json!({ "path": path, "relative": relative, "isRepo": is_repo })
+    }
+
+    fn begin_home_search(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::WindowHandle<Shell>,
+        tempfile::TempDir,
+        FakeEngine,
+        serde_json::Value,
+    ) {
+        let (window, dir, mut engine) = picker(cx, "remote");
+        go_home(window, cx);
+        let warm = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        assert_eq!(warm.len(), 1);
+        engine.reply(
+            &warm[0],
+            serde_json::json!({ "matches": [], "indexing": true }),
+        );
+        cx.run_until_parked();
+        // Merely warming Home must not start polling an empty query.
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(engine.take(methods::SEARCH_HOME_FOLDERS, cx).is_empty());
+        type_query(window, "comet", cx);
+        let request = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        assert_eq!(request.len(), 1);
+        (window, dir, engine, request.into_iter().next().unwrap())
+    }
+
+    #[gpui::test]
+    fn home_search_refreshes_with_capped_backoff_and_no_overlapping_requests(
+        cx: &mut TestAppContext,
+    ) {
+        let (window, _dir, mut engine, first) = begin_home_search(cx);
+        engine.reply(
+            &first,
+            serde_json::json!({ "matches": [], "indexing": true }),
+        );
+        cx.run_until_parked();
+        assert!(rows(window, cx).is_empty());
+        let comet = found("/home/me/dev/comet", "dev/comet", true);
+        for (round, millis) in [500, 1000, 2000, 2000].into_iter().enumerate() {
+            cx.executor()
+                .advance_clock(Duration::from_millis(millis - 1));
+            assert!(engine.take(methods::SEARCH_HOME_FOLDERS, cx).is_empty());
+            cx.executor().advance_clock(Duration::from_millis(1));
+            let requests = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["params"], first["params"]);
+            assert_eq!(requests[0]["params"]["targetDeviceId"], "remote");
+            // A slow response does not queue more requests or erase rows.
+            let partial = rows(window, cx);
+            cx.executor().advance_clock(Duration::from_secs(10));
+            assert!(engine.take(methods::SEARCH_HOME_FOLDERS, cx).is_empty());
+            assert_eq!(rows(window, cx), partial);
+            let matches = if round == 0 {
+                vec![comet.clone()]
+            } else {
+                vec![
+                    found("/home/me/new/comet", "new/comet", true),
+                    comet.clone(),
+                ]
+            };
+            engine.reply(
+                &requests[0],
+                serde_json::json!({
+                    "matches": matches, "indexing": round < 3,
+                }),
+            );
+            cx.run_until_parked();
+            window
+                .read_with(cx, |shell, cx| {
+                    let flow = shell.add_space.as_ref().unwrap();
+                    assert_eq!(flow.home_search.indexing, round < 3);
+                    assert!(!flow.home_search.loading);
+                    // The original selected folder survives result reordering.
+                    assert!(matches!(
+                        &shell.add_space_folder_rows(cx)[flow.active],
+                        FolderRow::Home(found) if found.relative == "dev/comet"
+                    ));
+                })
+                .unwrap();
+        }
+        assert_eq!(rows(window, cx).len(), 2);
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(engine.take(methods::SEARCH_HOME_FOLDERS, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn home_search_cancels_retries_on_edits_navigation_and_close(cx: &mut TestAppContext) {
+        for action in ["clear", "short", "path", "drive", "device", "close"] {
+            let (window, _dir, mut engine, first) = begin_home_search(cx);
+            engine.reply(
+                &first,
+                serde_json::json!({ "matches": [], "indexing": true }),
+            );
+            cx.run_until_parked();
+            match action {
+                "clear" => type_query(window, "", cx),
+                "short" => type_query(window, "c", cx),
+                "path" => type_query(window, "/mnt/data", cx),
+                _ => window
+                    .update(cx, |shell, _, cx| match action {
+                        "drive" => shell.add_space_goto_location(
+                            "Data".into(),
+                            Some("/mnt/data".into()),
+                            cx,
+                        ),
+                        "device" => {
+                            shell.add_space_back_to(ProjectStep::Devices, cx);
+                            shell.add_space_pick_device(device("local"), cx);
+                        }
+                        "close" => shell.close_add_space(cx),
+                        _ => unreachable!(),
+                    })
+                    .unwrap(),
+            }
+            cx.executor().advance_clock(Duration::from_secs(10));
+            assert!(
+                engine.take(methods::SEARCH_HOME_FOLDERS, cx).is_empty(),
+                "{action}"
+            );
+            window
+                .read_with(cx, |shell, _| {
+                    assert!(
+                        !shell
+                            .add_space
+                            .as_ref()
+                            .is_some_and(|flow| flow.home_search.indexing)
+                    );
+                })
+                .unwrap();
+        }
+    }
+
+    #[gpui::test]
+    fn new_home_query_resets_backoff_and_ignores_in_flight_answers(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine, first) = begin_home_search(cx);
+        engine.reply(
+            &first,
+            serde_json::json!({ "matches": [], "indexing": true }),
+        );
+        cx.run_until_parked();
+        cx.executor().advance_clock(HOME_FOLDER_INDEX_RETRY);
+        let stale = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        assert_eq!(stale.len(), 1);
+        type_query(window, "updated", cx);
+        let updated = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0]["params"]["query"], "updated");
+        engine.reply(
+            &updated[0],
+            serde_json::json!({ "matches": [], "indexing": true }),
+        );
+        engine.reply(
+            &stale[0],
+            serde_json::json!({
+                "matches": [found("/home/me/dev/comet", "dev/comet", true)], "indexing": true,
+            }),
+        );
+        cx.run_until_parked();
+        assert!(rows(window, cx).is_empty());
+        cx.executor()
+            .advance_clock(HOME_FOLDER_INDEX_RETRY - Duration::from_millis(1));
+        assert!(engine.take(methods::SEARCH_HOME_FOLDERS, cx).is_empty());
+        cx.executor().advance_clock(Duration::from_millis(1));
+        let retry = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0]["params"], updated[0]["params"]);
+        engine.reply(
+            &retry[0],
+            serde_json::json!({ "matches": [], "indexing": false }),
+        );
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(engine.take(methods::SEARCH_HOME_FOLDERS, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn home_search_stops_retrying_after_errors(cx: &mut TestAppContext) {
+        for error in ["failed", "unsupported", "decode"] {
+            let (window, _dir, mut engine, first) = begin_home_search(cx);
+            engine.reply(
+                &first,
+                serde_json::json!({ "matches": [], "indexing": true }),
+            );
+            cx.run_until_parked();
+            cx.executor().advance_clock(HOME_FOLDER_INDEX_RETRY);
+            let retry = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+            assert_eq!(retry.len(), 1);
+            match error {
+                "failed" => engine.fail(&retry[0], "search failed"),
+                "unsupported" => engine.fail(&retry[0], "unknown method: SearchHomeFolders"),
+                "decode" => engine.reply(&retry[0], serde_json::json!({})),
+                _ => unreachable!(),
+            }
+            cx.run_until_parked();
+            window
+                .read_with(cx, |shell, _| {
+                    let search = &shell.add_space.as_ref().unwrap().home_search;
+                    assert!(!search.indexing);
+                    assert!(!search.loading);
+                })
+                .unwrap();
+            cx.executor().advance_clock(Duration::from_secs(10));
+            assert!(
+                engine.take(methods::SEARCH_HOME_FOLDERS, cx).is_empty(),
+                "{error}"
+            );
+        }
     }
 
     #[gpui::test]

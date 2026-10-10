@@ -30,8 +30,11 @@ pub mod wallpaper;
 pub mod wallpaper_colors;
 pub mod widgets;
 
-/// Sidebar drag-resize bounds (px).
-pub const SIDEBAR_MIN: f32 = 224.0;
+/// Sidebar drag-resize bounds (px). The minimum keeps the sidebar options
+/// button inside the sidebar beside the titlebar controls: 88 (past the
+/// traffic lights) + 82 (toggle, back, forward) + 32 (new session) + 8 gap
+/// + 24 (options) + 8 inset.
+pub const SIDEBAR_MIN: f32 = 242.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
@@ -852,6 +855,8 @@ pub struct UiSettings {
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
+    /// The project filter row at the top of the sidebar.
+    pub sidebar_show_project_filter: bool,
     /// The sidebar's "Star on GitHub" banner was dismissed (its close button
     /// or following the link). Device-local; never shown again once set.
     pub github_star_banner_dismissed: bool,
@@ -1035,6 +1040,7 @@ impl Default for UiSettings {
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
+            sidebar_show_project_filter: true,
             github_star_banner_dismissed: false,
             last_space_id: None,
             last_project_action_by_space_id: std::collections::HashMap::new(),
@@ -1685,6 +1691,7 @@ impl UiSettings {
             sidebar_show_harness,
             sidebar_show_branch,
             sidebar_show_pull_request,
+            sidebar_show_project_filter,
             github_star_banner_dismissed,
             last_space_id,
             last_project_action_by_space_id,
@@ -2711,6 +2718,7 @@ mod tests {
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
+            sidebar_show_project_filter: false,
             github_star_banner_dismissed: true,
             last_space_id: Some("space-1".into()),
             last_project_action_by_space_id: std::collections::HashMap::from([(
@@ -2936,11 +2944,13 @@ mod tests {
         assert!(settings.sidebar_compact);
         assert!(settings.sidebar_show_project_icon);
         assert!(settings.sidebar_show_project_label);
+        assert!(settings.sidebar_show_project_filter);
         let customized = UiSettings {
             sidebar_hover_enabled: false,
             sidebar_compact: false,
             sidebar_show_project_icon: false,
             sidebar_show_project_label: false,
+            sidebar_show_project_filter: false,
             sidebar_organization: SidebarOrganization::ByProject,
             ..settings
         };

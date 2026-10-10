@@ -184,11 +184,20 @@ fn move_settings_focus(
     }
 }
 
-#[derive(Clone, Copy)]
+/// Whether the chat menu's Copy submenu is open beside it.
+#[derive(Clone, Copy, PartialEq)]
 enum ChatMenuPage {
     Root,
     Copy,
 }
+
+/// Hover-intent keys for the chat menu's rows; only Copy owns a submenu.
+const CHAT_MENU_ROW_RENAME: u8 = 0;
+const CHAT_MENU_ROW_PIN: u8 = 1;
+const CHAT_MENU_ROW_ARCHIVE: u8 = 2;
+const CHAT_MENU_ROW_COPY: u8 = 3;
+const CHAT_MENU_ROW_DELETE: u8 = 4;
+const CHAT_MENU_ROW_TAB: u8 = 5;
 
 #[derive(Clone, Copy)]
 enum TabCloseAction {
@@ -1121,7 +1130,9 @@ struct SidebarSessionTransfer {
     cursor_offset: Point<Pixels>,
     pointer: Point<Pixels>,
     viewport: Option<gpui::Bounds<Pixels>>,
+    /// The lifted row's window position: `slide` its top, `slide_x` its left.
     slide: SidebarSessionSlide,
+    slide_x: SidebarSessionSlide,
     preview: Option<SidebarSessionGap>,
     source_group: String,
     source_index: usize,
@@ -2000,6 +2011,11 @@ pub struct Shell {
     appearance_settings_sub: Option<Subscription>,
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
+    /// The Copy submenu's hover grace, its painted bounds, and which side
+    /// of the menu it opens on (the sidebar options menu's recipe).
+    chat_copy_intent: popover::HoverIntent<u8>,
+    chat_copy_bounds: Option<gpui::Bounds<Pixels>>,
+    chat_copy_left: bool,
     /// The chat title being edited in place on its row.
     chat_rename: Option<ChatRename>,
     /// Chat id awaiting delete confirmation.
@@ -2464,6 +2480,9 @@ impl Shell {
             files_settings_sub: None,
             appearance_settings_sub: None,
             chat_menu: popover::Popup::default(),
+            chat_copy_intent: Default::default(),
+            chat_copy_bounds: None,
+            chat_copy_left: false,
             chat_rename: None,
             delete_confirm: None,
             discard_working_tree: None,
@@ -2652,7 +2671,7 @@ impl Shell {
             self.side_chat_creating = false;
         }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
-            self.sidebar_notice = Some(notice.into());
+            self.show_notice(crate::toast::ToastKind::Info, notice, cx);
         }
         let next_sync_flow = {
             let state = state.read(cx);
@@ -4678,17 +4697,258 @@ impl Shell {
 
     /// Close the session-row context menu through the exit animation.
     fn close_chat_menu(&mut self, cx: &mut Context<Self>) {
+        self.chat_copy_intent.reset();
         if self.chat_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.chat_menu);
             cx.notify();
         }
     }
 
-    fn open_chat_copy_menu(&mut self, cx: &mut Context<Self>) {
-        if let Some(menu) = self.chat_menu.open_mut() {
-            menu.page = ChatMenuPage::Copy;
+    /// A sidebar-level notice (a failed mutation, a copied link) as a toast.
+    /// The latest message is kept so a pin-write failure can be matched later.
+    pub(super) fn show_notice(
+        &mut self,
+        kind: crate::toast::ToastKind,
+        message: impl Into<SharedString>,
+        cx: &mut App,
+    ) {
+        let message = message.into();
+        self.sidebar_notice = Some(message.clone());
+        crate::toast::show(cx, kind, message);
+    }
+
+    fn set_chat_copy_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        let page = if open {
+            ChatMenuPage::Copy
+        } else {
+            ChatMenuPage::Root
+        };
+        if let Some(menu) = self.chat_menu.open_mut()
+            && menu.page != page
+        {
+            menu.page = page;
+            if !open {
+                self.chat_copy_bounds = None;
+            }
             cx.notify();
         }
+    }
+
+    /// Pointer intent over a chat-menu row: hovering Copy opens its submenu,
+    /// any other row closes it — after a grace while the pointer is heading
+    /// into the open submenu.
+    fn hover_chat_menu_row(
+        &mut self,
+        key: u8,
+        pointer: Point<Pixels>,
+        moved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .chat_menu
+            .as_open()
+            .filter(|menu| menu.page == ChatMenuPage::Copy)
+            .map(|_| CHAT_MENU_ROW_COPY);
+        let (bounds, left) = (self.chat_copy_bounds, self.chat_copy_left);
+        let action = if moved {
+            self.chat_copy_intent
+                .moved(current.as_ref(), &key, pointer, bounds, left)
+        } else {
+            self.chat_copy_intent
+                .enter(current.as_ref(), &key, pointer, bounds, left)
+        };
+        match action {
+            popover::HoverAction::None => {}
+            popover::HoverAction::Open => {
+                self.set_chat_copy_open(key == CHAT_MENU_ROW_COPY, cx);
+                self.chat_copy_intent.record_origin(pointer);
+            }
+            popover::HoverAction::Defer => {
+                self.chat_copy_intent.defer(cx, move |this, cx| {
+                    if this.chat_menu.is_open()
+                        && this.chat_copy_intent.pending() == Some(&key)
+                    {
+                        this.chat_copy_intent.cancel();
+                        this.set_chat_copy_open(key == CHAT_MENU_ROW_COPY, cx);
+                        this.chat_copy_intent.record_origin(pointer);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Wrap a chat-menu row in the hover surface that feeds
+    /// [`Self::hover_chat_menu_row`]. The row keeps its own hover fade.
+    fn chat_menu_hover_row(
+        &self,
+        key: u8,
+        row: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(("chat-menu-hover", key as usize))
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                if *hovered {
+                    this.hover_chat_menu_row(key, window.mouse_position(), false, cx);
+                } else {
+                    this.chat_copy_intent.leave(&key);
+                }
+            }))
+            .on_mouse_move(cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                this.hover_chat_menu_row(key, event.position, true, cx);
+            }))
+            .child(row)
+            .into_any_element()
+    }
+
+    /// The chat menu's Copy row: opens its submenu beside the menu on hover
+    /// (or click), on whichever side has room.
+    fn render_chat_copy_trigger(
+        &mut self,
+        chat_id: &str,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.entity().downgrade();
+        let exit_entity = entity.clone();
+        let mut row = popover::menu_row_nav(theme, open, false, format!("chat-menu-copy-{chat_id}"))
+            .id("chat-menu-copy")
+            .relative()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.chat_copy_intent.reset();
+                this.set_chat_copy_open(true, cx);
+                cx.stop_propagation();
+            }))
+            .child(icon(icons::COPY).size(px(16.0)).text_color(theme.text_muted))
+            .child(div().flex_1().child(SharedString::from("Copy")))
+            .child(
+                icon(icons::ALT_ARROW_RIGHT)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let left = bounds.right() + px(244.0) > window.viewport_size().width;
+                        let _ = entity.update(cx, |this, cx| {
+                            if this.chat_copy_left != left {
+                                this.chat_copy_left = left;
+                                cx.notify();
+                            }
+                        });
+                    },
+                    move |trigger, _, window, _| {
+                        if !open {
+                            return;
+                        }
+                        // Leaving the trigger anywhere but toward the submenu
+                        // closes it, as in the sidebar options menu.
+                        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            let _ = exit_entity.update(cx, |this, cx| {
+                                let (bounds, left) = (this.chat_copy_bounds, this.chat_copy_left);
+                                if this
+                                    .chat_copy_intent
+                                    .contains_pointer(trigger, bounds, event.position, left)
+                                {
+                                    return;
+                                }
+                                this.chat_copy_intent.reset();
+                                this.set_chat_copy_open(false, cx);
+                            });
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            );
+        if open {
+            let submenu = self.render_chat_copy_submenu(chat_id, theme, cx);
+            row = row.child(popover::nested_menu(
+                format!("chat-copy-submenu-{chat_id}"),
+                submenu,
+                self.chat_copy_left,
+            ));
+        }
+        row.into_any_element()
+    }
+
+    /// The Copy submenu's card: what can be copied for this chat.
+    fn render_chat_copy_submenu(
+        &mut self,
+        chat_id: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .cloned();
+        let harness_link = chat
+            .as_ref()
+            .and_then(crate::links::harness_conversation_link);
+        let session_id = chat
+            .as_ref()
+            .and_then(|chat| chat.harness_session_id.as_deref())
+            .is_some_and(|id| !id.trim().is_empty());
+        let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
+        let zeron_id = chat_id.to_owned();
+        let harness_id = chat_id.to_owned();
+        let session_chat_id = chat_id.to_owned();
+        let path_chat_id = chat_id.to_owned();
+        let item = |id: &'static str, label: SharedString| {
+            popover::menu_row(theme, false, format!("{id}-{chat_id}"))
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .child(icon(icons::COPY).size(px(16.0)).text_color(theme.text_muted))
+                .child(label)
+        };
+        let entity = cx.entity().downgrade();
+        popover::popover_card(theme)
+            .w(px(232.0))
+            .relative()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .when(has_path, |menu| {
+                menu.child(item("chat-copy-path", "Path".into()).on_click(cx.listener(
+                    move |this, _, _, cx| this.copy_chat_path(&path_chat_id, cx),
+                )))
+            })
+            .child(
+                item("chat-copy-zeron", "Zeron conversation link".into()).on_click(cx.listener(
+                    move |this, _, _, cx| this.copy_zeron_conversation_link(&zeron_id, cx),
+                )),
+            )
+            .when_some(harness_link, |menu, link| {
+                menu.child(item("chat-copy-harness", link.label.into()).on_click(cx.listener(
+                    move |this, _, _, cx| this.copy_harness_conversation_link(&harness_id, cx),
+                )))
+            })
+            .when(session_id, |menu| {
+                menu.child(
+                    item("chat-copy-session", "Harness session ID".into()).on_click(cx.listener(
+                        move |this, _, _, cx| this.copy_harness_session_id(&session_chat_id, cx),
+                    )),
+                )
+            })
+            .child(
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        let _ = entity.update(cx, |this, _| this.chat_copy_bounds = Some(bounds));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .into_any_element()
     }
 
     fn copy_zeron_conversation_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
@@ -4703,9 +4963,9 @@ impl Shell {
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.sidebar_notice = Some("Zeron conversation link copied".into());
+            self.show_notice(crate::toast::ToastKind::Success, "Zeron conversation link copied", cx);
         } else {
-            self.sidebar_notice = Some("Conversation link is not ready yet".into());
+            self.show_notice(crate::toast::ToastKind::Error, "Conversation link is not ready yet", cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -4721,7 +4981,7 @@ impl Shell {
             .and_then(crate::links::harness_conversation_link);
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link.url));
-            self.sidebar_notice = Some(format!("{} copied", link.label).into());
+            self.show_notice(crate::toast::ToastKind::Success, format!("{} copied", link.label), cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -4737,7 +4997,7 @@ impl Shell {
             .and_then(|chat| chat.harness_session_id.clone());
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
-            self.sidebar_notice = Some("Harness session ID copied".into());
+            self.show_notice(crate::toast::ToastKind::Success, "Harness session ID copied", cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -4754,7 +5014,7 @@ impl Shell {
             .map(str::to_owned);
         if let Some(path) = path {
             cx.write_to_clipboard(ClipboardItem::new_string(path));
-            self.sidebar_notice = Some("Path copied".into());
+            self.show_notice(crate::toast::ToastKind::Success, "Path copied", cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -5287,14 +5547,14 @@ impl Shell {
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some("Engine not connected".into());
+            self.show_notice(crate::toast::ToastKind::Error, "Engine not connected", cx);
             cx.notify();
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.show_notice(crate::toast::ToastKind::Error, format!("{err}"), cx);
                     cx.notify();
                 })
                 .ok();
@@ -5347,7 +5607,7 @@ impl Shell {
         if !revealed {
             // The sidebar explains its own refusals.
             if surface == ChatRenameSurface::Explorer {
-                self.sidebar_notice = Some("Open this side chat's parent to rename it".into());
+                self.show_notice(crate::toast::ToastKind::Error, "Open this side chat's parent to rename it", cx);
             }
             cx.notify();
             return;
@@ -5598,7 +5858,7 @@ impl Shell {
             zeron_proto::validate_sidebar_pin_update(&current, pins)
         };
         if let Err(message) = result {
-            self.sidebar_notice = Some(message.into());
+            self.show_notice(crate::toast::ToastKind::Error, message, cx);
             cx.notify();
             return false;
         }
@@ -5970,8 +6230,7 @@ impl Shell {
                         if local {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
-                        shell.sidebar_notice =
-                            Some(format!("Could not cancel sign-in: {err}").into());
+                        shell.show_notice(crate::toast::ToastKind::Error, format!("Could not cancel sign-in: {err}"), cx);
                     }
                 }
                 cx.notify();
@@ -6300,7 +6559,7 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
+                    shell.show_notice(crate::toast::ToastKind::Error, format!("Sign in failed: {err}"), cx);
                     cx.notify();
                 }
             })
@@ -6799,6 +7058,42 @@ impl Shell {
                     ))
             }))
             .into_any_element()
+    }
+
+    /// The sidebar's view options ride the titlebar at the sidebar's trailing
+    /// edge, sliding and fading with it as it collapses. They never cross
+    /// back over the control cluster on a narrow sidebar.
+    fn render_sidebar_options_titlebar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sidebar = self.sidebar_now();
+        let reveal = (sidebar / self.settings.sidebar_width.max(1.0)).clamp(0.0, 1.0);
+        if reveal <= 0.01 {
+            return None;
+        }
+        let cluster_end = self.eval_tween(
+            self.titlebar_tween,
+            cluster_buttons_start(
+                cfg!(target_os = "macos"),
+                self.fullscreen.unwrap_or(false),
+                self.linux_left_caption_count(),
+            ),
+        ) + CLUSTER_BUTTONS_WIDTH
+            + TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+        let left = (sidebar - Theme::SPACE_SM - 24.0).max(cluster_end + TITLEBAR_GROUP_GAP);
+        let theme = Theme::of(cx).clone();
+        let trigger = self.render_sidebar_view_trigger(&theme, cx);
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left(px(left))
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .pt(px(Theme::TITLEBAR_TOP_PAD))
+                .flex()
+                .items_center()
+                .opacity(reveal)
+                .child(trigger)
+                .into_any_element(),
+        )
     }
 
     /// The titlebar owns new-session creation regardless of sidebar state. It
@@ -8772,28 +9067,6 @@ impl Shell {
             // update strip — both above the user menu, below the lists.
             .when_some(github_star_banner, |el, banner| el.child(banner))
             .when_some(update_strip, |el, strip| el.child(strip))
-            // Inline mutation-failure notice.
-            .when_some(self.sidebar_notice.clone(), |el, notice| {
-                el.child(
-                    div()
-                        .id("sidebar-notice")
-                        .mx(px(Theme::SPACE_SM))
-                        .mb(px(Theme::SPACE_SM))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(4.0))
-                        .rounded(px(Theme::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(theme.danger)
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.danger)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_notice = None;
-                            cx.notify();
-                        }))
-                        .child(notice),
-                )
-            })
             .child(
                 div()
                     .p(px(Theme::SPACE_SM))
@@ -10087,45 +10360,49 @@ impl Shell {
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    // The Copy submenu floats outside this card: a press on
+                    // it is inside the menu.
+                    if this
+                        .chat_copy_bounds
+                        .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        return;
+                    }
                     this.close_chat_menu(cx);
                 }))
                 .flex()
                 .flex_col();
-            let menu = match menu_state.page {
-                _ if chat_id.is_empty() => menu,
-                ChatMenuPage::Root => menu
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
-                            .id("chat-menu-rename")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                // A side chat's title is edited on its row
-                                // under the file tree: dock the explorer
-                                // when the menu came from its tab.
-                                if is_side_chat && !this.files_panel_open(cx) {
-                                    this.add_files_surface(window, cx);
-                                }
-                                this.open_rename_chat(rename_id.clone(), cx)
-                            }))
-                            .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
-                            .child(SharedString::from("Rename")),
-                    )
-                    .when(!is_side_chat, |menu| {
-                        menu.child(
-                            popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
-                                .id("chat-menu-pin")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
-                                }))
-                                .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
-                                .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" })),
-                        )
-                        .child(
-                            popover::menu_row(
-                                &theme,
-                                false,
-                                format!("chat-menu-archive-{chat_id}"),
-                            )
+            let copy_open = menu_state.page == ChatMenuPage::Copy;
+            let menu = if chat_id.is_empty() {
+                menu
+            } else {
+                let rename = popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
+                    .id("chat-menu-rename")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // A side chat's title is edited on its row under the
+                        // file tree: dock the explorer when the menu came
+                        // from its tab.
+                        if is_side_chat && !this.files_panel_open(cx) {
+                            this.add_files_surface(window, cx);
+                        }
+                        this.open_rename_chat(rename_id.clone(), cx)
+                    }))
+                    .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
+                    .child(SharedString::from("Rename"));
+                let menu = menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_RENAME, rename, cx));
+                let menu = if is_side_chat {
+                    menu
+                } else {
+                    let pin = popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                        .id("chat-menu-pin")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
+                        }))
+                        .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" }));
+                    let archive =
+                        popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.archive_chat(archive_id.clone(), cx)
@@ -10135,166 +10412,46 @@ impl Shell {
                                     .size(px(16.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Archive")),
-                        )
-                        .child(
-                            popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
-                                .id("chat-menu-copy")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.open_chat_copy_menu(cx)),
-                                )
-                                .child(
-                                    icon(icons::COPY)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(div().flex_1().child(SharedString::from("Copy")))
-                                .child(
-                                    icon(icons::ALT_ARROW_RIGHT)
-                                        .size(px(14.0))
-                                        .text_color(theme.text_muted),
-                                ),
-                        )
-                    })
-                    .child(popover::menu_separator())
+                            .child(SharedString::from("Archive"));
+                    let copy = self.render_chat_copy_trigger(&chat_id, copy_open, &theme, cx);
+                    menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_PIN, pin, cx))
+                        .child(self.chat_menu_hover_row(CHAT_MENU_ROW_ARCHIVE, archive, cx))
+                        .child(self.chat_menu_hover_row(CHAT_MENU_ROW_COPY, copy, cx))
+                };
+                let delete = popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
+                    .id("chat-menu-delete")
+                    .text_color(theme.danger)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_chat_menu(cx);
+                        this.delete_confirm = Some(delete_id.clone());
+                        cx.notify();
+                    }))
                     .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
-                            .id("chat-menu-delete")
-                            .text_color(theme.danger)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_chat_menu(cx);
-                                this.delete_confirm = Some(delete_id.clone());
-                                cx.notify();
-                            }))
-                            .child(
-                                icon(icons::TRASH_BIN_MINIMALISTIC)
-                                    .size(px(16.0))
-                                    .text_color(theme.danger),
-                            )
-                            .child(SharedString::from("Delete…")),
-                    ),
-                ChatMenuPage::Copy => {
-                    let chat = self
-                        .state
-                        .read(cx)
-                        .chats
-                        .iter()
-                        .find(|chat| chat.id == chat_id)
-                        .cloned();
-                    let harness_link = chat
-                        .as_ref()
-                        .and_then(crate::links::harness_conversation_link);
-                    let session_id = chat
-                        .as_ref()
-                        .and_then(|chat| chat.harness_session_id.as_deref())
-                        .is_some_and(|id| !id.trim().is_empty());
-                    let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
-                    let zeron_id = chat_id.clone();
-                    let harness_id = chat_id.clone();
-                    let session_chat_id = chat_id.clone();
-                    let path_chat_id = chat_id.clone();
-                    menu.child(
-                        popover::menu_row(&theme, false, format!("chat-copy-back-{chat_id}"))
-                            .id("chat-copy-back")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(menu) = this.chat_menu.open_mut() {
-                                    menu.page = ChatMenuPage::Root;
-                                    cx.notify();
-                                }
-                            }))
-                            .child(
-                                icon(icons::ALT_ARROW_LEFT)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Back")),
+                        icon(icons::TRASH_BIN_MINIMALISTIC)
+                            .size(px(16.0))
+                            .text_color(theme.danger),
                     )
-                    .child(popover::menu_separator())
-                    .when(has_path, |menu| {
-                        menu.child(
-                            popover::menu_row(&theme, false, format!("chat-copy-path-{chat_id}"))
-                                .id("chat-copy-path")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_chat_path(&path_chat_id, cx)
-                                }))
-                                .child(
-                                    icon(icons::COPY)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Path")),
-                        )
-                    })
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-copy-zeron-{chat_id}"))
-                            .id("chat-copy-zeron")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_zeron_conversation_link(&zeron_id, cx)
-                            }))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Zeron conversation link")),
-                    )
-                    .when_some(harness_link, |menu, link| {
-                        menu.child(
-                            popover::menu_row(
-                                &theme,
-                                false,
-                                format!("chat-copy-harness-{chat_id}"),
-                            )
-                            .id("chat-copy-harness")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_harness_conversation_link(&harness_id, cx)
-                            }))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from(link.label)),
-                        )
-                    })
-                    .when(session_id, |menu| {
-                        menu.child(
-                            popover::menu_row(
-                                &theme,
-                                false,
-                                format!("chat-copy-session-{chat_id}"),
-                            )
-                            .id("chat-copy-session")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_harness_session_id(&session_chat_id, cx)
-                            }))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Harness session ID")),
-                        )
-                    })
-                }
+                    .child(SharedString::from("Delete…"));
+                menu.child(popover::menu_separator())
+                    .child(self.chat_menu_hover_row(CHAT_MENU_ROW_DELETE, delete, cx))
             };
             let mut menu = menu;
-            if let Some((key, surface)) = menu_state.tab
-                && matches!(menu_state.page, ChatMenuPage::Root)
-            {
+            if let Some((key, surface)) = menu_state.tab {
                 if !chat_id.is_empty() {
                     menu = menu.child(popover::menu_separator());
                 }
-                for (action, label) in [
+                for (ix, (action, label)) in [
                     (TabCloseAction::This, "Close tab"),
                     (TabCloseAction::Others, "Close other tabs"),
                     (TabCloseAction::Left, "Close tabs to the left"),
                     (TabCloseAction::Right, "Close tabs to the right"),
-                ] {
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     let enabled = !self.tabs_to_close(surface, action, cx).is_empty();
                     let key = key.clone();
-                    menu = menu.child(
-                        popover::menu_row(&theme, false, label)
+                    let row = popover::menu_row(&theme, false, label)
                             .id(SharedString::from(label))
                             .when(!enabled, |el| el.opacity(0.4).cursor_default())
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -10308,8 +10465,12 @@ impl Shell {
                                     }
                                 }
                             }))
-                            .child(label),
-                    );
+                            .child(label);
+                    menu = menu.child(self.chat_menu_hover_row(
+                        CHAT_MENU_ROW_TAB + ix as u8,
+                        row,
+                        cx,
+                    ));
                 }
             }
             let menu = menu.into_any_element();
@@ -10951,6 +11112,7 @@ impl Shell {
                     .child(self.render_terminal_container(terminal_geometry, window, cx))
             })
             .child(Self::attachment_drop_overlay(theme))
+            .child(Self::mention_drop_overlay(theme))
             .into_any_element()
     }
 
@@ -13691,6 +13853,7 @@ impl Render for Shell {
                             || self.sidebar_peek_mounted(),
                         |el| el.child(self.sidebar_peek_pointer_observer(cx)),
                     )
+                    .children(self.render_sidebar_options_titlebar(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
@@ -13711,6 +13874,8 @@ impl Render for Shell {
         } else {
             root
         };
+        // Toasts float over every phase and route.
+        let root = root.children(crate::toast::render_toaster(window, cx));
 
         // A manually-driven tween is mid-flight: keep frames coming (the same
         // scheduling `with_animation` would have requested). Hover color fades
@@ -13898,6 +14063,20 @@ mod tests {
         assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
+    }
+
+    #[test]
+    fn narrowest_sidebar_keeps_its_options_button_beside_the_titlebar_controls() {
+        for is_macos in [true, false] {
+            let cluster_end = cluster_buttons_start(is_macos, false, 0)
+                + CLUSTER_BUTTONS_WIDTH
+                + TITLEBAR_ACTION_SLOT_WIDTH;
+            let options_right = cluster_end + TITLEBAR_GROUP_GAP + 24.0;
+            assert!(
+                options_right + Theme::SPACE_SM <= SIDEBAR_MIN,
+                "options button ends at {options_right} in a {SIDEBAR_MIN} sidebar"
+            );
+        }
     }
 
     #[test]
@@ -18148,6 +18327,81 @@ mod settings_modal_regressions {
                 );
             })
             .unwrap();
+    }
+
+    /// The full shell draws its sidebar as a cached view after its own
+    /// render, so the lifted row must be built and drawn within one frame.
+    /// Carried out of the sidebar it follows the pointer, and dropped on a
+    /// conversation it becomes a chat chip in that composer.
+    #[gpui::test]
+    fn a_dragged_session_leaves_the_sidebar_and_drops_as_a_chat_mention(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        init_settings_test(settings::UiSettings::default(), dir.path(), cx);
+        let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
+        cx.simulate_resize(gpui::size(px(1200.0), px(800.0)));
+        shell.update(cx, |shell, cx| {
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.splash = SplashPhase::Gone;
+            shell.reduced_motion = true;
+            shell.settings.sidebar_organization = SidebarOrganization::InOneList;
+            shell.state.update(cx, |state, _| {
+                state.workspace_scope = Some(WorkspaceScope::Local);
+                state.local_device_id = Some("local".into());
+                state.chats = ["older", "newer"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, id)| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "title": format!("Chat {id}"), "deviceId": "local",
+                            "archived": false,
+                            "createdAt": Utc::now() - chrono::Duration::minutes(10 - ix as i64),
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+                state.selected_chat = Some("newer".into());
+            });
+            shell.active_chat = "newer".into();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let row = cx.debug_bounds("chat-older").expect("sidebar row");
+        let from = row.center();
+        cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+        // Several frames of dragging, inside the sidebar and then out of it.
+        for step in 1..=6 {
+            let x = from.x + px(4.0 + 120.0 * step as f32);
+            cx.simulate_mouse_move(
+                gpui::point(x, from.y + px(40.0)),
+                Some(MouseButton::Left),
+                gpui::Modifiers::default(),
+            );
+            cx.update(|window, cx| window.draw(cx).clear());
+        }
+        // The sidebar is a cached view, whose contents tests can't query by
+        // selector; the lifted row's own window position is the check.
+        let sidebar_width = shell.read_with(cx, |shell, _| shell.settings.sidebar_width);
+        shell.read_with(cx, |shell, _| {
+            let transfer = shell.sidebar_session_transfer.as_ref().expect("still dragging");
+            let left = transfer.slide_x.to;
+            let expected = f32::from(transfer.pointer.x - transfer.cursor_offset.x);
+            assert!(left > sidebar_width, "outside the sidebar the row follows the pointer");
+            assert!((left - expected).abs() < 0.5);
+        });
+        let drop = gpui::point(from.x + px(724.0), from.y + px(40.0));
+        cx.simulate_mouse_up(drop, MouseButton::Left, gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| {
+            let text = shell.composer.read(cx).input.read(cx).text().to_owned();
+            assert!(
+                text.contains("[Chat older](zeron-chat:older)"),
+                "the drop mentions the chat: {text:?}"
+            );
+            assert!(shell.sidebar_session_transfer.is_none());
+        });
     }
 
     #[gpui::test]

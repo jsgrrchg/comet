@@ -1439,10 +1439,10 @@ impl Repos {
     }
 
     /// The new-project picker is done with the home index: drop it now
-    /// unless a focused projectless chat pins it.
+    /// unless a projectless chat warmed it.
     pub fn release_home_folder_search(&self) {
         if let Ok(home) = home_search_root() {
-            self.inner.workspace_search.release_if_unpinned(&home);
+            self.inner.workspace_search.release_unless_warmed(&home);
         }
     }
 

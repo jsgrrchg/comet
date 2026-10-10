@@ -1,27 +1,20 @@
-//! Keeps the focused chat's workspace search index warm on its host, so the
-//! first `@`, file-tree or cmd+K search in a chat does not pay for the scan.
-//!
-//! Focusing a chat warms its index pinned and renews the pin every
-//! [`WARM_HEARTBEAT`]; leaving it releases the pin (`pin: false`), handing
-//! the index to the host's idle eviction. Hosts that predate
+//! Warms the focused chat's workspace search index on its host once, when
+//! the chat gains focus, so its first `@`, file-tree or cmd+K search does not
+//! pay for the scan. The host evicts the index after it sits unused (15 min)
+//! or for capacity; refocusing the chat warms it again. Hosts that predate
 //! `WarmWorkspaceSearch` are skipped silently.
 
-use std::time::Duration;
-
-use gpui::{Context, Task};
+use gpui::Context;
 
 use super::Shell;
 use crate::files::client::{FilesRequestContext, WorkspaceFilesClient};
 use crate::state::EngineHandle;
 
-/// Well inside the host's pin lifetime (`PIN_TTL`, 3 min).
-pub(super) const WARM_HEARTBEAT: Duration = Duration::from_secs(60);
-
+/// The focus last warmed, so unrelated state churn does not warm again.
 pub(super) struct SearchWarm {
     chat_id: String,
     context: FilesRequestContext,
     engine: EngineHandle,
-    _heartbeat: Task<()>,
 }
 
 impl SearchWarm {
@@ -31,7 +24,7 @@ impl SearchWarm {
 }
 
 impl Shell {
-    /// Follow the selected chat: pin its index, unpin the one left behind.
+    /// Follow the selected chat: warm its index when it gains focus.
     pub(super) fn sync_search_warm(&mut self, cx: &mut Context<Self>) {
         let (focused, engine) = {
             let state = self.state.read(cx);
@@ -41,31 +34,24 @@ impl Shell {
             });
             (focused, state.engine().cloned())
         };
-        let current = focused.as_ref().zip(engine.as_ref());
-        if let (Some(warm), Some(((chat_id, context), engine))) = (&self.search_warm, current)
-            && warm.is_for(chat_id, context, engine)
+        let (Some((chat_id, context)), Some(engine)) = (focused, engine) else {
+            self.search_warm = None;
+            return;
+        };
+        if self
+            .search_warm
+            .as_ref()
+            .is_some_and(|warm| warm.is_for(&chat_id, &context, &engine))
         {
             return;
         }
-        if let Some(previous) = self.search_warm.take() {
-            let client = WorkspaceFilesClient::new(previous.engine, previous.context);
-            cx.spawn(async move |_, _| client.hint_search_warm(false).await)
-                .detach();
-        }
-        let (Some((chat_id, context)), Some(engine)) = (focused, engine) else {
-            return;
-        };
         let client = WorkspaceFilesClient::new(engine.clone(), context.clone());
-        let heartbeat = cx.spawn(async move |_, cx| {
-            while client.hint_search_warm(true).await {
-                cx.background_executor().timer(WARM_HEARTBEAT).await;
-            }
-        });
+        cx.spawn(async move |_, _| client.hint_search_warm().await)
+            .detach();
         self.search_warm = Some(SearchWarm {
             chat_id,
             context,
             engine,
-            _heartbeat: heartbeat,
         });
     }
 }
@@ -119,13 +105,13 @@ mod tests {
         .unwrap()
     }
 
-    /// `(chatId, pin)` of every WarmWorkspaceSearch sent so far, answering each.
+    /// The chat ids of every WarmWorkspaceSearch sent so far, answering each.
     fn drain_warms(
         cx: &mut gpui::TestAppContext,
         runtime: &tokio::runtime::Runtime,
         requests: &mut tokio::sync::mpsc::Receiver<String>,
         replies: &tokio::sync::mpsc::Sender<String>,
-    ) -> Vec<(String, bool)> {
+    ) -> Vec<String> {
         let mut warms = Vec::new();
         loop {
             cx.run_until_parked();
@@ -134,10 +120,7 @@ mod tests {
             };
             let request: serde_json::Value = serde_json::from_str(&request).unwrap();
             if request["method"] == zeron_rpc::methods::WARM_WORKSPACE_SEARCH {
-                warms.push((
-                    request["params"]["chatId"].as_str().unwrap().to_owned(),
-                    request["params"]["pin"].as_bool().unwrap(),
-                ));
+                warms.push(request["params"]["chatId"].as_str().unwrap().to_owned());
             }
             let reply = serde_json::json!({ "id": request["id"], "ok": { "state": "ready" } });
             runtime.block_on(replies.send(reply.to_string())).unwrap();
@@ -145,7 +128,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn focusing_a_chat_pins_its_index_and_releases_the_previous(cx: &mut gpui::TestAppContext) {
+    fn focusing_a_chat_warms_its_index_once(cx: &mut gpui::TestAppContext) {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -168,10 +151,7 @@ mod tests {
                 });
             })
             .unwrap();
-        assert_eq!(
-            drain_warms(cx, &runtime, &mut requests, &replies),
-            vec![("a".to_owned(), true)]
-        );
+        assert_eq!(drain_warms(cx, &runtime, &mut requests, &replies), ["a"]);
 
         window
             .update(cx, |shell, _, cx| {
@@ -180,9 +160,8 @@ mod tests {
                     .update(cx, |state, cx| state.select_chat(Some("b".into()), cx));
             })
             .unwrap();
-        let mut warms = drain_warms(cx, &runtime, &mut requests, &replies);
-        warms.sort();
-        assert_eq!(warms, vec![("a".to_owned(), false), ("b".to_owned(), true)]);
+        // Leaving "a" sends nothing; the host's idle eviction owns it now.
+        assert_eq!(drain_warms(cx, &runtime, &mut requests, &replies), ["b"]);
 
         // Unrelated state churn does not re-send.
         window

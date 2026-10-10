@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let search = repos.workspace_search();
     let started = Instant::now();
-    search.warm(&root, false)?;
+    search.warm(&root)?;
     if !search.wait_until_indexed(&root, Duration::from_secs(600)) {
         return Err("index did not finish within 10 minutes".into());
     }

@@ -2055,7 +2055,7 @@ pub struct Shell {
     /// The New project palette's collapsed-breadcrumbs (`…`) menu.
     project_crumb_menu: popover::Popup<()>,
     command_palette: Option<command_palette::CommandPalette>,
-    /// The focused chat's pinned workspace search index (see `search_warm`).
+    /// The focus whose workspace search index was last warmed (see `search_warm`).
     search_warm: Option<search_warm::SearchWarm>,
     /// Per chat, the files opened in editor tabs, most recent first.
     recent_files: std::collections::HashMap<String, std::collections::VecDeque<String>>,

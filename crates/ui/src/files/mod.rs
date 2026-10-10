@@ -882,14 +882,14 @@ impl FilesSurface {
         self.started = true;
         self.load_directory(String::new(), None, cx);
         // Opening the tree is a strong hint a search follows; start the
-        // host's index now (unpinned: the focused chat's pin is the shell's).
+        // host's index now.
         if let (Some(engine), Some(context)) = (
             self.state.read(cx).engine().cloned(),
             self.request_context.clone(),
         ) {
             let client = WorkspaceFilesClient::new(engine, context);
             cx.spawn(async move |_, _| {
-                client.hint_search_warm(false).await;
+                client.hint_search_warm().await;
             })
             .detach();
         }

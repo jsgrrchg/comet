@@ -459,7 +459,7 @@ impl WorkspaceFiles {
     ) -> Result<WarmWorkspaceSearchResult, WorkspaceFilesError> {
         let workspace = self.resolve_target(&request.target).await?;
         let search = self.inner.repos.workspace_search().clone();
-        let state = tokio::task::spawn_blocking(move || search.warm(&workspace.root, request.pin))
+        let state = tokio::task::spawn_blocking(move || search.warm(&workspace.root))
             .await
             .map_err(|error| WorkspaceFilesError::Io(format!("search worker failed: {error}")))?
             .map_err(|error| WorkspaceFilesError::Io(error.to_string()))?;
@@ -2589,7 +2589,7 @@ mod tests {
         per_file: Option<u16>,
     ) -> Result<WorkspaceContentSearchResult, WorkspaceFilesError> {
         let search = WorkspaceSearch::new();
-        search.warm(root, false).unwrap();
+        search.warm(root).unwrap();
         let request = SearchWorkspaceContentRequest {
             target: WorkspaceTarget {
                 chat_id: Some("chat".into()),

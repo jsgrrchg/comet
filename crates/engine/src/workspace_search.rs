@@ -7,9 +7,8 @@
 //! bounded: an index idle for [`IDLE_EVICT`] is dropped, at most [`MAX_LIVE`]
 //! are alive at once (least recently used goes first), and the content cache
 //! of each one is capped at [`CACHE_BUDGET_BYTES`]. Indexes hold paths only:
-//! content search greps the indexed files without a bigram prefilter. A pinned index (the
-//! focused chat's, renewed by the UI heartbeat) is evicted for capacity only
-//! when every live index is pinned.
+//! content search greps the indexed files without a bigram prefilter. The UI
+//! warms the focused chat's index once, so its first search finds it built.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,20 +23,18 @@ use fff_search::{
 };
 
 /// An index nobody searched or warmed for this long is dropped.
-pub const IDLE_EVICT: Duration = Duration::from_secs(5 * 60);
+pub const IDLE_EVICT: Duration = Duration::from_secs(15 * 60);
 /// Live indexes at once; creating one more evicts the least recently used.
-pub const MAX_LIVE: usize = 3;
+/// Each runs its own file watcher, so the cap also bounds inotify use.
+pub const MAX_LIVE: usize = 7;
 /// Per-index cap on cached file contents (fff defaults to up to 512 MB).
 pub const CACHE_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
-/// A pin outlives the UI's 60 s warm heartbeat by a comfortable margin, so a
-/// client that disappears cannot keep its index alive forever.
-pub const PIN_TTL: Duration = Duration::from_secs(3 * 60);
 /// A search waits this long for the initial scan before answering from
 /// whatever is indexed so far (flagged `indexing`).
 pub const SCAN_WAIT: Duration = Duration::from_millis(300);
 /// Interactive content searches return partial results past this budget.
 pub const CONTENT_TIME_BUDGET: Duration = Duration::from_secs(2);
-const REAPER_INTERVAL: Duration = Duration::from_secs(30);
+const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 /// Ceiling for logging a finished scan; a scan still running then is not logged.
 const SCAN_LOG_WAIT: Duration = Duration::from_secs(10 * 60);
 
@@ -108,13 +105,18 @@ pub struct WorkspaceSearch {
 struct Inner {
     entries: Mutex<HashMap<PathBuf, Entry>>,
     clock: Clock,
+    /// Whether indexes run a file watcher; off only for eviction tests, which
+    /// need many indexes but no updates (each watcher is an inotify instance).
+    watch: bool,
     reaper_started: std::sync::Once,
 }
 
 struct Entry {
     picker: SharedFilePicker,
     last_used: Instant,
-    pinned_until: Option<Instant>,
+    /// A chat warmed it: it serves a conversation, not only a transient
+    /// caller such as the new-project folder picker.
+    warmed: bool,
 }
 
 impl Default for WorkspaceSearch {
@@ -125,23 +127,23 @@ impl Default for WorkspaceSearch {
 
 impl WorkspaceSearch {
     pub fn new() -> Self {
-        Self::with_clock(Arc::new(Instant::now))
+        Self::with_clock(Arc::new(Instant::now), true)
     }
 
-    fn with_clock(clock: Clock) -> Self {
+    fn with_clock(clock: Clock, watch: bool) -> Self {
         Self {
             inner: Arc::new(Inner {
                 entries: Mutex::new(HashMap::new()),
                 clock,
+                watch,
                 reaper_started: std::sync::Once::new(),
             }),
         }
     }
 
-    /// Start (or keep alive) the index for `root`. `pin` protects it from
-    /// capacity eviction for [`PIN_TTL`]; `pin: false` releases a pin.
-    pub fn warm(&self, root: &Path, pin: bool) -> Result<IndexState, WorkspaceSearchError> {
-        let picker = self.acquire(root, Some(pin))?;
+    /// Start (or keep alive) the index for a chat's `root`.
+    pub fn warm(&self, root: &Path) -> Result<IndexState, WorkspaceSearchError> {
+        let picker = self.acquire(root, true)?;
         Ok(if picker.wait_for_scan(Duration::ZERO) {
             IndexState::Ready
         } else {
@@ -158,7 +160,7 @@ impl WorkspaceSearch {
         limit: usize,
         kinds: NameKinds,
     ) -> Result<NameSearch, WorkspaceSearchError> {
-        let picker = self.acquire(root, None)?;
+        let picker = self.acquire(root, false)?;
         let indexing = !picker.wait_for_scan(SCAN_WAIT);
         if limit == 0 {
             return Ok(NameSearch {
@@ -236,7 +238,7 @@ impl WorkspaceSearch {
         limit: usize,
         per_file: usize,
     ) -> Result<ContentSearch, WorkspaceSearchError> {
-        let picker = self.acquire(root, None)?;
+        let picker = self.acquire(root, false)?;
         let indexing = !picker.wait_for_scan(SCAN_WAIT);
         if limit == 0 || per_file == 0 || query.trim().is_empty() {
             return Ok(ContentSearch {
@@ -308,16 +310,13 @@ impl WorkspaceSearch {
         }
     }
 
-    /// Drop `root`'s index now unless it is pinned (a focused chat's), for a
-    /// caller done with an index it may have started. `true` if dropped.
-    pub fn release_if_unpinned(&self, root: &Path) -> bool {
-        let now = (self.inner.clock)();
+    /// Drop `root`'s index now unless a chat warmed it, for a caller done
+    /// with an index it may have started. `true` if dropped.
+    pub fn release_unless_warmed(&self, root: &Path) -> bool {
         let removed = {
             let mut entries = lock(&self.inner.entries);
-            let pinned = entries
-                .get(root)
-                .is_some_and(|entry| entry.pinned_until.is_some_and(|until| until > now));
-            if pinned { None } else { entries.remove(root) }
+            let warmed = entries.get(root).is_some_and(|entry| entry.warmed);
+            if warmed { None } else { entries.remove(root) }
         };
         let Some(entry) = removed else {
             return false;
@@ -352,11 +351,8 @@ impl WorkspaceSearch {
         }
     }
 
-    fn acquire(
-        &self,
-        root: &Path,
-        pin: Option<bool>,
-    ) -> Result<SharedFilePicker, WorkspaceSearchError> {
+    /// `warm`: a chat is asking (see [`Entry::warmed`]).
+    fn acquire(&self, root: &Path, warm: bool) -> Result<SharedFilePicker, WorkspaceSearchError> {
         self.start_reaper();
         let now = (self.inner.clock)();
         let mut evicted = None;
@@ -364,24 +360,20 @@ impl WorkspaceSearch {
             let mut entries = lock(&self.inner.entries);
             if let Some(entry) = entries.get_mut(root) {
                 entry.last_used = now;
-                match pin {
-                    Some(true) => entry.pinned_until = Some(now + PIN_TTL),
-                    Some(false) => entry.pinned_until = None,
-                    None => {}
-                }
+                entry.warmed |= warm;
                 entry.picker.clone()
             } else {
                 if entries.len() >= MAX_LIVE {
-                    evicted = lru_victim(&entries, now)
+                    evicted = lru_victim(&entries)
                         .and_then(|victim| entries.remove(&victim).map(|entry| (victim, entry)));
                 }
-                let picker = create_picker(root)?;
+                let picker = create_picker(root, self.inner.watch)?;
                 entries.insert(
                     root.to_path_buf(),
                     Entry {
                         picker: picker.clone(),
                         last_used: now,
-                        pinned_until: (pin == Some(true)).then(|| now + PIN_TTL),
+                        warmed: warm,
                     },
                 );
                 picker
@@ -416,19 +408,14 @@ fn reap(inner: Weak<Inner>) {
     }
 }
 
-/// Least recently used unpinned index; the least recently used overall when
-/// every index is pinned (the live cap holds regardless).
-fn lru_victim(entries: &HashMap<PathBuf, Entry>, now: Instant) -> Option<PathBuf> {
-    let pinned = |entry: &Entry| entry.pinned_until.is_some_and(|until| until > now);
+fn lru_victim(entries: &HashMap<PathBuf, Entry>) -> Option<PathBuf> {
     entries
         .iter()
-        .filter(|(_, entry)| !pinned(entry))
         .min_by_key(|(_, entry)| entry.last_used)
-        .or_else(|| entries.iter().min_by_key(|(_, entry)| entry.last_used))
         .map(|(root, _)| root.clone())
 }
 
-fn create_picker(root: &Path) -> Result<SharedFilePicker, WorkspaceSearchError> {
+fn create_picker(root: &Path, watch: bool) -> Result<SharedFilePicker, WorkspaceSearchError> {
     let picker = SharedFilePicker::default();
     let started = Instant::now();
     FilePicker::new_with_shared_state(
@@ -444,7 +431,7 @@ fn create_picker(root: &Path) -> Result<SharedFilePicker, WorkspaceSearchError> 
             enable_content_indexing: false,
             mode: FFFMode::Neovim,
             cache_budget: ContentCacheBudget::from_overrides(0, CACHE_BUDGET_BYTES, 0),
-            watch: true,
+            watch,
             follow_symlinks: false,
             enable_fs_root_scanning: false,
             // Projectless chats live in the home folder; fff skips its dotfiles
@@ -541,7 +528,7 @@ mod tests {
         let clock = Arc::new(ManualClock(Mutex::new(Instant::now())));
         let reader = clock.clone();
         (
-            WorkspaceSearch::with_clock(Arc::new(move || *lock(&reader.0))),
+            WorkspaceSearch::with_clock(Arc::new(move || *lock(&reader.0)), false),
             clock,
         )
     }
@@ -558,7 +545,7 @@ mod tests {
     }
 
     fn ready(search: &WorkspaceSearch, root: &Path) -> SharedFilePicker {
-        search.warm(root, false).unwrap();
+        search.warm(root).unwrap();
         let picker = lock(&search.inner.entries)[root].picker.clone();
         assert!(picker.wait_for_indexing_complete(Duration::from_secs(20)));
         picker
@@ -620,16 +607,18 @@ mod tests {
     }
 
     #[test]
-    fn releasing_spares_a_pinned_index() {
+    fn releasing_spares_an_index_a_chat_warmed() {
         let (_a, a) = folder(&[("a.rs", b"")]);
         let (_b, b) = folder(&[("b.rs", b"")]);
         let search = WorkspaceSearch::new();
-        search.warm(&a, true).unwrap();
-        search.warm(&b, false).unwrap();
+        search.warm(&a).unwrap();
+        search
+            .search_names(&b, "b", 5, NameKinds::Directories)
+            .unwrap();
 
-        assert!(!search.release_if_unpinned(&a));
-        assert!(search.release_if_unpinned(&b));
-        assert!(!search.release_if_unpinned(&b));
+        assert!(!search.release_unless_warmed(&a));
+        assert!(search.release_unless_warmed(&b));
+        assert!(!search.release_unless_warmed(&b));
         let entries = lock(&search.inner.entries);
         assert!(entries.contains_key(&a));
         assert!(!entries.contains_key(&b));
@@ -656,9 +645,9 @@ mod tests {
         let (_a, a) = folder(&[("a.rs", b"")]);
         let (_b, b) = folder(&[("b.rs", b"")]);
         let (search, clock) = manual();
-        search.warm(&a, false).unwrap();
+        search.warm(&a).unwrap();
         clock.advance(IDLE_EVICT / 2);
-        search.warm(&b, false).unwrap();
+        search.warm(&b).unwrap();
         clock.advance(IDLE_EVICT / 2);
 
         search.evict_idle();
@@ -670,36 +659,20 @@ mod tests {
 
     #[test]
     fn creating_past_the_cap_evicts_the_least_recently_used() {
-        let folders: Vec<_> = (0..4).map(|_| folder(&[("x.rs", b"")])).collect();
+        let folders: Vec<_> = (0..=MAX_LIVE).map(|_| folder(&[("x.rs", b"")])).collect();
         let (search, clock) = manual();
-        for (_, root) in &folders[..3] {
-            search.warm(root, false).unwrap();
+        for (_, root) in &folders[..MAX_LIVE] {
+            search.warm(root).unwrap();
             clock.advance(Duration::from_secs(1));
         }
         // Touching the oldest makes the second the least recently used.
-        search.warm(&folders[0].1, false).unwrap();
+        search.warm(&folders[0].1).unwrap();
         clock.advance(Duration::from_secs(1));
 
-        search.warm(&folders[3].1, false).unwrap();
+        search.warm(&folders[MAX_LIVE].1).unwrap();
 
         let entries = lock(&search.inner.entries);
         assert_eq!(entries.len(), MAX_LIVE);
-        assert!(!entries.contains_key(&folders[1].1));
-    }
-
-    #[test]
-    fn a_pinned_index_survives_capacity_eviction() {
-        let folders: Vec<_> = (0..4).map(|_| folder(&[("x.rs", b"")])).collect();
-        let (search, clock) = manual();
-        search.warm(&folders[0].1, true).unwrap();
-        for (_, root) in &folders[1..] {
-            clock.advance(Duration::from_secs(1));
-            search.warm(root, false).unwrap();
-        }
-
-        let entries = lock(&search.inner.entries);
-        assert_eq!(entries.len(), MAX_LIVE);
-        assert!(entries.contains_key(&folders[0].1));
         assert!(!entries.contains_key(&folders[1].1));
     }
 

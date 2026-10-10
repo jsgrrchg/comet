@@ -29,14 +29,16 @@ returns:
   background and keeps itself current with its own file watcher.
 - A search waits up to 300 ms (`SCAN_WAIT`) for the initial scan, then answers
   from whatever is indexed; content answers carry `indexing: true` then.
-- Dropped after 5 minutes without a search or warm-up (`IDLE_EVICT`; a reaper
-  thread checks every 30 s).
-- At most 3 live indexes (`MAX_LIVE`); creating a fourth evicts the least
-  recently used. The focused chat's index is *pinned*: the UI warms it with
-  `pin: true` on focus and every 60 s, and releases the pin when focus moves.
-  A pin lasts 3 minutes (`PIN_TTL`) without renewal, so a vanished client
-  cannot keep an index alive. Pinned indexes are evicted for capacity only
-  when all three are pinned.
+- Dropped after 15 minutes without a search or warm-up (`IDLE_EVICT`; a
+  reaper thread checks every 60 s, so up to 16 minutes in practice).
+- At most 7 live indexes (`MAX_LIVE`); creating an eighth evicts the least
+  recently used. Each index runs its own file watcher, so the cap also bounds
+  inotify instances.
+- The UI warms the focused chat's index once, when the chat gains focus. There
+  is no heartbeat or pinning: a focused chat left without searches for 15
+  minutes loses its index and the next search (or refocus) rebuilds it.
+- An index a chat warmed survives `release_unless_warmed`, which the
+  new-project folder picker calls on the home index when it closes.
 - Each index caps its cached file contents at 16 MB (`CACHE_BUDGET_BYTES`);
   fff would otherwise size it up to 512 MB.
 - Eviction stops the scan and watcher, drops the index, and asks glibc to
@@ -131,7 +133,7 @@ build CPU from ~2.0 s to ~0.9 s.
   compiler is required on every platform) and `notify 9.0.0-rc` alongside our
   `notify 7`. `nucleo-matcher` is gone.
 - Threads: fff's global search and background pools, plus one watcher per
-  live index (at most three).
+  live index (at most seven).
 
 ## Reproduce
 

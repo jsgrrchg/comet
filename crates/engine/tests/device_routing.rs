@@ -1447,7 +1447,6 @@ async fn workspace_file_surface_proxies_over_the_relay() {
             methods::WARM_WORKSPACE_SEARCH,
             serde_json::json!({
                 "chatId": "chat-files",
-                "pin": true,
                 "targetDeviceId": "device-b",
             }),
         )

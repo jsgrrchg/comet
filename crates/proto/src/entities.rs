@@ -623,16 +623,13 @@ pub struct WorkspaceContentSearchResult {
     pub indexing: bool,
 }
 
-/// Start (or keep alive) the host's search index for a workspace. `pin`
-/// marks it as the focused chat's: the UI renews it every minute, and a
-/// pinned index is the last to be evicted. `pin: false` releases the pin.
+/// Start (or keep alive) the host's search index for a workspace, so the
+/// chat's first search finds it built.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WarmWorkspaceSearchRequest {
     #[serde(flatten)]
     pub target: WorkspaceTarget,
-    #[serde(default)]
-    pub pin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1472,10 +1469,10 @@ mod tests {
 
     #[test]
     fn warm_workspace_search_flattens_its_target() {
+        // Early clients also sent a `pin` flag; it is ignored now.
         let request: WarmWorkspaceSearchRequest =
-            serde_json::from_value(serde_json::json!({ "chatId": "chat-1" })).unwrap();
+            serde_json::from_value(serde_json::json!({ "chatId": "chat-1", "pin": true })).unwrap();
         assert_eq!(request.target.chat_id.as_deref(), Some("chat-1"));
-        assert!(!request.pin);
         assert_eq!(
             serde_json::to_value(WarmWorkspaceSearchResult {
                 state: WorkspaceSearchIndexState::Building,

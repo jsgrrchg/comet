@@ -798,7 +798,7 @@ impl Shell {
             }
             RowKind::Content(found) => {
                 let line = u32::try_from(found.line).unwrap_or(u32::MAX);
-                let column = u32::try_from(found.column + 1).ok();
+                let column = Some(FileColumn::Byte(found.column));
                 self.open_palette_path(found.path, false, Some((line, column)), window, cx)
             }
         }
@@ -810,7 +810,7 @@ impl Shell {
         &mut self,
         path: String,
         is_dir: bool,
-        location: Option<(u32, Option<u32>)>,
+        location: Option<(u32, Option<FileColumn>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {

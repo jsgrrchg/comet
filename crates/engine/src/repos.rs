@@ -1572,7 +1572,7 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
     let truncated = entries.len() > FOLDER_LIST_MAX_ENTRIES;
     entries.truncate(FOLDER_LIST_MAX_ENTRIES);
     Ok(FolderListing {
-        path: target.to_string_lossy().to_string(),
+        path: folder_browser_path(target),
         entries,
         truncated,
     })
@@ -2013,7 +2013,7 @@ fn search_folders_under(
         .into_iter()
         .take(limit)
         .map(|(relative, is_repo)| HomeFolderMatch {
-            path: home.join(&relative).to_string_lossy().into_owned(),
+            path: folder_browser_path(&home.join(&relative)),
             relative,
             is_repo,
         })
@@ -2022,6 +2022,15 @@ fn search_folders_under(
         matches,
         indexing: found.indexing,
     })
+}
+
+/// Keep canonical index keys internal. Ordinary Windows paths are easier for
+/// browser clients to compare with Home and existing spaces; retain extended
+/// paths when their length or names require them, and for UNC shares.
+fn folder_browser_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let path = dunce::simplified(path);
+    path.to_string_lossy().into_owned()
 }
 
 /// Re-rank fuzzy folder candidates `(relative path, is a repository)`, given
@@ -2517,7 +2526,7 @@ tmpfs /run tmpfs rw 0 0
         );
         assert_eq!(
             result.matches[0].path,
-            home.join("work/clients/comet").to_string_lossy()
+            folder_browser_path(&home.join("work/clients/comet"))
         );
         assert!(
             search_folders_under(&search, &home, "", 20)
@@ -2525,6 +2534,36 @@ tmpfs /run tmpfs rw 0 0
                 .matches
                 .is_empty()
         );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn browser_paths_preserve_native_posix_spelling() {
+        for path in [
+            "/home/ana/code",
+            "/Users/Ana/code",
+            r"/tmp/name\with\backslashes",
+        ] {
+            assert_eq!(folder_browser_path(Path::new(path)), path);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn browser_paths_simplify_only_safe_windows_drive_paths() {
+        assert_eq!(
+            folder_browser_path(Path::new(r"\\?\C:\Users\Ana\repo")),
+            r"C:\Users\Ana\repo"
+        );
+        for path in [
+            r"\\?\C:\repo.",
+            r"\\?\C:\NUL.txt",
+            r"\\?\UNC\server\share\repo",
+        ] {
+            assert_eq!(folder_browser_path(Path::new(path)), path);
+        }
+        let long = format!(r"\\?\C:\{}\{}", "a".repeat(150), "b".repeat(150));
+        assert_eq!(folder_browser_path(Path::new(&long)), long);
     }
 
     fn ranked(query: &str, candidates: &[(&str, bool)]) -> Vec<String> {

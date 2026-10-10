@@ -9,7 +9,10 @@
 //! Child module of `shell` so it renders straight off `Shell`'s private state.
 
 use super::*;
-use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
+use crate::pickers::{
+    breadcrumbs, browser_rows, completion_prefix_len, folder_path_key, parent_path,
+    same_folder_path,
+};
 use gpui::{FocusHandle, Window};
 use std::collections::HashSet;
 use zeron_proto::{
@@ -2570,6 +2573,8 @@ fn device_glyph(platform: &str) -> &'static str {
 /// `/media/ab`); a root base covers everything. Either separator counts, so
 /// Windows drive paths (`D:\` under `D:\`) work too.
 fn path_under(path: &str, base: &str) -> bool {
+    let path = folder_path_key(path);
+    let base = folder_path_key(base);
     let base = base.trim_end_matches(['/', '\\']);
     base.is_empty()
         || path
@@ -6077,6 +6082,7 @@ impl Shell {
                     .iter()
                     .map(|entry| crate::pickers::child_path(open, &entry.name))
                     .chain(std::iter::once(open.to_owned()))
+                    .map(|path| folder_path_key(&path))
                     .collect()
             })
             .unwrap_or_default();
@@ -6090,7 +6096,7 @@ impl Shell {
             .map(FolderRow::Local)
             .chain(
                 home.iter()
-                    .filter(|found| !listed.contains(&found.path))
+                    .filter(|found| !listed.contains(&folder_path_key(&found.path)))
                     .cloned()
                     .map(FolderRow::Home),
             )
@@ -6354,7 +6360,7 @@ impl Shell {
             .read(cx)
             .spaces
             .iter()
-            .find(|s| s.device_id == device.id && s.path == path)
+            .find(|s| s.device_id == device.id && same_folder_path(&s.path, &path))
             .map(|s| s.id.clone())
         {
             self.close_add_space(cx);
@@ -6440,7 +6446,7 @@ impl Shell {
                     .and_then(|(_, path)| path.as_deref())
                     .or(flow.home.as_deref());
                 let parent = listing
-                    .filter(|l| Some(l.path.as_str()) != root)
+                    .filter(|l| !root.is_some_and(|root| same_folder_path(&l.path, root)))
                     .and_then(|l| parent_path(&l.path));
                 if let Some(parent) = parent {
                     self.add_space_descend(parent, false, cx);
@@ -6853,7 +6859,11 @@ impl Shell {
                 .map(|l| l.path.clone())
                 .or(browser_path)
                 .or(root.clone());
-            let at_root = open_path.is_none() || open_path == root;
+            let at_root = open_path.is_none()
+                || open_path
+                    .as_deref()
+                    .zip(root.as_deref())
+                    .is_some_and(|(open, root)| same_folder_path(open, root));
             crumb_key.push_str(&name);
             specs.push(Crumb {
                 name: name.clone().into(),
@@ -6884,7 +6894,7 @@ impl Shell {
                     specs.push(Crumb {
                         name: name.into(),
                         glyph: None,
-                        current: full == open_path,
+                        current: same_folder_path(&full, &open_path),
                         target: CrumbTarget::Folder(full),
                     });
                 }
@@ -7535,6 +7545,11 @@ mod project_flow_tests {
         assert!(path_under(r"D:\Random", r"D:\"));
         assert!(!path_under(r"D:\Random2", r"D:\Random"));
         assert!(!path_under(r"C:\Random", r"D:\"));
+        assert!(path_under(r"\\?\D:\Random", r"D:\"));
+        assert!(path_under(r"D:\Random", r"\\?\D:\"));
+        assert!(path_under(r"\\?\UNC\server\share\repo", r"\\server\share\"));
+        assert!(!path_under(r"\\server\share2\repo", r"\\server\share\"));
+        assert!(!path_under(r"\\other\share\repo", r"\\server\share\"));
     }
 
     #[gpui::test]
@@ -8010,6 +8025,99 @@ mod home_folder_search_tests {
         assert_eq!(rows.len(), 2);
         assert!(matches!(&rows[0], FolderRow::Local(entry) if entry.name == "code"));
         assert!(matches!(&rows[1], FolderRow::Home(m) if m.relative == "dev/comet" && m.is_repo));
+    }
+
+    #[gpui::test]
+    fn remote_windows_home_matches_navigate_and_reuse_existing_spaces(cx: &mut TestAppContext) {
+        for (home, extended_home) in [
+            (r"C:\Users\Ana", r"\\?\C:\Users\Ana"),
+            (r"\\server\share\Ana", r"\\?\UNC\server\share\Ana"),
+        ] {
+            let (window, _dir, mut engine) = picker(cx, "remote");
+            cx.update(|cx| {
+                crate::history::init(
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                    cx,
+                );
+            });
+            engine.listing["path"] = home.into();
+            go_home(window, cx);
+            let warm = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+            engine.reply(
+                &warm[0],
+                serde_json::json!({ "matches": [], "indexing": false }),
+            );
+            type_query(window, "co", cx);
+            let search = engine.take(methods::SEARCH_HOME_FOLDERS, cx);
+            let code = format!("{extended_home}\\code");
+            let comet = format!("{code}\\comet");
+            engine.reply(
+                &search[0],
+                serde_json::json!({
+                    "matches": [found(&code, "code", false), found(&comet, "code/comet", true)],
+                    "indexing": false,
+                }),
+            );
+            cx.run_until_parked();
+            // Plain ListFolders and extended SearchHomeFolders paths refer
+            // to the same local row; only the nested match is added.
+            let listed = rows(window, cx);
+            assert_eq!(listed.len(), 2);
+            assert!(matches!(&listed[0], FolderRow::Local(entry) if entry.name == "code"));
+            window
+                .update(cx, |shell, _, cx| {
+                    shell.add_space.as_mut().unwrap().active = 1;
+                    shell.add_space_open_active(cx);
+                })
+                .unwrap();
+            let browse = engine.take(methods::LIST_FOLDERS, cx);
+            assert_eq!(browse[0]["params"]["path"], comet);
+            assert_eq!(browse[0]["params"]["targetDeviceId"], "remote");
+            engine.reply(
+                &browse[0],
+                serde_json::json!({
+                    "path": comet,
+                    "entries": [{ "name": "src", "isDir": true, "isRepo": false }],
+                }),
+            );
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, cx| shell.add_space_open_active(cx))
+                .unwrap();
+            let child = engine.take(methods::LIST_FOLDERS, cx);
+            assert_eq!(child[0]["params"]["path"], format!("{comet}\\src"));
+            engine.reply(
+                &child[0],
+                serde_json::json!({ "path": format!("{comet}\\src"), "entries": [] }),
+            );
+            cx.run_until_parked();
+            window
+                .update(cx, |shell, _, cx| shell.add_space_go_up(cx))
+                .unwrap();
+            let parent = engine.take(methods::LIST_FOLDERS, cx);
+            assert_eq!(parent[0]["params"]["path"], comet);
+            engine.reply(
+                &parent[0],
+                serde_json::json!({ "path": comet, "entries": [] }),
+            );
+            cx.run_until_parked();
+            window.update(cx, |shell, _, cx| {
+                shell.state.update(cx, |state, _| {
+                    state.spaces.push(serde_json::from_value(serde_json::json!({
+                        "id": "existing", "deviceId": "remote", "path": format!("{home}\\code\\comet"),
+                        "gitDetected": true, "createdAt": "2026-09-20T00:00:00Z",
+                    })).unwrap());
+                });
+                shell.submit_add_space(cx);
+                assert!(shell.add_space.is_none());
+                assert_eq!(shell.state.read(cx).selected_space.as_deref(), Some("existing"));
+                assert_eq!(shell.state.read(cx).spaces.len(), 1);
+            }).unwrap();
+            assert!(engine.take(methods::MUTATE, cx).is_empty());
+        }
     }
 
     #[gpui::test]

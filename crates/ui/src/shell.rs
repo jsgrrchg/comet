@@ -16365,6 +16365,43 @@ mod exit_regressions {
     }
 
     #[gpui::test]
+    fn pull_request_tabs_reorder_by_dragging(cx: &mut TestAppContext) {
+        let (shell, cx, _dir) = pull_request_shell(cx);
+        cx.update(|_, cx| motion::set_reduced_motion(cx, true));
+        cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+        shell.update(cx, |shell, cx| shell.open_pull_requests(cx));
+        cx.run_until_parked();
+        open_pull_request(cx, 1);
+        open_pull_request(cx, 2);
+        cx.update(|window, cx| window.draw(cx).clear());
+        let from = cx.debug_bounds("pull-request-tab-0").unwrap().center();
+        let to = cx.debug_bounds("pull-request-tab-1").unwrap().center();
+        cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+        // The first move starts the drag; the next one reports its slot.
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.update(|_, cx| assert!(cx.has_active_drag(), "tab drag never started"));
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.simulate_mouse_up(to, MouseButton::Left, gpui::Modifiers::default());
+        shell.read_with(cx, |shell, _| {
+            let urls: Vec<_> = shell
+                .pull_request_pane
+                .tabs
+                .iter()
+                .map(|tab| tab.url.as_str())
+                .collect();
+            assert_eq!(
+                urls,
+                [
+                    "https://github.com/a/b/pull/2",
+                    "https://github.com/a/b/pull/1"
+                ]
+            );
+            // The active pull request stays active in its new slot.
+            assert_eq!(shell.pull_request_pane.active_index(), Some(0));
+        });
+    }
+
+    #[gpui::test]
     fn pull_request_route_uses_full_window_without_titlebar_overlap(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         cx.update(|cx| {

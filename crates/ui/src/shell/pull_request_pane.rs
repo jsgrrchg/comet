@@ -24,6 +24,12 @@ pub(super) struct PullRequestTab {
     _subscription: Subscription,
 }
 
+/// Drag payload for reordering the pane's tabs.
+pub(super) struct PullRequestTabDrag {
+    from: usize,
+    title: SharedString,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct PullRequestTabMenu {
     ix: usize,
@@ -54,6 +60,8 @@ pub(super) struct PullRequestPane {
     pub(super) edge_bounce: Option<motion::ResizeEdgeBounce>,
     pub(super) resize_edge: Option<motion::ResizeEdge>,
     pub(super) tab_scroll: gpui::ScrollHandle,
+    /// Live drag-over state while a tab is dragged along the strip.
+    drag: Option<RightTabDragState>,
     /// A tab's context menu: Close, Close others, Close to the left/right.
     pub(super) menu: popover::Popup<PullRequestTabMenu>,
     /// The last closed tab's view, kept on screen while the pane animates
@@ -329,6 +337,55 @@ impl Shell {
         true
     }
 
+    /// Move a dragged tab to the slot it was dropped on. The active tab is
+    /// tracked by URL, so it stays active wherever it lands.
+    fn reorder_pull_request_tabs(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let tabs = &mut self.pull_request_pane.tabs;
+        if from < tabs.len() && to < tabs.len() && from != to {
+            let tab = tabs.remove(from);
+            tabs.insert(to, tab);
+            cx.notify();
+        }
+    }
+
+    /// Track the hovered drop slot mid-drag; epoch bumps restart the slide.
+    fn update_pull_request_tab_drag_over(
+        &mut self,
+        from: usize,
+        over: usize,
+        cx: &mut Context<Self>,
+    ) {
+        match &mut self.pull_request_pane.drag {
+            Some(drag) if drag.over != over => {
+                drag.prev_over = drag.over;
+                drag.over = over;
+                drag.epoch += 1;
+                cx.notify();
+            }
+            Some(_) => {}
+            None => {
+                self.pull_request_pane.drag = Some(RightTabDragState {
+                    from,
+                    over,
+                    epoch: 0,
+                    prev_over: from,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Finish a drag on the slot it was last over.
+    fn drop_pull_request_tab(&mut self, payload: &PullRequestTabDrag, cx: &mut Context<Self>) {
+        let to = self
+            .pull_request_pane
+            .drag
+            .take()
+            .map_or(payload.from, |drag| drag.over);
+        self.reorder_pull_request_tabs(payload.from, to, cx);
+        cx.notify();
+    }
+
     /// Close several tabs, keeping the active one where it survives.
     fn close_pull_request_tabs(&mut self, mut tabs: Vec<usize>, cx: &mut Context<Self>) {
         // Highest first, so earlier indices stay valid.
@@ -583,7 +640,19 @@ impl Shell {
     /// The pane's tabs, drawn in the titlebar band above it like the chat
     /// pane's surface tabs.
     pub(super) fn render_pull_request_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        use crate::surface_chrome::{TAB_CHIP_HEIGHT, TAB_CHIP_SLOT, TAB_CHIP_WIDTH};
         let theme = Theme::of(cx).clone();
+        // Heal drag state if the pointer was released outside the strip.
+        if self.pull_request_pane.drag.is_some() && !cx.has_active_drag() {
+            self.pull_request_pane.drag = None;
+        }
+        let drag = self
+            .pull_request_pane
+            .drag
+            .as_ref()
+            .map(|d| (d.from, d.over, d.epoch, d.prev_over));
+        let count = self.pull_request_pane.tabs.len();
+        let scroll = self.pull_request_pane.tab_scroll.clone();
         let active = self.pull_request_pane.active_index();
         let rows: Vec<_> = self
             .pull_request_pane
@@ -611,7 +680,22 @@ impl Shell {
             // Windows caption hit-testing includes the scroll-only hitboxes
             // behind each chip. Stop at the scroller so the titlebar cannot
             // claim tab clicks, while wheel events still reach this scroller.
-            .when(cfg!(target_os = "windows"), |strip| strip.occlude());
+            .when(cfg!(target_os = "windows"), |strip| strip.occlude())
+            // Drop math runs in content coordinates: viewport-relative x
+            // plus the scrolled-off width.
+            .on_drag_move::<PullRequestTabDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<PullRequestTabDrag>, _, cx| {
+                    let from = event.drag(cx).from;
+                    let x = f32::from(event.event.position.x)
+                        - f32::from(event.bounds.left())
+                        - f32::from(scroll.offset().x);
+                    let over = crate::terminal::panel::drop_index(x, TAB_CHIP_SLOT, count);
+                    this.update_pull_request_tab_drag_over(from, over, cx);
+                },
+            ))
+            .on_drop::<PullRequestTabDrag>(
+                cx.listener(|this, payload, _, cx| this.drop_pull_request_tab(payload, cx)),
+            );
         for (ix, (number, title, loading)) in rows.into_iter().enumerate() {
             let is_active = active == Some(ix);
             let label: SharedString = match number {
@@ -632,6 +716,7 @@ impl Shell {
                 crate::surface_chrome::tab_chip_icon(icons::PULL_REQUEST, is_active, &theme)
             };
             let tooltip = label.clone();
+            let ghost_title: SharedString = title.clone().into();
             let chip = crate::surface_chrome::tab_chip(
                 crate::surface_chrome::TabChip {
                     id: "pull-request-tab",
@@ -671,8 +756,51 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Middle,
                 cx.listener(move |this, _, _, cx| this.close_pull_request_tab(ix, cx)),
+            )
+            .on_drag(
+                PullRequestTabDrag {
+                    from: ix,
+                    title: ghost_title,
+                },
+                |payload, _point, _, cx| {
+                    let title = payload.title.clone();
+                    cx.stop_propagation();
+                    cx.new(|_| SurfaceTabGhost { title })
+                },
+            )
+            // The chip's hitbox cuts the strip out of the hover stack, so the
+            // chip receives the drop too (the chat strip's carve-out).
+            .on_drop::<PullRequestTabDrag>(
+                cx.listener(|this, payload, _, cx| this.drop_pull_request_tab(payload, cx)),
             );
-            strip = strip.child(chip);
+            // Siblings slide aside while a tab drags over them; the dragged
+            // tab leaves a spacer, the ghost carries it.
+            let wrapped: AnyElement = match drag {
+                Some((from, over, epoch, prev_over)) if ix != from => {
+                    let target =
+                        crate::terminal::panel::slide_offset(ix, from, over) * TAB_CHIP_SLOT;
+                    let start =
+                        crate::terminal::panel::slide_offset(ix, from, prev_over) * TAB_CHIP_SLOT;
+                    div()
+                        .relative()
+                        .child(chip.with_animation(
+                            (
+                                "pull-request-tab-slide",
+                                (ix as u64) | ((epoch as u64) << 32),
+                            ),
+                            TAB_SLIDE.animation(),
+                            move |el, t| el.left(px(motion::lerp(start, target, t))),
+                        ))
+                        .into_any_element()
+                }
+                Some((from, ..)) if ix == from => div()
+                    .w(px(TAB_CHIP_WIDTH))
+                    .h(px(TAB_CHIP_HEIGHT))
+                    .flex_none()
+                    .into_any_element(),
+                _ => chip.into_any_element(),
+            };
+            strip = strip.child(wrapped);
         }
         crate::surface_chrome::tab_strip_region(strip, &self.pull_request_pane.tab_scroll, &theme)
     }

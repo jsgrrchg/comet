@@ -11973,10 +11973,9 @@ impl Shell {
     /// (icon · title · ✕) plus the `+` menu — the t3code RightPanelTabs bar,
     /// living in the top row; the diff options moved into the pane below.
     pub(crate) fn render_right_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        /// Fixed chip slot — the terminal drawer's drag mechanics (drop-index
-        /// quantisation + slide offsets) assume uniform widths.
-        const CHIP_W: f32 = 112.0;
-        const CHIP_SLOT: f32 = CHIP_W + 4.0; // + the strip's own gap
+        use crate::surface_chrome::{
+            TAB_CHIP_HEIGHT as CHIP_H, TAB_CHIP_SLOT as CHIP_SLOT, TAB_CHIP_WIDTH as CHIP_W,
+        };
 
         let theme = Theme::of(cx).clone();
         // Heal drag state if the pointer was released outside the strip.
@@ -11991,14 +11990,6 @@ impl Shell {
             .as_ref()
             .map(|d| (d.from, d.over, d.epoch, d.prev_over));
 
-        // Fade flags from the LAST frame's scroll state (invisible lag).
-        // The EdgeFade scope below fades per-pixel on x for glyphs AND
-        // quads/images (fork 5d1f83d) — washes dissolve across the band.
-        const FADE_WIDTH: f32 = 36.0;
-        let scrolled = -f32::from(self.right_tab_scroll.offset().x);
-        let max_scroll = f32::from(self.right_tab_scroll.max_offset().x);
-        let fade_left = scrolled > 1.0;
-        let fade_right = scrolled < max_scroll - 1.0;
         // The old session-tab strip's proven scroll shape: the flex row IS
         // the scroller (id + overflow_x_scroll + track_scroll), wrapped in a
         // relative min_w_0 region below; drop math runs in CONTENT
@@ -12103,10 +12094,6 @@ impl Shell {
                 }),
                 _ => false,
             };
-            // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
-            // (same slot, no width jump) — the ✕ only shows while the tab is
-            // hovered (user request).
-            let group: SharedString = format!("right-surface-tab-{ix}").into();
             let ghost_title = title.clone();
             let workspace_path = self.workspace_path_for_surface(surface, cx);
             let accessible_name = detail.as_ref().unwrap_or(&title);
@@ -12115,94 +12102,106 @@ impl Shell {
             } else {
                 accessible_name.to_string()
             };
-            let chip = crate::surface_chrome::tab(("right-surface-tab", ix), is_active, &theme)
-                .debug_selector(|| format!("right-surface-tab-{ix}"))
-                .group(group.clone())
-                .h(px(24.0))
-                .w(px(CHIP_W))
-                .flex_none()
-                .px(px(4.0))
-                .rounded(px(6.0))
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(3.0))
-                .cursor_pointer()
-                .role(gpui::Role::Button)
-                .aria_label(accessible_label)
-                .when_some(detail, |chip, detail| {
-                    chip.tooltip(move |_, cx| {
-                        cx.new(|_| SurfaceTabTooltip {
-                            text: detail.clone(),
-                        })
-                        .into()
+            let leading = if subagent_running {
+                loaders::mini_glyph_spinner(
+                    format!("subagent-tab-{ix}"),
+                    2.0,
+                    theme.glyph,
+                    cx.entity_id(),
+                    cx,
+                )
+                .into_any_element()
+            } else if let Some(favicon) = browser_favicon {
+                gpui::img(favicon).size(px(12.0)).into_any_element()
+            } else if matches!(surface, RightSurface::File(_)) {
+                crate::file_icons::icon(
+                    crate::file_icons::FileIconIdentity::file(file_identity_path.as_ref()),
+                    theme.appearance,
+                )
+                .size(px(14.0))
+                .when(!is_active, |icon| icon.opacity(0.78))
+                .into_any_element()
+            } else {
+                crate::surface_chrome::tab_chip_icon(icon_path, is_active, &theme)
+            };
+            let chip = crate::surface_chrome::tab_chip(
+                crate::surface_chrome::TabChip {
+                    id: "right-surface-tab",
+                    close_id: "right-surface-close",
+                    ix,
+                    active: is_active,
+                    title,
+                    dirty,
+                    leading,
+                },
+                &theme,
+                cx.listener(move |this, _, window, cx| {
+                    this.close_right_surface(surface, window, cx);
+                }),
+            )
+            .aria_label(accessible_label)
+            .when_some(detail, |chip, detail| {
+                chip.tooltip(move |_, cx| {
+                    cx.new(|_| SurfaceTabTooltip {
+                        text: detail.clone(),
                     })
-                    .tooltip_show_delay(Duration::from_millis(350))
+                    .into()
                 })
-                // The old session-tab strip's solved carve-out: NOT
-                // `.occlude()` — a BlockMouse hitbox ends the hit test,
-                // so the scroll container behind the tabs never saw
-                // wheel events and an overflowing strip could not be
-                // scrolled (tabs tile the whole region). ExceptScroll
-                // keeps the titlebar drag-region carve-out and lets the
-                // strip scroll.
-                .block_mouse_except_scroll()
-                .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                    window.prevent_default()
-                })
-                .on_click(cx.listener(move |this, _, window, cx| {
+                .tooltip_show_delay(Duration::from_millis(350))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                this.activate_right_surface(surface, window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    let chat_id = match surface {
+                        RightSurface::SideChat(id) => this
+                            .side_chats
+                            .get(&id)
+                            .and_then(|tab| tab.state.read(cx).selected_chat.clone())
+                            .unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    this.chat_menu.open(ChatMenuState {
+                        chat_id,
+                        tab: Some((this.panel_key(cx), surface)),
+                        position: event.position,
+                        page: ChatMenuPage::Root,
+                    });
+                    cx.notify();
+                }),
+            )
+            // Middle-click closes, like every tab strip.
+            .on_mouse_down(
+                gpui::MouseButton::Middle,
+                cx.listener(move |this, _, window, cx| {
+                    this.close_right_surface(surface, window, cx);
+                }),
+            )
+            .on_drag(
+                RightTabDrag {
+                    panel_key: self.panel_key(cx),
+                    from: ix,
+                    title: ghost_title,
+                    workspace_path,
+                },
+                |payload, _point, _, cx| {
+                    let title = payload.title.clone();
                     cx.stop_propagation();
-                    this.activate_right_surface(surface, window, cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        let chat_id = match surface {
-                            RightSurface::SideChat(id) => this
-                                .side_chats
-                                .get(&id)
-                                .and_then(|tab| tab.state.read(cx).selected_chat.clone())
-                                .unwrap_or_default(),
-                            _ => String::new(),
-                        };
-                        this.chat_menu.open(ChatMenuState {
-                            chat_id,
-                            tab: Some((this.panel_key(cx), surface)),
-                            position: event.position,
-                            page: ChatMenuPage::Root,
-                        });
-                        cx.notify();
-                    }),
-                )
-                // Middle-click closes, like every tab strip.
-                .on_mouse_down(
-                    gpui::MouseButton::Middle,
-                    cx.listener(move |this, _, window, cx| {
-                        this.close_right_surface(surface, window, cx);
-                    }),
-                )
-                .on_drag(
-                    RightTabDrag {
-                        panel_key: self.panel_key(cx),
-                        from: ix,
-                        title: ghost_title,
-                        workspace_path,
-                    },
-                    |payload, _point, _, cx| {
-                        let title = payload.title.clone();
-                        cx.stop_propagation();
-                        cx.new(|_| SurfaceTabGhost { title })
-                    },
-                )
-                // The chip's BlockMouse hitbox (the titlebar/scroll carve-out
-                // below) cuts the strip out of the hover stack, so the
-                // strip's own on_drop can never fire while the pointer is
-                // over a chip — tabs tile the strip. Receiving the drop on
-                // the chip itself keeps drag-reorder working without giving
-                // up the carve-out. The bubble dispatch reaches the chip
-                // before the strip, and the handler consumes the drag, so
-                // the two never double-apply.
-                .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
+                    cx.new(|_| SurfaceTabGhost { title })
+                },
+            )
+            // The chip's BlockMouse hitbox (the titlebar/scroll carve-out)
+            // cuts the strip out of the hover stack, so the strip's own
+            // on_drop can never fire while the pointer is over a chip — tabs
+            // tile the strip. Receiving the drop on the chip itself keeps
+            // drag-reorder working without giving up the carve-out. The
+            // bubble dispatch reaches the chip before the strip, and the
+            // handler consumes the drag, so the two never double-apply.
+            .on_drop::<RightTabDrag>(cx.listener(
+                move |this, payload: &RightTabDrag, _, cx| {
                     if payload.panel_key != this.panel_key(cx) {
                         this.right_tab_drag = None;
                         cx.notify();
@@ -12215,114 +12214,9 @@ impl Shell {
                         .unwrap_or(payload.from);
                     this.right_tab_drag = None;
                     this.reorder_right_tabs(payload.from, to, cx);
-                }))
-                .child(
-                    // Leading slot: the surface's icon.
-                    div()
-                        .flex_none()
-                        .size(px(18.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(if subagent_running {
-                            loaders::mini_glyph_spinner(
-                                format!("subagent-tab-{ix}"),
-                                2.0,
-                                theme.glyph,
-                                cx.entity_id(),
-                                cx,
-                            )
-                            .into_any_element()
-                        } else if let Some(favicon) = browser_favicon {
-                            gpui::img(favicon).size(px(12.0)).into_any_element()
-                        } else if matches!(surface, RightSurface::File(_)) {
-                            crate::file_icons::icon(
-                                crate::file_icons::FileIconIdentity::file(
-                                    file_identity_path.as_ref(),
-                                ),
-                                theme.appearance,
-                            )
-                            .size(px(14.0))
-                            .when(!is_active, |icon| icon.opacity(0.78))
-                            .into_any_element()
-                        } else {
-                            icon(icon_path)
-                                .size(px(12.0))
-                                .text_color(if is_active {
-                                    theme.text_muted
-                                } else {
-                                    theme.text_muted.opacity(0.7)
-                                })
-                                .into_any_element()
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(crate::typography::ui_rems(11.5))
-                        .text_color(if is_active {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
-                        .child(title),
-                )
-                .child(
-                    // Trailing slot: the unsaved dot normally, ✕ on tab
-                    // hover — two stacked layers opacity-swapped by the
-                    // group hover.
-                    div()
-                        .id(("right-surface-close", ix))
-                        .debug_selector(|| format!("right-surface-close-{ix}"))
-                        .flex_none()
-                        .size(px(18.0))
-                        .rounded(px(4.0))
-                        .relative()
-                        .role(gpui::Role::Button)
-                        .aria_label("Close tab")
-                        .tooltip(crate::settings::widgets::text_tooltip("Close tab"))
-                        .hover(|s| s.bg(crate::theme::wash(0.12)))
-                        // The tab owns a drag payload. Claim the close press
-                        // before it reaches that parent or GPUI starts a tab
-                        // drag instead of delivering the close click.
-                        .on_mouse_down(gpui::MouseButton::Left, |_, window, cx| {
-                            window.prevent_default();
-                            cx.stop_propagation();
-                        })
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            this.close_right_surface(surface, window, cx);
-                        }))
-                        .when(dirty, |slot| {
-                            slot.child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .group_hover(group.clone(), |s| s.opacity(0.0))
-                                    .child(div().size(px(6.0)).rounded_full().bg(theme.text_muted)),
-                            )
-                        })
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .opacity(0.0)
-                                .group_hover(group.clone(), |s| s.opacity(1.0))
-                                .child(
-                                    icon(icons::CLOSE)
-                                        .size(px(12.0))
-                                        .text_color(theme.text_muted),
-                                ),
-                        ),
-                );
+                },
+            ));
+
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the
@@ -12343,7 +12237,7 @@ impl Shell {
                 }
                 Some((from, ..)) if ix == from => div()
                     .w(px(CHIP_W))
-                    .h(px(24.0))
+                    .h(px(CHIP_H))
                     .flex_none()
                     .into_any_element(),
                 _ => chip.into_any_element(),
@@ -12486,56 +12380,7 @@ impl Shell {
         // The empty-state picker already offers every surface. Show a single
         // Chrome-style add-tab affordance only after at least one tab exists.
         strip = strip.when(count > 0, |strip| strip.child(plus));
-        // Edge fades on whichever side hides tabs (flags computed above).
-        // Glass: per-glyph EdgeFade scope over the chips' own opacity ramps;
-        // opaque: painted gradients in the shell surface tone.
-        let glass = theme.is_glass();
-        let bar_bg = theme.surface;
-        let region = div()
-            .relative()
-            .min_w_0()
-            .size_full()
-            .flex()
-            .items_center()
-            .child(strip)
-            .when(fade_left && !glass, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(FADE_WIDTH))
-                        .bg(gpui::linear_gradient(
-                            90.0,
-                            gpui::linear_color_stop(bar_bg, 0.0),
-                            gpui::linear_color_stop(bar_bg.opacity(0.0), 1.0),
-                        )),
-                )
-            })
-            .when(fade_right && !glass, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(FADE_WIDTH))
-                        .bg(gpui::linear_gradient(
-                            270.0,
-                            gpui::linear_color_stop(bar_bg, 0.0),
-                            gpui::linear_color_stop(bar_bg.opacity(0.0), 1.0),
-                        )),
-                )
-            });
-        if glass {
-            crate::edge_fade::edge_faded(FADE_WIDTH, false, false, region)
-                .fade_left(fade_left)
-                .fade_right(fade_right)
-                .into_any_element()
-        } else {
-            region.into_any_element()
-        }
+        crate::surface_chrome::tab_strip_region(strip, &self.right_tab_scroll, &theme)
     }
 
     /// Toggle the changes-panel takeover (the header's expand button, t3code

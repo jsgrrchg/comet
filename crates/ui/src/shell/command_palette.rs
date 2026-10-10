@@ -21,6 +21,8 @@ const CONTENT_MATCHES_PER_FILE: usize = 3;
 const MIN_WORKSPACE_QUERY_CHARS: usize = 2;
 /// Content search waits for typing to pause; name search does not.
 const CONTENT_DEBOUNCE: Duration = Duration::from_millis(80);
+/// Refresh partial results until the host finishes its initial scan.
+const CONTENT_INDEX_RETRY: Duration = Duration::from_millis(500);
 const RESULTS_FADE_BAND: f32 = 18.0;
 
 pub(super) struct CommandPalette {
@@ -513,18 +515,31 @@ impl Shell {
         };
         palette.content.task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(CONTENT_DEBOUNCE).await;
-            let result = client
-                .search_content(request)
-                .await
-                .map(|found| (found.matches, found.indexing));
-            this.update(cx, |shell, cx| {
-                if let Some(palette) = shell.command_palette.as_mut()
-                    && palette.content.finish(generation, result, "content")
-                {
-                    cx.notify();
+            loop {
+                let result = client
+                    .search_content(request.clone())
+                    .await
+                    .map(|found| (found.matches, found.indexing));
+                let retry = this
+                    .update(cx, |shell, cx| {
+                        let Some(palette) = shell.command_palette.as_mut() else {
+                            return false;
+                        };
+                        if !palette.content.finish(generation, result, "content") {
+                            return false;
+                        }
+                        cx.notify();
+                        palette.content.indexing
+                    })
+                    .unwrap_or(false);
+                if !retry {
+                    break;
                 }
-            })
-            .ok();
+                // Keep partial rows and their selection visible. Replacing the
+                // query or closing the palette drops this task, cancelling the
+                // wait as well as any in-flight request.
+                cx.background_executor().timer(CONTENT_INDEX_RETRY).await;
+            }
         }));
     }
 
@@ -1942,6 +1957,140 @@ mod tests {
         engine.reply(&requests[0], content_answer(Vec::new(), false));
         cx.run_until_parked();
         assert!(palette_section(window, Section::InFiles, cx).is_none());
+    }
+
+    #[gpui::test]
+    fn content_search_refreshes_partial_results_until_indexed(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "needle", cx);
+        let first = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        engine.reply(&first[0], content_answer(Vec::new(), true));
+        cx.run_until_parked();
+        assert!(
+            engine
+                .take(methods::SEARCH_WORKSPACE_CONTENT, cx)
+                .is_empty()
+        );
+
+        cx.executor().advance_clock(CONTENT_INDEX_RETRY);
+        let second = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0]["params"], first[0]["params"]);
+        engine.reply(
+            &second[0],
+            content_answer(vec![content_match("src/lib.rs", 2)], true),
+        );
+        cx.run_until_parked();
+        let partial = palette_section(window, Section::InFiles, cx).unwrap();
+        assert_eq!(partial.rows.len(), 1);
+        assert_eq!(partial.status.as_deref(), Some("Indexing…"));
+        let selected = partial.rows[0].key();
+        window
+            .update(cx, |shell, _, cx| {
+                shell.select_palette_tab(Tab::Files, cx);
+                shell.command_palette.as_mut().unwrap().active = Some(selected.clone());
+            })
+            .unwrap();
+
+        cx.executor().advance_clock(CONTENT_INDEX_RETRY);
+        let third = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        assert_eq!(third.len(), 1);
+        assert_eq!(third[0]["params"], first[0]["params"]);
+        assert_eq!(palette_section(window, Section::InFiles, cx), Some(partial));
+        engine.reply(
+            &third[0],
+            content_answer(
+                vec![
+                    content_match("src/lib.rs", 1),
+                    content_match("src/lib.rs", 2),
+                ],
+                false,
+            ),
+        );
+        cx.run_until_parked();
+        let complete = palette_section(window, Section::InFiles, cx).unwrap();
+        assert_eq!(complete.rows.len(), 2);
+        assert_eq!(complete.status, None);
+        window
+            .read_with(cx, |shell, cx| {
+                let sections = shell.palette_sections(cx);
+                let rows = flat_rows(&sections);
+                let palette = shell.command_palette.as_ref().unwrap();
+                assert_eq!(rows[palette.active_position(&rows)].key(), selected);
+            })
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(
+            engine
+                .take(methods::SEARCH_WORKSPACE_CONTENT, cx)
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    fn changing_the_query_cancels_content_index_retries(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "needle", cx);
+        let first = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        engine.reply(&first[0], content_answer(Vec::new(), true));
+        cx.run_until_parked();
+
+        type_query(window, "updated", cx);
+        cx.run_until_parked();
+        cx.executor().advance_clock(CONTENT_INDEX_RETRY);
+        let updated = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0]["params"]["query"], "updated");
+        engine.reply(&updated[0], content_answer(Vec::new(), false));
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(
+            engine
+                .take(methods::SEARCH_WORKSPACE_CONTENT, cx)
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    fn closing_the_palette_cancels_content_index_retries(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "needle", cx);
+        let first = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        engine.reply(&first[0], content_answer(Vec::new(), true));
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, window, cx| {
+                shell.close_command_palette(window, cx)
+            })
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(
+            engine
+                .take(methods::SEARCH_WORKSPACE_CONTENT, cx)
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    fn content_index_retries_stop_on_error(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "needle", cx);
+        let first = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        engine.reply(&first[0], content_answer(Vec::new(), true));
+        cx.run_until_parked();
+        cx.executor().advance_clock(CONTENT_INDEX_RETRY);
+        let retry = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        assert_eq!(retry.len(), 1);
+        engine.fail(&retry[0], "search failed");
+        cx.run_until_parked();
+        let section = palette_section(window, Section::InFiles, cx).unwrap();
+        assert_eq!(section.status.as_deref(), Some("Search failed"));
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(
+            engine
+                .take(methods::SEARCH_WORKSPACE_CONTENT, cx)
+                .is_empty()
+        );
     }
 
     #[gpui::test]

@@ -7545,6 +7545,8 @@ mod project_flow_tests {
         assert!(path_under(r"D:\Random", r"D:\"));
         assert!(!path_under(r"D:\Random2", r"D:\Random"));
         assert!(!path_under(r"C:\Random", r"D:\"));
+        assert!(path_under(r"c:\Random\repo", r"C:\Random"));
+        assert!(!path_under(r"C:\random\repo", r"C:\Random"));
         assert!(path_under(r"\\?\D:\Random", r"D:\"));
         assert!(path_under(r"D:\Random", r"\\?\D:\"));
         assert!(path_under(r"\\?\UNC\server\share\repo", r"\\server\share\"));

@@ -374,11 +374,26 @@ pub fn folder_path_key(path: &str) -> String {
     } else {
         windows.root.replace('/', "\\")
     };
+    // Drive letters never distinguish case (`c:` is `C:`). Folder names keep
+    // theirs: a directory can be made case-sensitive (`fsutil
+    // setCaseSensitiveInfo`), so `Repo` and `repo` may be different folders.
+    let root = uppercase_drive_letter(root);
     if rest.is_empty() {
         format!("{root}\\")
     } else {
         format!("{root}\\{rest}")
     }
+}
+
+/// `c:` → `C:`, also behind an extended `\\?\` prefix; other roots unchanged.
+fn uppercase_drive_letter(mut root: String) -> String {
+    let drive = root.strip_prefix(r"\\?\").unwrap_or(&root);
+    let bytes = drive.as_bytes();
+    if bytes.len() == 2 && bytes[1] == b':' && bytes[0].is_ascii_lowercase() {
+        let at = root.len() - 2;
+        root[at..at + 1].make_ascii_uppercase();
+    }
+    root
 }
 
 pub fn same_folder_path(left: &str, right: &str) -> bool {
@@ -9519,6 +9534,12 @@ mod tests {
         ));
         assert!(!same_folder_path(r"C:\repo", r"D:\repo"));
         assert!(!same_folder_path(r"C:\Repo", r"C:\repo"));
+        // Only the drive letter is case-insensitive.
+        assert!(same_folder_path(r"c:\Users\Ana", r"C:\Users\Ana"));
+        assert!(same_folder_path(r"c:/Users/Ana/", r"\\?\C:\Users\Ana"));
+        assert!(same_folder_path(r"\\?\c:\repo.", r"\\?\C:\repo."));
+        assert!(same_folder_path(r"d:\", r"D:\"));
+        assert!(!same_folder_path(r"c:\users\ana", r"C:\Users\Ana"));
         // Extended paths can refer to names with different Win32 semantics.
         for name in ["repo.", "repo ", "..", "NUL.txt", "COM¹"] {
             assert!(!same_folder_path(

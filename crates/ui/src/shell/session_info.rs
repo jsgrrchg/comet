@@ -1,8 +1,9 @@
 //! The session card: where this chat runs (device, project, branch), its
 //! side-chat actions, and the project's run actions, in one toggleable card.
-//! With room, the card docks at the right of the main column and the
-//! transcript keeps to its left (staying centered when it fits); on a narrow
-//! column it floats over the transcript's top-right corner instead.
+//! When the centered transcript leaves room at the column's right, the card
+//! shows there on its own (until the user hides it); on a tighter column it
+//! stays hidden, and opening it floats it over the transcript. The card never
+//! takes room from the transcript.
 use super::*;
 
 use crate::project_actions::{ProjectActionsStatus, action_icon};
@@ -14,46 +15,13 @@ const SESSION_CARD_INSET: f32 = 12.0;
 const SESSION_CARD_GAP: f32 = 24.0;
 /// The transcript's own side gutters (its rows pad 48px each side).
 const TRANSCRIPT_GUTTER: f32 = 48.0;
-/// Below this reading-column width the card floats rather than docking.
-const DOCKED_MIN_COLUMN: f32 = 480.0;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct SessionCardLayout {
-    /// Docked at the column's right (else floating over the transcript).
-    pub docked: bool,
-    /// Room the transcript holds free on its right while docked: none while
-    /// its centered column already clears the card.
-    pub reserve: f32,
-    /// The card's left edge within the main column.
-    pub left: f32,
-}
-
-/// Where the card sits in a main column `main` wide, for a configured
-/// reading width `transcript`. Either way the card hugs the right edge.
-/// Docked, the transcript stays centered on the whole column while it
-/// clears the card by the gap; otherwise it shifts left just enough, and
-/// only then narrows.
-pub(super) fn session_card_layout(main: f32, transcript: f32) -> SessionCardLayout {
-    let left = (main - SESSION_CARD_WIDTH - SESSION_CARD_INSET).max(0.0);
-    // The most the transcript can give up: its right gutter then ends at
-    // the gap before the card.
-    let max_reserve = SESSION_CARD_WIDTH + SESSION_CARD_INSET + SESSION_CARD_GAP - TRANSCRIPT_GUTTER;
-    let docked = main - 2.0 * TRANSCRIPT_GUTTER - max_reserve >= DOCKED_MIN_COLUMN;
-    if !docked {
-        return SessionCardLayout {
-            docked: false,
-            reserve: 0.0,
-            left,
-        };
-    }
-    // Centered in `main - reserve`, the column's right edge is
-    // (main - reserve) / 2 + transcript / 2; keep it at `left - gap`.
-    let needed = main + transcript - 2.0 * (left - SESSION_CARD_GAP);
-    SessionCardLayout {
-        docked: true,
-        reserve: needed.clamp(0.0, max_reserve),
-        left,
-    }
+/// Whether a main column `main` wide fits the card beside the centered
+/// reading column (configured `transcript` wide) without moving it.
+pub(super) fn session_card_fits(main: f32, transcript: f32) -> bool {
+    let column = transcript.min(main - 2.0 * TRANSCRIPT_GUTTER).max(0.0);
+    let card_left = main - SESSION_CARD_WIDTH - SESSION_CARD_INSET;
+    main / 2.0 + column / 2.0 <= card_left - SESSION_CARD_GAP
 }
 
 /// A non-interactive card row: icon slot, label, optional trailing detail.
@@ -79,35 +47,82 @@ fn row_glyph(path: &'static str, theme: &Theme) -> AnyElement {
 }
 
 impl Shell {
-    /// The persisted open state; the card only exists for a selected chat.
-    pub(super) fn session_info_open(&self) -> bool {
-        self.settings.session_info_open
+    /// Whether the main column, at its LIVE width, fits the card beside the
+    /// transcript: while the sidebar or a pane animates, the settled width
+    /// would show or hide the card ahead of the column.
+    pub(super) fn session_info_fits(&self, cx: &App) -> bool {
+        let main = (self.viewport_width
+            - self.sidebar_now()
+            - self.right_visible_width(cx)
+            - self.files_visible_width(cx))
+        .max(0.0);
+        session_card_fits(main, crate::settings::transcript_width(cx))
+    }
+
+    /// Beside the transcript it shows unless hidden; over it, only while
+    /// opened.
+    pub(super) fn session_info_visible(&self, cx: &App) -> bool {
+        if self.session_info_fits(cx) {
+            !self.settings.session_info_hidden
+        } else {
+            self.session_info_overlay
+        }
+    }
+
+    /// The toggle's mouse-down: note whether the card showed, so the click
+    /// that follows closes it rather than reopening it. Reads the last
+    /// painted state, which the overlay's click-outside dismissal (handled
+    /// on the same press, in either order) leaves alone.
+    pub(super) fn note_session_info_press(&mut self) {
+        self.session_info_pressed_open = Some(self.session_info_shown);
     }
 
     pub(super) fn toggle_session_info(&mut self, cx: &mut Context<Self>) {
-        let from = self.session_info_reveal();
-        self.settings.session_info_open = !self.settings.session_info_open;
-        let to = if self.settings.session_info_open { 1.0 } else { 0.0 };
-        self.session_info_tween = Some(WidthTween::new(from, to));
-        self.schedule_save(cx);
+        let show = !self
+            .session_info_pressed_open
+            .take()
+            .unwrap_or(self.session_info_shown);
+        if self.session_info_fits(cx) {
+            self.settings.session_info_hidden = !show;
+            self.schedule_save(cx);
+        } else {
+            self.session_info_overlay = show;
+        }
         cx.notify();
     }
 
-    /// 0 (closed) → 1 (open), easing on the shell's resize clock.
-    pub(super) fn session_info_reveal(&self) -> f32 {
-        let target = if self.settings.session_info_open {
-            1.0
-        } else {
-            0.0
-        };
-        self.eval_tween(self.session_info_tween, target)
+    fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.session_info_overlay {
+            self.session_info_overlay = false;
+            cx.notify();
+        }
+    }
+
+    /// This frame's card: docked beside the transcript (else floating over
+    /// it) and its reveal, 0 (hidden) → 1 (shown), easing on the shell's
+    /// resize clock whenever the card shows or hides, by toggle or by the
+    /// column crossing the fit.
+    pub(super) fn session_info_frame(&mut self, has_selection: bool, cx: &App) -> (bool, f32) {
+        let docked = self.session_info_fits(cx);
+        if docked {
+            // An overlay opened on a tighter column ends once the card fits.
+            self.session_info_overlay = false;
+        }
+        let shown = has_selection && self.session_info_visible(cx);
+        let target = if shown { 1.0 } else { 0.0 };
+        if shown != self.session_info_shown {
+            let from = self.eval_tween(self.session_info_tween, 1.0 - target);
+            self.session_info_tween = Some(WidthTween::new(from, target));
+            self.session_info_shown = shown;
+        }
+        (docked, self.eval_tween(self.session_info_tween, target))
     }
 
     /// The card, positioned within the main column; `None` while closed or
     /// with no chat selected.
     pub(super) fn render_session_info(
         &mut self,
-        layout: SessionCardLayout,
+        docked: bool,
         reveal: f32,
         max_height: f32,
         cx: &mut Context<Self>,
@@ -221,14 +236,14 @@ impl Shell {
             .border_1()
             .border_color(theme.border)
             .bg(popover::surface_bg(&theme))
-            .when(!layout.docked && !theme.is_frost(), |card| card.shadow_lg())
+            .when(!docked && !theme.is_frost(), |card| card.shadow_lg())
             .child(body);
 
         // Docked, the card slides in from the right beside the column;
         // floating, it drops in from just above. Either way it is placed from
         // the column's right edge, so it rides that edge while panes animate.
         let ease = crate::motion::RESIZE.progress(reveal.clamp(0.0, 1.0));
-        let (dx, dy) = if layout.docked {
+        let (dx, dy) = if docked {
             (12.0 * (1.0 - ease), 0.0)
         } else {
             (0.0, -6.0 * (1.0 - ease))
@@ -242,6 +257,13 @@ impl Shell {
                 .right(px(SESSION_CARD_INSET - dx))
                 .opacity(ease)
                 .occlude()
+                // Over the transcript it is a popover: a press elsewhere
+                // dismisses it.
+                .when(!docked, |card| {
+                    card.on_mouse_down_out(
+                        cx.listener(|this, _, _, cx| this.close_session_info_overlay(cx)),
+                    )
+                })
                 .child(crate::frost::frosted(
                     popover::CARD_RADIUS,
                     crate::frost::MENU_BLUR,
@@ -398,46 +420,20 @@ impl Shell {
 mod tests {
     use super::*;
 
-    /// The reading column's right edge for a layout (rows pad 48 each side
-    /// and center in what the reserve leaves).
-    fn column_right(main: f32, transcript: f32, layout: SessionCardLayout) -> f32 {
-        let column = transcript.min(main - 2.0 * TRANSCRIPT_GUTTER - layout.reserve);
-        (main - layout.reserve) / 2.0 + column / 2.0
+    #[test]
+    fn a_wide_column_fits_the_card_beside_the_centered_transcript() {
+        assert!(session_card_fits(1400.0, 736.0));
+        // The centered column's right edge clears the card by the gap.
+        let main = 1400.0;
+        let card_left = main - SESSION_CARD_WIDTH - SESSION_CARD_INSET;
+        assert!(main / 2.0 + 736.0 / 2.0 <= card_left - SESSION_CARD_GAP);
     }
 
     #[test]
-    fn a_wide_column_keeps_the_transcript_centered_beside_the_card() {
-        let layout = session_card_layout(1400.0, 736.0);
-        assert!(layout.docked);
-        assert_eq!(layout.reserve, 0.0, "no shift while it clears the card");
-        assert_eq!(layout.left + SESSION_CARD_WIDTH + SESSION_CARD_INSET, 1400.0);
-        assert!(column_right(1400.0, 736.0, layout) <= layout.left - SESSION_CARD_GAP);
-    }
-
-    #[test]
-    fn a_tighter_column_shifts_the_transcript_just_enough_then_narrows_it() {
-        let layout = session_card_layout(1200.0, 736.0);
-        assert!(layout.docked && layout.reserve > 0.0);
-        let right = column_right(1200.0, 736.0, layout);
-        assert!((right - (layout.left - SESSION_CARD_GAP)).abs() < 0.01);
-        // At the docking floor the column is narrower than configured but
-        // still clears the card.
-        let main = 2.0 * TRANSCRIPT_GUTTER
-            + SESSION_CARD_WIDTH
-            + SESSION_CARD_INSET
-            + SESSION_CARD_GAP
-            - TRANSCRIPT_GUTTER
-            + DOCKED_MIN_COLUMN;
-        let floor = session_card_layout(main, 736.0);
-        assert!(floor.docked);
-        assert!(column_right(main, 736.0, floor) <= floor.left - SESSION_CARD_GAP + 0.01);
-    }
-
-    #[test]
-    fn a_narrow_column_floats_the_card_at_the_same_corner() {
-        let layout = session_card_layout(700.0, 736.0);
-        assert!(!layout.docked);
-        assert_eq!(layout.reserve, 0.0);
-        assert_eq!(layout.left + SESSION_CARD_WIDTH + SESSION_CARD_INSET, 700.0);
+    fn a_tighter_column_does_not_fit_it() {
+        assert!(!session_card_fits(1200.0, 736.0));
+        assert!(!session_card_fits(700.0, 736.0));
+        // A narrower reading column leaves room sooner.
+        assert!(session_card_fits(1200.0, 560.0));
     }
 }

@@ -6966,40 +6966,13 @@ impl Shell {
         cluster + CLUSTER_BUTTONS_WIDTH + TITLEBAR_IDENTITY_GAP
     }
 
-    /// The session titlebar, or on the Pull requests route the open pull
-    /// request's own bar.
+    /// The session titlebar, or on the Pull requests route the bar carrying
+    /// the pull request pane's tabs.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if !matches!(self.route, Route::PullRequests) {
             return self.render_session_title_bar(cx);
         }
-        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
-        let right_pad = self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET);
-        // The open pull request's bar sits over the pane, clear of the board.
-        let pane_width = self.pull_request_pane_visible_width();
-        let detail = self
-            .pull_request_pane_open()
-            .then(|| self.active_pull_request_page())
-            .flatten();
-        let inner = div()
-            .size_full()
-            .flex()
-            .items_center()
-            .pt(px(Theme::TITLEBAR_TOP_PAD))
-            .pl(px((self.sidebar_now() + Theme::SPACE_LG)
-                .max(self.title_bar_content_start() + plus_inset)))
-            .pr(px(right_pad))
-            .when_some(detail, |bar, detail| {
-                bar.child(div().flex_1()).child(
-                    div()
-                        .w(px((pane_width - right_pad - Theme::SPACE_SM).max(0.0)))
-                        .min_w_0()
-                        .flex_shrink(1.0)
-                        .child(detail.update(cx, |page, cx| page.titlebar(cx))),
-                )
-            });
-        let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
-        self.titlebar_drag_region("pull-requests-titlebar", bar, cx)
-            .into_any_element()
+        self.render_pull_request_title_bar(cx)
     }
 
     /// Make a titlebar strip drag the window — zed's platform-titlebar
@@ -16316,6 +16289,26 @@ mod exit_regressions {
             "the board stays beside the pane"
         );
         assert!(pane.right() <= px(1400.0));
+        // Expand covers the board; collapsing gives it back.
+        let click = |cx: &mut gpui::VisualTestContext, selector: &'static str| {
+            let bounds = cx.debug_bounds(selector).unwrap();
+            cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+            cx.update(|window, cx| window.draw(cx).clear());
+        };
+        click(cx, "expand-pull-request-pane");
+        let covering = cx.debug_bounds("pull-request-pane").unwrap();
+        assert!(covering.size.width > pane.size.width);
+        assert!(covering.left() <= board.left());
+        click(cx, "expand-pull-request-pane");
+        assert_eq!(cx.debug_bounds("pull-request-pane").unwrap(), pane);
+        // The toggle hides the pane and keeps its tabs.
+        click(cx, "toggle-pull-request-pane");
+        assert!(cx.debug_bounds("pull-request-pane").is_none());
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.pull_request_pane.tabs.len(), 2)
+        });
+        click(cx, "toggle-pull-request-pane");
+        assert_eq!(cx.debug_bounds("pull-request-pane").unwrap(), pane);
         // Closing the last tab collapses the pane; the board fills back in.
         for _ in 0..2 {
             cx.update(|window, cx| {
@@ -16330,7 +16323,7 @@ mod exit_regressions {
         cx.update(|window, cx| window.draw(cx).clear());
         assert!(cx.debug_bounds("pull-request-pane").is_none());
 
-        // The PR header and the persistent controls share the titlebar even
+        // The pane's tabs and the persistent controls share the titlebar even
         // with the sidebar collapsed and the macOS traffic lights hidden.
         cx.update(|window, cx| {
             motion::set_reduced_motion(cx, true);
@@ -16359,11 +16352,19 @@ mod exit_regressions {
                     });
                     cx.run_until_parked();
                     let new_session = cx.debug_bounds("titlebar-new-session").unwrap();
-                    let title = cx.debug_bounds("pr-detail-title").unwrap();
+                    let tab = cx.debug_bounds("pull-request-tab-0").unwrap();
+                    // Covering the board, the tabs sit just past the cluster
+                    // like the chat pane's in takeover.
                     assert!(
-                        title.left() >= new_session.right() + px(8.0),
-                        "PR header overlaps New session: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, title={title:?}, new_session={new_session:?}"
+                        tab.left() >= new_session.right(),
+                        "PR tab overlaps New session: width={width}, collapsed={collapsed}, fullscreen={fullscreen}, tab={tab:?}, new_session={new_session:?}"
                     );
+                    let toggle = cx.debug_bounds("toggle-pull-request-pane").unwrap();
+                    assert!(toggle.left() >= tab.right() && toggle.right() <= px(width));
+                    // The pull request's own header is the pane's toolbar,
+                    // below the titlebar band.
+                    let title = cx.debug_bounds("pr-toolbar-title").unwrap();
+                    assert!(title.top() >= px(Theme::TITLEBAR_HEIGHT));
                     let external = cx.debug_bounds("pr-external").unwrap();
                     assert!(external.right() <= px(width));
                 }

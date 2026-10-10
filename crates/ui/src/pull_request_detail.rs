@@ -594,25 +594,34 @@ impl PullRequestDetailPage {
         page
     }
 
-    pub(crate) fn titlebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx).clone();
-        let url = self.url.clone();
-        let copy_url = self.url.clone();
-        let identity = self
-            .detail
+    /// The pull request's number and title, from the details or else the
+    /// board's preview row.
+    pub(crate) fn identity(&self) -> (Option<u64>, String) {
+        self.detail
             .as_ref()
             .map(|detail| (detail.number, detail.title.clone()))
             .or_else(|| {
                 self.preview
                     .as_ref()
                     .map(|item| (item.number, item.title.clone()))
-            });
-        let (title, number) = identity.map_or_else(
-            || ("Pull request".to_owned(), None),
-            |(number, title)| (title, Some(number)),
-        );
-        // The session header's shape: glyph and title. A plain header; Back
-        // returns to the board.
+            })
+            .map_or_else(
+                || (None, "Pull request".to_owned()),
+                |(number, title)| (Some(number), title),
+            )
+    }
+
+    /// The details are loading, e.g. for the tab's working indicator.
+    pub(crate) fn is_loading(&self) -> bool {
+        self.loading
+    }
+
+    /// The pane's toolbar row: glyph, title and the pull request's actions.
+    pub(crate) fn toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let url = self.url.clone();
+        let copy_url = self.url.clone();
+        let (number, title) = self.identity();
         div()
             .w_full()
             .min_w_0()
@@ -621,8 +630,8 @@ impl PullRequestDetailPage {
             .gap(px(4.0))
             .child(
                 div()
-                    .id("pr-detail-title")
-                    .debug_selector(|| "pr-detail-title".into())
+                    .id("pr-toolbar-title")
+                    .debug_selector(|| "pr-toolbar-title".into())
                     .role(gpui::Role::Heading)
                     .aria_label(match number {
                         Some(number) => format!("Pull request {number}: {title}"),
@@ -2219,7 +2228,6 @@ impl Render for PullRequestDetailPage {
             }))
             .flex()
             .flex_col()
-            .pt(px(Theme::TITLEBAR_HEIGHT))
             // Paint before Markdown registers this frame's text geometry.
             .child(crate::markdown::render::selection_frame_reset_for(
                 cx.entity_id().as_u64(),
@@ -3434,25 +3442,19 @@ mod tests {
 
     impl Render for DetailHost {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            let header = self.page.update(cx, |page, cx| page.titlebar(cx));
+            // The pull request pane's shape: the toolbar row, then the page.
+            let header = self.page.update(cx, |page, cx| page.toolbar(cx));
+            let theme = Theme::of(cx).clone();
             div()
                 .size_full()
-                .relative()
+                .flex()
+                .flex_col()
                 .on_action(cx.listener(|host, _: &ClosePullRequest, _, cx| {
                     host.returned = true;
                     cx.notify();
                 }))
-                .child(self.page.clone())
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .w_full()
-                        .h(px(Theme::TITLEBAR_HEIGHT))
-                        .flex()
-                        .items_center()
-                        .child(header),
-                )
+                .child(crate::surface_chrome::toolbar(&theme).child(header))
+                .child(div().flex_1().min_h_0().child(self.page.clone()))
         }
     }
 
@@ -3468,13 +3470,21 @@ mod tests {
             cx.simulate_resize(gpui::size(px(width), px(800.0)));
             cx.run_until_parked();
             let mut previous_right = px(0.0);
-            for selector in ["pr-detail-title", "pr-detail-refresh", "pr-copy-url", "pr-external"] {
+            for selector in [
+                "pr-toolbar-title",
+                "pr-detail-refresh",
+                "pr-copy-url",
+                "pr-external",
+            ] {
                 let bounds = cx.debug_bounds(selector).unwrap();
                 assert!(
                     bounds.left() >= previous_right && bounds.right() <= px(width),
                     "{selector}: {bounds:?}"
                 );
-                assert!(bounds.top() >= px(0.0) && bounds.bottom() <= px(Theme::TITLEBAR_HEIGHT));
+                assert!(
+                    bounds.top() >= px(0.0) && bounds.bottom() <= px(Theme::TITLEBAR_HEIGHT),
+                    "{selector} at {width}: {bounds:?}"
+                );
                 previous_right = bounds.right();
             }
             let nav = cx.debug_bounds("pr-detail-nav").unwrap();

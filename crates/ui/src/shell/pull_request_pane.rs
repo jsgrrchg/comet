@@ -33,6 +33,7 @@ pub(super) struct PullRequestPane {
     pub(super) tween: Option<WidthTween>,
     pub(super) edge_bounce: Option<motion::ResizeEdgeBounce>,
     pub(super) resize_edge: Option<motion::ResizeEdge>,
+    pub(super) tab_scroll: gpui::ScrollHandle,
     /// The last closed tab's view, kept on screen while the pane animates
     /// shut.
     closing: Option<Entity<PullRequestDetailPage>>,
@@ -242,6 +243,31 @@ impl Shell {
         cx.notify();
     }
 
+    pub(super) fn activate_pull_request_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if ix >= self.pull_request_pane.tabs.len() {
+            return;
+        }
+        self.pull_request_pane.activate(ix);
+        self.sync_pull_request_selection(cx);
+        cx.notify();
+    }
+
+    /// The titlebar toggle: hide or reveal the pane, keeping its tabs.
+    pub(super) fn toggle_pull_request_pane(&mut self, cx: &mut Context<Self>) {
+        self.set_pull_request_pane_open(!self.pull_request_pane.open, cx);
+    }
+
+    /// Takeover: the pane covers the board, and back to its own width.
+    pub(super) fn toggle_pull_request_pane_expand(&mut self, cx: &mut Context<Self>) {
+        if !self.pull_request_pane_open() {
+            return;
+        }
+        let from = self.pull_request_pane_visible_width();
+        self.pull_request_pane.expanded = !self.pull_request_pane.expanded;
+        self.retarget_pull_request_pane(from);
+        cx.notify();
+    }
+
     /// Close one tab; closing the last collapses the pane.
     pub(super) fn close_pull_request_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix >= self.pull_request_pane.tabs.len() {
@@ -348,11 +374,24 @@ impl Shell {
         let target = self.pull_request_pane_target();
         let covers_board = target >= self.pull_request_pane_available() - 0.5;
         let corner = Self::window_corner_radius(window);
-        let content = self
+        let content = match self
             .active_pull_request_page()
             .or_else(|| self.pull_request_pane.closing.clone())
-            .map(IntoElement::into_any_element)
-            .unwrap_or_else(|| Empty.into_any_element());
+        {
+            // The pull request's title and actions sit in the pane's own
+            // toolbar row; its tabs live in the titlebar band above.
+            Some(page) => {
+                let toolbar = page.update(cx, |page, cx| page.toolbar(cx));
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(crate::surface_chrome::toolbar(&theme).child(toolbar))
+                    .child(div().flex_1().min_h_0().child(page))
+                    .into_any_element()
+            }
+            None => Empty.into_any_element(),
+        };
         let panel = div()
             .id("pull-request-pane")
             .debug_selector(|| "pull-request-pane".into())
@@ -369,6 +408,9 @@ impl Shell {
             })
             .bg(theme.panel_bg())
             .overflow_hidden()
+            // The titlebar is a glass overlay over the full-height content
+            // row; the pane's own chrome starts below it.
+            .pt(px(Theme::TITLEBAR_HEIGHT))
             .child(content);
         let transition = self.active_tween_endpoints(self.pull_request_pane.tween);
         let content_width = stable_panel_content_width(target, transition).max(visible);
@@ -387,6 +429,215 @@ impl Shell {
                     .w(px(content_width))
                     .child(panel),
             )
+            .into_any_element()
+    }
+}
+
+impl Shell {
+    /// The pane's tabs, drawn in the titlebar band above it like the chat
+    /// pane's surface tabs.
+    pub(super) fn render_pull_request_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let active = self.pull_request_pane.active_index();
+        let rows: Vec<_> = self
+            .pull_request_pane
+            .tabs
+            .iter()
+            .map(|tab| {
+                let page = tab.page.read(cx);
+                let (number, title) = page.identity();
+                (number, title, page.is_loading())
+            })
+            .collect();
+        let mut strip = div()
+            .id("pull-request-tab-strip")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(crate::surface_chrome::CONTROL_GAP))
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(&self.pull_request_pane.tab_scroll)
+            // Windows caption hit-testing includes the scroll-only hitboxes
+            // behind each chip. Stop at the scroller so the titlebar cannot
+            // claim tab clicks, while wheel events still reach this scroller.
+            .when(cfg!(target_os = "windows"), |strip| strip.occlude());
+        for (ix, (number, title, loading)) in rows.into_iter().enumerate() {
+            let is_active = active == Some(ix);
+            let label: SharedString = match number {
+                Some(number) => format!("#{number} {title}"),
+                None => title.clone(),
+            }
+            .into();
+            let leading = if loading {
+                loaders::mini_glyph_spinner(
+                    format!("pull-request-tab-{ix}"),
+                    2.0,
+                    theme.glyph,
+                    cx.entity_id(),
+                    cx,
+                )
+                .into_any_element()
+            } else {
+                crate::surface_chrome::tab_chip_icon(icons::PULL_REQUEST, is_active, &theme)
+            };
+            let tooltip = label.clone();
+            let chip = crate::surface_chrome::tab_chip(
+                crate::surface_chrome::TabChip {
+                    id: "pull-request-tab",
+                    close_id: "pull-request-tab-close",
+                    ix,
+                    active: is_active,
+                    title: title.into(),
+                    dirty: false,
+                    leading,
+                },
+                &theme,
+                cx.listener(move |this, _, _, cx| this.close_pull_request_tab(ix, cx)),
+            )
+            .aria_label(label)
+            .tooltip(move |_, cx| {
+                cx.new(|_| SurfaceTabTooltip {
+                    text: tooltip.clone(),
+                })
+                .into()
+            })
+            .tooltip_show_delay(Duration::from_millis(350))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.activate_pull_request_tab(ix, cx);
+            }))
+            // Middle-click closes, like every tab strip.
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(move |this, _, _, cx| this.close_pull_request_tab(ix, cx)),
+            );
+            strip = strip.child(chip);
+        }
+        crate::surface_chrome::tab_strip_region(strip, &self.pull_request_pane.tab_scroll, &theme)
+    }
+
+    /// The route's titlebar: the pane's tabs and controls over the pane,
+    /// and its toggle while it is hidden.
+    pub(super) fn render_pull_request_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        /// The pane toggle's fixed right-edge slot.
+        const TOGGLE_SLOT: f32 = 28.0;
+        let theme = Theme::of(cx).clone();
+        let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+        let sidebar_now = self.sidebar_now();
+        let right_pad = self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET);
+        let open = self.pull_request_pane_open();
+        let pane_width = self.pull_request_pane_visible_width();
+        let covers_board = open && pane_width >= self.pull_request_pane_available() - 0.5;
+        // Covering the board, the tabs start at the pane's own gutter off the
+        // sidebar seam, clear of the window-control cluster (the chat pane's
+        // takeover inset).
+        let row_left = if covers_board {
+            let cluster_end =
+                self.title_bar_content_start() - TITLEBAR_IDENTITY_GAP + plus_inset - 14.0;
+            (sidebar_now - 8.0).max(cluster_end)
+        } else {
+            (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start() + plus_inset)
+        };
+        let row_gap = 8.0;
+        let reveal = if open {
+            (pane_width - right_pad - TOGGLE_SLOT)
+                .min(self.viewport_width - row_left - right_pad - TOGGLE_SLOT - row_gap)
+                .max(0.0)
+        } else {
+            0.0
+        };
+        let has_tabs = !self.pull_request_pane.tabs.is_empty();
+        let expanded = self.pull_request_pane.expanded;
+        let can_expand = expanded || self.pull_request_pane_resizable();
+        let mut controls = div()
+            .id("pull-request-titlebar-controls")
+            .flex_none()
+            .h_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            // A wheel over the tabs must scroll the strip, never the board.
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation());
+        if open {
+            let tabs = self.render_pull_request_tab_strip(cx);
+            controls = controls.child(
+                div()
+                    .w(px(reveal))
+                    .h_full()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .overflow_hidden()
+                    .pl(px(8.0))
+                    .pr(px(4.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .overflow_hidden()
+                            .child(tabs),
+                    )
+                    .when(can_expand, |el| {
+                        el.child(
+                            header_icon_button(
+                                "expand-pull-request-pane",
+                                super::tabs::right_pane_expand_icon(expanded),
+                                if expanded {
+                                    "Collapse panel"
+                                } else {
+                                    "Expand panel"
+                                },
+                                &theme,
+                                cx.listener(|this, _, _, cx| {
+                                    this.toggle_pull_request_pane_expand(cx)
+                                }),
+                            )
+                            .debug_selector(|| "expand-pull-request-pane".into()),
+                        )
+                    }),
+            );
+        }
+        if has_tabs {
+            controls = controls.child(
+                header_icon_button_with(
+                    "toggle-pull-request-pane",
+                    icons::sidebar_glyph(
+                        motion::state_t(
+                            "toggle-pull-request-pane",
+                            open,
+                            motion::GLYPH_STATE,
+                            self.reduced_motion,
+                        ),
+                        true,
+                        16.0,
+                        theme.text_muted,
+                    ),
+                    if open {
+                        "Hide pull requests panel"
+                    } else {
+                        "Show pull requests panel"
+                    },
+                    cx.listener(|this, _, _, cx| this.toggle_pull_request_pane(cx)),
+                )
+                .debug_selector(|| "toggle-pull-request-pane".into()),
+            );
+        }
+        let inner = div()
+            .size_full()
+            .flex()
+            .items_center()
+            .pt(px(Theme::TITLEBAR_TOP_PAD))
+            .gap(px(row_gap))
+            .pl(px(row_left))
+            .pr(px(right_pad))
+            .child(div().flex_1())
+            .child(controls);
+        let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+        self.titlebar_drag_region("pull-requests-titlebar", bar, cx)
             .into_any_element()
     }
 }

@@ -79,6 +79,7 @@ use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_
 #[cfg(test)]
 mod panel_interaction_tests;
 pub(crate) mod project_icon;
+mod pull_request_pane;
 mod session_info;
 mod side_chats;
 mod sidebar_pins;
@@ -1083,6 +1084,7 @@ enum PaneResizeKind {
     Right,
     Files,
     Terminal,
+    PullRequests,
 }
 
 /// Resolve one pointer sample while keeping the persisted width legal. The
@@ -2023,8 +2025,8 @@ pub struct Shell {
     /// Route history behind the titlebar back/forward buttons (§ nav history).
     nav: NavHistory,
     pull_requests_page: Option<Entity<PullRequestsPage>>,
-    pull_request_detail: Option<Entity<crate::pull_request_detail::PullRequestDetailPage>>,
-    pull_request_detail_subscription: Option<Subscription>,
+    /// Opened pull requests, as tabs in a pane beside the board.
+    pull_request_pane: pull_request_pane::PullRequestPane,
     /// A detail view a history step landed on, opened by the next render
     /// (creating it needs the window).
     pending_pull_request: Option<(String, Option<String>)>,
@@ -2524,8 +2526,7 @@ impl Shell {
             settings_return_route: Route::Chat,
             nav,
             pull_requests_page: None,
-            pull_request_detail: None,
-            pull_request_detail_subscription: None,
+            pull_request_pane: Default::default(),
             pending_pull_request: None,
             pull_request_cache: Default::default(),
             devices_page: None,
@@ -4735,6 +4736,7 @@ impl Shell {
             PaneResizeKind::Sidebar => self.sidebar_resize_edge = None,
             PaneResizeKind::Terminal => self.terminal_drag_anchor = None,
             PaneResizeKind::Right => self.right_resize_edge = None,
+            PaneResizeKind::PullRequests => self.pull_request_pane.resize_edge = None,
             PaneResizeKind::Files => {}
         }
     }
@@ -5297,64 +5299,6 @@ impl Shell {
         }
         if self.space_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.space_menu);
-        }
-        cx.notify();
-    }
-
-    /// Open `url`'s detail view over the board without recording a
-    /// navigation. Re-showing the open pull request keeps its view state.
-    fn show_pull_request_detail(
-        &mut self,
-        url: String,
-        target: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.pending_pull_request = None;
-        if self.pull_requests_page.is_none() {
-            self.pull_requests_page =
-                Some(cx.new(|cx| PullRequestsPage::new(self.state.clone(), cx)));
-        }
-        if let Some(page) = &self.pull_requests_page {
-            page.update(cx, |page, cx| page.select_url(Some(url.clone()), cx));
-        }
-        if self
-            .pull_request_detail
-            .as_ref()
-            .is_some_and(|detail| detail.read(cx).url == url)
-        {
-            cx.notify();
-            return;
-        }
-        let preview = self
-            .pull_requests_page
-            .as_ref()
-            .and_then(|page| page.read(cx).preview(&url));
-        self.pull_request_detail = Some(cx.new(|cx| {
-            crate::pull_request_detail::PullRequestDetailPage::new(
-                self.state.clone(),
-                url,
-                target,
-                self.pull_request_cache.clone(),
-                preview,
-                window,
-                cx,
-            )
-        }));
-        self.pull_request_detail_subscription = self
-            .pull_request_detail
-            .as_ref()
-            .map(|detail| cx.observe(detail, |_, _, cx| cx.notify()));
-        cx.notify();
-    }
-
-    /// Return to the board without recording a navigation.
-    fn dismiss_pull_request_detail(&mut self, cx: &mut Context<Self>) {
-        self.pending_pull_request = None;
-        self.pull_request_detail = None;
-        self.pull_request_detail_subscription = None;
-        if let Some(page) = &self.pull_requests_page {
-            page.update(cx, |page, cx| page.select_url(None, cx));
         }
         cx.notify();
     }
@@ -7029,6 +6973,13 @@ impl Shell {
             return self.render_session_title_bar(cx);
         }
         let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+        let right_pad = self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET);
+        // The open pull request's bar sits over the pane, clear of the board.
+        let pane_width = self.pull_request_pane_visible_width();
+        let detail = self
+            .pull_request_pane_open()
+            .then(|| self.active_pull_request_page())
+            .flatten();
         let inner = div()
             .size_full()
             .flex()
@@ -7036,9 +6987,15 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .pl(px((self.sidebar_now() + Theme::SPACE_LG)
                 .max(self.title_bar_content_start() + plus_inset)))
-            .pr(px(self.titlebar_right_pad(TITLEBAR_ACTION_EDGE_INSET)))
-            .when_some(self.pull_request_detail.clone(), |bar, detail| {
-                bar.child(detail.update(cx, |page, cx| page.titlebar(cx)))
+            .pr(px(right_pad))
+            .when_some(detail, |bar, detail| {
+                bar.child(div().flex_1()).child(
+                    div()
+                        .w(px((pane_width - right_pad - Theme::SPACE_SM).max(0.0)))
+                        .min_w_0()
+                        .flex_shrink(1.0)
+                        .child(detail.update(cx, |page, cx| page.titlebar(cx))),
+                )
             });
         let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
         self.titlebar_drag_region("pull-requests-titlebar", bar, cx)
@@ -10893,9 +10850,6 @@ impl Shell {
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
 
         if matches!(self.route, Route::PullRequests) {
-            if let Some((url, device)) = self.pending_pull_request.take() {
-                self.show_pull_request_detail(url, device, window, cx);
-            }
             if self.pull_requests_page.is_none() {
                 self.pull_requests_page =
                     Some(cx.new(|cx| PullRequestsPage::new(self.state.clone(), cx)));
@@ -10906,15 +10860,6 @@ impl Shell {
                 .cloned()
                 .map(IntoElement::into_any_element)
                 .unwrap_or_else(|| Empty.into_any_element());
-            if let Some(detail) = self.pull_request_detail.clone() {
-                return div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .flex()
-                    .child(div().flex_1().min_w_0().h_full().child(detail))
-                    .into_any_element();
-            }
             return div()
                 .flex_1()
                 .min_w_0()
@@ -13230,8 +13175,7 @@ impl Render for Shell {
                 self.browser_context = crate::browser::BrowserContext::default();
                 self.pull_request_cache = Default::default();
                 self.pull_requests_page = None;
-                self.pull_request_detail = None;
-                self.pull_request_detail_subscription = None;
+                self.reset_pull_request_pane();
             }
             self.browser_profile = browser_profile;
         }
@@ -13410,6 +13354,7 @@ impl Render for Shell {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_drag_move(cx.listener(Self::on_sidebar_drag))
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
+            .on_drag_move(cx.listener(Self::on_pull_request_pane_drag))
             .on_drag_move(cx.listener(Self::on_files_panel_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
             // The panel shortcuts are chat-scoped chrome: in Settings they are
@@ -13468,15 +13413,9 @@ impl Render for Shell {
             ))
             .on_action(cx.listener(
                 |this, _: &crate::pull_request_detail::ClosePullRequest, _, cx| {
-                    // Closing the detail view is Back when the board is
-                    // behind it, so history doesn't grow a loop.
-                    if this.nav.previous() == Some(&NavEntry::PullRequests) {
-                        this.navigate_back(cx);
-                    } else {
-                        this.dismiss_pull_request_detail(cx);
-                        this.nav.push(NavEntry::PullRequests);
+                    if let Some(ix) = this.pull_request_pane.active_index() {
+                        this.close_pull_request_tab(ix, cx);
                     }
-                    cx.notify();
                 },
             ))
             .on_action(cx.listener(
@@ -13678,11 +13617,17 @@ impl Render for Shell {
                         .child(sidebar_tone)
                         .child(motion::fade_in("phase-app", page));
                 }
-                // The Pull requests route shares this layout without the
-                // chat's side pane.
+                // The Pull requests route shares this layout with its own
+                // side pane: opened pull requests as tabs beside the board.
                 let on_chat = matches!(self.route, Route::Chat);
+                let on_pull_requests = matches!(self.route, Route::PullRequests);
+                if on_pull_requests && let Some((url, device)) = self.pending_pull_request.take() {
+                    self.show_pull_request_detail(url, device, window, cx);
+                }
                 let right_target_width = if on_chat {
                     self.right_visible_width(cx)
+                } else if on_pull_requests {
+                    self.pull_request_pane_visible_width()
                 } else {
                     0.0
                 };
@@ -13765,9 +13710,16 @@ impl Render for Shell {
                     // A forgiving transparent hit target centered on the
                     // seam; the panel's 1px border remains the visual divider.
                     .left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH))
+                })
+                .or_else(|| {
+                    on_pull_requests
+                        .then(|| self.pull_request_pane_handle(cx))
+                        .flatten()
                 });
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(window, cx)
+                } else if on_pull_requests {
+                    self.render_pull_request_pane(window, cx)
                 } else {
                     Empty.into_any_element()
                 };
@@ -16320,6 +16272,64 @@ mod exit_regressions {
             "the board keeps the room the pane would take"
         );
 
+        // Opening pull requests adds tabs to a pane beside the board.
+        let open = |cx: &mut gpui::VisualTestContext, number: u32| {
+            cx.update(|window, cx| {
+                window.dispatch_action(
+                    Box::new(crate::pull_request_detail::OpenPullRequest(
+                        format!("https://github.com/a/b/pull/{number}"),
+                        None,
+                    )),
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+        };
+        cx.update(|_, cx| motion::set_reduced_motion(cx, true));
+        cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+        open(cx, 1);
+        open(cx, 2);
+        open(cx, 1);
+        shell.read_with(cx, |shell, _| {
+            let tabs: Vec<_> = shell
+                .pull_request_pane
+                .tabs
+                .iter()
+                .map(|tab| tab.url.as_str())
+                .collect();
+            assert_eq!(
+                tabs,
+                [
+                    "https://github.com/a/b/pull/1",
+                    "https://github.com/a/b/pull/2"
+                ],
+                "reopening a pull request reuses its tab"
+            );
+            assert_eq!(shell.pull_request_pane.active_index(), Some(0));
+            assert!(shell.pull_request_pane_open());
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let pane = cx.debug_bounds("pull-request-pane").unwrap();
+        let board = cx.debug_bounds("pull-requests-column").unwrap();
+        assert!(
+            board.right() <= pane.left(),
+            "the board stays beside the pane"
+        );
+        assert!(pane.right() <= px(1400.0));
+        // Closing the last tab collapses the pane; the board fills back in.
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                window.dispatch_action(Box::new(crate::pull_request_detail::ClosePullRequest), cx);
+            });
+            cx.run_until_parked();
+        }
+        shell.read_with(cx, |shell, _| {
+            assert!(shell.pull_request_pane.tabs.is_empty());
+            assert!(!shell.pull_request_pane_open());
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("pull-request-pane").is_none());
+
         // The PR header and the persistent controls share the titlebar even
         // with the sidebar collapsed and the macOS traffic lights hidden.
         cx.update(|window, cx| {
@@ -18533,7 +18543,7 @@ impl Shell {
     pub fn fixture_pull_request_detail(
         &self,
     ) -> Option<Entity<crate::pull_request_detail::PullRequestDetailPage>> {
-        self.pull_request_detail.clone()
+        self.active_pull_request_page()
     }
 
     pub fn fixture_pull_request_settings(&mut self, open: bool, cx: &mut Context<Self>) {

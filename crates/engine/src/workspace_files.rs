@@ -2644,6 +2644,66 @@ mod tests {
     }
 
     #[test]
+    fn content_search_preserves_spaces_and_tabs_in_the_query() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("literal.txt"),
+            "let  needle = 1;\nlet\tneedle = 2;\nlet needle = 3;\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+
+        for (query, line) in [("let  needle", 1), ("let\tneedle", 2)] {
+            let result = content(&root, query, None).unwrap();
+            assert_eq!(result.matches.len(), 1, "query: {query:?}");
+            let found = &result.matches[0];
+            assert_eq!(found.path, "literal.txt");
+            assert_eq!(found.line, line, "query: {query:?}");
+            assert_eq!(found.column, 0);
+            assert_eq!(found.ranges, vec![(0, query.len() as u32)]);
+            assert!(found.preview.starts_with(query));
+        }
+    }
+
+    #[test]
+    fn content_search_treats_exclamation_marks_as_literal_text() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("literal.txt"), "if !ready {\nif ready {\n").unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+
+        let result = content(&root, "if !ready", None).unwrap();
+        assert_eq!(result.matches.len(), 1);
+        let found = &result.matches[0];
+        assert_eq!(found.path, "literal.txt");
+        assert_eq!(found.line, 1);
+        assert_eq!(found.column, 0);
+        assert_eq!(found.preview, "if !ready {");
+        assert_eq!(found.ranges, vec![(0, 9)]);
+    }
+
+    #[test]
+    fn content_search_preserves_literal_backslashes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("literal.txt"),
+            "\\n\nn\n\\!ready\n!ready\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+
+        for (query, line) in [(r"\n", 1), (r"\!ready", 3)] {
+            let result = content(&root, query, None).unwrap();
+            assert_eq!(result.matches.len(), 1, "query: {query:?}");
+            let found = &result.matches[0];
+            assert_eq!(found.path, "literal.txt");
+            assert_eq!(found.line, line);
+            assert_eq!(found.column, 0);
+            assert_eq!(found.preview, query);
+            assert_eq!(found.ranges, vec![(0, query.len() as u32)]);
+        }
+    }
+
+    #[test]
     fn content_search_uses_smart_case() {
         let (_dir, root) = content_fixture();
         let insensitive = content(&root, "needle", Some(10)).unwrap();

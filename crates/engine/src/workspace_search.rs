@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use fff_search::file_picker::FilePicker;
 use fff_search::{
     Casing, ContentCacheBudget, DirSearchConfig, FFFMode, FilePickerOptions, FuzzySearchOptions,
-    GrepConfig, GrepMode, GrepSearchOptions, MixedItemRef, MixedSearchConfig, PaginationArgs,
-    QueryParser, SharedFilePicker, SharedFrecency,
+    GrepMode, GrepSearchOptions, MixedItemRef, MixedSearchConfig, PaginationArgs, QueryParser,
+    SharedFilePicker, SharedFrecency,
 };
 
 /// An index nobody searched or warmed for this long is dropped.
@@ -250,7 +250,6 @@ impl WorkspaceSearch {
         let Some(fff) = guard.as_ref() else {
             return Ok(ContentSearch::default());
         };
-        let parsed = QueryParser::new(GrepConfig).parse(query);
         let options = GrepSearchOptions {
             max_matches_per_file: per_file,
             casing: Some(Casing::Smart),
@@ -260,7 +259,10 @@ impl WorkspaceSearch {
             enforce_time_budget: true,
             ..Default::default()
         };
-        let result = fff.grep(&parsed, &options);
+        // The raw-pattern API preserves whitespace, constraint-like tokens
+        // and backslashes. `grep` parses filters and interprets escapes even
+        // in PlainText mode, so use one literal pattern with no constraints.
+        let result = fff.multi_grep(&[query], &[], &options);
         let mut truncated = result.next_file_offset != 0 || result.matches.len() > limit;
         let mut matches = Vec::with_capacity(result.matches.len().min(limit));
         for found in result.matches {

@@ -16,10 +16,30 @@ pub(super) const PULL_REQUEST_TABS_MAX: usize = 8;
 
 pub(super) struct PullRequestTab {
     pub(super) url: String,
+    /// The device whose engine reads it; `None` for this device.
+    pub(super) device: Option<String>,
     pub(super) page: Entity<PullRequestDetailPage>,
     /// Activation stamp; the smallest is the least recently viewed.
     viewed: u64,
     _subscription: Subscription,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PullRequestTabMenu {
+    ix: usize,
+    position: Point<Pixels>,
+}
+
+/// The tabs a context-menu action closes, as indices into `len` tabs.
+fn tabs_to_close(len: usize, index: usize, action: TabCloseAction) -> Vec<usize> {
+    (0..len)
+        .filter(|&i| match action {
+            TabCloseAction::This => i == index,
+            TabCloseAction::Others => i != index,
+            TabCloseAction::Left => i < index,
+            TabCloseAction::Right => i > index,
+        })
+        .collect()
 }
 
 /// Session-local view state; tabs are not persisted across launches.
@@ -34,6 +54,8 @@ pub(super) struct PullRequestPane {
     pub(super) edge_bounce: Option<motion::ResizeEdgeBounce>,
     pub(super) resize_edge: Option<motion::ResizeEdge>,
     pub(super) tab_scroll: gpui::ScrollHandle,
+    /// A tab's context menu: Close, Close others, Close to the left/right.
+    pub(super) menu: popover::Popup<PullRequestTabMenu>,
     /// The last closed tab's view, kept on screen while the pane animates
     /// shut.
     closing: Option<Entity<PullRequestDetailPage>>,
@@ -181,6 +203,21 @@ impl Shell {
         }
     }
 
+    /// The history entry for the route as it stands: the pull request
+    /// shown in the pane, else the board alone.
+    pub(super) fn pull_request_pane_entry(&self) -> NavEntry {
+        match self.pull_request_pane.active_index() {
+            Some(ix) if self.pull_request_pane.open => {
+                let tab = &self.pull_request_pane.tabs[ix];
+                NavEntry::PullRequest {
+                    url: tab.url.clone(),
+                    device: tab.device.clone(),
+                }
+            }
+            _ => NavEntry::PullRequests,
+        }
+    }
+
     /// The active tab's detail view, if the pane has one.
     pub(super) fn active_pull_request_page(&self) -> Option<Entity<PullRequestDetailPage>> {
         self.pull_request_pane.active_page()
@@ -217,7 +254,7 @@ impl Shell {
                     PullRequestDetailPage::new(
                         self.state.clone(),
                         url.clone(),
-                        target,
+                        target.clone(),
                         self.pull_request_cache.clone(),
                         preview,
                         window,
@@ -228,6 +265,7 @@ impl Shell {
                 let pane = &mut self.pull_request_pane;
                 pane.tabs.push(PullRequestTab {
                     url: url.clone(),
+                    device: target,
                     page,
                     viewed: 0,
                     _subscription: subscription,
@@ -243,13 +281,115 @@ impl Shell {
         cx.notify();
     }
 
+    /// Show a tab, recording it in history so Back returns to the one
+    /// viewed before.
     pub(super) fn activate_pull_request_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
-        if ix >= self.pull_request_pane.tabs.len() {
+        let Some(tab) = self.pull_request_pane.tabs.get(ix) else {
             return;
+        };
+        let entry = NavEntry::PullRequest {
+            url: tab.url.clone(),
+            device: tab.device.clone(),
+        };
+        if self.nav.current() != &entry {
+            self.nav.push(entry);
         }
         self.pull_request_pane.activate(ix);
+        self.set_pull_request_pane_open(true, cx);
         self.sync_pull_request_selection(cx);
         cx.notify();
+    }
+
+    /// The next or previous tab, wrapping (Ctrl+Tab while the pane has
+    /// focus).
+    pub(super) fn cycle_pull_request_tabs(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let count = self.pull_request_pane.tabs.len();
+        if count <= 1 {
+            return;
+        }
+        let next = match (self.pull_request_pane.active_index(), forward) {
+            (Some(at), true) => (at + 1) % count,
+            (Some(at), false) => (at + count - 1) % count,
+            (None, true) => 0,
+            (None, false) => count - 1,
+        };
+        self.activate_pull_request_tab(next, cx);
+    }
+
+    /// The ⌘W cascade on this route: close the active tab while the pane
+    /// shows. Returns true when the close was consumed.
+    pub(super) fn close_active_pull_request_tab(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.pull_request_pane_open() {
+            return false;
+        }
+        let Some(ix) = self.pull_request_pane.active_index() else {
+            return false;
+        };
+        self.close_pull_request_tab(ix, cx);
+        true
+    }
+
+    /// Close several tabs, keeping the active one where it survives.
+    fn close_pull_request_tabs(&mut self, mut tabs: Vec<usize>, cx: &mut Context<Self>) {
+        // Highest first, so earlier indices stay valid.
+        tabs.sort_unstable_by(|a, b| b.cmp(a));
+        for ix in tabs {
+            self.close_pull_request_tab(ix, cx);
+        }
+    }
+
+    pub(super) fn close_pull_request_tab_menu(&mut self, cx: &mut Context<Self>) {
+        if self.pull_request_pane.menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.pull_request_pane.menu);
+            cx.notify();
+        }
+    }
+
+    /// A tab's context menu, at the pointer.
+    pub(super) fn render_pull_request_tab_menu(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let PullRequestTabMenu { ix, position } = *self.pull_request_pane.menu.get()?;
+        let closing = self.pull_request_pane.menu.closing_since();
+        let theme = Theme::of(cx).clone();
+        let len = self.pull_request_pane.tabs.len();
+        let mut rows = div().flex().flex_col().gap(px(2.0));
+        for (action, label) in [
+            (TabCloseAction::This, "Close tab"),
+            (TabCloseAction::Others, "Close other tabs"),
+            (TabCloseAction::Left, "Close tabs to the left"),
+            (TabCloseAction::Right, "Close tabs to the right"),
+        ] {
+            let enabled = ix < len && !tabs_to_close(len, ix, action).is_empty();
+            rows = rows.child(
+                popover::menu_row(&theme, false, label)
+                    .id(SharedString::from(format!("pull-request-tab-menu-{label}")))
+                    .debug_selector(move || format!("pull-request-tab-menu-{label}"))
+                    .when(!enabled, |el| el.opacity(0.4).cursor_default())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !enabled {
+                            return;
+                        }
+                        this.close_pull_request_tab_menu(cx);
+                        let len = this.pull_request_pane.tabs.len();
+                        if ix < len {
+                            this.close_pull_request_tabs(tabs_to_close(len, ix, action), cx);
+                        }
+                    }))
+                    .child(label),
+            );
+        }
+        let menu = popover::popover_card(&theme)
+            .w(px(216.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_pull_request_tab_menu(cx)))
+            .child(rows);
+        Some(popover::menu_at(
+            "pull-request-tab-menu",
+            position,
+            menu.into_any_element(),
+            closing,
+        ))
     }
 
     /// The titlebar toggle: hide or reveal the pane, keeping its tabs.
@@ -395,6 +535,12 @@ impl Shell {
         let panel = div()
             .id("pull-request-pane")
             .debug_selector(|| "pull-request-pane".into())
+            // The chat pane is unmounted on this route; this pane takes its
+            // focus boundary, so Ctrl+Tab cycles these tabs.
+            .track_focus(&self.navigation_focus.right)
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                this.capture_navigation_focus(true, false, window, cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -451,6 +597,10 @@ impl Shell {
             .collect();
         let mut strip = div()
             .id("pull-request-tab-strip")
+            .track_focus(&self.navigation_focus.tabs)
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                this.capture_navigation_focus(true, true, window, cx);
+            }))
             .flex()
             .flex_row()
             .items_center()
@@ -507,6 +657,16 @@ impl Shell {
                 cx.stop_propagation();
                 this.activate_pull_request_tab(ix, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                    this.pull_request_pane.menu.open(PullRequestTabMenu {
+                        ix,
+                        position: event.position,
+                    });
+                    cx.notify();
+                }),
+            )
             // Middle-click closes, like every tab strip.
             .on_mouse_down(
                 MouseButton::Middle,
@@ -616,11 +776,7 @@ impl Shell {
                         16.0,
                         theme.text_muted,
                     ),
-                    if open {
-                        "Hide pull requests panel"
-                    } else {
-                        "Show pull requests panel"
-                    },
+                    ShortcutId::ToggleChanges.label(),
                     cx.listener(|this, _, _, cx| this.toggle_pull_request_pane(cx)),
                 )
                 .debug_selector(|| "toggle-pull-request-pane".into()),
@@ -645,6 +801,15 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_menu_actions_pick_their_tabs() {
+        assert_eq!(tabs_to_close(4, 1, TabCloseAction::This), [1]);
+        assert_eq!(tabs_to_close(4, 1, TabCloseAction::Others), [0, 2, 3]);
+        assert_eq!(tabs_to_close(4, 1, TabCloseAction::Left), [0]);
+        assert_eq!(tabs_to_close(4, 1, TabCloseAction::Right), [2, 3]);
+        assert!(tabs_to_close(1, 0, TabCloseAction::Others).is_empty());
+    }
 
     #[test]
     fn pane_leaves_the_board_its_minimum_or_covers_it() {

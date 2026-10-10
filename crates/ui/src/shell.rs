@@ -4468,6 +4468,10 @@ impl Shell {
     /// closes — the same cascade browsers use. The native traffic-light close
     /// deliberately skips this rung: it always closes the window.
     pub fn close_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // The Pull requests route's pane holds pull request tabs instead.
+        if matches!(self.route, Route::PullRequests) {
+            return self.close_active_pull_request_tab(cx);
+        }
         let Some(surface) = self.closable_right_surface(cx) else {
             return false;
         };
@@ -5276,12 +5280,20 @@ impl Shell {
         }
     }
 
+    /// The Pull requests entry: from elsewhere, return to the board as it
+    /// was left, its pane included; on the board already, show it alone.
     fn open_pull_requests(&mut self, cx: &mut Context<Self>) {
-        if matches!(self.route, Route::PullRequests) {
-            return;
-        }
+        let entry = if matches!(self.route, Route::PullRequests) {
+            self.dismiss_pull_request_detail(cx);
+            NavEntry::PullRequests
+        } else {
+            self.pull_request_pane_entry()
+        };
         self.enter_pull_requests_route(cx);
-        self.nav.push(NavEntry::PullRequests);
+        if self.nav.current() != &entry {
+            self.nav.push(entry);
+        }
+        cx.notify();
     }
 
     /// Show the board's route without recording a navigation.
@@ -9581,10 +9593,7 @@ impl Shell {
                 // Leaving Settings through its own footer is a plain route
                 // change; nothing there should grab focus on the way out.
                 this.settings_focus_pending = false;
-                this.dismiss_pull_request_detail(cx);
-                this.enter_pull_requests_route(cx);
-                this.nav.push(NavEntry::PullRequests);
-                cx.notify();
+                this.open_pull_requests(cx);
             }))
             .tooltip(crate::settings::widgets::text_tooltip("Pull requests"))
             .child(icon(icons::PULL_REQUEST).size(px(15.0)).text_color(
@@ -10582,6 +10591,9 @@ impl Shell {
                 menu,
                 chat_menu_closing,
             ));
+        }
+        if let Some(menu) = self.render_pull_request_tab_menu(cx) {
+            overlays.push(menu);
         }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));
@@ -13445,7 +13457,9 @@ impl Render for Shell {
                 this.cycle_navigation(false, window, cx)
             }))
             .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
-                if matches!(this.route, Route::Chat) {
+                if matches!(this.route, Route::PullRequests) {
+                    this.toggle_pull_request_pane(cx);
+                } else if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx);
                     if !this.right_pane_open(cx) {
                         // The hidden editor can retain a focus handle after unmounting.
@@ -16181,6 +16195,173 @@ mod exit_regressions {
                 "it opens the board straight from Settings"
             )
         });
+    }
+
+    /// A ready Shell with no engine, for the Pull requests route.
+    fn pull_request_shell(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<Shell>,
+        &mut gpui::VisualTestContext,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            settings::init(settings::UiSettings::default(), dir.path(), cx);
+        });
+        let data_dir = dir.path().to_path_buf();
+        let (shell, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.connection = zeron_proto::view::ConnectionStatus::Ready;
+                state
+            });
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir,
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        shell.update(cx, |shell, _| shell.debug_gate = Some(GatePhase::Ready));
+        (shell, cx, dir)
+    }
+
+    fn open_pull_request(cx: &mut gpui::VisualTestContext, number: u32) {
+        cx.update(|window, cx| {
+            window.dispatch_action(
+                Box::new(crate::pull_request_detail::OpenPullRequest(
+                    format!("https://github.com/a/b/pull/{number}"),
+                    None,
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn pull_request_pane_follows_history_shortcuts_and_its_tab_menu(cx: &mut TestAppContext) {
+        let (shell, cx, _dir) = pull_request_shell(cx);
+        cx.update(|_, cx| motion::set_reduced_motion(cx, true));
+        cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+        shell.update(cx, |shell, cx| shell.open_pull_requests(cx));
+        cx.run_until_parked();
+        for number in 1..=3 {
+            open_pull_request(cx, number);
+        }
+        let redraw = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| window.draw(cx).clear());
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear());
+        };
+        let pane = |cx: &mut gpui::VisualTestContext| {
+            shell.read_with(cx, |shell, _| {
+                (
+                    shell.pull_request_pane_open(),
+                    shell.pull_request_pane.active_index(),
+                    shell.pull_request_pane.tabs.len(),
+                )
+            })
+        };
+        let back = |cx: &mut gpui::VisualTestContext, forward: bool| {
+            shell.update(cx, |shell, cx| {
+                if forward {
+                    shell.navigate_forward(cx)
+                } else {
+                    shell.navigate_back(cx)
+                }
+            });
+            redraw(cx);
+        };
+
+        // Back steps through the pull requests viewed, then to the board
+        // alone with the tabs kept; Forward reopens the pane.
+        back(cx, false);
+        assert_eq!(pane(cx), (true, Some(1), 3));
+        back(cx, false);
+        assert_eq!(pane(cx), (true, Some(0), 3));
+        back(cx, false);
+        assert_eq!(pane(cx).0, false);
+        assert_eq!(pane(cx).2, 3);
+        back(cx, true);
+        assert_eq!(pane(cx), (true, Some(0), 3));
+
+        // Picking a tab is a step Back can undo.
+        redraw(cx);
+        let tab = cx.debug_bounds("pull-request-tab-2").unwrap();
+        cx.simulate_click(tab.center(), gpui::Modifiers::default());
+        assert_eq!(pane(cx).1, Some(2));
+        back(cx, false);
+        assert_eq!(pane(cx).1, Some(0));
+
+        // The right sidebar shortcut hides and shows the pane.
+        for open in [false, true] {
+            cx.update(|window, cx| window.dispatch_action(Box::new(ToggleChanges), cx));
+            redraw(cx);
+            assert_eq!(pane(cx).0, open);
+        }
+
+        // Next tab cycles the pane's tabs while it has focus.
+        cx.update(|window, cx| {
+            let focus = shell.read(cx).navigation_focus.right.clone();
+            window.focus(&focus, cx);
+            window.dispatch_action(Box::new(NextSession), cx);
+        });
+        redraw(cx);
+        assert_eq!(pane(cx).1, Some(1));
+
+        // ⌘W closes the active tab first.
+        shell.update_in(cx, |shell, window, cx| {
+            assert!(shell.close_active_surface(window, cx))
+        });
+        assert_eq!(pane(cx).2, 2);
+
+        // The tab menu closes the others.
+        redraw(cx);
+        let tab = cx.debug_bounds("pull-request-tab-0").unwrap();
+        cx.simulate_mouse_down(
+            tab.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_up(
+            tab.center(),
+            gpui::MouseButton::Right,
+            gpui::Modifiers::default(),
+        );
+        redraw(cx);
+        let others = cx
+            .debug_bounds("pull-request-tab-menu-Close other tabs")
+            .unwrap();
+        cx.simulate_click(others.center(), gpui::Modifiers::default());
+        redraw(cx);
+        let urls: Vec<_> = shell.read_with(cx, |shell, _| {
+            shell
+                .pull_request_pane
+                .tabs
+                .iter()
+                .map(|tab| tab.url.clone())
+                .collect()
+        });
+        assert_eq!(urls, ["https://github.com/a/b/pull/1"]);
     }
 
     #[gpui::test]

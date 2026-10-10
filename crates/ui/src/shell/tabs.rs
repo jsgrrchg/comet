@@ -93,7 +93,7 @@ impl Shell {
             return;
         }
         if self.pull_request_pane_open() && self.navigation_focus.in_right(window, cx) {
-            self.cycle_pull_request_tabs(forward, cx);
+            self.cycle_pull_request_tabs(forward, window, cx);
         } else if matches!(self.route, Route::Chat)
             && self.right_pane_open(cx)
             && self.navigation_focus.in_right(window, cx)

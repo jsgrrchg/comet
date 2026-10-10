@@ -16419,6 +16419,69 @@ mod exit_regressions {
     }
 
     #[gpui::test]
+    fn pull_request_tab_cycling_keeps_focus_after_leaving_content(cx: &mut TestAppContext) {
+        let (shell, cx, _dir) = pull_request_shell(cx);
+        cx.update(|_, cx| motion::set_reduced_motion(cx, true));
+        cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+        shell.update(cx, |shell, cx| shell.open_pull_requests(cx));
+        cx.run_until_parked();
+        open_pull_request(cx, 1);
+        open_pull_request(cx, 2);
+        cx.update(|window, cx| window.draw(cx).clear());
+
+        // Focus a descendant that is unmounted when its PR tab is hidden,
+        // rather than the pane's stable focus handle used by the other test.
+        let content = cx.debug_bounds("pr-detail-scroll").unwrap();
+        cx.simulate_click(
+            gpui::point(content.left() + px(24.0), content.top() + px(100.0)),
+            gpui::Modifiers::default(),
+        );
+        cx.update(|window, cx| {
+            let shell = shell.read(cx);
+            assert!(!shell.right_pane_open(cx), "the chat pane is closed");
+            assert!(shell.navigation_focus.in_right(window, cx));
+            assert!(!shell.navigation_focus.right.is_focused(window));
+        });
+
+        for (key, expected) in [("ctrl-tab", 0), ("ctrl-tab", 1), ("ctrl-shift-tab", 0)] {
+            cx.simulate_keystrokes(key);
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear());
+            cx.update(|window, cx| {
+                let shell = shell.read(cx);
+                assert!(matches!(shell.route, Route::PullRequests));
+                assert_eq!(shell.pull_request_pane.active_index(), Some(expected));
+                assert!(
+                    shell.navigation_focus.in_right(window, cx),
+                    "focus after {key}"
+                );
+            });
+        }
+
+        // History switches pages without explicit tab activation, so focus
+        // recovery must also recognize the PR pane independently of the chat.
+        let content = cx.debug_bounds("pr-detail-scroll").unwrap();
+        cx.simulate_click(
+            gpui::point(content.left() + px(24.0), content.top() + px(100.0)),
+            gpui::Modifiers::default(),
+        );
+        shell.update(cx, |shell, cx| shell.navigate_back(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.update(|window, cx| {
+            let shell = shell.read(cx);
+            assert_eq!(shell.pull_request_pane.active_index(), Some(1));
+            assert!(shell.navigation_focus.in_right(window, cx));
+        });
+        cx.simulate_keystrokes("ctrl-shift-tab");
+        cx.run_until_parked();
+        shell.read_with(cx, |shell, _| {
+            assert!(matches!(shell.route, Route::PullRequests));
+            assert_eq!(shell.pull_request_pane.active_index(), Some(0));
+        });
+    }
+
+    #[gpui::test]
     fn pull_request_tabs_reorder_by_dragging(cx: &mut TestAppContext) {
         let (shell, cx, _dir) = pull_request_shell(cx);
         cx.update(|_, cx| motion::set_reduced_motion(cx, true));

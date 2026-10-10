@@ -291,7 +291,12 @@ impl Shell {
 
     /// Show a tab, recording it in history so Back returns to the one
     /// viewed before.
-    pub(super) fn activate_pull_request_tab(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(super) fn activate_pull_request_tab(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(tab) = self.pull_request_pane.tabs.get(ix) else {
             return;
         };
@@ -302,6 +307,10 @@ impl Shell {
         if self.nav.current() != &entry {
             self.nav.push(entry);
         }
+        // The old page's focused content is about to unmount. Keep keyboard
+        // navigation in the pane, as activating a chat surface does.
+        self.navigation_focus.right_was_focused = true;
+        window.focus(&self.navigation_focus.right, cx);
         self.pull_request_pane.activate(ix);
         self.set_pull_request_pane_open(true, cx);
         self.sync_pull_request_selection(cx);
@@ -310,7 +319,12 @@ impl Shell {
 
     /// The next or previous tab, wrapping (Ctrl+Tab while the pane has
     /// focus).
-    pub(super) fn cycle_pull_request_tabs(&mut self, forward: bool, cx: &mut Context<Self>) {
+    pub(super) fn cycle_pull_request_tabs(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let count = self.pull_request_pane.tabs.len();
         if count <= 1 {
             return;
@@ -321,7 +335,7 @@ impl Shell {
             (None, true) => 0,
             (None, false) => count - 1,
         };
-        self.activate_pull_request_tab(next, cx);
+        self.activate_pull_request_tab(next, window, cx);
     }
 
     /// The ⌘W cascade on this route: close the active tab while the pane
@@ -738,9 +752,9 @@ impl Shell {
                 .into()
             })
             .tooltip_show_delay(Duration::from_millis(350))
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 cx.stop_propagation();
-                this.activate_pull_request_tab(ix, cx);
+                this.activate_pull_request_tab(ix, window, cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,

@@ -444,6 +444,35 @@ pub struct FolderListing {
     pub truncated: bool,
 }
 
+/// `SearchHomeFolders`: folders anywhere under the host's home whose names
+/// match `query`, for the new-project picker. An empty query only starts the
+/// host's home search index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchHomeFoldersRequest {
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeFolderMatch {
+    /// Absolute path on the host.
+    pub path: String,
+    /// Home-relative, `/`-separated (what the picker shows).
+    pub relative: String,
+    pub is_repo: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HomeFolderSearchResult {
+    pub matches: Vec<HomeFolderMatch>,
+    /// The host's home index was still scanning; results may be incomplete.
+    pub indexing: bool,
+}
+
 /// A browse root beyond home: a mounted drive/volume (or the system root).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

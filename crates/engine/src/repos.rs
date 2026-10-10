@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 
 use zeron_proto::{
     DriveEntry, FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit,
-    GitHistoryComparison, GitHistoryPage, GitHistoryRef, GitHistoryRefKind, Repo, RepoRef,
-    Worktree,
+    GitHistoryComparison, GitHistoryPage, GitHistoryRef, GitHistoryRefKind, HomeFolderMatch,
+    HomeFolderSearchResult, Repo, RepoRef, Worktree,
 };
 
 use crate::EngineError;
@@ -42,6 +42,13 @@ const DRIVE_LIST_MAX_ENTRIES: usize = 50;
 const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
+/// Folders `SearchHomeFolders` returns by default, and at most.
+pub const HOME_FOLDER_RESULTS: usize = 20;
+pub const HOME_FOLDER_MAX_RESULTS: usize = 50;
+/// Candidates taken from the index before re-ranking by name; more for a
+/// `/` query, which searches only its last segment.
+const HOME_FOLDER_CANDIDATES: usize = 300;
+const HOME_FOLDER_PATH_CANDIDATES: usize = 2_000;
 const GITHUB_AVATAR_TIMEOUT: Duration = Duration::from_secs(6);
 pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
 pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
@@ -1409,6 +1416,36 @@ impl Repos {
             .await
     }
 
+    // ── SearchHomeFolders ───────────────────────────────────────────────────
+
+    /// Folders anywhere under home whose names match `query`, from the home
+    /// workspace search index — the one projectless chats use, so it skips
+    /// dot folders, dependency and cache folders, and each repository's
+    /// ignored paths. An empty query only starts the index.
+    pub async fn search_home_folders(
+        &self,
+        query: String,
+        limit: usize,
+    ) -> Result<HomeFolderSearchResult, EngineError> {
+        let search = self.inner.workspace_search.clone();
+        let worker = disposable_worker("home-folder-search", move || {
+            search_home_folders_blocking(&search, &query, limit)
+        });
+        match tokio::time::timeout(FILE_SEARCH_TIMEOUT, worker).await {
+            Ok(Some(result)) => result,
+            Ok(None) => Err(EngineError::Other("folder search worker exited".into())),
+            Err(_) => Err(EngineError::Other("folder search timed out".into())),
+        }
+    }
+
+    /// The new-project picker is done with the home index: drop it now
+    /// unless a focused projectless chat pins it.
+    pub fn release_home_folder_search(&self) {
+        if let Ok(home) = home_search_root() {
+            self.inner.workspace_search.release_if_unpinned(&home);
+        }
+    }
+
     /// Search a checkout's files and directories by fuzzy relative path,
     /// from the workspace search index (fff), which honors `.gitignore`,
     /// `.ignore`, and global git excludes. An empty query lists the chat's
@@ -1930,6 +1967,120 @@ fn search_files_blocking(
     Ok(matches)
 }
 
+/// The home folder as the workspace search index keys it.
+fn home_search_root() -> Result<PathBuf, EngineError> {
+    let home = session_home_dir().map_err(|error| EngineError::Other(error.to_string()))?;
+    canonical_search_root(&home)
+}
+
+fn search_home_folders_blocking(
+    search: &WorkspaceSearch,
+    query: &str,
+    limit: usize,
+) -> Result<HomeFolderSearchResult, EngineError> {
+    search_folders_under(search, &home_search_root()?, query, limit)
+}
+
+/// `SearchHomeFolders` against an already-resolved (canonical) root.
+fn search_folders_under(
+    search: &WorkspaceSearch,
+    home: &Path,
+    query: &str,
+    limit: usize,
+) -> Result<HomeFolderSearchResult, EngineError> {
+    // fff scores a `/` query against whole paths, where a folder loses to
+    // its many descendants; ask for the last segment's folders instead and
+    // let `rank_home_folders` check the leading segments.
+    let (index_query, candidates) = match query.trim().trim_end_matches('/').rsplit_once('/') {
+        Some((_, last)) if !last.is_empty() => (last, HOME_FOLDER_PATH_CANDIDATES),
+        _ => (query, HOME_FOLDER_CANDIDATES),
+    };
+    let found = search
+        .search_names(home, index_query, candidates, NameKinds::Directories)
+        .map_err(|e| EngineError::Other(e.to_string()))?;
+    // A `.git` probe per candidate (a few hundred stats) lets repositories
+    // rank first.
+    let candidates = found
+        .matches
+        .into_iter()
+        .filter(|found| !is_git_metadata(&found.path))
+        .map(|found| {
+            let is_repo = home.join(&found.path).join(".git").exists();
+            (found.path, is_repo)
+        })
+        .collect();
+    let matches = rank_home_folders(query, candidates)
+        .into_iter()
+        .take(limit)
+        .map(|(relative, is_repo)| HomeFolderMatch {
+            path: home.join(&relative).to_string_lossy().into_owned(),
+            relative,
+            is_repo,
+        })
+        .collect();
+    Ok(HomeFolderSearchResult {
+        matches,
+        indexing: found.indexing,
+    })
+}
+
+/// Re-rank fuzzy folder candidates `(relative path, is a repository)`, given
+/// in index order, by how well the folder itself matches: an exact name,
+/// then a name starting with the query, then one containing it. A query
+/// with `/` matches the path's last segments instead, each query segment a
+/// prefix of its path segment (`dev/com` → `…/development/comet`). Within a
+/// tier repositories go first, then shallower folders. Candidates matching
+/// only through a typo or a parent's name are kept only when nothing better
+/// matched, ordered the same way.
+fn rank_home_folders(query: &str, candidates: Vec<(String, bool)>) -> Vec<(String, bool)> {
+    let query = query.trim().to_lowercase();
+    let segments: Vec<&str> = query.split('/').filter(|s| !s.is_empty()).collect();
+    let tier = |relative: &str| -> u8 {
+        let relative = relative.to_lowercase();
+        let path: Vec<&str> = relative.split('/').collect();
+        if query.contains('/') {
+            if segments.is_empty() || segments.len() > path.len() {
+                return 0;
+            }
+            let tail = &path[path.len() - segments.len()..];
+            if !tail
+                .iter()
+                .zip(&segments)
+                .all(|(seg, q)| seg.starts_with(q))
+            {
+                return 0;
+            }
+            return if tail.last() == segments.last() { 3 } else { 2 };
+        }
+        let name = path.last().copied().unwrap_or_default();
+        if name == query {
+            3
+        } else if name.starts_with(&query) {
+            2
+        } else {
+            u8::from(name.contains(&query))
+        }
+    };
+    let mut ranked: Vec<(u8, usize, usize, (String, bool))> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(order, (relative, is_repo))| {
+            let depth = relative.matches('/').count();
+            (tier(&relative), depth, order, (relative, is_repo))
+        })
+        .collect();
+    if ranked.iter().any(|(tier, ..)| *tier > 0) {
+        ranked.retain(|(tier, ..)| *tier > 0);
+    }
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.3.1.cmp(&a.3.1))
+            .then(a.1.cmp(&b.1))
+            .then(a.2.cmp(&b.2))
+    });
+    ranked.into_iter().map(|(.., found)| found).collect()
+}
+
 /// Repository metadata is never offered, even if an index surfaced it.
 fn is_git_metadata(relative: &str) -> bool {
     relative.split('/').any(|component| component == ".git")
@@ -2328,6 +2479,118 @@ tmpfs /run tmpfs rw 0 0
         assert_eq!(compact[0].parent_shas, vec![oldest.clone()]);
         assert_eq!(compact[1].sha, oldest);
         assert!(compact[1].parent_shas.is_empty());
+    }
+
+    #[test]
+    fn home_folder_search_finds_nested_repositories() {
+        let home = tempfile::tempdir().unwrap();
+        for dir in [
+            "work/clients/comet/.git",
+            "work/clients/comet/src",
+            "notes/comet-ideas",
+            "notes/other",
+        ] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        std::fs::write(home.path().join("notes/comet-ideas/todo.md"), b"").unwrap();
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let search = WorkspaceSearch::new();
+        // The first call starts the index; wait out its scan.
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let result = loop {
+            let result = search_folders_under(&search, &home, "comet", 20).unwrap();
+            if !result.indexing && !result.matches.is_empty() {
+                break result;
+            }
+            assert!(std::time::Instant::now() < deadline, "index never finished");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let found: Vec<_> = result
+            .matches
+            .iter()
+            .map(|m| (m.relative.as_str(), m.is_repo))
+            .collect();
+        // The exact name outranks the shallower prefix match.
+        assert_eq!(
+            found,
+            [("work/clients/comet", true), ("notes/comet-ideas", false)]
+        );
+        assert_eq!(
+            result.matches[0].path,
+            home.join("work/clients/comet").to_string_lossy()
+        );
+        assert!(
+            search_folders_under(&search, &home, "", 20)
+                .unwrap()
+                .matches
+                .is_empty()
+        );
+    }
+
+    fn ranked(query: &str, candidates: &[(&str, bool)]) -> Vec<String> {
+        let candidates = candidates
+            .iter()
+            .map(|(path, is_repo)| ((*path).to_owned(), *is_repo))
+            .collect();
+        rank_home_folders(query, candidates)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    #[test]
+    fn home_folders_rank_by_their_own_name() {
+        let candidates = [
+            ("Drive/notes about comet launch", false),
+            ("dev/comet/apps/ios", false),
+            ("old/comet-archive", false),
+            ("dev/comet", false),
+            ("dev/mycomet", false),
+        ];
+        assert_eq!(
+            ranked("Comet", &candidates),
+            [
+                "dev/comet",
+                "old/comet-archive",
+                // Same tier, repo flag and depth: the index's order decides.
+                "Drive/notes about comet launch",
+                "dev/mycomet",
+            ]
+        );
+    }
+
+    #[test]
+    fn home_folders_put_repositories_first_within_a_tier() {
+        let candidates = [("a/comet-docs", false), ("b/c/comet-app", true)];
+        assert_eq!(
+            ranked("comet", &candidates),
+            ["b/c/comet-app", "a/comet-docs"]
+        );
+        // Typo matches survive only when nothing contains the query, and
+        // order the same way.
+        let candidates = [
+            ("Models/Comfy/comfy_types", false),
+            ("dev/comet", true),
+            ("dev/tools", false),
+        ];
+        assert_eq!(
+            ranked("comt", &candidates),
+            ["dev/comet", "dev/tools", "Models/Comfy/comfy_types"]
+        );
+    }
+
+    #[test]
+    fn slash_queries_match_trailing_segment_prefixes() {
+        let candidates = [
+            ("Documentos/development/comet/apps", false),
+            ("Documentos/development/comet", true),
+            ("Documentos/dev/tools", false),
+            ("dev/com", false),
+        ];
+        assert_eq!(
+            ranked("dev/com", &candidates),
+            ["dev/com", "Documentos/development/comet"]
+        );
     }
 
     fn search_files_blocking(

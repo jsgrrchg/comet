@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use fff_search::file_picker::FilePicker;
 use fff_search::{
-    Casing, ContentCacheBudget, FFFMode, FilePickerOptions, FuzzySearchOptions, GrepConfig,
-    GrepMode, GrepSearchOptions, MixedItemRef, MixedSearchConfig, PaginationArgs, QueryParser,
-    SharedFilePicker, SharedFrecency,
+    Casing, ContentCacheBudget, DirSearchConfig, FFFMode, FilePickerOptions, FuzzySearchOptions,
+    GrepConfig, GrepMode, GrepSearchOptions, MixedItemRef, MixedSearchConfig, PaginationArgs,
+    QueryParser, SharedFilePicker, SharedFrecency,
 };
 
 /// An index nobody searched or warmed for this long is dropped.
@@ -57,6 +57,7 @@ pub enum IndexState {
 pub enum NameKinds {
     FilesAndDirectories,
     Files,
+    Directories,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +149,7 @@ impl WorkspaceSearch {
     }
 
     /// Fuzzy file (and directory) names. An empty query lists files by
-    /// recency (git and modification time).
+    /// recency (git and modification time), or no directories at all.
     pub fn search_names(
         &self,
         root: &Path,
@@ -173,7 +174,24 @@ impl WorkspaceSearch {
             ..Default::default()
         };
         let mut matches = Vec::with_capacity(limit);
-        if kinds == NameKinds::Files || query.trim().is_empty() {
+        if kinds == NameKinds::Directories {
+            if query.trim().is_empty() {
+                return Ok(NameSearch { matches, indexing });
+            }
+            let parsed = QueryParser::new(DirSearchConfig).parse(query);
+            let result = fff.fuzzy_search_directories(&parsed, options);
+            for (dir, score) in result.items.into_iter().zip(result.scores) {
+                let path = dir.relative_path(fff).trim_end_matches('/').to_owned();
+                if path.is_empty() {
+                    continue;
+                }
+                matches.push(NameMatch {
+                    path,
+                    is_dir: true,
+                    score: i64::from(score.total),
+                });
+            }
+        } else if kinds == NameKinds::Files || query.trim().is_empty() {
             let parsed = QueryParser::default().parse(query);
             let result = fff.fuzzy_search(&parsed, None, options);
             for (item, score) in result.items.into_iter().zip(result.scores) {
@@ -287,6 +305,24 @@ impl WorkspaceSearch {
         for (root, entry) in entries {
             release(&root, entry, "explicit");
         }
+    }
+
+    /// Drop `root`'s index now unless it is pinned (a focused chat's), for a
+    /// caller done with an index it may have started. `true` if dropped.
+    pub fn release_if_unpinned(&self, root: &Path) -> bool {
+        let now = (self.inner.clock)();
+        let removed = {
+            let mut entries = lock(&self.inner.entries);
+            let pinned = entries
+                .get(root)
+                .is_some_and(|entry| entry.pinned_until.is_some_and(|until| until > now));
+            if pinned { None } else { entries.remove(root) }
+        };
+        let Some(entry) = removed else {
+            return false;
+        };
+        release(root, entry, "released");
+        true
     }
 
     /// Number of live indexes.
@@ -557,6 +593,44 @@ mod tests {
             .unwrap();
         assert!(files.matches.iter().all(|m| !m.is_dir));
         assert_eq!(search.live(), 1);
+    }
+
+    #[test]
+    fn directory_search_returns_only_directories() {
+        let (_dir, root) = folder(&[
+            ("projects/comet/src/main.rs", b""),
+            ("projects/comet.md", b""),
+        ]);
+        let search = WorkspaceSearch::new();
+        ready(&search, &root);
+        let found = search
+            .search_names(&root, "comet", 20, NameKinds::Directories)
+            .unwrap();
+        assert_eq!(found.matches[0].path, "projects/comet");
+        assert!(found.matches.iter().all(|m| m.is_dir));
+        assert!(
+            search
+                .search_names(&root, "", 20, NameKinds::Directories)
+                .unwrap()
+                .matches
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn releasing_spares_a_pinned_index() {
+        let (_a, a) = folder(&[("a.rs", b"")]);
+        let (_b, b) = folder(&[("b.rs", b"")]);
+        let search = WorkspaceSearch::new();
+        search.warm(&a, true).unwrap();
+        search.warm(&b, false).unwrap();
+
+        assert!(!search.release_if_unpinned(&a));
+        assert!(search.release_if_unpinned(&b));
+        assert!(!search.release_if_unpinned(&b));
+        let entries = lock(&search.inner.entries);
+        assert!(entries.contains_key(&a));
+        assert!(!entries.contains_key(&b));
     }
 
     #[test]

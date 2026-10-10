@@ -163,6 +163,10 @@ pub mod methods {
     pub const LIST_FOLDERS: &str = "ListFolders";
     /// The device's browse roots: home plus mounted drives/volumes.
     pub const LIST_DRIVES: &str = "ListDrives";
+    /// Folders under the host's home by name (new-project picker).
+    pub const SEARCH_HOME_FOLDERS: &str = "SearchHomeFolders";
+    /// The new-project picker closed: drop the host's home index if unpinned.
+    pub const RELEASE_HOME_FOLDER_SEARCH: &str = "ReleaseHomeFolderSearch";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
     pub const SEARCH_FILES: &str = "SearchFiles";
     // Device-local workspace filesystem operations. All are relay-forwardable;

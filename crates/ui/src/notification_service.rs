@@ -293,6 +293,7 @@ mod tests {
             started_at: Some(Utc::now()),
             updated_at: Utc::now(),
             last_completed_turn: None,
+            running_subagents: 0,
         }
     }
 

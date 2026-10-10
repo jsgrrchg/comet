@@ -600,8 +600,18 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
 pub use zeron_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
-    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+    parse_auth_state, project_label, running_subagents, sort_active, sort_chats, sort_spaces, sort_tabs,
 };
+
+/// What a session row shows that ticks with the clock rather than with its
+/// content: the staleness-checked indicator and running-subagent count. A
+/// change in either must repaint even when the row itself is untouched.
+fn session_presence(session: &Session, now: DateTime<Utc>) -> (Indicator, u32) {
+    (
+        effective_indicator(Some(session), now),
+        running_subagents(Some(session), now),
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Org gate (pure)
@@ -753,7 +763,7 @@ pub struct AppState {
     device_presentation: Option<Vec<(Device, bool, String)>>,
     // Presence ticks also retire stale remote session indicators. Remember
     // their last published appearance even when the device rows stay online.
-    session_presence_presentation: Vec<Indicator>,
+    session_presence_presentation: Vec<(Indicator, u32)>,
     /// Live edge posture (WatchConnectivity): drives the connection pill,
     /// composer honesty ("will queue"), and the Queued send badges.
     pub connectivity: zeron_proto::Connectivity,
@@ -895,11 +905,11 @@ fn is_text_append(frame: &TranscriptFrame) -> bool {
         if upsert.is_empty() && remove.is_empty() && !append.is_empty())
 }
 
-/// Each session's indicator at `now` (the lease-dependent part of a frame).
-fn session_presence_at(sessions: &[Session], now: DateTime<Utc>) -> Vec<Indicator> {
+/// Each session's presence at `now` (the lease-dependent part of a frame).
+fn session_presence_at(sessions: &[Session], now: DateTime<Utc>) -> Vec<(Indicator, u32)> {
     sessions
         .iter()
-        .map(|session| effective_indicator(Some(session), now))
+        .map(|session| session_presence(session, now))
         .collect()
 }
 
@@ -1598,7 +1608,8 @@ impl AppState {
         if Some(chat.device_id.as_str()) == self.local_device_id.as_deref() {
             return false;
         }
-        if self.connectivity.state == S::Offline || !self.device_online(&chat.device_id, Utc::now())
+        if self.connectivity.state == S::Offline
+            || !self.device_online(&chat.device_id, Utc::now())
         {
             return true;
         }
@@ -2483,6 +2494,13 @@ impl AppState {
         self.sessions.iter().find(|s| s.chat_id == chat_id)
     }
 
+    /// Subagents running under `chat_id` right now (the engine's count on its
+    /// session row; 0 once that row goes stale). Every device can ask, opened
+    /// chat or not.
+    pub fn running_subagents_for(&self, chat_id: &str, now: DateTime<Utc>) -> u32 {
+        running_subagents(self.session_for(chat_id), now)
+    }
+
     /// Staleness-checked status dot for a chat row. A send in flight reads as
     /// Working (see [`Self::display_status_for`]).
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
@@ -2809,17 +2827,16 @@ impl AppState {
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
-        let owner = state.clone();
+        // The state owns this task. A strong handle in its future would retain
+        // the state if the last window closes before bootstrap completes.
+        let pending_state = state.downgrade();
         let task = cx.spawn(async move |cx| {
             let outcome = match boot.await {
                 Ok(Ok(handle)) => Ok(handle),
                 Ok(Err(err)) => Err(format!("{err:#}")),
                 Err(join_err) => Err(join_err.to_string()),
             };
-            // NB: at the pinned rev `Entity::update(&mut AsyncApp)` returns the
-            // closure's value directly (no Result) — AsyncApp implements
-            // AppContext like App does.
-            state.update(cx, |s, cx| {
+            let _ = pending_state.update(cx, |s, cx| {
                 s.bootstrap_task = None;
                 match outcome {
                     Ok(handle) => s.attach_engine(handle, cx),
@@ -2831,7 +2848,7 @@ impl AppState {
                 }
             });
         });
-        owner.update(cx, |s, _| s.bootstrap_task = Some(task));
+        state.update(cx, |s, _| s.bootstrap_task = Some(task));
     }
 
     /// Wire the connected engine: mark Ready and start the standing watches.
@@ -3266,10 +3283,7 @@ impl AppState {
         cx.spawn(async move |_, _| {
             if let Err(error) = handle
                 .client()
-                .call(
-                    methods::FOCUS_CHAT,
-                    serde_json::json!({ "chatId": chat_id }),
-                )
+                .call(methods::FOCUS_CHAT, serde_json::json!({ "chatId": chat_id }))
                 .await
             {
                 tracing::debug!(%chat_id, %error, "chat focus sync hint unavailable");
@@ -3814,6 +3828,43 @@ mod tests {
     // `SessionStatus` is only needed to build the fixtures below — the module
     // itself derives everything through `zeron_proto::view`.
     use zeron_proto::{SessionStatus, UserProfile};
+
+    #[gpui::test]
+    fn pending_bootstrap_releases_its_application_state(cx: &mut gpui::TestAppContext) {
+        // Leave Tokio unpolled so bootstrap cannot finish before the owner
+        // disappears, as when the app closes immediately after launch.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let owner = cx.update(|cx| {
+            gpui_tokio::init_from_handle(cx, runtime.handle().clone());
+            let owner = cx.new(|_| AppState::new());
+            AppState::bootstrap(
+                owner.clone(),
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: HarnessId::Mock,
+                },
+                cx,
+            );
+            assert!(owner.read(cx).bootstrap_task.is_some());
+            owner
+        });
+        let weak = owner.downgrade();
+        drop(owner);
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "pending bootstrap retained its owner"
+        );
+    }
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
@@ -4380,6 +4431,7 @@ mod tests {
     ) -> Session {
         Session {
             last_completed_turn: None,
+            running_subagents: 0,
             chat_id: chat_id.into(),
             device_id: "dev".into(),
             status,
@@ -4624,6 +4676,7 @@ mod tests {
         let now = Utc::now();
         let mut row = Session {
             last_completed_turn: None,
+            running_subagents: 0,
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,
@@ -4655,6 +4708,7 @@ mod tests {
         let now = Utc::now();
         state.sessions = vec![Session {
             last_completed_turn: None,
+            running_subagents: 0,
             chat_id: "chat".into(),
             device_id: "host".into(),
             status: SessionStatus::Working,
@@ -6511,7 +6565,7 @@ mod tests {
     }
 }
 
-#[cfg(feature = "appshots-fixture")]
+#[cfg(any(feature = "appshots-fixture", feature = "pull-request-fixture"))]
 impl AppState {
     /// Keep fixture documents deterministic while using the real attachment RPC.
     pub fn fixture_attachment_engine(&mut self, engine: EngineHandle) {

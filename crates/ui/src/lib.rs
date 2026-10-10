@@ -18,6 +18,7 @@ pub mod app_update;
 mod app_runtime;
 pub mod appearance;
 pub mod appshots;
+mod asset_http;
 pub mod attachments;
 pub mod badges;
 pub mod browser;
@@ -32,6 +33,7 @@ mod composer_markdown;
 mod context_usage;
 mod dictation;
 pub mod edge_fade;
+pub mod rounded_clip;
 pub mod file_icons;
 pub mod files;
 pub mod frost;
@@ -57,9 +59,16 @@ pub mod orb;
 pub mod pickers;
 pub mod popover;
 pub mod project_actions;
+pub mod pull_request_detail;
+mod pull_request_media;
+mod pull_request_skeleton;
+#[cfg(test)]
+mod pull_request_test_support;
+pub mod pull_requests;
 pub mod queue;
 pub mod rail;
 mod roll_text;
+pub mod running_pill;
 pub mod settings;
 pub mod shell;
 pub mod sound;
@@ -71,6 +80,7 @@ mod todo_panel;
 pub(crate) mod tool_images;
 pub mod theme;
 pub mod theme_library;
+pub mod toast;
 pub mod transcript;
 pub mod typography;
 #[cfg(feature = "multi-window-fixture")]
@@ -143,7 +153,9 @@ fn run_application(
     // default runtime has only two workers, insufficient for a desktop engine.
     let runtime = tokio::runtime::Runtime::new().expect("desktop Tokio runtime");
     let runtime_handle = runtime.handle().clone();
-    let app = gpui_platform::application().with_assets(icons::Assets);
+    let app = gpui_platform::application()
+        .with_assets(icons::Assets)
+        .with_http_client(asset_http::AssetHttpClient::new(runtime_handle.clone()));
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
     let callback_tx = url_tx.clone();
     app.on_open_urls(move |urls| {
@@ -397,6 +409,28 @@ fn open_main_window(
             appearance::observe_window(window, cx).detach();
             let shell = cx.new(|cx| shell::Shell::new(state, boot, cx));
             let weak_shell = shell.downgrade();
+            #[cfg(target_os = "linux")]
+            window.on_window_should_close(cx, move |window, cx| {
+                // X11 holds its client state while asking whether to close.
+                // Preparing the close can redraw a peer window, so run it
+                // after the native callback has returned and released that state.
+                let handle = window.window_handle();
+                let weak_shell = weak_shell.clone();
+                cx.spawn(async move |cx| {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let should_close = weak_shell
+                            .update(cx, |shell, cx| shell.prepare_window_close(cx))
+                            .unwrap_or(true);
+                        if should_close {
+                            settings::flush(cx);
+                            window.remove_window();
+                        }
+                    });
+                })
+                .detach();
+                false
+            });
+            #[cfg(not(target_os = "linux"))]
             window.on_window_should_close(cx, move |_, cx| {
                 let should_close = weak_shell
                     .update(cx, |shell, cx| shell.prepare_window_close(cx))

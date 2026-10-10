@@ -435,6 +435,7 @@ pub(crate) fn seed(
         if let Some(status) = demo.status {
             doc.upsert_session(&Session {
                 last_completed_turn: None,
+                running_subagents: 0,
                 chat_id: demo.id.into(),
                 device_id: demo.device.into(),
                 status,
@@ -490,6 +491,8 @@ pub(crate) fn seed(
                 change: SidebarSectionChange::Assign {
                     session_id: (*member).into(),
                     section_id: Some(section.into()),
+                    after: None,
+                    before: None,
                 },
             })?;
         }

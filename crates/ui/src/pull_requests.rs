@@ -1398,6 +1398,18 @@ impl PullRequestsPage {
                         // The trailing button sits one card inset from the
                         // edge, like the row's own text.
                         .pr(px(popover::CARD_INSET + 2.0))
+                        // Enter is unbound in a "PaletteSearch" input and
+                        // bubbles here: it opens the typed repository, like
+                        // the Open button.
+                        .on_key_down(cx.listener(|page, event: &gpui::KeyDownEvent, _, cx| {
+                            if event.keystroke.key == "enter"
+                                && !event.keystroke.modifiers.modified()
+                            {
+                                cx.stop_propagation();
+                                page.return_focus = Some(page.repository_focus.clone());
+                                page.select_repository(cx);
+                            }
+                        }))
                         .child(
                             div()
                                 .min_w_0()
@@ -3987,6 +3999,42 @@ mod tests {
                 Some("saved/repo")
             );
             assert_eq!(restored.last_pull_request_device.as_deref(), Some("remote"));
+        });
+    }
+
+    #[gpui::test]
+    fn enter_opens_the_typed_repository(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        fixture::init(cx);
+        let (page, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            PullRequestsPage::new(state, cx)
+        });
+        page.update(cx, |page, _| {
+            // A cached board, so opening it needs no engine.
+            page.snapshots.push((
+                (None, "acme/zeron".into(), ChangeRequestFilter::Authored),
+                vec![pull_request("acme/zeron", 10, 1, 1, 1)],
+                Instant::now(),
+                Paging::default(),
+            ));
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+        cx.run_until_parked();
+        let trigger = cx.debug_bounds("pr-repository").unwrap();
+        cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        page.update(cx, |page, cx| {
+            assert!(page.repository_menu.is_open());
+            page.repository_input
+                .update(cx, |input, cx| input.set_text("acme/zeron", cx));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.repository.as_deref(), Some("acme/zeron"));
+            assert!(!page.repository_menu.is_open());
+            assert_eq!(page.items[0].number, 10);
         });
     }
 

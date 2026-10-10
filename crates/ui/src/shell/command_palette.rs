@@ -6,7 +6,7 @@ use crate::appearance::AppearanceMode;
 use crate::files::client::{FilesClientError, FilesRequestContext, WorkspaceFilesClient};
 use zeron_proto::{
     SearchWorkspaceContentRequest, SearchWorkspaceFilesRequest, WorkspaceContentMatch,
-    WorkspaceEntryKind, WorkspaceFileSearchMatch, WorkspaceSearchIndexState,
+    WorkspaceEntryKind, WorkspaceFileSearchMatch, WorkspaceSearchIndexState, WorkspaceTarget,
 };
 
 /// Key context of the palette card: its mod-1…4 tab bindings live here.
@@ -45,6 +45,10 @@ pub(super) struct CommandPalette {
     scroll: gpui::ScrollHandle,
     /// File-name matches in the focused chat's workspace.
     files: WorkspaceQuery<Vec<WorkspaceFileSearchMatch>>,
+    /// The workspace whose index a probe found ready during this palette
+    /// session: name searches there skip the readiness probe, saving a round
+    /// trip per keystroke on remote hosts.
+    files_ready: Option<WorkspaceTarget>,
     /// Content matches in the focused chat's workspace.
     content: WorkspaceQuery<Vec<WorkspaceContentMatch>>,
     _search_events: Subscription,
@@ -448,6 +452,7 @@ impl Shell {
             focus_pending: true,
             scroll: gpui::ScrollHandle::new(),
             files: WorkspaceQuery::default(),
+            files_ready: None,
             content: WorkspaceQuery::default(),
             _search_events: events,
         });
@@ -498,29 +503,44 @@ impl Shell {
             limit: Some(FILES_TAB_LIMIT as u16),
         };
         let names = client.clone();
+        let target = client.target().clone();
+        let mut probe = palette.files_ready.as_ref() != Some(&target);
         palette.files.task = Some(cx.spawn(async move |this, cx| {
             loop {
+                let mut ready = false;
                 let result = async {
                     // SearchWorkspaceFiles keeps its list-shaped wire response.
                     // Check readiness BEFORE searching: a scan finishing after
                     // a partial answer must still trigger one final search.
-                    let indexing = match names.warm_search().await {
-                        Ok(warm) => warm.state == WorkspaceSearchIndexState::Building,
-                        // Older hosts search without the new index/warm method.
-                        Err(FilesClientError::Unsupported(_)) => false,
-                        Err(error) => return Err(error),
+                    // Once ready, the index stays built while in use, so later
+                    // keystrokes go straight to the search.
+                    let indexing = if probe {
+                        match names.warm_search().await {
+                            Ok(warm) => warm.state == WorkspaceSearchIndexState::Building,
+                            // Older hosts search without the new index/warm method.
+                            Err(FilesClientError::Unsupported(_)) => false,
+                            Err(error) => return Err(error),
+                        }
+                    } else {
+                        false
                     };
+                    ready = probe && !indexing;
                     names
                         .search(request.clone())
                         .await
                         .map(|found| (found, indexing))
                 }
                 .await;
+                probe &= !ready;
+                let target = target.clone();
                 let retry = this
                     .update(cx, |shell, cx| {
                         let Some(palette) = shell.command_palette.as_mut() else {
                             return false;
                         };
+                        if ready {
+                            palette.files_ready = Some(target);
+                        }
                         if !palette.files.finish(generation, result, "file") {
                             return false;
                         }
@@ -1819,6 +1839,96 @@ mod tests {
         let search = engine.take(methods::SEARCH_WORKSPACE_FILES, cx);
         assert_eq!(search.len(), 1);
         search.into_iter().next().unwrap()
+    }
+
+    /// Every request sent so far, each answered: warm-ups as `warm`, name
+    /// searches with no matches. Returns the methods in order.
+    fn answer_all(engine: &mut FakeEngine, warm: &str, cx: &mut TestAppContext) -> Vec<String> {
+        let mut methods_seen = Vec::new();
+        loop {
+            cx.executor().advance_clock(CONTENT_DEBOUNCE);
+            cx.run_until_parked();
+            let Ok(request) = engine.requests.try_recv() else {
+                return methods_seen;
+            };
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            let method = request["method"].as_str().unwrap().to_owned();
+            match method.as_str() {
+                methods::WARM_WORKSPACE_SEARCH if warm == "unsupported" => engine.fail(
+                    &request,
+                    &format!("unknown method: {}", methods::WARM_WORKSPACE_SEARCH),
+                ),
+                methods::WARM_WORKSPACE_SEARCH => {
+                    engine.reply(&request, serde_json::json!({ "state": warm }))
+                }
+                methods::SEARCH_WORKSPACE_FILES => engine.reply(&request, serde_json::json!([])),
+                _ => engine.reply(&request, content_answer(Vec::new(), false)),
+            }
+            if method != methods::SEARCH_WORKSPACE_CONTENT {
+                methods_seen.push(method);
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn a_ready_index_skips_the_probe_until_the_palette_reopens(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = file_search_palette(cx);
+        let probed = [
+            methods::WARM_WORKSPACE_SEARCH,
+            methods::SEARCH_WORKSPACE_FILES,
+        ];
+        type_query(window, "ne", cx);
+        assert_eq!(answer_all(&mut engine, "ready", cx), probed);
+        for query in ["nee", "need"] {
+            type_query(window, query, cx);
+            assert_eq!(
+                answer_all(&mut engine, "ready", cx),
+                [methods::SEARCH_WORKSPACE_FILES],
+                "{query}"
+            );
+        }
+
+        window
+            .update(cx, |shell, window, cx| {
+                shell.close_command_palette(window, cx);
+                shell.toggle_command_palette(window, cx);
+            })
+            .unwrap();
+        type_query(window, "ne", cx);
+        assert_eq!(answer_all(&mut engine, "ready", cx), probed);
+    }
+
+    #[gpui::test]
+    fn a_building_index_keeps_probing(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = file_search_palette(cx);
+        type_query(window, "ne", cx);
+        answer_all(&mut engine, "building", cx);
+        type_query(window, "nee", cx);
+        assert_eq!(
+            answer_all(&mut engine, "ready", cx),
+            [
+                methods::WARM_WORKSPACE_SEARCH,
+                methods::SEARCH_WORKSPACE_FILES
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn an_older_host_is_probed_once(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = file_search_palette(cx);
+        type_query(window, "ne", cx);
+        assert_eq!(
+            answer_all(&mut engine, "unsupported", cx),
+            [
+                methods::WARM_WORKSPACE_SEARCH,
+                methods::SEARCH_WORKSPACE_FILES
+            ]
+        );
+        type_query(window, "nee", cx);
+        assert_eq!(
+            answer_all(&mut engine, "unsupported", cx),
+            [methods::SEARCH_WORKSPACE_FILES]
+        );
     }
 
     #[gpui::test]

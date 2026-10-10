@@ -55,10 +55,9 @@ impl Shell {
     }
 
     fn sidebar_peek_progress(&self) -> f32 {
-        self.eval_tween_with_spec(
+        self.eval_tween(
             self.sidebar_peek.tween,
             if self.sidebar_peek.open { 1.0 } else { 0.0 },
-            PEEK_MOTION,
         )
     }
 
@@ -138,7 +137,12 @@ impl Shell {
             if !open {
                 self.sidebar_peek.keyboard_focus = false;
             }
-            self.sidebar_peek.tween = Some(WidthTween::new(from, if open { 1.0 } else { 0.0 }));
+            self.sidebar_peek.tween = Some(WidthTween {
+                duration: PEEK_MOTION.total().mul_f32(motion::speed_scale()),
+                curve: PEEK_MOTION.curve,
+                started: self.render_time.unwrap_or_else(|| self.motion_time()),
+                ..WidthTween::new(from, if open { 1.0 } else { 0.0 })
+            });
             cx.notify();
         }
     }
@@ -260,7 +264,7 @@ impl Shell {
             .child(
                 self.sidebar_pane.clone().cached(
                     gpui::StyleRefinement::default()
-                        .w(px(self.settings.sidebar_width))
+                        .w(px(self.sidebar_content_width()))
                         .h_full()
                         .flex_none(),
                 ),
@@ -658,6 +662,11 @@ mod tests {
                 );
                 let visible = shell.sidebar_peek_progress();
                 assert!(visible > 0.0 && visible < 1.0);
+                assert_eq!(
+                    shell.sidebar_content_width(),
+                    310.0,
+                    "floating content keeps its width without a pinned column"
+                );
                 shell.set_sidebar_peek(false, cx);
                 assert_eq!(shell.sidebar_peek.tween.unwrap().from, visible);
                 assert_eq!(shell.sidebar_target(), 0.0);

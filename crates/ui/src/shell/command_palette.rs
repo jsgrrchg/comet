@@ -416,7 +416,7 @@ impl Shell {
             self.close_command_palette(window, cx);
             return;
         }
-        self.add_space = None;
+        self.close_add_space(cx);
         let search = cx.new(|cx| {
             ComposerInput::with_context("Search threads, commands and files…", "PaletteSearch", cx)
         });

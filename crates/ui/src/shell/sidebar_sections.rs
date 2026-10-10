@@ -763,6 +763,16 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         assert!(cx.debug_bounds("session-info").is_none());
+
+        // Choosing one of its rows dismisses it too.
+        window
+            .update(&mut cx, |shell, _, cx| shell.toggle_session_info(cx))
+            .unwrap();
+        cx.run_until_parked();
+        let fork = cx.debug_bounds("session-info-fork").unwrap();
+        cx.simulate_click(fork.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-info").is_none());
     }
 
     #[gpui::test]

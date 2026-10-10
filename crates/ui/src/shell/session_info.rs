@@ -91,6 +91,8 @@ impl Shell {
         cx.notify();
     }
 
+    /// Dismiss the card floating over the transcript; one shown beside it
+    /// stays put.
     fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
         if self.session_info_overlay {
             self.session_info_overlay = false;
@@ -197,14 +199,20 @@ impl Shell {
             .id("session-info-side-chat")
             .debug_selector(|| "session-info-side-chat".into())
             .when(busy, |row| row.opacity(0.5))
-            .on_click(cx.listener(|this, _, _, cx| this.create_child_chat(None, cx)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_session_info_overlay(cx);
+                this.create_child_chat(None, cx)
+            }))
             .child(popover::picker_icon_slot(row_glyph(icons::PLUS, &theme)))
             .child(div().flex_1().child("New side chat"));
         let fork = popover::picker_row(&theme, false, false, "session-info-fork")
             .id("session-info-fork")
             .debug_selector(|| "session-info-fork".into())
             .when(busy, |row| row.opacity(0.5))
-            .on_click(cx.listener(|this, _, _, cx| this.create_side_chat(cx)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_session_info_overlay(cx);
+                this.create_side_chat(cx)
+            }))
             .child(popover::picker_icon_slot(row_glyph(icons::FORK, &theme)))
             .child(div().flex_1().child("Fork chat"));
 
@@ -257,8 +265,8 @@ impl Shell {
                 .right(px(SESSION_CARD_INSET - dx))
                 .opacity(ease)
                 .occlude()
-                // Over the transcript it is a popover: a press elsewhere
-                // dismisses it.
+                // Over the transcript it is a popover: a press elsewhere, or
+                // choosing one of its rows, dismisses it.
                 .when(!docked, |card| {
                     card.on_mouse_down_out(
                         cx.listener(|this, _, _, cx| this.close_session_info_overlay(cx)),
@@ -338,6 +346,7 @@ impl Shell {
                     .when(!can_run, |row| row.opacity(0.5).cursor_default())
                     .when(can_run, |row| {
                         row.on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_session_info_overlay(cx);
                             this.run_project_action(&key, run.clone(), cx)
                         }))
                     })
@@ -364,6 +373,7 @@ impl Shell {
                             .tooltip(crate::settings::widgets::text_tooltip("Edit action"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
+                                this.close_session_info_overlay(cx);
                                 this.open_project_action_editor(Some(edit.clone()), None, cx)
                             }))
                             .child(
@@ -382,6 +392,7 @@ impl Shell {
                 popover::picker_row(theme, false, false, row_id.clone())
                     .id(row_id)
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_session_info_overlay(cx);
                         this.open_project_action_editor(None, Some(import.clone()), cx)
                     }))
                     .child(popover::picker_icon_slot(row_glyph(
@@ -406,6 +417,7 @@ impl Shell {
             popover::picker_row(theme, false, false, "session-info-add-action")
                 .id("session-info-add-action")
                 .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_session_info_overlay(cx);
                     this.open_project_action_editor(None, None, cx)
                 }))
                 .child(popover::picker_icon_slot(row_glyph(icons::PLUS, theme)))

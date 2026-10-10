@@ -42,8 +42,8 @@ returns:
 - Eviction stops the scan and watcher, drops the index, and asks glibc to
   return the freed memory (`malloc_trim`) on Linux.
 
-Fixed options: content indexing on (except for the home folder, which is
-searched unindexed), mmap warm-up off, no frecency database (`SharedDb::noop`),
+Fixed options: no content (bigram) index — see "Paths-only index" below —,
+mmap warm-up off, no frecency database (`SharedDb::noop`),
 git recency on, symlinks not followed. fff's tracing and panic hooks are not
 installed.
 
@@ -87,6 +87,25 @@ ms; the tree's `Cargo.toml` query, 200 results, is the slowest). Content p50
 the index itself (+19.4 MB); query-time allocations add more until eviction.
 Back within ±10 MB of baseline after eviction — not met on Linux (+10.5 MB
 after one cycle, plateauing near +20 MB).
+
+## Paths-only index
+
+The tables above were taken with fff's content index on. It is now off:
+indexes hold paths only and `SearchWorkspaceContent` greps the indexed files
+without a bigram prefilter. Re-measured the same way:
+
+| | comet, content index | comet, paths only | t3code, content index | t3code, paths only |
+| --- | ---: | ---: | ---: | ---: |
+| Index ready | 51–61 ms | 41 ms | 625–685 ms | 303 ms |
+| RSS with the index | 25.5 MB | 19.5 MB | 90.5 MB | 76.7 MB |
+| RSS after every query | 39.3 MB | 43.8 MB | 123.0 MB | 91.7 MB |
+| `SearchWorkspaceContent` median | 0.17–0.43 ms | 0.48–2.3 ms | 0.72–1.99 ms | 1.1–21 ms |
+
+Name searches are unchanged. Content queries with many hits stay near 1 ms;
+rare or absent strings scan every candidate (~20 ms on t3code's 27.7k files,
+page cache warm). A cold disk makes the first such query slower; that was not
+measured. A full rescan of t3code drops from ~1.7 s to ~1.05 s of CPU, and
+build CPU from ~2.0 s to ~0.9 s.
 
 ## Behavior changes
 

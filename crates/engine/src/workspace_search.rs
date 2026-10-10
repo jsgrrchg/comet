@@ -6,7 +6,8 @@
 //! background and keeps itself current with its own watcher. Memory stays
 //! bounded: an index idle for [`IDLE_EVICT`] is dropped, at most [`MAX_LIVE`]
 //! are alive at once (least recently used goes first), and the content cache
-//! of each one is capped at [`CACHE_BUDGET_BYTES`]. A pinned index (the
+//! of each one is capped at [`CACHE_BUDGET_BYTES`]. Indexes hold paths only:
+//! content search greps the indexed files without a bigram prefilter. A pinned index (the
 //! focused chat's, renewed by the UI heartbeat) is evicted for capacity only
 //! when every live index is pinned.
 
@@ -428,7 +429,6 @@ fn lru_victim(entries: &HashMap<PathBuf, Entry>, now: Instant) -> Option<PathBuf
 }
 
 fn create_picker(root: &Path) -> Result<SharedFilePicker, WorkspaceSearchError> {
-    let home = std::fs::canonicalize(crate::repos::home_dir()).is_ok_and(|home| home == root);
     let picker = SharedFilePicker::default();
     let started = Instant::now();
     FilePicker::new_with_shared_state(
@@ -437,9 +437,11 @@ fn create_picker(root: &Path) -> Result<SharedFilePicker, WorkspaceSearchError> 
         FilePickerOptions {
             base_path: root.to_string_lossy().into_owned(),
             enable_mmap_cache: false,
-            // The bigram index makes content search fast; a whole home folder
-            // is too large to be worth it, so it is searched unindexed there.
-            enable_content_indexing: !home,
+            // No bigram index: it costs a third of a large repo's index memory
+            // and scan CPU on every focused chat, while grep without it still
+            // answers in ~20 ms on a 28k-file repo (see
+            // docs/performance-workspace-search.md).
+            enable_content_indexing: false,
             mode: FFFMode::Neovim,
             cache_budget: ContentCacheBudget::from_overrides(0, CACHE_BUDGET_BYTES, 0),
             watch: true,

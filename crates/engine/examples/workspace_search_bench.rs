@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("index did not finish within 10 minutes".into());
     }
     println!(
-        "index scanned and content-indexed in {:?}",
+        "index ready in {:?}",
         started.elapsed()
     );
     print_rss("after index");

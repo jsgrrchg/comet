@@ -6,7 +6,7 @@ use crate::appearance::AppearanceMode;
 use crate::files::client::{FilesClientError, FilesRequestContext, WorkspaceFilesClient};
 use zeron_proto::{
     SearchWorkspaceContentRequest, SearchWorkspaceFilesRequest, WorkspaceContentMatch,
-    WorkspaceEntryKind, WorkspaceFileSearchMatch,
+    WorkspaceEntryKind, WorkspaceFileSearchMatch, WorkspaceSearchIndexState,
 };
 
 /// Key context of the palette card: its mod-1…4 tab bindings live here.
@@ -23,6 +23,7 @@ const MIN_WORKSPACE_QUERY_CHARS: usize = 2;
 const CONTENT_DEBOUNCE: Duration = Duration::from_millis(80);
 /// Refresh partial results until the host finishes its initial scan.
 const CONTENT_INDEX_RETRY: Duration = Duration::from_millis(500);
+const FILE_INDEX_RETRY: Duration = Duration::from_millis(500);
 const RESULTS_FADE_BAND: f32 = 18.0;
 
 pub(super) struct CommandPalette {
@@ -495,15 +496,42 @@ impl Shell {
         };
         let names = client.clone();
         palette.files.task = Some(cx.spawn(async move |this, cx| {
-            let result = names.search(request).await.map(|found| (found, false));
-            this.update(cx, |shell, cx| {
-                if let Some(palette) = shell.command_palette.as_mut()
-                    && palette.files.finish(generation, result, "file")
-                {
-                    cx.notify();
+            loop {
+                let result = async {
+                    // SearchWorkspaceFiles keeps its list-shaped wire response.
+                    // Check readiness BEFORE searching: a scan finishing after
+                    // a partial answer must still trigger one final search.
+                    let indexing = match names.warm_search().await {
+                        Ok(warm) => warm.state == WorkspaceSearchIndexState::Building,
+                        // Older hosts search without the new index/warm method.
+                        Err(FilesClientError::Unsupported(_)) => false,
+                        Err(error) => return Err(error),
+                    };
+                    names
+                        .search(request.clone())
+                        .await
+                        .map(|found| (found, indexing))
                 }
-            })
-            .ok();
+                .await;
+                let retry = this
+                    .update(cx, |shell, cx| {
+                        let Some(palette) = shell.command_palette.as_mut() else {
+                            return false;
+                        };
+                        if !palette.files.finish(generation, result, "file") {
+                            return false;
+                        }
+                        cx.notify();
+                        palette.files.indexing
+                    })
+                    .unwrap_or(false);
+                if !retry {
+                    break;
+                }
+                // Keep partial rows and selection; replacing the query or
+                // closing the palette drops this task and cancels retries.
+                cx.background_executor().timer(FILE_INDEX_RETRY).await;
+            }
         }));
 
         let generation = palette.content.begin();
@@ -1647,7 +1675,7 @@ mod tests {
 
     impl FakeEngine {
         /// Every request sent so far for `method`; other methods are
-        /// answered with an empty object.
+        /// answered with an empty object (or a ready search index).
         fn take(&mut self, method: &str, cx: &mut TestAppContext) -> Vec<serde_json::Value> {
             let mut found = Vec::new();
             loop {
@@ -1659,6 +1687,8 @@ mod tests {
                 let request: serde_json::Value = serde_json::from_str(&request).unwrap();
                 if request["method"] == method {
                     found.push(request);
+                } else if request["method"] == methods::WARM_WORKSPACE_SEARCH {
+                    self.reply(&request, serde_json::json!({ "state": "ready" }));
                 } else {
                     self.reply(&request, serde_json::json!({}));
                 }
@@ -1758,6 +1788,186 @@ mod tests {
 
     fn name_match(path: &str, kind: &str) -> serde_json::Value {
         serde_json::json!({ "path": path, "name": path, "kind": kind, "score": 1 })
+    }
+
+    /// Settle the independent focus warm-up before controlling search probes.
+    fn file_search_palette(
+        cx: &mut TestAppContext,
+    ) -> (gpui::WindowHandle<Shell>, tempfile::TempDir, FakeEngine) {
+        let (window, dir, mut engine) = engine_palette(cx, true);
+        for warm in engine.take(methods::WARM_WORKSPACE_SEARCH, cx) {
+            engine.reply(&warm, serde_json::json!({ "state": "ready" }));
+        }
+        cx.run_until_parked();
+        (window, dir, engine)
+    }
+
+    fn answer_file_index(
+        engine: &mut FakeEngine,
+        state: &str,
+        cx: &mut TestAppContext,
+    ) -> serde_json::Value {
+        let warm = engine.take(methods::WARM_WORKSPACE_SEARCH, cx);
+        assert_eq!(warm.len(), 1);
+        assert_eq!(warm[0]["params"]["chatId"], "focused");
+        engine.reply(&warm[0], serde_json::json!({ "state": state }));
+        let search = engine.take(methods::SEARCH_WORKSPACE_FILES, cx);
+        assert_eq!(search.len(), 1);
+        search.into_iter().next().unwrap()
+    }
+
+    #[gpui::test]
+    fn file_search_refreshes_partial_results_until_indexed(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = file_search_palette(cx);
+        type_query(window, "needle", cx);
+        let first = answer_file_index(&mut engine, "building", cx);
+        engine.reply(&first, serde_json::json!([]));
+        cx.run_until_parked();
+        let empty = palette_section(window, Section::Files, cx).unwrap();
+        assert!(empty.rows.is_empty());
+        assert_eq!(empty.status.as_deref(), Some("Indexing…"));
+        assert!(engine.take(methods::WARM_WORKSPACE_SEARCH, cx).is_empty());
+
+        cx.executor().advance_clock(FILE_INDEX_RETRY);
+        let second = answer_file_index(&mut engine, "building", cx);
+        assert_eq!(second["params"], first["params"]);
+        engine.reply(
+            &second,
+            serde_json::json!([name_match("needle.rs", "file")]),
+        );
+        cx.run_until_parked();
+        let partial = palette_section(window, Section::Files, cx).unwrap();
+        assert_eq!(partial.rows.len(), 1);
+        assert_eq!(partial.status.as_deref(), Some("Indexing…"));
+        let selected = partial.rows[0].key();
+        window
+            .update(cx, |shell, _, cx| {
+                shell.select_palette_tab(Tab::Files, cx);
+                shell.command_palette.as_mut().unwrap().active = Some(selected.clone());
+            })
+            .unwrap();
+
+        cx.executor().advance_clock(FILE_INDEX_RETRY);
+        // Even though the index is ready now, search again: the previous
+        // answer was obtained while it was still building.
+        let third = answer_file_index(&mut engine, "ready", cx);
+        assert_eq!(third["params"], first["params"]);
+        assert_eq!(palette_section(window, Section::Files, cx), Some(partial));
+        engine.reply(
+            &third,
+            serde_json::json!([
+                name_match("another-needle.rs", "file"),
+                name_match("needle.rs", "file")
+            ]),
+        );
+        cx.run_until_parked();
+        let complete = palette_section(window, Section::Files, cx).unwrap();
+        assert_eq!(complete.rows.len(), 2);
+        assert_eq!(complete.status, None);
+        window
+            .read_with(cx, |shell, cx| {
+                let sections = shell.palette_sections(cx);
+                let rows = flat_rows(&sections);
+                let palette = shell.command_palette.as_ref().unwrap();
+                assert_eq!(rows[palette.active_position(&rows)].key(), selected);
+            })
+            .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(engine.take(methods::WARM_WORKSPACE_SEARCH, cx).is_empty());
+        assert!(engine.take(methods::SEARCH_WORKSPACE_FILES, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn changing_query_cancels_file_index_retries(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = file_search_palette(cx);
+        type_query(window, "needle", cx);
+        let first = answer_file_index(&mut engine, "building", cx);
+        engine.reply(&first, serde_json::json!([]));
+        cx.run_until_parked();
+        type_query(window, "updated", cx);
+        cx.executor().advance_clock(FILE_INDEX_RETRY);
+        let updated = answer_file_index(&mut engine, "ready", cx);
+        assert_eq!(updated["params"]["query"], "updated");
+        engine.reply(
+            &updated,
+            serde_json::json!([name_match("updated.rs", "file")]),
+        );
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(engine.take(methods::WARM_WORKSPACE_SEARCH, cx).is_empty());
+        assert!(engine.take(methods::SEARCH_WORKSPACE_FILES, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn clearing_or_closing_cancels_file_index_retries(cx: &mut TestAppContext) {
+        for close in [false, true] {
+            let (window, _dir, mut engine) = file_search_palette(cx);
+            type_query(window, "needle", cx);
+            let first = answer_file_index(&mut engine, "building", cx);
+            engine.reply(&first, serde_json::json!([]));
+            cx.run_until_parked();
+            if close {
+                window
+                    .update(cx, |shell, window, cx| {
+                        shell.close_command_palette(window, cx);
+                    })
+                    .unwrap();
+            } else {
+                type_query(window, "", cx);
+            }
+            cx.executor().advance_clock(Duration::from_secs(10));
+            assert!(engine.take(methods::WARM_WORKSPACE_SEARCH, cx).is_empty());
+            assert!(engine.take(methods::SEARCH_WORKSPACE_FILES, cx).is_empty());
+        }
+    }
+
+    #[gpui::test]
+    fn file_search_on_an_older_host_keeps_the_legacy_search(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = file_search_palette(cx);
+        type_query(window, "needle", cx);
+        let warm = engine.take(methods::WARM_WORKSPACE_SEARCH, cx);
+        assert_eq!(warm.len(), 1);
+        engine.fail(&warm[0], "unknown method: WarmWorkspaceSearch");
+        let search = engine.take(methods::SEARCH_WORKSPACE_FILES, cx);
+        assert_eq!(search.len(), 1);
+        engine.reply(
+            &search[0],
+            serde_json::json!([name_match("needle.rs", "file")]),
+        );
+        cx.run_until_parked();
+        let files = palette_section(window, Section::Files, cx).unwrap();
+        assert_eq!(files.rows.len(), 1);
+        assert_eq!(files.status, None);
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(engine.take(methods::WARM_WORKSPACE_SEARCH, cx).is_empty());
+        assert!(engine.take(methods::SEARCH_WORKSPACE_FILES, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn file_index_retries_stop_on_warm_or_search_error(cx: &mut TestAppContext) {
+        for fail_warm in [false, true] {
+            let (window, _dir, mut engine) = file_search_palette(cx);
+            type_query(window, "needle", cx);
+            let first = answer_file_index(&mut engine, "building", cx);
+            engine.reply(&first, serde_json::json!([name_match("needle.rs", "file")]));
+            cx.run_until_parked();
+            cx.executor().advance_clock(FILE_INDEX_RETRY);
+            let request = if fail_warm {
+                let warm = engine.take(methods::WARM_WORKSPACE_SEARCH, cx);
+                assert_eq!(warm.len(), 1);
+                warm.into_iter().next().unwrap()
+            } else {
+                answer_file_index(&mut engine, "building", cx)
+            };
+            engine.fail(&request, "search failed");
+            cx.run_until_parked();
+            let files = palette_section(window, Section::Files, cx).unwrap();
+            assert!(files.rows.is_empty());
+            assert_eq!(files.status.as_deref(), Some("Search failed"));
+            cx.executor().advance_clock(Duration::from_secs(10));
+            assert!(engine.take(methods::WARM_WORKSPACE_SEARCH, cx).is_empty());
+            assert!(engine.take(methods::SEARCH_WORKSPACE_FILES, cx).is_empty());
+        }
     }
 
     #[gpui::test]

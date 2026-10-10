@@ -2308,7 +2308,7 @@ const HOME_FOLDER_INDEX_RETRY_MAX: Duration = Duration::from_secs(2);
 /// The new-project picker's search over the device's home, answered by the
 /// host's home search index (the one projectless chats use). Entering Home
 /// starts the index; leaving Home or closing the picker releases it unless a
-/// focused projectless chat pins it.
+/// projectless chat warmed it.
 #[derive(Default)]
 struct HomeFolderSearch {
     /// Bumped per request; an answer to an older one is dropped.
@@ -5919,7 +5919,7 @@ impl Shell {
     }
 
     /// Tell the host the picker is done with its home index (it stays when a
-    /// focused projectless chat pins it).
+    /// projectless chat warmed it).
     fn release_home_folder_search(&mut self, cx: &mut Context<Self>) {
         let engine = self.state.read(cx).engine().cloned();
         let local = self.state.read(cx).local_device_id.clone();

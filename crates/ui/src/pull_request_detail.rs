@@ -72,6 +72,39 @@ fn failure_reason(error: &zeron_rpc::RpcError) -> &'static str {
     }
 }
 
+/// The canonical `https://github.com/owner/repo/pull/N` a link points into,
+/// e.g. from its Files tab or a review comment; `None` for anything else.
+pub(crate) fn pull_request_link(url: &str) -> Option<String> {
+    let url = url::Url::parse(url).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("github.com")
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    let (owner, repository) = (segments.next()?, segments.next()?);
+    let number = (segments.next()? == "pull")
+        .then(|| segments.next())
+        .flatten()?
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)?;
+    if owner.is_empty() || repository.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "https://github.com/{owner}/{repository}/pull/{number}"
+    ))
+}
+
+/// Whether pull requests open in Zeron's own view, per Settings.
+pub(crate) fn opens_natively(cx: &App) -> bool {
+    settings::current(cx).pull_request_destination != PullRequestDestination::External
+}
+
 pub fn open(url: &str, window: &mut Window, cx: &mut App) {
     open_on_device(url, None, window, cx);
 }
@@ -2989,6 +3022,34 @@ mod tests {
                 .filter(|row| row.kind != crate::changes::LineKind::Meta)
                 .all(|row| !row.spans.is_empty())
         );
+    }
+
+    #[test]
+    fn pull_request_links_resolve_to_their_pull_request() {
+        for link in [
+            "https://github.com/a/b/pull/12",
+            "https://github.com/a/b/pull/12/files",
+            "https://github.com/a/b/pull/12#discussion_r1",
+            "https://github.com/a/b/pull/12/?tab=checks",
+        ] {
+            assert_eq!(
+                pull_request_link(link).as_deref(),
+                Some("https://github.com/a/b/pull/12"),
+                "{link}"
+            );
+        }
+        for link in [
+            "http://github.com/a/b/pull/12",
+            "https://gitlab.com/a/b/pull/12",
+            "https://github.com/a/b/issues/12",
+            "https://github.com/a/b/pull/0",
+            "https://github.com/a/b/pull/x",
+            "https://github.com/a/b",
+            "https://user@github.com/a/b/pull/12",
+            "https://github.com:8443/a/b/pull/12",
+        ] {
+            assert_eq!(pull_request_link(link), None, "{link}");
+        }
     }
 
     #[gpui::test]

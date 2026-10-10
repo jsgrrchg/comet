@@ -65,6 +65,7 @@ mod actions_ui;
 mod chat_dropzone;
 #[cfg(test)]
 mod chat_dropzone_tests;
+mod chat_pull_requests;
 #[cfg(test)]
 mod chat_rename_tests;
 mod command_palette;
@@ -694,6 +695,8 @@ pub enum RightSurface {
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
     SideChat(u64),
+    /// A pull request opened from the chat — keys [`Shell::chat_pull_requests`].
+    PullRequest(u64),
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -2003,6 +2006,9 @@ pub struct Shell {
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
     browser_seq: u64,
+    /// Pull request tabs in session panes, keyed like the other surfaces.
+    chat_pull_requests: std::collections::HashMap<u64, chat_pull_requests::ChatPullRequest>,
+    chat_pull_request_seq: u64,
     browser_context: crate::browser::BrowserContext,
     browser_profile: Option<String>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
@@ -2508,6 +2514,8 @@ impl Shell {
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
             browser_seq: 0,
+            chat_pull_requests: std::collections::HashMap::new(),
+            chat_pull_request_seq: 0,
             browser_context: crate::browser::BrowserContext::default(),
             browser_profile: None,
             right_tabs: std::collections::HashMap::new(),
@@ -3409,6 +3417,9 @@ impl Shell {
                         browser.page.url.clone().map(Into::into),
                     )
                 }),
+                RightSurface::PullRequest(id) => self
+                    .chat_pull_request_title(*id, cx)
+                    .map(|(title, detail)| (*surface, title, false, Some(detail))),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -3459,7 +3470,8 @@ impl Shell {
             | RightSurface::Terminal(_)
             | RightSurface::SideChat(_)
             | RightSurface::Subagent(_)
-            | RightSurface::Browser(_) => {
+            | RightSurface::Browser(_)
+            | RightSurface::PullRequest(_) => {
                 return None;
             }
         };
@@ -3596,7 +3608,8 @@ impl Shell {
                     });
                 }
             }
-            RightSurface::Subagent(_) | RightSurface::Browser(_) => {}
+            RightSurface::Subagent(_) | RightSurface::Browser(_) | RightSurface::PullRequest(_) => {
+            }
             RightSurface::Picker => {}
         }
         self.sync_explorer_selection(cx);
@@ -3749,6 +3762,24 @@ impl Shell {
             } else {
                 LinkOutcome::Rejected
             };
+        }
+        // A pull request link opens Zeron's own view in this session's pane,
+        // unless Settings sends pull requests to the browser.
+        if matches!(
+            activation.action,
+            LinkAction::Primary | LinkAction::Internal
+        ) && crate::pull_request_detail::opens_natively(cx)
+            && self.chat_pull_requests_available()
+            && let Some(url) = activation
+                .target
+                .navigation
+                .as_deref()
+                .ok()
+                .and_then(crate::pull_request_detail::pull_request_link)
+        {
+            let target = self.chat_pull_request_device(None, cx);
+            self.open_chat_pull_request(url, target, window, cx);
+            return LinkOutcome::Internal;
         }
         let mut resolved = activation.clone();
         if resolved.action == LinkAction::Primary {
@@ -4389,6 +4420,11 @@ impl Shell {
                 // Dropping the entity tears down its diff watch.
                 self.diffs.remove(&id);
                 self.diff_subs.remove(&id);
+            }
+            RightSurface::PullRequest(id) => {
+                // A comment being posted outlives its view; see
+                // `PullRequestCache::submissions`.
+                self.chat_pull_requests.remove(&id);
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
@@ -6151,6 +6187,9 @@ impl Shell {
                         browser.update(cx, |browser, cx| browser.close(cx));
                     }
                     self.browser_subs.remove(id);
+                }
+                if let RightSurface::PullRequest(id) = surface {
+                    self.chat_pull_requests.remove(id);
                 }
             }
         }
@@ -11631,6 +11670,9 @@ impl Shell {
                     panel.into_any_element()
                 }
                 RightSurface::SideChat(id) => self.render_side_chat(id, cx),
+                RightSurface::PullRequest(id) => self
+                    .render_chat_pull_request(id, cx)
+                    .unwrap_or_else(|| self.render_surface_picker(cx)),
                 RightSurface::Subagent(id) if self.subagent_tabs.contains_key(&id) => {
                     let transcript = self
                         .subagent_tabs
@@ -11990,6 +12032,7 @@ impl Shell {
                 RightSurface::Subagent(_) => icons::BOT,
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
+                RightSurface::PullRequest(_) => icons::PULL_REQUEST,
                 RightSurface::Picker => icons::PLUS,
             };
             // A live subagent tab swaps its icon for the mini working
@@ -12015,6 +12058,7 @@ impl Shell {
                     .browsers
                     .get(&id)
                     .is_some_and(|b| b.read(cx).page.loading),
+                RightSurface::PullRequest(id) => self.chat_pull_request_loading(id, cx),
                 RightSurface::Subagent(id) => self.subagent_tabs.get(&id).is_some_and(|tab| {
                     self.state
                         .read(cx)
@@ -13161,6 +13205,8 @@ impl Render for Shell {
                 self.pull_request_cache = Default::default();
                 self.pull_requests_page = None;
                 self.reset_pull_request_pane();
+                // Their tabs read as closed; rows skip a missing surface.
+                self.chat_pull_requests.clear();
             }
             self.browser_profile = browser_profile;
         }
@@ -13372,6 +13418,14 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(
                 |this, action: &crate::pull_request_detail::OpenPullRequest, window, cx| {
+                    // From a chat (a sidebar badge, the composer's badge), the
+                    // pull request opens beside the focused session, so
+                    // several can be compared in one conversation.
+                    if this.chat_pull_requests_available() {
+                        let target = this.chat_pull_request_device(action.1.clone(), cx);
+                        this.open_chat_pull_request(action.0.clone(), target, window, cx);
+                        return;
+                    }
                     let target = if let Some(device) = action.1.clone() {
                         (Some(device.as_str()) != this.state.read(cx).local_device_id.as_deref())
                             .then_some(device)

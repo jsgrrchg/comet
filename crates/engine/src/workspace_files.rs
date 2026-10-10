@@ -26,7 +26,7 @@ use zeron_proto::{
 };
 use zeron_rpc::RpcError;
 
-use crate::workspace_search::{IndexState, NameKinds};
+use crate::workspace_search::{IndexState, NameKinds, normalize_name_query};
 use crate::{Repos, WorkspaceHost, WorkspaceSearch};
 
 mod mutations;
@@ -1349,7 +1349,7 @@ fn search_including_ignored(
         }
     }
 
-    let query = query.trim().to_lowercase();
+    let query = normalize_name_query(query).trim().to_lowercase();
     let mut builder = ignore::WalkBuilder::new(root);
     builder
         .follow_links(false)
@@ -1393,7 +1393,10 @@ fn search_including_ignored(
             2
         } else if lower_name.contains(&query) {
             1
-        } else if relative.to_string_lossy().to_lowercase().contains(&query) {
+        } else if normalize_name_query(&relative.to_string_lossy())
+            .to_lowercase()
+            .contains(&query)
+        {
             0
         } else {
             continue;
@@ -2560,6 +2563,43 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn search_including_ignored_matches_nested_paths() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join(".ignore"), b"aa\n").unwrap();
+        std::fs::create_dir_all(root.path().join("aa/bb/cc/dd")).unwrap();
+        std::fs::write(root.path().join("aa/bb/cc/dd/file.rs"), b"").unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+
+        let forward =
+            search_workspace_blocking(&root, "aa/bb/cc/dd", true, 20, &no_cancel()).unwrap();
+        let paths: Vec<_> = forward.iter().map(|m| m.path.as_str()).collect();
+        assert_eq!(paths, ["aa/bb/cc/dd", "aa/bb/cc/dd/file.rs"]);
+        #[cfg(windows)]
+        for query in [r"aa\bb\cc\dd", r"aa\bb/cc\dd"] {
+            let found = search_workspace_blocking(&root, query, true, 20, &no_cancel()).unwrap();
+            assert_eq!(found, forward);
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn search_including_ignored_preserves_literal_posix_backslashes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(r"aa\bb/cc\dd")).unwrap();
+        std::fs::create_dir_all(root.path().join("aa/bb/cc/dd")).unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+
+        let found =
+            search_workspace_blocking(&root, r"aa\bb/cc\dd", true, 20, &no_cancel()).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, r"aa\bb/cc\dd");
+        let forward =
+            search_workspace_blocking(&root, "aa/bb/cc/dd", true, 20, &no_cancel()).unwrap();
+        assert_eq!(forward.len(), 1);
+        assert_eq!(forward[0].path, "aa/bb/cc/dd");
     }
 
     #[test]

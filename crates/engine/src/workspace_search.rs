@@ -10,6 +10,7 @@
 //! content search greps the indexed files without a bigram prefilter. The UI
 //! warms the focused chat's index once, so its first search finds it built.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -37,6 +38,16 @@ pub const CONTENT_TIME_BUDGET: Duration = Duration::from_secs(2);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
 /// Ceiling for logging a finished scan; a scan still running then is not logged.
 const SCAN_LOG_WAIT: Duration = Duration::from_secs(10 * 60);
+
+/// Name queries follow the engine host's path syntax. fff indexes `/` paths,
+/// while a backslash is a literal filename character on POSIX hosts.
+pub(crate) fn normalize_name_query(query: &str) -> Cow<'_, str> {
+    #[cfg(windows)]
+    if query.contains('\\') {
+        return Cow::Owned(query.replace('\\', "/"));
+    }
+    Cow::Borrowed(query)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum WorkspaceSearchError {
@@ -160,6 +171,8 @@ impl WorkspaceSearch {
         limit: usize,
         kinds: NameKinds,
     ) -> Result<NameSearch, WorkspaceSearchError> {
+        let query = normalize_name_query(query);
+        let query = query.as_ref();
         let picker = self.acquire(root, false)?;
         let indexing = !picker.wait_for_scan(SCAN_WAIT);
         if limit == 0 {
@@ -606,6 +619,53 @@ mod tests {
                 .matches
                 .is_empty()
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn name_search_accepts_both_windows_separators() {
+        let (_dir, root) = folder(&[("aa/bb/cc/dd/file.rs", b"")]);
+        let search = WorkspaceSearch::new();
+        ready(&search, &root);
+
+        for (kinds, query, expected) in [
+            (
+                NameKinds::Files,
+                "aa/bb/cc/dd/file.rs",
+                "aa/bb/cc/dd/file.rs",
+            ),
+            (NameKinds::Directories, "aa/bb/cc/dd", "aa/bb/cc/dd"),
+            (NameKinds::FilesAndDirectories, "aa/bb/cc/dd", "aa/bb/cc/dd"),
+        ] {
+            let forward = search.search_names(&root, query, 20, kinds).unwrap();
+            assert!(forward.matches.iter().any(|m| m.path == expected));
+            for alternative in [query.replace('/', "\\"), query.replacen('/', "\\", 2)] {
+                let found = search.search_names(&root, &alternative, 20, kinds).unwrap();
+                assert_eq!(found.matches, forward.matches);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn name_search_preserves_literal_posix_backslashes() {
+        let literal = r"aa\bb\cc\dd";
+        let (_dir, root) = folder(&[(r"aa\bb\cc\dd/file.rs", b""), ("aa/bb/cc/dd/file.rs", b"")]);
+        let search = WorkspaceSearch::new();
+        ready(&search, &root);
+
+        for kinds in [NameKinds::Directories, NameKinds::FilesAndDirectories] {
+            let found = search.search_names(&root, literal, 20, kinds).unwrap();
+            assert_eq!(found.matches[0].path, literal);
+        }
+        let found = search
+            .search_names(&root, &format!("{literal}/file.rs"), 20, NameKinds::Files)
+            .unwrap();
+        assert_eq!(found.matches[0].path, format!("{literal}/file.rs"));
+        let forward = search
+            .search_names(&root, "aa/bb/cc/dd", 20, NameKinds::Directories)
+            .unwrap();
+        assert_eq!(forward.matches[0].path, "aa/bb/cc/dd");
     }
 
     #[test]

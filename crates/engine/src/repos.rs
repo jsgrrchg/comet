@@ -25,7 +25,7 @@ use zeron_proto::{
 
 use crate::EngineError;
 use crate::WorkspaceSearch;
-use crate::workspace_search::NameKinds;
+use crate::workspace_search::{NameKinds, normalize_name_query};
 
 /// Existence probe timeout for user-chosen / remembered paths, which can point at
 /// dead network mounts where a bare `stat` hangs for minutes.
@@ -1988,6 +1988,8 @@ fn search_folders_under(
     query: &str,
     limit: usize,
 ) -> Result<HomeFolderSearchResult, EngineError> {
+    let query = normalize_name_query(query);
+    let query = query.as_ref();
     // fff scores a `/` query against whole paths, where a folder loses to
     // its many descendants; ask for the last segment's folders instead and
     // let `rank_home_folders` check the leading segments.
@@ -2534,6 +2536,53 @@ tmpfs /run tmpfs rw 0 0
                 .matches
                 .is_empty()
         );
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn home_folder_search_accepts_both_windows_separators() {
+        let home = tempfile::tempdir().unwrap();
+        for dir in ["aa/bb/cc/dd/src", "aa/bb/cc/dd-other", "elsewhere/dd"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let search = WorkspaceSearch::new();
+        search.warm(&home).unwrap();
+        assert!(search.wait_until_indexed(&home, Duration::from_secs(20)));
+
+        let forward = search_folders_under(&search, &home, "aa/bb/cc/dd", 20).unwrap();
+        assert_eq!(forward.matches[0].relative, "aa/bb/cc/dd");
+        assert!(
+            forward
+                .matches
+                .iter()
+                .any(|m| m.relative == "aa/bb/cc/dd-other")
+        );
+        for query in [r"aa\bb\cc\dd", r"aa\bb/cc\dd", r"aa\bb\cc\dd\"] {
+            let found = search_folders_under(&search, &home, query, 20).unwrap();
+            assert_eq!(found.matches, forward.matches);
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn home_folder_search_preserves_literal_posix_backslashes() {
+        let home = tempfile::tempdir().unwrap();
+        let literal = r"aa\bb\cc\dd";
+        for dir in [literal, "aa/bb/cc/dd"] {
+            std::fs::create_dir_all(home.path().join(dir)).unwrap();
+        }
+        let home = std::fs::canonicalize(home.path()).unwrap();
+        let search = WorkspaceSearch::new();
+        search.warm(&home).unwrap();
+        assert!(search.wait_until_indexed(&home, Duration::from_secs(20)));
+
+        let found = search_folders_under(&search, &home, literal, 20).unwrap();
+        assert_eq!(found.matches.len(), 1);
+        assert_eq!(found.matches[0].relative, literal);
+        let forward = search_folders_under(&search, &home, "aa/bb/cc/dd", 20).unwrap();
+        assert_eq!(forward.matches.len(), 1);
+        assert_eq!(forward.matches[0].relative, "aa/bb/cc/dd");
     }
 
     #[test]

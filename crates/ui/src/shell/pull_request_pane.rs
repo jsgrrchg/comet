@@ -201,6 +201,21 @@ impl Shell {
 
     /// The board highlights the pull request shown beside it.
     pub(super) fn sync_pull_request_selection(&mut self, cx: &mut Context<Self>) {
+        if self.pull_request_pane.open
+            && let Some(ix) = self.pull_request_pane.active_index()
+            && let Some(board) = &self.pull_requests_page
+        {
+            let tab = &self.pull_request_pane.tabs[ix];
+            let board = board.read(cx);
+            // Only compare revisions observed by the same device. This is a
+            // local lookup, not another board fetch on every tab activation.
+            if board.target_device() == tab.device
+                && let Some(preview) = board.preview(&tab.url)
+            {
+                tab.page
+                    .update(cx, |page, cx| page.update_board_preview(preview, cx));
+            }
+        }
         let selected = self
             .pull_request_pane
             .open

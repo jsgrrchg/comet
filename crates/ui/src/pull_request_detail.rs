@@ -452,7 +452,11 @@ impl PullRequestDetailPage {
             copy_reset: None,
             copied_link: false,
             diff: None,
-            review: CodeReview::default(),
+            // Open on the layout last chosen here or in the Changes pane.
+            review: CodeReview {
+                split: settings::current(cx).diff_split,
+                ..CodeReview::default()
+            },
             diff_error: None,
             diff_refresh_owed: false,
             tab: Tab::Summary,
@@ -2934,6 +2938,29 @@ mod tests {
                 .filter(|row| row.kind != crate::changes::LineKind::Meta)
                 .all(|row| !row.spans.is_empty())
         );
+    }
+
+    #[gpui::test]
+    fn pull_request_code_opens_on_the_saved_split_preference(cx: &mut gpui::TestAppContext) {
+        let mut saved = settings::UiSettings::default();
+        saved.diff_split = true;
+        let _settings = fixture::settings(cx, saved);
+        let (host, cx) = cx.add_window_view(|window, cx| DetailHost::new(window, cx, true));
+        let page = host.read_with(cx, |host, _| host.page.clone());
+        page.update(cx, |page, cx| {
+            assert!(page.review.split);
+            let patch =
+                "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n";
+            page.install_diff(ParsedDiff::new(patch.into()), cx);
+            page.select_tab(Tab::Code, cx);
+            assert!(
+                page.review
+                    .stream
+                    .iter()
+                    .any(|row| matches!(row, code::StreamRow::Pair(..))),
+                "the first visit renders split rows"
+            );
+        });
     }
 
     #[gpui::test]

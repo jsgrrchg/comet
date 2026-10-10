@@ -2,7 +2,7 @@
 //! right "Changes" pane, plus the boot splash and the connection gate.
 //!
 //! Layout is zeron's: collapsible drag-resizable sidebar (224–400px, default
-//! 256) with a 200ms ease-out width transition; main panel with an h-11 header,
+//! 256) with a gentle 180–240ms width transition; main panel with an h-11 header,
 //! content outlet, and a reserved h-6 status strip so later content never
 //! shifts; right pane scaffold (360px floor, default 520), hidden by default.
 //! Widths/collapsed state persist to `ui-settings.json` (debounced).
@@ -34,7 +34,9 @@ use crate::files::{
 };
 use crate::icons::{self, icon};
 use crate::loaders;
-use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
+use crate::motion::{
+    self, AnimationExt as _, MotionSpec, PANEL_RESIZE, RESIZE, SPLASH_OUT, TAB_SLIDE,
+};
 use crate::popover::{self, Loadable};
 use crate::pull_requests::PullRequestsPage;
 use crate::rail;
@@ -47,7 +49,7 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    self, CHAT_PANEL_MIN, ComposerSendBehavior, JUMP_SLOTS, KeymapConfig, RIGHT_PANE_DEFAULT,
+    self, CHAT_PANEL_MIN, ComposerSendBehavior, FILES_PANEL_MIN, JUMP_SLOTS, KeymapConfig,
     RIGHT_PANE_MIN, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, SavePolicy, ShortcutId,
     SidebarOrganization, SidebarSort, TERMINAL_DEFAULT_HEIGHT, TERMINAL_MAX_VH,
     TERMINAL_MIN_HEIGHT, UiSettings, badge_combo, jump_hints_visible, modifier_send_hint_visible,
@@ -74,7 +76,12 @@ mod harness_updates;
 mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
+mod panel_layout;
+use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_tween};
+#[cfg(test)]
+mod panel_interaction_tests;
 pub(crate) mod project_icon;
+mod session_info;
 mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
@@ -187,11 +194,20 @@ fn move_settings_focus(
     }
 }
 
-#[derive(Clone, Copy)]
+/// Whether the chat menu's Copy submenu is open beside it.
+#[derive(Clone, Copy, PartialEq)]
 enum ChatMenuPage {
     Root,
     Copy,
 }
+
+/// Hover-intent keys for the chat menu's rows; only Copy owns a submenu.
+const CHAT_MENU_ROW_RENAME: u8 = 0;
+const CHAT_MENU_ROW_PIN: u8 = 1;
+const CHAT_MENU_ROW_ARCHIVE: u8 = 2;
+const CHAT_MENU_ROW_COPY: u8 = 3;
+const CHAT_MENU_ROW_DELETE: u8 = 4;
+const CHAT_MENU_ROW_TAB: u8 = 5;
 
 #[derive(Clone, Copy)]
 enum TabCloseAction {
@@ -676,9 +692,8 @@ pub enum Route {
 }
 
 /// Maximum width the right pane may occupy while retaining the conversation
-/// floor. On unusually small windows this deliberately falls below the right
-/// pane's preferred minimum: the chat remains usable and the side surface
-/// yields the scarce space.
+/// floor. The horizontal fit policy hides a lower-priority column before this
+/// budget can fall below the right pane's minimum at rest.
 fn right_pane_max_width(viewport: f32, sidebar: f32, chat_floor: f32) -> f32 {
     (viewport - sidebar - chat_floor).max(0.0)
 }
@@ -731,10 +746,17 @@ fn workspace_file_title(path: &str) -> SharedString {
 pub struct ChatPanels {
     /// The explorer portion of the right pane is docked.
     pub files_open: bool,
+    files_opened_at: u64,
     pub terminal_open: bool,
     /// The surface host portion of the right pane is visible (historically
     /// the Changes pane). The pane itself shows when either portion does.
     pub changes_open: bool,
+    /// Takeover is remembered with its owning chat, not inherited by the
+    /// next conversation (or by the new-thread canvas).
+    right_expanded: bool,
+    /// Opening order, which the window fit ranks columns by. Zero predates
+    /// an explicit open.
+    changes_opened_at: u64,
     /// Which surface tab renders; validated against the live tab list each
     /// frame (a closed tab falls back gracefully).
     pub right_active: RightSurface,
@@ -1286,7 +1308,7 @@ impl Render for DragGhost {
     }
 }
 
-/// A oneshot width tween (200ms ease-out), driven MANUALLY from render via
+/// A oneshot width tween, driven MANUALLY from render via
 /// [`Shell::eval_tween`] — never through a `with_animation` wrapper. gpui keys
 /// an animation element's start time by its full global element-id path, so a
 /// wrapper that mounts/remounts (route swap, or an ancestor animation keyed by
@@ -1298,6 +1320,8 @@ struct WidthTween {
     from: f32,
     to: f32,
     started: std::time::Instant,
+    duration: Duration,
+    curve: motion::CubicBezier,
 }
 
 impl WidthTween {
@@ -1306,6 +1330,25 @@ impl WidthTween {
             from,
             to,
             started: std::time::Instant::now(),
+            duration: RESIZE.total().mul_f32(motion::speed_scale()),
+            curve: RESIZE.curve,
+        }
+    }
+
+    /// A panel column moving from `from` to `to`. Longer moves take longer,
+    /// so a wide pane travels at about the pace of the sidebar instead of
+    /// covering twice the distance in the same time: 180ms up to the
+    /// sidebar's width, growing with the square root of the distance to
+    /// 240ms. The dialog entrance curve eases into the movement and settles
+    /// without overshoot, rather than starting a large column at full speed.
+    fn panel(from: f32, to: f32) -> Self {
+        let scale = ((to - from).abs() / SIDEBAR_DEFAULT)
+            .sqrt()
+            .clamp(1.0, 4.0 / 3.0);
+        Self {
+            duration: PANEL_RESIZE.total().mul_f32(motion::speed_scale() * scale),
+            curve: PANEL_RESIZE.curve,
+            ..Self::new(from, to)
         }
     }
 }
@@ -2027,6 +2070,11 @@ pub struct Shell {
     appearance_settings_sub: Option<Subscription>,
     /// Session-row context menu, including the Copy submenu.
     chat_menu: popover::Popup<ChatMenuState>,
+    /// The Copy submenu's hover grace, its painted bounds, and which side
+    /// of the menu it opens on (the sidebar options menu's recipe).
+    chat_copy_intent: popover::HoverIntent<u8>,
+    chat_copy_bounds: Option<gpui::Bounds<Pixels>>,
+    chat_copy_left: bool,
     /// The chat title being edited in place on its row.
     chat_rename: Option<ChatRename>,
     /// Chat id awaiting delete confirmation.
@@ -2135,6 +2183,8 @@ pub struct Shell {
     /// Session-scoped panel open flags (terminal / changes per chat; §1.10-1.11
     /// parity — heights stay in [`UiSettings`]).
     panels: SessionPanels,
+    panel_open_sequence: u64,
+    sidebar_opened_at: u64,
     /// The panel key of the chat currently shown ("" = new-chat canvas).
     active_chat: String,
     /// Last selected session survives opening the blank Appshot destination.
@@ -2158,6 +2208,27 @@ pub struct Shell {
     debug_upload: Option<String>,
     sidebar_tween: Option<WidthTween>,
     files_tween: Option<WidthTween>,
+    /// The session card's reveal (0 closed → 1 open).
+    session_info_tween: Option<WidthTween>,
+    files_content_tween: Option<WidthTween>,
+    /// The last tracked frame: its chat, the window fit, and for each of
+    /// `[sidebar, surface host, Files]` the width painted and the width its
+    /// content laid out at.
+    painted_columns: Option<(String, HorizontalPanelFit, [(f32, f32); 3])>,
+    /// Columns the fit just hid while still open, easing out from the width
+    /// they last painted with their content held at its layout width (same
+    /// order).
+    fit_exits: [Option<(WidthTween, f32)>; 3],
+    /// The window width the surface host's share was last split for. Seeded
+    /// by the first frame, so a saved divider survives a relaunch.
+    split_viewport: Option<f32>,
+    /// The last window fit and the inputs it was computed from, one slot
+    /// per `closing` flag of `fit`: layout helpers ask for both many times
+    /// per frame while a close runs. Not a per-frame value, since handlers
+    /// re-read the fit right after changing what it depends on.
+    fit_memo: [std::cell::Cell<Option<(FitInputs, HorizontalPanelFit)>>; 2],
+    /// The closed surface host already released its image previews.
+    right_images_suspended: bool,
     sidebar_edge_bounce: Option<motion::ResizeEdgeBounce>,
     /// Boundary currently held during a sidebar drag. Cleared on re-entry or
     /// release so the next genuine edge crossing can acknowledge the limit.
@@ -2167,14 +2238,18 @@ pub struct Shell {
     /// a constrained edge takes over with its bounce cue.
     pane_resize_active: Option<PaneResizeKind>,
     pane_resize_dragging: Option<PaneResizeKind>,
+    /// The window changed width since the previous frame. Live window
+    /// resizing moves layout directly instead of through motion springs.
+    viewport_resized: bool,
     right_tween: Option<WidthTween>,
     right_edge_bounce: Option<motion::ResizeEdgeBounce>,
     right_resize_edge: Option<motion::ResizeEdge>,
-    /// Mirrors `right_tween` only for takeover entry/exit, allowing the visible
-    /// right-panel contents to resize with their outer frame in that mode.
-    right_takeover_content_tween: Option<WidthTween>,
-    /// Conversation-width tween used only while entering/leaving right-pane
-    /// takeover. Normal right-pane open/close keeps the upstream flex behavior.
+    /// Holds content geometry during masked open/close (including reversals),
+    /// or resizes it during takeover. The outer mask has its own tween.
+    right_content_tween: Option<WidthTween>,
+    /// Takeover mask transition. `from` also retains the conversation's content
+    /// width while covered, even after expansion settles. Ordinary panel
+    /// open/close keeps the upstream flex behavior.
     main_takeover_tween: Option<WidthTween>,
     /// Changes-panel takeover (the header's expand button): the panel fills
     /// everything right of the sidebar and the conversation column collapses
@@ -2218,6 +2293,9 @@ pub struct Shell {
     /// All pane masks and chrome evaluate animation at the same frame time.
     /// A slow render must not give the native page and its titlebar different widths.
     render_time: Option<std::time::Instant>,
+    /// A deterministic clock for rendered integration tests.
+    #[cfg(test)]
+    test_time: Option<std::time::Instant>,
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
@@ -2493,6 +2571,9 @@ impl Shell {
             files_settings_sub: None,
             appearance_settings_sub: None,
             chat_menu: popover::Popup::default(),
+            chat_copy_intent: Default::default(),
+            chat_copy_bounds: None,
+            chat_copy_left: false,
             chat_rename: None,
             delete_confirm: None,
             discard_working_tree: None,
@@ -2556,6 +2637,8 @@ impl Shell {
             settings_base: settings::current(cx),
             settings,
             panels: SessionPanels::default(),
+            panel_open_sequence: 0,
+            sidebar_opened_at: 0,
             active_chat: String::new(),
             last_appshot_chat: None,
             sidebar_prev_order: Vec::new(),
@@ -2568,14 +2651,22 @@ impl Shell {
             debug_upload,
             sidebar_tween: None,
             files_tween: None,
+            session_info_tween: None,
+            files_content_tween: None,
+            painted_columns: None,
+            fit_exits: [None; 3],
+            split_viewport: None,
+            fit_memo: Default::default(),
+            right_images_suspended: false,
             sidebar_edge_bounce: None,
             sidebar_resize_edge: None,
             pane_resize_active: None,
             pane_resize_dragging: None,
+            viewport_resized: false,
             right_tween: None,
             right_edge_bounce: None,
             right_resize_edge: None,
-            right_takeover_content_tween: None,
+            right_content_tween: None,
             main_takeover_tween: None,
             right_pane_expanded: false,
             viewport_width: 1280.0,
@@ -2593,6 +2684,8 @@ impl Shell {
             reduced_motion: false,
             motion_active: std::cell::Cell::new(false),
             render_time: None,
+            #[cfg(test)]
+            test_time: None,
             splash,
             splash_task: None,
             focus_sub: None,
@@ -2682,7 +2775,7 @@ impl Shell {
             self.side_chat_creating = false;
         }
         if let Some(notice) = state.update(cx, |state, _| state.take_deep_link_notice()) {
-            self.sidebar_notice = Some(notice.into());
+            self.show_notice(crate::toast::ToastKind::Info, notice, cx);
         }
         let next_sync_flow = {
             let state = state.read(cx);
@@ -3014,6 +3107,11 @@ impl Shell {
         }
         if selected != self.active_chat {
             self.suspend_file_images(cx);
+            if !self.active_chat.is_empty() {
+                let expanded = self.right_pane_expanded;
+                self.panels
+                    .update(&self.active_chat, |panels| panels.right_expanded = expanded);
+            }
             self.active_chat = selected;
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
@@ -3028,11 +3126,9 @@ impl Shell {
                     self.nav.push(entry);
                 }
             }
-            self.files_tween = None;
-            self.right_tween = None;
-            self.right_takeover_content_tween = None;
-            self.main_takeover_tween = None;
+            self.clear_panel_transitions();
             self.terminal_tween = None;
+            self.fit_exits = [None; 3];
             let key = self.panel_key(cx);
             // Entering the new-chat canvas always lands with the terminal
             // hidden (user request) — a previously opened canvas drawer must
@@ -3046,6 +3142,8 @@ impl Shell {
             } else {
                 self.panels.get(&key)
             };
+            self.right_pane_expanded =
+                !self.active_chat.is_empty() && panels.changes_open && panels.right_expanded;
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
             }
@@ -3081,10 +3179,11 @@ impl Shell {
     // ---- layout state ----
 
     fn sidebar_target(&self) -> f32 {
-        if self.settings.sidebar_collapsed {
+        let fit = self.horizontal_fit();
+        if self.settings.sidebar_collapsed || !fit.sidebar {
             0.0
         } else {
-            self.settings.sidebar_width
+            fit.sidebar_limit
         }
     }
 
@@ -3117,41 +3216,67 @@ impl Shell {
         !self.active_chat.is_empty() && self.panels.get(&self.panel_key(cx)).changes_open
     }
 
+    /// Open and on screen: the window fit is not hiding it.
+    fn right_pane_shown(&self, cx: &App) -> bool {
+        self.right_pane_open(cx) && self.horizontal_fit().right
+    }
+
     /// The current chat's terminal flag (per-session, in-memory).
     fn terminal_open(&self, cx: &App) -> bool {
         self.panels.get(&self.panel_key(cx)).terminal_open
     }
 
     fn right_target(&self, cx: &App) -> f32 {
-        if !self.right_pane_open(cx) {
+        self.right_target_for_columns(cx, self.sidebar_now(), self.files_reserved_width(cx))
+    }
+
+    /// The surface host's width once every running transition has landed.
+    /// The initial target uses the sidebar and Files' settled allocation;
+    /// the painted pane follows its live target while its neighbours move.
+    fn right_settled_target(&self, cx: &App) -> f32 {
+        self.right_target_for_columns(cx, self.sidebar_target(), self.files_settled_width(cx))
+    }
+
+    fn right_target_for_columns(&self, cx: &App, sidebar: f32, files: f32) -> f32 {
+        if !self.right_pane_shown(cx) {
             0.0
         } else {
             // Manual sizing preserves a usable conversation column. Takeover
             // intentionally consumes it completely. Both ride the sidebar
             // tween so toggling it remains seamless.
-            let sidebar_now = self.sidebar_now();
             if self.right_pane_expanded {
-                right_pane_takeover_width(
-                    self.viewport_width - self.files_reserved_width(cx),
-                    sidebar_now,
-                )
+                right_pane_takeover_width(self.viewport_width - files, sidebar)
             } else {
-                self.settings
-                    .right_pane_width
-                    .min(self.surface_max_width(cx))
+                self.settings.right_pane_width.min(right_pane_max_width(
+                    self.viewport_width - files,
+                    sidebar,
+                    CHAT_PANEL_MIN,
+                ))
             }
         }
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.sidebar_collapsed
+            && self.promote_hidden_panel(AuxiliaryPanel::Sidebar, cx)
+        {
+            return;
+        }
         let from = self.sidebar_now();
+        let before = self.painted_panels(cx);
         self.sidebar_edge_bounce = None;
         self.sidebar_resize_edge = None;
         self.pane_resize_active = None;
         self.pane_resize_dragging = None;
         self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
-        self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
+        // Record the open before targeting: the fit ranks columns by recency,
+        // and an unrecorded sidebar would target the width of a hidden one.
+        if !self.settings.sidebar_collapsed {
+            self.record_panel_open(AuxiliaryPanel::Sidebar, &self.panel_key(cx));
+        }
+        self.sidebar_tween = Some(self.panel_tween(from, self.sidebar_target()));
         self.schedule_save(cx);
+        self.resplit_panels(before, None, cx);
         cx.notify();
     }
 
@@ -3160,6 +3285,9 @@ impl Shell {
     /// it opens the surface host beside it, and it never hides the explorer —
     /// only the explorer's own toggle undocks that portion.
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
+        if self.right_pane_open(cx) && self.promote_hidden_panel(AuxiliaryPanel::Right, cx) {
+            return;
+        }
         self.set_surfaces_open(!self.right_pane_open(cx), cx);
     }
 
@@ -3176,42 +3304,58 @@ impl Shell {
     /// Show or hide the surface host portion of the right pane. A no-op when
     /// already in the requested state, so programmatic opens (a file, a
     /// browser link, a subagent chip) never close a pane the user has open.
+    /// An open pane the window fit hides is brought forward instead, so the
+    /// requested content is reachable.
     fn set_surfaces_open(&mut self, open: bool, cx: &mut Context<Self>) {
-        if self.active_chat.is_empty() || self.right_pane_open(cx) == open {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        if self.right_pane_open(cx) == open {
+            if open {
+                self.promote_hidden_panel(AuxiliaryPanel::Right, cx);
+            }
             return;
         }
         // Reverse from the visible width when toggled during an animation.
-        let from = self.right_visible_width(cx);
+        let before = self.painted_panels(cx);
+        let from = before.right;
+        let content_from = before.right_content;
         self.right_edge_bounce = None;
         self.right_resize_edge = None;
         self.finish_pane_resize(PaneResizeKind::Right);
         let sidebar_now = self.sidebar_now();
-        let from_main = conversation_width(
-            self.viewport_width - self.files_reserved_width(cx),
-            sidebar_now,
-            from,
-        );
-        let was_expanded = self.right_pane_expanded;
+        let from_main = self.main_content_width(self.main_target_width(from, cx), cx);
+        let was_expanded = self.right_pane_expanded || self.tween_active(self.main_takeover_tween);
         let key = self.panel_key(cx);
-        self.panels.update(&key, |p| p.changes_open = open);
-        if !open {
-            self.suspend_file_images(cx);
+        if open {
+            self.record_panel_open(AuxiliaryPanel::Right, &key);
+            // Its previews load again; the next hide releases them anew.
+            self.right_images_suspended = false;
+        } else {
             // Closing always leaves takeover mode — reopening at full bleed
             // with the conversation gone read as a broken chat.
             self.right_pane_expanded = false;
         }
-        let to = self.right_target(cx);
-        self.right_tween = Some(WidthTween::new(from, to));
-        self.right_takeover_content_tween = None;
-        self.main_takeover_tween = was_expanded.then(|| {
-            WidthTween::new(
-                from_main,
-                conversation_width(
-                    self.viewport_width - self.files_reserved_width(cx),
-                    sidebar_now,
-                    to,
-                ),
-            )
+        self.panels.update(&key, |p| p.changes_open = open);
+        self.resplit_panels(before, Some(AuxiliaryPanel::Right), cx);
+        let to = self.right_settled_target(cx);
+        let pane = self.panel_tween(from, to);
+        self.right_tween = Some(pane);
+        let (content_start, content_end) = panel_content_tween(content_from, from, to);
+        self.right_content_tween = Some(WidthTween {
+            from: content_start,
+            to: content_end,
+            ..pane
+        });
+        // The conversation's return rides the pane's own tween.
+        self.main_takeover_tween = was_expanded.then(|| WidthTween {
+            from: from_main,
+            to: conversation_width(
+                self.viewport_width - self.files_reserved_width(cx),
+                sidebar_now,
+                to,
+            ),
+            ..pane
         });
         if open
             && let RightSurface::Diff(id) = self.resolved_right_active(cx)
@@ -3422,6 +3566,22 @@ impl Shell {
     fn suspend_file_images(&mut self, cx: &mut Context<Self>) {
         for files in self.files.values().chain(self.file_surfaces.values()) {
             files.update(cx, |files, cx| files.suspend_images(cx));
+        }
+    }
+
+    /// Release image previews once the surface host stops painting: after
+    /// its close mask lands, while the window fit hides it, or off the chat
+    /// route. Once per hide, so a quick reversal never unloads the frame.
+    fn suspend_hidden_right_images(&mut self, cx: &mut Context<Self>) {
+        let painting = matches!(self.route, Route::Chat)
+            && ((self.horizontal_fit().right
+                && (self.right_pane_open(cx) || self.tween_active(self.right_tween)))
+                || self.fit_exit_width(1).is_some());
+        if painting {
+            self.right_images_suspended = false;
+        } else if !self.right_images_suspended {
+            self.suspend_file_images(cx);
+            self.right_images_suspended = true;
         }
     }
 
@@ -3927,13 +4087,7 @@ impl Shell {
             return false;
         };
 
-        let key = self.panel_key(cx);
-        let was_open = self.panels.get(&key).changes_open;
-        let from = self.right_target(cx);
-        self.panels.update(&key, |panel| panel.changes_open = true);
-        if !was_open {
-            self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
-        }
+        self.set_surfaces_open(true, cx);
         self.add_file_surface_at(
             owner,
             link.path,
@@ -4362,7 +4516,7 @@ impl Shell {
     /// active surface while the pane is open, or `None` on the picker empty
     /// state / a closed pane / the new-session canvas.
     fn closable_right_surface(&self, cx: &App) -> Option<RightSurface> {
-        if !self.right_pane_open(cx) {
+        if !self.right_pane_shown(cx) {
             return None;
         }
         match self.resolved_right_active(cx) {
@@ -4413,11 +4567,19 @@ impl Shell {
         let mut dirty = editors.collect::<Vec<_>>();
         dirty.sort_by_key(|(key, _)| (key != &current, key.clone()));
         if let Some((key, surface)) = dirty.into_iter().next() {
-            self.panels.update(&key, |panel| {
-                panel.changes_open = true;
-                panel.right_active = surface;
-            });
-            self.apply_nav(NavEntry::Chat(key), cx);
+            self.panels
+                .update(&key, |panel| panel.right_active = surface);
+            if key == current {
+                // The ordinary open: it animates, re-splits the columns, and
+                // brings forward a pane the window fit hides.
+                self.apply_nav(NavEntry::Chat(key), cx);
+                self.set_surfaces_open(true, cx);
+            } else {
+                // Rank the pane most recent so a narrow window shows it.
+                self.panels.update(&key, |panel| panel.changes_open = true);
+                self.record_panel_open(AuxiliaryPanel::Right, &key);
+                self.apply_nav(NavEntry::Chat(key), cx);
+            }
         }
     }
 
@@ -4558,6 +4720,7 @@ impl Shell {
     ) {
         let x = f32::from(event.event.position.x);
         let sample = sidebar_drag_sample(x, self.sidebar_resize_edge, self.reduced_motion);
+        let was_collapsed = self.settings.sidebar_collapsed;
         self.settings.sidebar_width = sample.width;
         self.settings.sidebar_collapsed = false;
         self.pane_resize_dragging = Some(PaneResizeKind::Sidebar);
@@ -4570,6 +4733,9 @@ impl Shell {
         self.pane_resize_active = sample.edge.is_none().then_some(PaneResizeKind::Sidebar);
         self.sidebar_resize_edge = sample.edge;
         self.schedule_save(cx);
+        if was_collapsed {
+            self.record_panel_open(AuxiliaryPanel::Sidebar, &self.panel_key(cx));
+        }
         cx.notify();
     }
 
@@ -4587,7 +4753,7 @@ impl Shell {
         let pointer_x = f32::from(event.event.position.x);
         let sidebar_left = f32::from(event.bounds.left());
         let inside_sidebar =
-            pointer_x >= sidebar_left && pointer_x <= sidebar_left + self.settings.sidebar_width;
+            pointer_x >= sidebar_left && pointer_x <= sidebar_left + self.sidebar_now();
         if !inside_window || !inside_sidebar {
             if let Some(transfer) = self.sidebar_session_transfer.as_mut() {
                 transfer.preview = None;
@@ -4646,7 +4812,7 @@ impl Shell {
         self.pane_resize_active = sample.edge.is_none().then_some(PaneResizeKind::Right);
         self.right_resize_edge = sample.edge;
         self.right_tween = None;
-        self.right_takeover_content_tween = None;
+        self.right_content_tween = None;
         self.main_takeover_tween = None;
         self.schedule_save(cx);
         cx.notify();
@@ -4712,17 +4878,258 @@ impl Shell {
 
     /// Close the session-row context menu through the exit animation.
     fn close_chat_menu(&mut self, cx: &mut Context<Self>) {
+        self.chat_copy_intent.reset();
         if self.chat_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.chat_menu);
             cx.notify();
         }
     }
 
-    fn open_chat_copy_menu(&mut self, cx: &mut Context<Self>) {
-        if let Some(menu) = self.chat_menu.open_mut() {
-            menu.page = ChatMenuPage::Copy;
+    /// A sidebar-level notice (a failed mutation, a copied link) as a toast.
+    /// The latest message is kept so a pin-write failure can be matched later.
+    pub(super) fn show_notice(
+        &mut self,
+        kind: crate::toast::ToastKind,
+        message: impl Into<SharedString>,
+        cx: &mut App,
+    ) {
+        let message = message.into();
+        self.sidebar_notice = Some(message.clone());
+        crate::toast::show(cx, kind, message);
+    }
+
+    fn set_chat_copy_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        let page = if open {
+            ChatMenuPage::Copy
+        } else {
+            ChatMenuPage::Root
+        };
+        if let Some(menu) = self.chat_menu.open_mut()
+            && menu.page != page
+        {
+            menu.page = page;
+            if !open {
+                self.chat_copy_bounds = None;
+            }
             cx.notify();
         }
+    }
+
+    /// Pointer intent over a chat-menu row: hovering Copy opens its submenu,
+    /// any other row closes it — after a grace while the pointer is heading
+    /// into the open submenu.
+    fn hover_chat_menu_row(
+        &mut self,
+        key: u8,
+        pointer: Point<Pixels>,
+        moved: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .chat_menu
+            .as_open()
+            .filter(|menu| menu.page == ChatMenuPage::Copy)
+            .map(|_| CHAT_MENU_ROW_COPY);
+        let (bounds, left) = (self.chat_copy_bounds, self.chat_copy_left);
+        let action = if moved {
+            self.chat_copy_intent
+                .moved(current.as_ref(), &key, pointer, bounds, left)
+        } else {
+            self.chat_copy_intent
+                .enter(current.as_ref(), &key, pointer, bounds, left)
+        };
+        match action {
+            popover::HoverAction::None => {}
+            popover::HoverAction::Open => {
+                self.set_chat_copy_open(key == CHAT_MENU_ROW_COPY, cx);
+                self.chat_copy_intent.record_origin(pointer);
+            }
+            popover::HoverAction::Defer => {
+                self.chat_copy_intent.defer(cx, move |this, cx| {
+                    if this.chat_menu.is_open()
+                        && this.chat_copy_intent.pending() == Some(&key)
+                    {
+                        this.chat_copy_intent.cancel();
+                        this.set_chat_copy_open(key == CHAT_MENU_ROW_COPY, cx);
+                        this.chat_copy_intent.record_origin(pointer);
+                    }
+                });
+            }
+        }
+    }
+
+    /// Wrap a chat-menu row in the hover surface that feeds
+    /// [`Self::hover_chat_menu_row`]. The row keeps its own hover fade.
+    fn chat_menu_hover_row(
+        &self,
+        key: u8,
+        row: impl IntoElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(("chat-menu-hover", key as usize))
+            .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+                if *hovered {
+                    this.hover_chat_menu_row(key, window.mouse_position(), false, cx);
+                } else {
+                    this.chat_copy_intent.leave(&key);
+                }
+            }))
+            .on_mouse_move(cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                this.hover_chat_menu_row(key, event.position, true, cx);
+            }))
+            .child(row)
+            .into_any_element()
+    }
+
+    /// The chat menu's Copy row: opens its submenu beside the menu on hover
+    /// (or click), on whichever side has room.
+    fn render_chat_copy_trigger(
+        &mut self,
+        chat_id: &str,
+        open: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let entity = cx.entity().downgrade();
+        let exit_entity = entity.clone();
+        let mut row = popover::menu_row_nav(theme, open, false, format!("chat-menu-copy-{chat_id}"))
+            .id("chat-menu-copy")
+            .relative()
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.chat_copy_intent.reset();
+                this.set_chat_copy_open(true, cx);
+                cx.stop_propagation();
+            }))
+            .child(icon(icons::COPY).size(px(16.0)).text_color(theme.text_muted))
+            .child(div().flex_1().child(SharedString::from("Copy")))
+            .child(
+                icon(icons::ALT_ARROW_RIGHT)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        let left = bounds.right() + px(244.0) > window.viewport_size().width;
+                        let _ = entity.update(cx, |this, cx| {
+                            if this.chat_copy_left != left {
+                                this.chat_copy_left = left;
+                                cx.notify();
+                            }
+                        });
+                    },
+                    move |trigger, _, window, _| {
+                        if !open {
+                            return;
+                        }
+                        // Leaving the trigger anywhere but toward the submenu
+                        // closes it, as in the sidebar options menu.
+                        window.on_mouse_event(move |event: &gpui::MouseMoveEvent, phase, _, cx| {
+                            if phase != gpui::DispatchPhase::Bubble {
+                                return;
+                            }
+                            let _ = exit_entity.update(cx, |this, cx| {
+                                let (bounds, left) = (this.chat_copy_bounds, this.chat_copy_left);
+                                if this
+                                    .chat_copy_intent
+                                    .contains_pointer(trigger, bounds, event.position, left)
+                                {
+                                    return;
+                                }
+                                this.chat_copy_intent.reset();
+                                this.set_chat_copy_open(false, cx);
+                            });
+                        });
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            );
+        if open {
+            let submenu = self.render_chat_copy_submenu(chat_id, theme, cx);
+            row = row.child(popover::nested_menu(
+                format!("chat-copy-submenu-{chat_id}"),
+                submenu,
+                self.chat_copy_left,
+            ));
+        }
+        row.into_any_element()
+    }
+
+    /// The Copy submenu's card: what can be copied for this chat.
+    fn render_chat_copy_submenu(
+        &mut self,
+        chat_id: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|chat| chat.id == chat_id)
+            .cloned();
+        let harness_link = chat
+            .as_ref()
+            .and_then(crate::links::harness_conversation_link);
+        let session_id = chat
+            .as_ref()
+            .and_then(|chat| chat.harness_session_id.as_deref())
+            .is_some_and(|id| !id.trim().is_empty());
+        let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
+        let zeron_id = chat_id.to_owned();
+        let harness_id = chat_id.to_owned();
+        let session_chat_id = chat_id.to_owned();
+        let path_chat_id = chat_id.to_owned();
+        let item = |id: &'static str, label: SharedString| {
+            popover::menu_row(theme, false, format!("{id}-{chat_id}"))
+                .id(id)
+                .debug_selector(move || id.to_owned())
+                .child(icon(icons::COPY).size(px(16.0)).text_color(theme.text_muted))
+                .child(label)
+        };
+        let entity = cx.entity().downgrade();
+        popover::popover_card(theme)
+            .w(px(232.0))
+            .relative()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .when(has_path, |menu| {
+                menu.child(item("chat-copy-path", "Path".into()).on_click(cx.listener(
+                    move |this, _, _, cx| this.copy_chat_path(&path_chat_id, cx),
+                )))
+            })
+            .child(
+                item("chat-copy-zeron", "Zeron conversation link".into()).on_click(cx.listener(
+                    move |this, _, _, cx| this.copy_zeron_conversation_link(&zeron_id, cx),
+                )),
+            )
+            .when_some(harness_link, |menu, link| {
+                menu.child(item("chat-copy-harness", link.label.into()).on_click(cx.listener(
+                    move |this, _, _, cx| this.copy_harness_conversation_link(&harness_id, cx),
+                )))
+            })
+            .when(session_id, |menu| {
+                menu.child(
+                    item("chat-copy-session", "Harness session ID".into()).on_click(cx.listener(
+                        move |this, _, _, cx| this.copy_harness_session_id(&session_chat_id, cx),
+                    )),
+                )
+            })
+            .child(
+                gpui::canvas(
+                    move |bounds, _, cx| {
+                        let _ = entity.update(cx, |this, _| this.chat_copy_bounds = Some(bounds));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .into_any_element()
     }
 
     fn copy_zeron_conversation_link(&mut self, chat_id: &str, cx: &mut Context<Self>) {
@@ -4737,9 +5144,9 @@ impl Shell {
         };
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link));
-            self.sidebar_notice = Some("Zeron conversation link copied".into());
+            self.show_notice(crate::toast::ToastKind::Success, "Zeron conversation link copied", cx);
         } else {
-            self.sidebar_notice = Some("Conversation link is not ready yet".into());
+            self.show_notice(crate::toast::ToastKind::Error, "Conversation link is not ready yet", cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -4755,7 +5162,7 @@ impl Shell {
             .and_then(crate::links::harness_conversation_link);
         if let Some(link) = link {
             cx.write_to_clipboard(ClipboardItem::new_string(link.url));
-            self.sidebar_notice = Some(format!("{} copied", link.label).into());
+            self.show_notice(crate::toast::ToastKind::Success, format!("{} copied", link.label), cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -4771,7 +5178,7 @@ impl Shell {
             .and_then(|chat| chat.harness_session_id.clone());
         if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
             cx.write_to_clipboard(ClipboardItem::new_string(id));
-            self.sidebar_notice = Some("Harness session ID copied".into());
+            self.show_notice(crate::toast::ToastKind::Success, "Harness session ID copied", cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -4788,7 +5195,7 @@ impl Shell {
             .map(str::to_owned);
         if let Some(path) = path {
             cx.write_to_clipboard(ClipboardItem::new_string(path));
-            self.sidebar_notice = Some("Path copied".into());
+            self.show_notice(crate::toast::ToastKind::Success, "Path copied", cx);
         }
         self.close_chat_menu(cx);
         cx.notify();
@@ -5321,14 +5728,14 @@ impl Shell {
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.sidebar_notice = Some("Engine not connected".into());
+            self.show_notice(crate::toast::ToastKind::Error, "Engine not connected", cx);
             cx.notify();
             return;
         };
         self.mutate_task = Some(cx.spawn(async move |this, cx| {
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("{err}").into());
+                    shell.show_notice(crate::toast::ToastKind::Error, format!("{err}"), cx);
                     cx.notify();
                 })
                 .ok();
@@ -5381,7 +5788,7 @@ impl Shell {
         if !revealed {
             // The sidebar explains its own refusals.
             if surface == ChatRenameSurface::Explorer {
-                self.sidebar_notice = Some("Open this side chat's parent to rename it".into());
+                self.show_notice(crate::toast::ToastKind::Error, "Open this side chat's parent to rename it", cx);
             }
             cx.notify();
             return;
@@ -5632,7 +6039,7 @@ impl Shell {
             zeron_proto::validate_sidebar_pin_update(&current, pins)
         };
         if let Err(message) = result {
-            self.sidebar_notice = Some(message.into());
+            self.show_notice(crate::toast::ToastKind::Error, message, cx);
             cx.notify();
             return false;
         }
@@ -6004,8 +6411,7 @@ impl Shell {
                         if local {
                             shell.sync_flow = SyncFlow::Enabling;
                         }
-                        shell.sidebar_notice =
-                            Some(format!("Could not cancel sign-in: {err}").into());
+                        shell.show_notice(crate::toast::ToastKind::Error, format!("Could not cancel sign-in: {err}"), cx);
                     }
                 }
                 cx.notify();
@@ -6334,7 +6740,7 @@ impl Shell {
                     {
                         shell.sync_flow = SyncFlow::Idle;
                     }
-                    shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
+                    shell.show_notice(crate::toast::ToastKind::Error, format!("Sign in failed: {err}"), cx);
                     cx.notify();
                 }
             })
@@ -6461,30 +6867,65 @@ impl Shell {
 
     // ---- render pieces ----
 
+    fn motion_time(&self) -> std::time::Instant {
+        #[cfg(test)]
+        if let Some(now) = self.test_time {
+            return now;
+        }
+        std::time::Instant::now()
+    }
+
+    fn panel_tween(&self, from: f32, to: f32) -> WidthTween {
+        WidthTween {
+            started: self.render_time.unwrap_or_else(|| self.motion_time()),
+            ..WidthTween::panel(from, to)
+        }
+    }
+
     fn tween_elapsed(&self, started: std::time::Instant) -> Duration {
         self.render_time
-            .unwrap_or_else(std::time::Instant::now)
+            .unwrap_or_else(|| self.motion_time())
             .saturating_duration_since(started)
     }
 
     /// Evaluate a width tween at the frame time (see [`WidthTween`]).
-    /// Mid-flight: eased 200ms lerp, and `motion_active` is flagged so render
-    /// schedules the next animation frame. Finished, stale, absent, or under
+    /// Mid-flight: lerp on the tween's curve, flagging `motion_active` so
+    /// render schedules the next frame. Finished, stale, absent, or under
     /// reduced motion: exactly `target`. Honors `ZERON_MOTION_SCALE`.
     fn eval_tween(&self, tween: Option<WidthTween>, target: f32) -> f32 {
-        let Some(WidthTween { from, to, started }) = tween else {
+        let Some(WidthTween {
+            from,
+            to,
+            started,
+            duration,
+            curve,
+        }) = tween
+        else {
             return target;
         };
         if self.reduced_motion {
             return target;
         }
-        let total = RESIZE.total().mul_f32(motion::speed_scale());
-        let raw = self.tween_elapsed(started).as_secs_f32() / total.as_secs_f32();
+        let raw = self.tween_elapsed(started).as_secs_f32() / duration.as_secs_f32();
         if raw >= 1.0 {
             return target;
         }
         self.motion_active.set(true);
-        motion::lerp(from, to, RESIZE.progress(raw))
+        motion::lerp(from, to, curve.eval(raw))
+    }
+
+    /// [`Self::eval_tween`] heading for `target` as it is this frame, not
+    /// the endpoint the tween saw when it started. A column's target follows
+    /// its neighbours while they move; easing toward it lands there instead
+    /// of snapping to it as the tween ends.
+    fn ease_toward(&self, tween: Option<WidthTween>, target: f32) -> f32 {
+        self.eval_tween(
+            tween.map(|tween| WidthTween {
+                to: target,
+                ..tween
+            }),
+            target,
+        )
     }
 
     fn eval_resize_edge_bounce(
@@ -6509,13 +6950,28 @@ impl Shell {
     }
 
     pub(super) fn sidebar_now(&self) -> f32 {
-        self.eval_tween(self.sidebar_tween, self.sidebar_target())
-            + self
-                .eval_resize_edge_bounce(self.sidebar_edge_bounce, !self.settings.sidebar_collapsed)
+        let fit = self.horizontal_fit();
+        if !fit.sidebar {
+            return self.fit_exit_width(0).unwrap_or(0.0);
+        }
+        let limit = self.sidebar_tween_limit(fit.sidebar_limit);
+        // The edge bounce applies past the limit so the drag cue at the
+        // maximum width stays visible.
+        (self
+            .ease_toward(self.sidebar_tween, self.sidebar_target())
+            .min(limit)
+            + self.eval_resize_edge_bounce(
+                self.sidebar_edge_bounce,
+                !self.settings.sidebar_collapsed,
+            ))
+        .max(0.0)
     }
 
-    fn right_now(&self, cx: &App) -> f32 {
-        self.eval_tween(self.right_tween, self.right_target(cx))
+    /// The surface host's eased width within `max`, plus its edge bounce,
+    /// which may cross `max` like the sidebar's.
+    fn right_now(&self, max: f32, cx: &App) -> f32 {
+        self.ease_toward(self.right_tween, self.right_target(cx))
+            .min(max)
             + self.eval_resize_edge_bounce(
                 self.right_edge_bounce,
                 self.right_pane_open(cx) && !self.right_pane_expanded,
@@ -6524,41 +6980,34 @@ impl Shell {
 
     fn tween_active(&self, tween: Option<WidthTween>) -> bool {
         tween.is_some_and(|tween| {
-            !self.reduced_motion
-                && self.tween_elapsed(tween.started) < RESIZE.total().mul_f32(motion::speed_scale())
+            !self.reduced_motion && self.tween_elapsed(tween.started) < tween.duration
         })
     }
 
     fn active_tween_endpoints(&self, tween: Option<WidthTween>) -> Option<(f32, f32)> {
         tween
             .filter(|transition| {
-                !self.reduced_motion
-                    && self.tween_elapsed(transition.started)
-                        < RESIZE.total().mul_f32(motion::speed_scale())
+                !self.reduced_motion && self.tween_elapsed(transition.started) < transition.duration
             })
             .map(|transition| (transition.from, transition.to))
     }
 
     /// Right-anchored variant for the changes pane. The outer width follows the
     /// existing shell tween, while descendants retain the larger endpoint's
-    /// geometry for that 200ms transition. This mirrors the sidebar's stable
+    /// geometry throughout the transition. This mirrors the sidebar's stable
     /// inner/clipped outer behavior without changing the center column's
     /// upstream flex layout.
     fn right_pane_container(
         &self,
-        tween: Option<WidthTween>,
         target: f32,
         visible: f32,
         edge_offset: f32,
         inner: AnyElement,
     ) -> AnyElement {
-        let takeover_width = self
-            .active_tween_endpoints(self.right_takeover_content_tween)
-            .map(|_| self.eval_tween(self.right_takeover_content_tween, target));
-        let content_width =
-            right_panel_content_width(target, self.active_tween_endpoints(tween), takeover_width)
-                + edge_offset;
+        let content_width = self.right_content_width(target) + edge_offset;
         div()
+            .id("right-panel")
+            .debug_selector(|| "right-panel".into())
             .h_full()
             .flex_none()
             .relative()
@@ -6613,9 +7062,9 @@ impl Shell {
 
     /// The session titlebar, or on the Pull requests route the open pull
     /// request's own bar.
-    fn render_title_bar(&mut self, viewport_height: Pixels, cx: &mut Context<Self>) -> AnyElement {
+    fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         if !matches!(self.route, Route::PullRequests) {
-            return self.render_session_title_bar(viewport_height, cx);
+            return self.render_session_title_bar(cx);
         }
         let plus_inset = TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
         let inner = div()
@@ -6824,6 +7273,42 @@ impl Shell {
                     ))
             }))
             .into_any_element()
+    }
+
+    /// The sidebar's view options ride the titlebar at the sidebar's trailing
+    /// edge, sliding and fading with it as it collapses. They never cross
+    /// back over the control cluster on a narrow sidebar.
+    fn render_sidebar_options_titlebar(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sidebar = self.sidebar_now();
+        let reveal = (sidebar / self.sidebar_content_width().max(1.0)).clamp(0.0, 1.0);
+        if reveal <= 0.01 {
+            return None;
+        }
+        let cluster_end = self.eval_tween(
+            self.titlebar_tween,
+            cluster_buttons_start(
+                cfg!(target_os = "macos"),
+                self.fullscreen.unwrap_or(false),
+                self.linux_left_caption_count(),
+            ),
+        ) + CLUSTER_BUTTONS_WIDTH
+            + TITLEBAR_ACTION_SLOT_WIDTH * self.titlebar_plus_alpha(cx);
+        let left = (sidebar - Theme::SPACE_SM - 24.0).max(cluster_end + TITLEBAR_GROUP_GAP);
+        let theme = Theme::of(cx).clone();
+        let trigger = self.render_sidebar_view_trigger(&theme, cx);
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left(px(left))
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .pt(px(Theme::TITLEBAR_TOP_PAD))
+                .flex()
+                .items_center()
+                .opacity(reveal)
+                .child(trigger)
+                .into_any_element(),
+        )
     }
 
     /// The titlebar owns new-session creation regardless of sidebar state. It
@@ -7167,7 +7652,7 @@ impl Shell {
         // activity/glyph personality independently of the selected variant.
         let inner = self.sidebar_pane.clone().cached(
             gpui::StyleRefinement::default()
-                .w(px(self.settings.sidebar_width))
+                .w(px(self.sidebar_content_width()))
                 .h_full()
                 .flex_none(),
         );
@@ -7176,6 +7661,8 @@ impl Shell {
         // full window height (the titlebar overlays it), so the column pads
         // itself below the chrome.
         div()
+            .id("sidebar-column")
+            .debug_selector(|| "sidebar-column".into())
             .h_full()
             .flex_none()
             .overflow_hidden()
@@ -8777,7 +9264,7 @@ impl Shell {
         let github_star_banner = self.render_github_star_banner(update_strip.is_some(), theme, cx);
 
         div()
-            .w(px(self.settings.sidebar_width))
+            .w(px(self.sidebar_content_width()))
             .h_full()
             .flex()
             .flex_col()
@@ -8795,28 +9282,6 @@ impl Shell {
             // update strip — both above the user menu, below the lists.
             .when_some(github_star_banner, |el, banner| el.child(banner))
             .when_some(update_strip, |el, strip| el.child(strip))
-            // Inline mutation-failure notice.
-            .when_some(self.sidebar_notice.clone(), |el, notice| {
-                el.child(
-                    div()
-                        .id("sidebar-notice")
-                        .mx(px(Theme::SPACE_SM))
-                        .mb(px(Theme::SPACE_SM))
-                        .px(px(Theme::SPACE_SM))
-                        .py(px(4.0))
-                        .rounded(px(Theme::CONTROL_RADIUS))
-                        .border_1()
-                        .border_color(theme.danger)
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(theme.danger)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.sidebar_notice = None;
-                            cx.notify();
-                        }))
-                        .child(notice),
-                )
-            })
             .child(
                 div()
                     .p(px(Theme::SPACE_SM))
@@ -9349,7 +9814,7 @@ impl Shell {
             let closing = self.user_menu.closing_since();
 
             let menu = popover::popover_card(theme)
-                .w(px(self.settings.sidebar_width
+                .w(px(self.sidebar_content_width()
                     - 2.0 * Theme::SPACE_SM
                     - SIDEBAR_FOOTER_ACTION_SIZE
                     - SIDEBAR_FOOTER_ACTION_GAP))
@@ -9908,7 +10373,7 @@ impl Shell {
     }
 
     fn active_changes(&self, cx: &App) -> Option<Entity<Changes>> {
-        if !self.right_pane_open(cx) {
+        if !self.right_pane_shown(cx) {
             return None;
         }
         let RightSurface::Diff(id) = self.resolved_right_active(cx) else {
@@ -10104,45 +10569,49 @@ impl Shell {
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    // The Copy submenu floats outside this card: a press on
+                    // it is inside the menu.
+                    if this
+                        .chat_copy_bounds
+                        .is_some_and(|bounds| bounds.contains(&event.position))
+                    {
+                        return;
+                    }
                     this.close_chat_menu(cx);
                 }))
                 .flex()
                 .flex_col();
-            let menu = match menu_state.page {
-                _ if chat_id.is_empty() => menu,
-                ChatMenuPage::Root => menu
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
-                            .id("chat-menu-rename")
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                // A side chat's title is edited on its row
-                                // under the file tree: dock the explorer
-                                // when the menu came from its tab.
-                                if is_side_chat && !this.files_panel_open(cx) {
-                                    this.add_files_surface(window, cx);
-                                }
-                                this.open_rename_chat(rename_id.clone(), cx)
-                            }))
-                            .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
-                            .child(SharedString::from("Rename")),
-                    )
-                    .when(!is_side_chat, |menu| {
-                        menu.child(
-                            popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
-                                .id("chat-menu-pin")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
-                                }))
-                                .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
-                                .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" })),
-                        )
-                        .child(
-                            popover::menu_row(
-                                &theme,
-                                false,
-                                format!("chat-menu-archive-{chat_id}"),
-                            )
+            let copy_open = menu_state.page == ChatMenuPage::Copy;
+            let menu = if chat_id.is_empty() {
+                menu
+            } else {
+                let rename = popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
+                    .id("chat-menu-rename")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        // A side chat's title is edited on its row under the
+                        // file tree: dock the explorer when the menu came
+                        // from its tab.
+                        if is_side_chat && !this.files_panel_open(cx) {
+                            this.add_files_surface(window, cx);
+                        }
+                        this.open_rename_chat(rename_id.clone(), cx)
+                    }))
+                    .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
+                    .child(SharedString::from("Rename"));
+                let menu = menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_RENAME, rename, cx));
+                let menu = if is_side_chat {
+                    menu
+                } else {
+                    let pin = popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                        .id("chat-menu-pin")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_chat_pinned(pin_id.clone(), !is_pinned, cx)
+                        }))
+                        .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from(if is_pinned { "Unpin" } else { "Pin" }));
+                    let archive =
+                        popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
                             .id("chat-menu-archive")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.archive_chat(archive_id.clone(), cx)
@@ -10152,166 +10621,46 @@ impl Shell {
                                     .size(px(16.0))
                                     .text_color(theme.text_muted),
                             )
-                            .child(SharedString::from("Archive")),
-                        )
-                        .child(
-                            popover::menu_row(&theme, false, format!("chat-menu-copy-{chat_id}"))
-                                .id("chat-menu-copy")
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.open_chat_copy_menu(cx)),
-                                )
-                                .child(
-                                    icon(icons::COPY)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(div().flex_1().child(SharedString::from("Copy")))
-                                .child(
-                                    icon(icons::ALT_ARROW_RIGHT)
-                                        .size(px(14.0))
-                                        .text_color(theme.text_muted),
-                                ),
-                        )
-                    })
-                    .child(popover::menu_separator())
+                            .child(SharedString::from("Archive"));
+                    let copy = self.render_chat_copy_trigger(&chat_id, copy_open, &theme, cx);
+                    menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_PIN, pin, cx))
+                        .child(self.chat_menu_hover_row(CHAT_MENU_ROW_ARCHIVE, archive, cx))
+                        .child(self.chat_menu_hover_row(CHAT_MENU_ROW_COPY, copy, cx))
+                };
+                let delete = popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
+                    .id("chat-menu-delete")
+                    .text_color(theme.danger)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_chat_menu(cx);
+                        this.delete_confirm = Some(delete_id.clone());
+                        cx.notify();
+                    }))
                     .child(
-                        popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
-                            .id("chat-menu-delete")
-                            .text_color(theme.danger)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_chat_menu(cx);
-                                this.delete_confirm = Some(delete_id.clone());
-                                cx.notify();
-                            }))
-                            .child(
-                                icon(icons::TRASH_BIN_MINIMALISTIC)
-                                    .size(px(16.0))
-                                    .text_color(theme.danger),
-                            )
-                            .child(SharedString::from("Delete…")),
-                    ),
-                ChatMenuPage::Copy => {
-                    let chat = self
-                        .state
-                        .read(cx)
-                        .chats
-                        .iter()
-                        .find(|chat| chat.id == chat_id)
-                        .cloned();
-                    let harness_link = chat
-                        .as_ref()
-                        .and_then(crate::links::harness_conversation_link);
-                    let session_id = chat
-                        .as_ref()
-                        .and_then(|chat| chat.harness_session_id.as_deref())
-                        .is_some_and(|id| !id.trim().is_empty());
-                    let has_path = chat.as_ref().and_then(chat_copy_path).is_some();
-                    let zeron_id = chat_id.clone();
-                    let harness_id = chat_id.clone();
-                    let session_chat_id = chat_id.clone();
-                    let path_chat_id = chat_id.clone();
-                    menu.child(
-                        popover::menu_row(&theme, false, format!("chat-copy-back-{chat_id}"))
-                            .id("chat-copy-back")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(menu) = this.chat_menu.open_mut() {
-                                    menu.page = ChatMenuPage::Root;
-                                    cx.notify();
-                                }
-                            }))
-                            .child(
-                                icon(icons::ALT_ARROW_LEFT)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Back")),
+                        icon(icons::TRASH_BIN_MINIMALISTIC)
+                            .size(px(16.0))
+                            .text_color(theme.danger),
                     )
-                    .child(popover::menu_separator())
-                    .when(has_path, |menu| {
-                        menu.child(
-                            popover::menu_row(&theme, false, format!("chat-copy-path-{chat_id}"))
-                                .id("chat-copy-path")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_chat_path(&path_chat_id, cx)
-                                }))
-                                .child(
-                                    icon(icons::COPY)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Path")),
-                        )
-                    })
-                    .child(
-                        popover::menu_row(&theme, false, format!("chat-copy-zeron-{chat_id}"))
-                            .id("chat-copy-zeron")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_zeron_conversation_link(&zeron_id, cx)
-                            }))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Zeron conversation link")),
-                    )
-                    .when_some(harness_link, |menu, link| {
-                        menu.child(
-                            popover::menu_row(
-                                &theme,
-                                false,
-                                format!("chat-copy-harness-{chat_id}"),
-                            )
-                            .id("chat-copy-harness")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_harness_conversation_link(&harness_id, cx)
-                            }))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from(link.label)),
-                        )
-                    })
-                    .when(session_id, |menu| {
-                        menu.child(
-                            popover::menu_row(
-                                &theme,
-                                false,
-                                format!("chat-copy-session-{chat_id}"),
-                            )
-                            .id("chat-copy-session")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_harness_session_id(&session_chat_id, cx)
-                            }))
-                            .child(
-                                icon(icons::COPY)
-                                    .size(px(16.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .child(SharedString::from("Harness session ID")),
-                        )
-                    })
-                }
+                    .child(SharedString::from("Delete…"));
+                menu.child(popover::menu_separator())
+                    .child(self.chat_menu_hover_row(CHAT_MENU_ROW_DELETE, delete, cx))
             };
             let mut menu = menu;
-            if let Some((key, surface)) = menu_state.tab
-                && matches!(menu_state.page, ChatMenuPage::Root)
-            {
+            if let Some((key, surface)) = menu_state.tab {
                 if !chat_id.is_empty() {
                     menu = menu.child(popover::menu_separator());
                 }
-                for (action, label) in [
+                for (ix, (action, label)) in [
                     (TabCloseAction::This, "Close tab"),
                     (TabCloseAction::Others, "Close other tabs"),
                     (TabCloseAction::Left, "Close tabs to the left"),
                     (TabCloseAction::Right, "Close tabs to the right"),
-                ] {
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     let enabled = !self.tabs_to_close(surface, action, cx).is_empty();
                     let key = key.clone();
-                    menu = menu.child(
-                        popover::menu_row(&theme, false, label)
+                    let row = popover::menu_row(&theme, false, label)
                             .id(SharedString::from(label))
                             .when(!enabled, |el| el.opacity(0.4).cursor_default())
                             .on_click(cx.listener(move |this, _, window, cx| {
@@ -10325,8 +10674,12 @@ impl Shell {
                                     }
                                 }
                             }))
-                            .child(label),
-                    );
+                            .child(label);
+                    menu = menu.child(self.chat_menu_hover_row(
+                        CHAT_MENU_ROW_TAB + ix as u8,
+                        row,
+                        cx,
+                    ));
                 }
             }
             let menu = menu.into_any_element();
@@ -10657,13 +11010,40 @@ impl Shell {
         }
         self.composer
             .update(cx, |composer, cx| composer.set_dock_frame(dock_frame, cx));
+        // The session card: docked, the transcript holds its room free on
+        // the right and the composer follows the column left by half of it,
+        // so column and card center together.
+        let session_reveal = if has_selection {
+            self.session_info_reveal()
+        } else {
+            0.0
+        };
+        // The column's LIVE width: while the sidebar or a pane animates,
+        // `main_content_width` already holds the end width, and a reserve or
+        // card placed from it would jump ahead of the column and wait.
+        let live_main_width = (self.viewport_width
+            - self.sidebar_now()
+            - self.right_visible_width(cx)
+            - self.files_visible_width(cx))
+        .max(0.0);
+        let session_layout = session_info::session_card_layout(
+            live_main_width,
+            ui_settings.transcript_width,
+        );
+        let session_reserve = session_layout.reserve * session_reveal;
+        self.transcript
+            .update(cx, |transcript, cx| transcript.set_right_reserve(session_reserve, cx));
+        // Panel open/close glides the composer width; a window resize or a
+        // seam drag is direct manipulation, so the width tracks the pointer.
+        let direct_width =
+            self.reduced_motion || self.viewport_resized || self.pane_resize_dragging.is_some();
         let composer_width = self.composer_dock.borrow_mut().layout_width(
             composer_target_width(
-                main_content_width,
+                main_content_width - session_reserve,
                 ui_settings.transcript_width,
                 has_selection,
             ),
-            self.reduced_motion,
+            direct_width,
             frame_time,
         );
         self.composer.update(cx, |composer, cx| {
@@ -10809,7 +11189,19 @@ impl Shell {
         } else {
             None
         };
-        let status = self.render_status_strip(composer_width, cx);
+        let status = div()
+            .relative()
+            .left(px(-session_reserve / 2.0))
+            .child(self.render_status_strip(composer_width, cx));
+        let session_card = self.render_session_info(
+            session_layout,
+            session_reveal,
+            self.viewport_height
+                - Theme::TITLEBAR_HEIGHT
+                - self.bottom_stack.get()
+                - 24.0,
+            cx,
+        );
         self.chat_dropzone("chat-dropzone", self.composer.clone(), cx)
             .debug_selector(|| "chat-dropzone".into())
             .track_focus(&self.navigation_focus.main)
@@ -10873,6 +11265,7 @@ impl Shell {
                         ))
                 },
             )
+            .children(session_card)
             .when_some(harness_update_card, |column, chip| {
                 // Home notices stay anchored to the window bottom, behind the
                 // dock. Clip paint and hitboxes at the same measured terminal
@@ -10948,6 +11341,7 @@ impl Shell {
                                 div()
                                     .id("persistent-composer")
                                     .relative()
+                                    .left(px(-session_reserve / 2.0))
                                     .w(px(composer_width))
                                     .opacity(composer_opacity)
                                     .mx_auto()
@@ -11286,18 +11680,21 @@ impl Shell {
     /// page (its options row + the lazy [`Changes`] viewer), workspace Files,
     /// an embedded terminal, or the surface picker when no tabs exist.
     fn render_right_pane(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let exiting = self.fit_exit_width(1).is_some();
+        if !self.horizontal_fit().right && !exiting {
+            return Empty.into_any_element();
+        }
         let theme = Theme::of(cx).clone();
-        let content: AnyElement = if self.right_pane_open(cx) || self.tween_active(self.right_tween)
-        {
+        let showing = self.right_pane_open(cx) || self.tween_active(self.right_tween) || exiting;
+        let content: AnyElement = if showing {
             match self.resolved_right_active(cx) {
-                // Rendering a Files surface activates its image. Keep it unmounted
-                // throughout the closing animation after suspending its resources.
-                RightSurface::File(_) if !self.right_pane_open(cx) => {
-                    gpui::Empty.into_any_element()
-                }
                 RightSurface::File(id) => {
                     if let Some(file) = self.file_surfaces.get(&id).cloned() {
-                        file.update(cx, |file, cx| file.ensure_loaded(cx));
+                        // Keep the last file frame behind the closing mask. Loading
+                        // while closing would reactivate suspended image resources.
+                        if self.right_pane_open(cx) {
+                            file.update(cx, |file, cx| file.ensure_loaded(cx));
+                        }
                         file.into_any_element()
                     } else {
                         self.render_surface_picker(cx)
@@ -11431,7 +11828,6 @@ impl Shell {
             self.right_pane_open(cx) && !self.right_pane_expanded,
         );
         self.right_pane_container(
-            self.right_tween,
             target,
             self.right_visible_width(cx),
             edge_offset,
@@ -12184,29 +12580,37 @@ impl Shell {
     /// hiding the conversation column; toggling back restores the saved
     /// width. Rides the same width tween as open/close so the jump glides.
     fn toggle_right_pane_expand(&mut self, cx: &mut Context<Self>) {
-        let from = self.right_target(cx);
+        // The outgoing header stays painted during close, but it must not
+        // turn an already closed surface into a zero-width takeover.
+        if !self.right_pane_shown(cx) {
+            return;
+        }
+        // A second click during the first expansion starts at the painted
+        // seam, not the previous destination.
+        let from = self.right_visible_width(cx);
+        let content_from = self.right_content_width(self.right_target(cx));
         self.right_edge_bounce = None;
         self.right_resize_edge = None;
         self.finish_pane_resize(PaneResizeKind::Right);
         let sidebar_now = self.sidebar_now();
-        let from_main = conversation_width(
-            self.viewport_width - self.files_reserved_width(cx),
-            sidebar_now,
-            from,
-        );
+        let from_main = self.main_content_width(self.main_target_width(from, cx), cx);
         self.right_pane_expanded = !self.right_pane_expanded;
         let to = self.right_target(cx);
-        let right_transition = WidthTween::new(from, to);
+        let right_transition = self.panel_tween(from, to);
         self.right_tween = Some(right_transition);
-        self.right_takeover_content_tween = Some(right_transition);
-        self.main_takeover_tween = Some(WidthTween::new(
-            from_main,
-            conversation_width(
+        self.right_content_tween = Some(WidthTween {
+            from: content_from,
+            ..right_transition
+        });
+        self.main_takeover_tween = Some(WidthTween {
+            from: from_main,
+            to: conversation_width(
                 self.viewport_width - self.files_reserved_width(cx),
                 sidebar_now,
                 to,
             ),
-        ));
+            ..right_transition
+        });
         cx.notify();
     }
 
@@ -12868,6 +13272,7 @@ fn header_icon_button_with(
     let fade_key = format!("header-icon-{id}");
     div()
         .id(id)
+        .debug_selector(|| id.into())
         .size(px(28.0))
         .flex_none()
         .flex()
@@ -12949,7 +13354,7 @@ impl Render for Shell {
         }
         self.focus_rename_chat(window, cx);
 
-        self.render_time = Some(std::time::Instant::now());
+        self.render_time = Some(self.motion_time());
         if self.all_file_edits_flushed(cx)
             && let Some(action) = self.pending_exit.take()
         {
@@ -12976,14 +13381,7 @@ impl Render for Shell {
             });
         }
         crate::transcript::record_view_frame("shell");
-        let viewport = f32::from(window.viewport_size().width);
-        if (self.viewport_width - viewport).abs() > 1.0 {
-            self.files_tween = None;
-            self.right_tween = None;
-            self.right_takeover_content_tween = None;
-            self.main_takeover_tween = None;
-        }
-        self.viewport_width = viewport;
+        self.observe_viewport_width(f32::from(window.viewport_size().width), cx);
         // Appearance actions persist independently of the shell. Mirror the
         // globals before any later debounced settings save can overwrite them.
         self.settings.appearance = crate::appearance::mode(cx);
@@ -13029,9 +13427,17 @@ impl Render for Shell {
             }
             self.browser_profile = browser_profile;
         }
+        // Manual tween drive bookkeeping for this pass (see [`WidthTween`]).
+        self.reduced_motion = motion::reduced_motion(cx);
+        self.motion_active.set(false);
+        self.track_horizontal_fit(cx);
+        self.suspend_hidden_right_images(cx);
+        // After the fit tracking, which starts a fit exit this frame.
         let browser_active = matches!(gate, GatePhase::Ready)
             && !restart_required
             && matches!(self.route, Route::Chat)
+            // A pane the fit evicts keeps painting while it slides out.
+            && (self.horizontal_fit().right || self.fit_exit_width(1).is_some())
             && (self.right_pane_open(cx) || self.tween_active(self.right_tween));
         // Native clipping follows the animated GPUI mask. Drags only transfer
         // pointer ownership; the browser continues rendering and reflowing.
@@ -13089,9 +13495,6 @@ impl Render for Shell {
             self.button_layout_sub =
                 Some(cx.observe_button_layout_changed(window, |_, _, cx| cx.notify()));
         }
-        // Manual tween drive bookkeeping for this pass (see [`WidthTween`]).
-        self.reduced_motion = motion::reduced_motion(cx);
-        self.motion_active.set(false);
 
         if self.activation_sub.is_none() {
             self.activation_sub = Some(cx.observe_window_activation(
@@ -13474,23 +13877,23 @@ impl Render for Shell {
                 } else {
                     0.0
                 };
-                let panel_handoff = self.composer_dock.borrow_mut().observe_pane(
+                let main_target_width = self.main_target_width(right_target_width, cx);
+                // Navigation can change either edge: Files and responsive
+                // sidebar fitting matter just as much as the right surface.
+                self.composer_dock
+                    .borrow_mut()
+                    .observe_conversation(&self.panel_key(cx));
+                let panel_handoff = self.composer_dock.borrow_mut().observe_column(
                     self.state.read(cx).selected_chat.is_some(),
-                    right_target_width,
+                    (self.sidebar_now(), main_target_width),
                     on_chat && !self.reduced_motion,
                     self.render_time.unwrap_or_else(std::time::Instant::now),
                 );
                 if panel_handoff {
                     self.motion_active.set(true);
                 }
-                let main_target_width = conversation_width(
-                    viewport - self.files_reserved_width(cx),
-                    self.sidebar_target(),
-                    right_target_width,
-                );
-                let main_transition = self.active_tween_endpoints(self.main_takeover_tween);
-                let main_content_width =
-                    stable_panel_content_width(main_target_width, main_transition);
+                let main_takeover = self.main_takeover_active();
+                let main_content_width = self.main_content_width(main_target_width, cx);
                 let transcript_width = self.composer_dock.borrow_mut().transcript_width(
                     main_content_width,
                     self.state.read(cx).selected_chat.is_some(),
@@ -13518,22 +13921,24 @@ impl Render for Shell {
                 });
 
                 let sidebar = self.render_sidebar(cx);
-                let sidebar_handle = self.resize_handle(
-                    "sidebar-resize",
-                    PaneResizeKind::Sidebar,
-                    || SidebarResize,
-                    |shell, _| {
-                        shell.settings.sidebar_width = SIDEBAR_DEFAULT;
-                        shell.sidebar_edge_bounce = None;
-                    },
-                    cx,
-                );
+                // A collapsed or fit-hidden sidebar has no seam: the window's
+                // own left edge sits there, and a press must resize the window
+                // rather than drag the sidebar open.
+                let sidebar_handle = (self.sidebar_now() > 0.5).then(|| {
+                    self.resize_handle(
+                        "sidebar-resize",
+                        PaneResizeKind::Sidebar,
+                        || SidebarResize,
+                        |shell, cx| shell.reset_panel_widths(PaneResizeKind::Sidebar, cx),
+                        cx,
+                    )
+                });
                 let main = self.render_main(window, main_content_width, transcript_width, cx);
                 // The Changes pane is chat-scoped chrome: the Settings route
                 // never renders it (zeron __root.tsx `!isSettings && activeChat`
                 // around the diff column) — the per-session open flags stay
                 // intact for the return trip.
-                let right_open = on_chat && self.right_pane_open(cx);
+                let right_open = on_chat && self.right_pane_shown(cx);
                 // Takeover mode derives its width from the viewport, so a
                 // manual drag handle would fight the expanded target.
                 let right_handle = (right_open
@@ -13545,10 +13950,7 @@ impl Render for Shell {
                         "right-pane-resize",
                         PaneResizeKind::Right,
                         || RightPaneResize,
-                        |shell, _| {
-                            shell.settings.right_pane_width = RIGHT_PANE_DEFAULT;
-                            shell.right_edge_bounce = None;
-                        },
+                        |shell, cx| shell.reset_panel_widths(PaneResizeKind::Right, cx),
                         cx,
                     )
                     // A forgiving transparent hit target centered on the
@@ -13571,7 +13973,7 @@ impl Render for Shell {
                 // flush and unbordered, the transcript directly on the frost
                 // glass; the changes pane is a flush left-bordered glass panel
                 // (built inside `render_right_pane`).
-                let main = if main_transition.is_some() {
+                let main = if main_takeover {
                     div()
                         .h_full()
                         .w(px(main_content_width))
@@ -13583,6 +13985,8 @@ impl Render for Shell {
                     main
                 };
                 let card: AnyElement = div()
+                    .id("conversation-column")
+                    .debug_selector(|| "conversation-column".into())
                     .flex_1()
                     .min_w_0()
                     .flex()
@@ -13604,7 +14008,10 @@ impl Render for Shell {
                     .h_full()
                     .flex_none()
                     .relative()
-                    .child(sidebar_handle.left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH)));
+                    .children(
+                        sidebar_handle
+                            .map(|handle| handle.left(px(-PANE_RESIZE_HITBOX_HALF_WIDTH))),
+                    );
                 // Keep the right resize target outside the pane's
                 // overflow-hidden width container. This mirrors the sidebar
                 // seam and lets the target straddle both adjacent panes.
@@ -13623,7 +14030,7 @@ impl Render for Shell {
                 } else {
                     Empty.into_any_element()
                 };
-                let title_bar = self.render_title_bar(window.viewport_size().height, cx);
+                let title_bar = self.render_title_bar(cx);
                 // Sidebar tone: a slightly lighter column behind the sidebar.
                 // Its width rides the same tween as the sidebar, so the tone
                 // melts away with the collapse instead of vanishing in a frame.
@@ -13679,6 +14086,7 @@ impl Render for Shell {
                     // the cluster: the sidebar toggle and navigation stay live.
                     .children(voice_stage)
                     .child(self.render_titlebar_cluster(cx))
+                    .children(self.render_sidebar_options_titlebar(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
@@ -13699,6 +14107,8 @@ impl Render for Shell {
         } else {
             root
         };
+        // Toasts float over every phase and route.
+        let root = root.children(crate::toast::render_toaster(window, cx));
 
         // A manually-driven tween is mid-flight: keep frames coming (the same
         // scheduling `with_animation` would have requested). Hover color fades
@@ -13874,6 +14284,20 @@ mod tests {
         assert_eq!(chat_sync_pill_caption(&chat), Some("Sync queued — changes are saved"));
         chat.sync_state = S::Connecting;
         assert_eq!(chat_sync_pill_caption(&chat), Some("Syncing…"));
+    }
+
+    #[test]
+    fn narrowest_sidebar_keeps_its_options_button_beside_the_titlebar_controls() {
+        for is_macos in [true, false] {
+            let cluster_end = cluster_buttons_start(is_macos, false, 0)
+                + CLUSTER_BUTTONS_WIDTH
+                + TITLEBAR_ACTION_SLOT_WIDTH;
+            let options_right = cluster_end + TITLEBAR_GROUP_GAP + 24.0;
+            assert!(
+                options_right + Theme::SPACE_SM <= SIDEBAR_MIN,
+                "options button ends at {options_right} in a {SIDEBAR_MIN} sidebar"
+            );
+        }
     }
 
     #[test]
@@ -15392,13 +15816,15 @@ mod exit_regressions {
             )
         });
         window
-            .update(cx, |shell, window, cx| {
+            .update(cx, |shell, _, cx| {
                 let duration = RESIZE.total().mul_f32(motion::speed_scale());
                 let started = std::time::Instant::now() - duration.mul_f32(2.);
                 let tween = Some(WidthTween {
                     from: 520.,
                     to: 0.,
                     started,
+                    duration,
+                    curve: RESIZE.curve,
                 });
                 shell.reduced_motion = false;
                 // The frame started halfway through the transition but rendering
@@ -15443,14 +15869,17 @@ mod exit_regressions {
                 assert!(!shell.right_pane_open(cx));
                 assert!(shell.tween_active(shell.right_tween));
                 assert!(
-                    !files.read(cx).test_images_visible(),
-                    "closing suspends image resources immediately"
+                    files.read(cx).test_images_visible(),
+                    "file content stays painted through the closing mask"
                 );
-                let _ = shell.render_right_pane(window, cx);
+                let frame_time = shell.render_time;
+                shell.render_time = Some(shell.right_tween.unwrap().started + duration);
+                shell.suspend_hidden_right_images(cx);
                 assert!(
                     !files.read(cx).test_images_visible(),
-                    "closing animation must not reactivate images"
+                    "image resources suspend once the close animation ends"
                 );
+                shell.render_time = frame_time;
                 shell.settings.sidebar_collapsed = true;
                 shell.sidebar_tween = tween;
                 shell.toggle_sidebar(cx);

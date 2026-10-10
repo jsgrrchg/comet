@@ -18728,6 +18728,18 @@ impl Shell {
         self.active_pull_request_page()
     }
 
+    /// Size the pull request pane by hand, without the open animation.
+    pub fn fixture_pull_request_pane_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.settings.pull_request_pane_width = width;
+        self.pull_request_pane.tween = None;
+        cx.notify();
+    }
+
+    pub fn fixture_toggle_pull_request_pane_expand(&mut self, cx: &mut Context<Self>) {
+        self.toggle_pull_request_pane_expand(cx);
+        self.pull_request_pane.tween = None;
+    }
+
     pub fn fixture_pull_request_settings(&mut self, open: bool, cx: &mut Context<Self>) {
         if open {
             self.open_settings(SettingsSection::General, cx);

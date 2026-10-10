@@ -21,8 +21,11 @@ const CONTENT_MATCHES_PER_FILE: usize = 3;
 const MIN_WORKSPACE_QUERY_CHARS: usize = 2;
 /// Content search waits for typing to pause; name search does not.
 const CONTENT_DEBOUNCE: Duration = Duration::from_millis(80);
-/// Refresh partial results until the host finishes its initial scan.
+/// Refresh partial results until the host finishes its initial scan,
+/// doubling the wait up to [`CONTENT_INDEX_RETRY_MAX`]: without a content
+/// index every refresh is a full grep, and a large folder can scan for long.
 const CONTENT_INDEX_RETRY: Duration = Duration::from_millis(500);
+const CONTENT_INDEX_RETRY_MAX: Duration = Duration::from_secs(2);
 const FILE_INDEX_RETRY: Duration = Duration::from_millis(500);
 const RESULTS_FADE_BAND: f32 = 18.0;
 
@@ -543,6 +546,7 @@ impl Shell {
         };
         palette.content.task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(CONTENT_DEBOUNCE).await;
+            let mut delay = CONTENT_INDEX_RETRY;
             loop {
                 let result = client
                     .search_content(request.clone())
@@ -566,7 +570,8 @@ impl Shell {
                 // Keep partial rows and their selection visible. Replacing the
                 // query or closing the palette drops this task, cancelling the
                 // wait as well as any in-flight request.
-                cx.background_executor().timer(CONTENT_INDEX_RETRY).await;
+                cx.background_executor().timer(delay).await;
+                delay = (delay * 2).min(CONTENT_INDEX_RETRY_MAX);
             }
         }));
     }
@@ -2202,7 +2207,7 @@ mod tests {
             })
             .unwrap();
 
-        cx.executor().advance_clock(CONTENT_INDEX_RETRY);
+        cx.executor().advance_clock(CONTENT_INDEX_RETRY * 2);
         let third = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
         assert_eq!(third.len(), 1);
         assert_eq!(third[0]["params"], first[0]["params"]);
@@ -2229,6 +2234,38 @@ mod tests {
                 assert_eq!(rows[palette.active_position(&rows)].key(), selected);
             })
             .unwrap();
+        cx.executor().advance_clock(Duration::from_secs(10));
+        assert!(
+            engine
+                .take(methods::SEARCH_WORKSPACE_CONTENT, cx)
+                .is_empty()
+        );
+    }
+
+    #[gpui::test]
+    fn content_index_retries_back_off_to_two_seconds(cx: &mut TestAppContext) {
+        let (window, _dir, mut engine) = engine_palette(cx, true);
+        type_query(window, "needle", cx);
+        let mut pending = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+        let early = Duration::from_millis(100);
+        for wait in [500, 1000, 2000, 2000].map(Duration::from_millis) {
+            engine.reply(&pending[0], content_answer(Vec::new(), true));
+            cx.run_until_parked();
+            // `take` itself advances the clock by the debounce; stay short of
+            // the wait, then cross it.
+            cx.executor().advance_clock(wait - early);
+            assert!(
+                engine
+                    .take(methods::SEARCH_WORKSPACE_CONTENT, cx)
+                    .is_empty(),
+                "refreshed before {wait:?}"
+            );
+            cx.executor().advance_clock(early);
+            pending = engine.take(methods::SEARCH_WORKSPACE_CONTENT, cx);
+            assert_eq!(pending.len(), 1, "no refresh after {wait:?}");
+        }
+        engine.reply(&pending[0], content_answer(Vec::new(), false));
+        cx.run_until_parked();
         cx.executor().advance_clock(Duration::from_secs(10));
         assert!(
             engine

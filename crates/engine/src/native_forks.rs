@@ -178,7 +178,10 @@ impl NativeForks {
                 .as_ref()
                 .is_some_and(|c| c.harness != point.harness)
             || source.cwd.as_deref().is_some_and(|cwd| {
-                crate::repos::expand_home(cwd).ok().as_deref() != Some(point.cwd.as_str())
+                crate::repos::expand_chat_cwd(cwd, &self.0.sessions.scratch_root())
+                    .ok()
+                    .as_deref()
+                    != Some(point.cwd.as_str())
             })
         {
             return Err("Native fork provenance does not match this chat".into());

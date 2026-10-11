@@ -1603,7 +1603,6 @@ struct RefMenu {
     /// Tracked on the card — puts it on the keyboard dispatch path while the
     /// search input holds focus (the structure every working picker uses).
     focus: FocusHandle,
-    list_scroll: gpui::ScrollHandle,
     _search_events: Subscription,
 }
 
@@ -1679,6 +1678,9 @@ pub struct Changes {
     scoped_task: Option<Task<()>>,
     scope_menu: Popup<()>,
     ref_menu: Popup<RefMenu>,
+    /// The ref menu's list scroll and rail. Lives outside [`RefMenu`] so the
+    /// rail can reach it mutably while the card plays its exit.
+    ref_menu_scroll: crate::settings::widgets::PageScroll,
     /// Only ever one: a second `+` moves the card rather than stacking two
     /// half-written notes.
     draft: Option<CommentDraft>,
@@ -1773,6 +1775,7 @@ impl Changes {
             scoped_task: None,
             scope_menu: Popup::default(),
             ref_menu: Popup::default(),
+            ref_menu_scroll: Default::default(),
             draft: None,
             hover: None,
             comment_key: 0,
@@ -2993,9 +2996,9 @@ impl Changes {
             search,
             active,
             focus: cx.focus_handle(),
-            list_scroll: gpui::ScrollHandle::new(),
             _search_events: search_events,
         });
+        self.ref_menu_scroll.reset();
         // Focusable before first paint (the add-space palette's proven order).
         window.focus(&handle, cx);
         cx.notify();
@@ -3034,7 +3037,7 @@ impl Changes {
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 if let Some(menu) = self.ref_menu.open_mut() {
                     menu.active = popover::menu_step(Some(menu.active), count, delta).unwrap_or(0);
-                    menu.list_scroll.scroll_to_item(menu.active);
+                    self.ref_menu_scroll.scroll.scroll_to_item(menu.active);
                     cx.notify();
                 }
             }
@@ -4187,17 +4190,13 @@ impl Changes {
 
     fn render_ref_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let theme = &theme.for_popup();
-        let (search, active, focus, list_scroll) = {
+        let (search, active, focus) = {
             let Some(menu) = self.ref_menu.get() else {
                 return div().into_any_element();
             };
-            (
-                menu.search.clone(),
-                menu.active,
-                menu.focus.clone(),
-                menu.list_scroll.clone(),
-            )
+            (menu.search.clone(), menu.active, menu.focus.clone())
         };
+        let list_scroll = self.ref_menu_scroll.scroll.clone();
         let rows = self.ref_menu_rows(cx);
         let current = self.base_ref.clone();
         let branches = self.branches.clone();
@@ -4215,19 +4214,23 @@ impl Changes {
                 }))
                 .into_any_element()
         } else {
-            div()
-                .id("changes-ref-list")
+            let rail = crate::settings::widgets::rail(
+                &mut self.ref_menu_scroll,
+                "changes-ref-scrollbar",
+                theme,
+                cx,
+                |changes| &mut changes.ref_menu_scroll,
+            );
+            let list = popover::menu_scroll_list("changes-ref-list", &list_scroll)
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
                 .max_h(px(240.0))
-                .overflow_y_scroll()
-                .track_scroll(&list_scroll)
                 .children(rows.into_iter().enumerate().map(|(row_ix, branch_ix)| {
                     let name = branches[branch_ix].clone();
                     let selected = current.as_deref() == Some(name.as_str());
                     let label = name.clone();
-                    popover::menu_row_nav(
+                    popover::picker_row(
                         theme,
                         selected,
                         row_ix == active,
@@ -4247,7 +4250,15 @@ impl Changes {
                             .text_size(px(12.0))
                             .child(SharedString::from(label)),
                     )
+                }));
+            popover::menu_scroll_host("changes-ref-list-host")
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if this.ref_menu_scroll.set_list_hovered(*hovered) {
+                        cx.notify();
+                    }
                 }))
+                .child(popover::faded_menu_list(&list_scroll, list))
+                .children(rail)
                 .into_any_element()
         };
 

@@ -75,6 +75,7 @@ mod todo_panel;
 pub(crate) mod tool_images;
 pub mod theme;
 pub mod theme_library;
+pub mod toast;
 pub mod transcript;
 pub mod typography;
 pub mod voice;

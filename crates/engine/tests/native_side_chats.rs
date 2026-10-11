@@ -804,6 +804,110 @@ async fn native_fork_resume_survives_restart_and_never_wraps_history() {
 }
 
 #[tokio::test]
+async fn native_forks_keep_the_projectless_source_folder_across_restart() {
+    for destination in [
+        NativeForkDestination::SideChat,
+        NativeForkDestination::MainConversation,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let harness = Arc::new(NativeStore::default());
+        let mut core = setup(dir.path(), harness.clone());
+        let mut source = core.workspace.chat("main").unwrap().unwrap();
+        let cwd = zeron_proto::projectless::scratch_cwd(&source.id, source.created_at);
+        let scratch_root = dir.path().join("scratch");
+        let actual = scratch_root.join(cwd.rsplit('/').next().unwrap());
+        std::fs::create_dir_all(&actual).unwrap();
+        std::fs::write(actual.join("keep.txt"), "source checkout").unwrap();
+        let actual_cwd = actual.to_string_lossy().into_owned();
+        source.cwd = Some(cwd.clone());
+        source.harness_session_cwd = Some(actual_cwd.clone());
+        core.workspace.import_chat_row(&source).unwrap();
+        let doc = core.doc_host.open("main").unwrap();
+        let mut point = doc
+            .doc()
+            .read_entries()
+            .unwrap()
+            .into_iter()
+            .find(|e| e.id == "a1")
+            .unwrap()
+            .native_fork_point
+            .unwrap();
+        point.cwd = actual_cwd.clone();
+        doc.doc().set_native_fork_point("a1", &point).unwrap();
+        let available = core
+            .native_forks
+            .availability(NativeForkAvailabilityRequest {
+                source_chat_id: "main".into(),
+                message_ids: vec!["a1".into()],
+                target_device_id: core.device_id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(available["a1"].available, "{:?}", available["a1"]);
+        let mut fork = request(&core);
+        fork.destination = destination;
+        let child = core.native_forks.create(fork).await.unwrap();
+        assert_eq!(child.cwd.as_deref(), Some(cwd.as_str()));
+        assert_eq!(
+            child.harness_session_cwd.as_deref(),
+            Some(actual_cwd.as_str())
+        );
+        assert_eq!(
+            child.parent_chat_id.as_deref(),
+            (destination == NativeForkDestination::SideChat).then_some("main")
+        );
+        assert!(harness.requests.lock().unwrap().is_empty());
+        drop(doc);
+        for i in 0..2 {
+            core.sessions.set_ipc_port(27699);
+            let before = harness.requests.lock().unwrap().len();
+            let mut send = send_request("Continue from the native prefix");
+            send.cwd = cwd.clone();
+            core.sessions
+                .dispatch("child", HarnessId::Mock, send, None)
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while harness.requests.lock().unwrap().len() == before
+                    || core
+                        .sessions
+                        .session_status("child")
+                        .is_some_and(|s| s.status != SessionStatus::Idle)
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let captured = harness.requests.lock().unwrap()[before].clone();
+            assert_eq!(captured.cwd, actual_cwd);
+            assert_eq!(captured.resume.as_deref(), Some("native-child-1"));
+            assert_eq!(captured.resume_policy, ResumePolicy::RequireExisting);
+            assert_eq!(captured.prompt, "Continue from the native prefix");
+            assert_eq!(captured.mcp.unwrap().env["ZERON_CHAT_ID"], "child");
+            assert_eq!(
+                std::fs::read_to_string(actual.join("keep.txt")).unwrap(),
+                "source checkout"
+            );
+            assert_eq!(
+                std::fs::read_dir(&scratch_root).unwrap().count(),
+                1,
+                "fork must reuse its source folder"
+            );
+            if i == 0 {
+                core.shutdown().await;
+                drop(core);
+                let registry = Arc::new(HarnessRegistry::new());
+                registry.register(harness.clone());
+                core = EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None).unwrap();
+            }
+        }
+        assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+        core.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn native_fork_resume_failure_cannot_retry_fresh_or_replace_identity() {
     for unexpected_identity in [false, true] {
         let dir = tempfile::tempdir().unwrap();

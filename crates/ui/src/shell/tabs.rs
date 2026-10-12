@@ -138,7 +138,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.navigation_focus.right_was_focused = true;
-        self.composer
+        self.active_composer()
             .update(cx, |composer, _| composer.focus_pending = false);
         // Establish a stable target before detaching the old editor. Read-only
         // surfaces keep it; editable surfaces claim their own focus below/on mount.
@@ -156,13 +156,20 @@ impl Shell {
             self.activate_right_surface(self.resolved_right_active(cx), window, cx);
         } else {
             self.navigation_focus.right_was_focused = false;
-            window.focus(&self.composer.focus_handle(cx), cx);
+            window.focus(&self.active_composer().focus_handle(cx), cx);
         }
     }
 
-    /// Navigation requests focus once the destination composer renders.
+    /// Navigation requests focus once the destination composer renders: the
+    /// selected chat's pane in a split.
     pub(super) fn focus_composer(&mut self, cx: &mut Context<Self>) {
-        self.composer.update(cx, |composer, cx| {
+        let selected = self
+            .state
+            .read(cx)
+            .selected_chat
+            .clone()
+            .unwrap_or_default();
+        self.composer_for(&selected).update(cx, |composer, cx| {
             composer.focus_pending = true;
             cx.notify();
         });
@@ -218,10 +225,13 @@ impl Shell {
         // already selected under it. The call keeps running in the background.
         self.set_voice_stage_open(false, cx);
         self.set_route(Route::Chat, cx);
-        self.focus_composer(cx);
         self.nav.push(NavEntry::Chat(chat_id.clone()));
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+        // A split member opens in its pane: bring the panes up now so the
+        // focus request reaches the right composer.
+        self.sync_split_panes(cx);
+        self.focus_composer(cx);
         cx.notify();
     }
 
@@ -579,7 +589,9 @@ impl Shell {
         // The session card's toggle belongs to the transcript: it ends the
         // transcript's stretch of the titlebar, left of the side pane's tabs
         // when one is open, else just left of the explorer toggle.
-        let session_info_toggle = (!takeover && !on_canvas).then(|| {
+        let split = self.shown_split(cx).cloned();
+        let show_title = !takeover && split.is_none();
+        let session_info_toggle = (!takeover && !on_canvas && split.is_none()).then(|| {
             let open = self.session_info_visible(cx);
             let label = if open {
                 "Hide session details"
@@ -612,7 +624,10 @@ impl Shell {
             // In panel takeover the header strip spans the whole band — the
             // title would sit UNDER it (both flex_none, the row overflows and
             // paint order stacks them), so it hides for the duration.
-            .when(!takeover, |el| {
+            .when_some(split.clone().filter(|_| !takeover), |el, view| {
+                el.child(self.render_split_titles(&view, row_left, cx))
+            })
+            .when(show_title, |el| {
                 el.child(
                     div()
                         .min_w_0()
@@ -647,7 +662,7 @@ impl Shell {
                         ),
                 )
             })
-            .child(div().flex_1())
+            .when(split.is_none(), |el| el.child(div().flex_1()))
             .children(session_info_toggle)
             .children(trailing);
 

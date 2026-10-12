@@ -904,7 +904,7 @@ impl Shell {
             }
             return;
         }
-        let key = self.panel_key(cx);
+        let key = self.layout_key(cx);
         let was_open = self.panels.get(&key).changes_open;
         let from = self.right_target(cx);
         self.panels.update(&key, |panel| panel.changes_open = true);

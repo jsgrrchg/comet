@@ -6623,6 +6623,11 @@ impl Composer {
     }
 
     #[cfg(test)]
+    pub(crate) fn saved_draft(&self, key: &str) -> Option<&str> {
+        self.drafts.get(key).map(String::as_str)
+    }
+
+    #[cfg(test)]
     pub(crate) fn failure(&self) -> Option<&SharedString> {
         self.failure.as_ref()
     }

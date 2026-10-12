@@ -86,6 +86,9 @@ mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
 mod search_warm;
+mod split_panes;
+#[cfg(test)]
+mod split_view_tests;
 pub(crate) mod spaces;
 mod thread_search;
 use side_chats::SideChatTab;
@@ -208,6 +211,8 @@ const CHAT_MENU_ROW_ARCHIVE: u8 = 2;
 const CHAT_MENU_ROW_COPY: u8 = 3;
 const CHAT_MENU_ROW_DELETE: u8 = 4;
 const CHAT_MENU_ROW_TAB: u8 = 5;
+// After the four tab rows.
+const CHAT_MENU_ROW_SPLIT: u8 = 9;
 
 #[derive(Clone, Copy)]
 enum TabCloseAction {
@@ -2023,6 +2028,10 @@ pub struct Shell {
     subagent_seq: u64,
     side_chats: std::collections::HashMap<u64, SideChatTab>,
     side_chat_seq: u64,
+    /// The panes of the split on screen, by chat id (see `split_panes.rs`).
+    split_panes: std::collections::HashMap<String, split_panes::ChatPane>,
+    /// The shown split's layout key, cached for the window fit.
+    split_layout: Option<String>,
     side_chat_creating: bool,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
@@ -2544,6 +2553,8 @@ impl Shell {
             subagent_seq: 0,
             side_chats: std::collections::HashMap::new(),
             side_chat_seq: 0,
+            split_panes: std::collections::HashMap::new(),
+            split_layout: None,
             side_chat_creating: false,
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
@@ -2751,10 +2762,11 @@ impl Shell {
             self.set_route(Route::Chat, cx);
         }
         let key = target.unwrap_or_default();
-        self.composer.update(cx, |composer, cx| {
+        let composer = self.composer_for(&key);
+        composer.update(cx, |composer, cx| {
             composer.stage_appshot_for(key, appshot, cx)
         });
-        window.focus(&self.composer.focus_handle(cx), cx);
+        window.focus(&composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -2765,9 +2777,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.set_route(Route::Chat, cx);
-        self.composer
-            .update(cx, |composer, cx| composer.show_appshot_error(message, cx));
-        window.focus(&self.composer.focus_handle(cx), cx);
+        let composer = self.active_composer();
+        composer.update(cx, |composer, cx| composer.show_appshot_error(message, cx));
+        window.focus(&composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -3122,14 +3134,35 @@ impl Shell {
         if !selected.is_empty() {
             self.last_appshot_chat = Some(selected.clone());
         }
-        if selected != self.active_chat {
+        self.sync_split_panes(cx);
+        // Focus moving between the panes of one split keeps the columns as
+        // they are: only their content follows the focused chat.
+        let same_layout = selected != self.active_chat
+            && !selected.is_empty()
+            && !self.active_chat.is_empty()
+            && self.layout_key_for(&selected, cx) == self.layout_key_for(&self.active_chat, cx);
+        if same_layout {
+            self.active_chat = selected;
+            self.refresh_split_layout(cx);
+            if matches!(self.route, Route::Chat) {
+                self.nav.push(NavEntry::Chat(self.active_chat.clone()));
+            }
+            if self.right_pane_open(cx)
+                && let RightSurface::Diff(id) = self.resolved_right_active(cx)
+                && let Some(changes) = self.diffs.get(&id).cloned()
+            {
+                changes.update(cx, |changes, cx| changes.ensure_content(cx));
+            }
+        } else if selected != self.active_chat {
             self.suspend_file_images(cx);
             if !self.active_chat.is_empty() {
                 let expanded = self.right_pane_expanded;
+                let key = self.layout_key_for(&self.active_chat, cx);
                 self.panels
-                    .update(&self.active_chat, |panels| panels.right_expanded = expanded);
+                    .update(&key, |panels| panels.right_expanded = expanded);
             }
             self.active_chat = selected;
+            self.refresh_split_layout(cx);
             // Route history: a chat switch is a navigation. The very first
             // selection off the untouched boot canvas REPLACES that entry —
             // zeron's `/` route redirected into the last-used chat, leaving no
@@ -3146,7 +3179,7 @@ impl Shell {
             self.clear_panel_transitions();
             self.terminal_tween = None;
             self.fit_exits = [None; 3];
-            let key = self.panel_key(cx);
+            let key = self.layout_key(cx);
             // Entering the new-chat canvas always lands with the terminal
             // hidden (user request) — a previously opened canvas drawer must
             // not pop open on a fresh canvas. The source chat's flag stays in
@@ -3230,7 +3263,7 @@ impl Shell {
     /// new-session canvas, where the titlebar carries no toggle to close it
     /// again (an earlier user request).
     fn right_pane_open(&self, cx: &App) -> bool {
-        !self.active_chat.is_empty() && self.panels.get(&self.panel_key(cx)).changes_open
+        !self.active_chat.is_empty() && self.panels.get(&self.layout_key(cx)).changes_open
     }
 
     /// Open and on screen: the window fit is not hiding it.
@@ -3240,7 +3273,7 @@ impl Shell {
 
     /// The current chat's terminal flag (per-session, in-memory).
     fn terminal_open(&self, cx: &App) -> bool {
-        self.panels.get(&self.panel_key(cx)).terminal_open
+        self.panels.get(&self.layout_key(cx)).terminal_open
     }
 
     fn right_target(&self, cx: &App) -> f32 {
@@ -3289,7 +3322,7 @@ impl Shell {
         // Record the open before targeting: the fit ranks columns by recency,
         // and an unrecorded sidebar would target the width of a hidden one.
         if !self.settings.sidebar_collapsed {
-            self.record_panel_open(AuxiliaryPanel::Sidebar, &self.panel_key(cx));
+            self.record_panel_open(AuxiliaryPanel::Sidebar, &self.layout_key(cx));
         }
         self.sidebar_tween = Some(self.panel_tween(from, self.sidebar_target()));
         self.schedule_save(cx);
@@ -3343,7 +3376,7 @@ impl Shell {
         let sidebar_now = self.sidebar_now();
         let from_main = self.main_content_width(self.main_target_width(from, cx), cx);
         let was_expanded = self.right_pane_expanded || self.tween_active(self.main_takeover_tween);
-        let key = self.panel_key(cx);
+        let key = self.layout_key(cx);
         if open {
             self.record_panel_open(AuxiliaryPanel::Right, &key);
             // Its previews load again; the next hide releases them anew.
@@ -3627,7 +3660,7 @@ impl Shell {
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
-                self.composer
+                self.active_composer()
                     .update(cx, |composer, _| composer.focus_pending = false);
                 panel.update(cx, |panel, cx| {
                     panel.select_tab_by_key(tab, cx);
@@ -3785,7 +3818,7 @@ impl Shell {
         let from_main = !self.active_chat.is_empty()
             && source == self.active_chat
             && self.state.read(cx).selected_chat.as_deref() == Some(self.active_chat.as_str());
-        if !from_main && !self.side_chat_open_here(&source, cx) {
+        if !from_main && !self.split_pane_open(&source) && !self.side_chat_open_here(&source, cx) {
             return LinkOutcome::Rejected;
         }
         if activation.target.navigation.is_err() {
@@ -3984,7 +4017,7 @@ impl Shell {
                                 crate::files::WorkspacePathSource::Tree,
                                 None,
                             );
-                        let composer = this.composer.clone();
+                        let composer = this.active_composer();
                         this.attach_workspace_drag(&payload, &composer, window, cx);
                     }
                     FilesEvent::Mutate(intent) => {
@@ -4666,13 +4699,13 @@ impl Shell {
     /// The flag is per chat (zeron `sessionPanels`).
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let from = self.terminal_geometry.get().height;
-        let key = self.panel_key(cx);
+        let key = self.layout_key(cx);
         let open = self.panels.toggle_terminal(&key);
         self.terminal_tween = Some(WidthTween::new(from, self.terminal_target(cx)));
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
-            self.composer
+            self.active_composer()
                 .update(cx, |composer, _| composer.focus_pending = false);
             panel.update(cx, |panel, cx| panel.request_focus(cx));
             // Opening lands keyboard focus IN the shell — typing goes straight
@@ -4687,7 +4720,7 @@ impl Shell {
             // hand focus to the composer. (Cmd+J is a pure toggle — a second
             // press closes even while the terminal is focused, as in zeron's
             // `useHotkey(toggleShortcut, ... setOpenScoped(!open))`.)
-            window.focus(&self.composer.focus_handle(cx), cx);
+            window.focus(&self.active_composer().focus_handle(cx), cx);
         }
         self.terminal_tween_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
@@ -4751,7 +4784,7 @@ impl Shell {
         self.sidebar_resize_edge = sample.edge;
         self.schedule_save(cx);
         if was_collapsed {
-            self.record_panel_open(AuxiliaryPanel::Sidebar, &self.panel_key(cx));
+            self.record_panel_open(AuxiliaryPanel::Sidebar, &self.layout_key(cx));
         }
         cx.notify();
     }
@@ -5829,8 +5862,9 @@ impl Shell {
         // A pending composer refocus (the first click of the double-click
         // opened the chat, or a side chat's tab) must not steal the field
         // before it is typed in.
-        for composer in
-            std::iter::once(&self.composer).chain(self.side_chats.values().map(|tab| &tab.composer))
+        for composer in std::iter::once(&self.composer)
+            .chain(self.side_chats.values().map(|tab| &tab.composer))
+            .chain(self.split_panes.values().map(|pane| &pane.composer))
         {
             composer.update(cx, |composer, _| composer.focus_pending = false);
         }
@@ -6197,15 +6231,17 @@ impl Shell {
             || self.section_dialog.is_some()
             || self.section_menu.is_some()
             || self.add_space.is_some()
-            || self.composer.read(cx).pickers().read(cx).is_open()
+            || self.active_composer().read(cx).pickers().read(cx).is_open()
             || self.open_side_chat_pickers(cx).is_some()
     }
 
-    /// The pickers of a side chat whose picker popover is open.
+    /// The pickers of a side chat or split pane whose picker popover is open.
     fn open_side_chat_pickers(&self, cx: &App) -> Option<Entity<crate::pickers::Pickers>> {
         self.side_chats
             .values()
-            .map(|side| side.composer.read(cx).pickers().clone())
+            .map(|side| &side.composer)
+            .chain(self.split_panes.values().map(|pane| &pane.composer))
+            .map(|composer| composer.read(cx).pickers().clone())
             .find(|pickers| pickers.read(cx).is_open())
     }
 
@@ -6230,7 +6266,7 @@ impl Shell {
         let queue_shortcut_revealed = matches!(self.route, Route::Chat)
             && !self.overlay_owns_keyboard(cx)
             && modifier_send_hint_visible(primary, mods.alt, mods.shift);
-        self.composer.update(cx, |composer, cx| {
+        self.active_composer().update(cx, |composer, cx| {
             composer.set_queue_shortcut_revealed(queue_shortcut_revealed, cx)
         });
     }
@@ -6259,6 +6295,10 @@ impl Shell {
         }
         self.composer
             .update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
+        if let Some(pane) = self.split_panes.get(&chat_id) {
+            pane.composer
+                .update(cx, |composer, cx| composer.purge_chat(&chat_id, cx));
+        }
         self.mutate(
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
             cx,
@@ -8392,10 +8432,22 @@ impl Shell {
                     // double-click edits the title in place.
                     if event.click_count() >= 2 && search_query_none {
                         this.open_rename_chat(select_id.clone(), cx);
+                    } else if event.modifiers().secondary() && !archived {
+                        // Cmd/Ctrl-click opens it beside the conversation.
+                        this.open_chat_in_split(select_id.clone(), cx);
                     } else {
                         this.open_chat(select_id.clone(), cx);
                     }
                 }))
+                .when(!archived, |el| {
+                    let split_id = id.clone();
+                    el.on_mouse_down(
+                        MouseButton::Middle,
+                        cx.listener(move |this, _, _, cx| {
+                            this.open_chat_in_split(split_id.clone(), cx);
+                        }),
+                    )
+                })
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -10517,6 +10569,11 @@ impl Shell {
                     .contains_focused(window, cx)
             })
             .map(|tab| (tab.state.clone(), tab.composer.clone()))
+            .or_else(|| {
+                self.split_panes
+                    .get(&self.active_chat)
+                    .map(|pane| (pane.state.clone(), pane.composer.clone()))
+            })
             .unwrap_or_else(|| (self.state.clone(), self.composer.clone()));
         let selected_chat = state.read(cx).selected_chat.clone();
         let indicator = selected_chat
@@ -10571,6 +10628,7 @@ impl Shell {
             let pin_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            let split_row = self.chat_menu_split_row(&chat_id, is_side_chat, &theme, cx);
             let menu = popover::popover_card(&theme)
                 .w(px(216.0))
                 .on_mouse_down_out(cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -10627,6 +10685,12 @@ impl Shell {
                             )
                             .child(SharedString::from("Archive"));
                     let copy = self.render_chat_copy_trigger(&chat_id, copy_open, &theme, cx);
+                    let menu = match split_row {
+                        Some(row) => {
+                            menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_SPLIT, row, cx))
+                        }
+                        None => menu,
+                    };
                     menu.child(self.chat_menu_hover_row(CHAT_MENU_ROW_PIN, pin, cx))
                         .child(self.chat_menu_hover_row(CHAT_MENU_ROW_ARCHIVE, archive, cx))
                         .child(self.chat_menu_hover_row(CHAT_MENU_ROW_COPY, copy, cx))
@@ -10967,6 +11031,9 @@ impl Shell {
         }
 
         let _ = (text, border);
+        if let Some(view) = self.shown_split(cx).cloned() {
+            return self.render_split(view, main_content_width, window, cx);
+        }
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
         let has_appshots = !self.composer.read(cx).staged_appshots().is_empty();
@@ -13319,7 +13386,7 @@ impl Render for Shell {
             use crate::composer::WorkspaceCommand;
             match command {
                 WorkspaceCommand::Model => self
-                    .composer
+                    .active_composer()
                     .update(cx, |c, cx| c.open_model_menu(window, cx)),
                 WorkspaceCommand::New => self.open_new_session(None, cx),
                 WorkspaceCommand::Resume => self.toggle_command_palette(window, cx),
@@ -13336,9 +13403,9 @@ impl Render for Shell {
                 WorkspaceCommand::Rename if !self.active_chat.is_empty() => {
                     self.open_rename_chat(self.active_chat.clone(), cx)
                 }
-                WorkspaceCommand::Stop => {
-                    self.composer.update(cx, |c, cx| c.interrupt_selected(cx))
-                }
+                WorkspaceCommand::Stop => self
+                    .active_composer()
+                    .update(cx, |c, cx| c.interrupt_selected(cx)),
                 _ => {}
             }
         }
@@ -13504,7 +13571,7 @@ impl Render for Shell {
                     if !window.is_window_active() {
                         this.reset_command_palette_key_state();
                         this.set_jump_hints(false, cx);
-                        this.composer.update(cx, |composer, cx| {
+                        this.active_composer().update(cx, |composer, cx| {
                             composer.set_queue_shortcut_revealed(false, cx)
                         });
                     }
@@ -13529,7 +13596,7 @@ impl Render for Shell {
             let target = self
                 .settings_return_focus
                 .take()
-                .unwrap_or_else(|| self.composer.focus_handle(cx));
+                .unwrap_or_else(|| self.active_composer().focus_handle(cx));
             window.on_next_frame(move |window, cx| window.focus(&target, cx));
         }
         let shortcut_focus = self.shortcut_focus.clone();
@@ -13730,7 +13797,7 @@ impl Render for Shell {
                     if !this.right_pane_open(cx) {
                         // The hidden editor can retain a focus handle after unmounting.
                         // Restore a mounted target so the next shortcut can reopen it.
-                        window.focus(&this.composer.focus_handle(cx), cx);
+                        window.focus(&this.active_composer().focus_handle(cx), cx);
                     }
                 }
             }))
@@ -13760,7 +13827,7 @@ impl Render for Shell {
                 // chat's — takes the digit as its model shortcut.
                 let pickers = this
                     .open_side_chat_pickers(cx)
-                    .unwrap_or_else(|| this.composer.read(cx).pickers().clone());
+                    .unwrap_or_else(|| this.active_composer().read(cx).pickers().clone());
                 let handled = pickers.update(cx, |pickers, cx| pickers.jump_model_slot(jump.0, cx));
                 if !handled && !this.overlay_owns_keyboard(cx) {
                     this.jump_to_session(jump.0, cx)
@@ -13774,7 +13841,7 @@ impl Render for Shell {
             }))
             .on_action(cx.listener(|this, _: &OpenModelPicker, window, cx| {
                 if matches!(this.route, Route::Chat) && !this.overlay_owns_keyboard(cx) {
-                    let pickers = this.composer.read(cx).pickers().clone();
+                    let pickers = this.active_composer().read(cx).pickers().clone();
                     pickers.update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
                 }
             }))
@@ -13882,7 +13949,7 @@ impl Render for Shell {
                 // sidebar fitting matter just as much as the right surface.
                 self.composer_dock
                     .borrow_mut()
-                    .observe_conversation(&self.panel_key(cx));
+                    .observe_conversation(&self.layout_key(cx));
                 let panel_handoff = self.composer_dock.borrow_mut().observe_column(
                     self.state.read(cx).selected_chat.is_some(),
                     (self.sidebar_now(), main_target_width),

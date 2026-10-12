@@ -73,7 +73,7 @@ impl Shell {
     pub(super) fn files_panel_open(&self, cx: &App) -> bool {
         matches!(self.route, Route::Chat)
             && !self.active_chat.is_empty()
-            && self.panels.get(&self.panel_key(cx)).files_open
+            && self.panels.get(&self.layout_key(cx)).files_open
     }
 
     fn files_layout(&self, visible: f32, cx: &App) -> FilesPanelLayout {
@@ -267,6 +267,36 @@ impl Shell {
             return;
         }
         let key = self.panel_key(cx);
+        self.ensure_files_explorer(window, cx);
+        let layout = self.layout_key(cx);
+        let before = self.painted_panels(cx);
+        let from = before.files;
+        let was_open = self.files_panel_open(cx);
+        let opening = !was_open || !self.horizontal_fit().files;
+        self.panels.update(&layout, |p| p.files_open = true);
+        if opening {
+            self.record_panel_open(AuxiliaryPanel::Files, &layout);
+            self.resplit_panels(before, Some(AuxiliaryPanel::Files), cx);
+            self.transition_files(from, before.files_content, self.files_settled_width(cx));
+        }
+        if let Some(files) = self.files.get(&key).cloned() {
+            files.update(cx, |files, cx| {
+                files.ensure_loaded(cx);
+                files.focus_explorer(window, cx);
+            });
+        }
+        self.active_composer()
+            .update(cx, |composer, _| composer.focus_pending = false);
+        cx.notify();
+    }
+
+    /// The focused conversation's explorer, created on first use. A split's
+    /// panes share the column, so focusing a pane that has none yet makes it.
+    pub(super) fn ensure_files_explorer(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        let key = self.panel_key(cx);
         if !self.files.contains_key(&key) {
             let files = cx.new(|cx| {
                 FilesSurface::new_explorer(
@@ -304,7 +334,7 @@ impl Shell {
                                 crate::files::WorkspacePathSource::Tree,
                                 None,
                             );
-                        let composer = this.composer.clone();
+                        let composer = this.active_composer();
                         this.attach_workspace_drag(&payload, &composer, window, cx);
                     }
                     FilesEvent::Mutate(intent)
@@ -359,27 +389,8 @@ impl Shell {
                 },
             );
             self.files.insert(key.clone(), files);
-            self.files_subs.insert(key.clone(), sub);
+            self.files_subs.insert(key, sub);
         }
-        let before = self.painted_panels(cx);
-        let from = before.files;
-        let was_open = self.files_panel_open(cx);
-        let opening = !was_open || !self.horizontal_fit().files;
-        self.panels.update(&key, |p| p.files_open = true);
-        if opening {
-            self.record_panel_open(AuxiliaryPanel::Files, &key);
-            self.resplit_panels(before, Some(AuxiliaryPanel::Files), cx);
-            self.transition_files(from, before.files_content, self.files_settled_width(cx));
-        }
-        if let Some(files) = self.files.get(&key).cloned() {
-            files.update(cx, |files, cx| {
-                files.ensure_loaded(cx);
-                files.focus_explorer(window, cx);
-            });
-        }
-        self.composer
-            .update(cx, |composer, _| composer.focus_pending = false);
-        cx.notify();
     }
 
     /// Undock the explorer portion. With the surface host closed too, this
@@ -393,7 +404,7 @@ impl Shell {
         }
         let before = self.painted_panels(cx);
         self.panels
-            .update(&self.panel_key(cx), |p| p.files_open = false);
+            .update(&self.layout_key(cx), |p| p.files_open = false);
         self.transition_files(before.files, before.files_content, 0.0);
         self.resplit_panels(before, Some(AuxiliaryPanel::Files), cx);
         cx.notify();
@@ -411,7 +422,7 @@ impl Shell {
             return;
         }
         self.close_files_panel(cx);
-        window.focus(&self.composer.focus_handle(cx), cx);
+        window.focus(&self.active_composer().focus_handle(cx), cx);
         if self.right_pane_open(cx) {
             self.focus_right_file_editor(self.resolved_right_active(cx), window, cx);
         }
@@ -457,6 +468,9 @@ impl Shell {
             return Empty.into_any_element();
         }
         let theme = Theme::of(cx).clone();
+        if visible {
+            self.ensure_files_explorer(window, cx);
+        }
         let content = self.files.get(&self.panel_key(cx)).cloned();
         if let Some(files) = &content {
             files.update(cx, |files, cx| {

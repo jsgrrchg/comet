@@ -98,7 +98,10 @@ impl Shell {
         } else if self.voice.read(cx).stage_open {
             (self.voice_stage_focus.clone(), self.unfocused.clone())
         } else {
-            (self.composer.focus_handle(cx), self.unfocused.clone())
+            (
+                self.active_composer().focus_handle(cx),
+                self.unfocused.clone(),
+            )
         }
     }
 }

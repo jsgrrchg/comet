@@ -27,7 +27,7 @@ impl Shell {
     /// device error): say why in the conversation's composer.
     fn show_side_chat_error(&mut self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
         let message = message.into();
-        self.composer
+        self.active_composer()
             .update(cx, |composer, cx| composer.show_error(message, cx));
     }
 

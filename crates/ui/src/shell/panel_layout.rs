@@ -174,7 +174,7 @@ impl Shell {
                 sidebar_limit: self.settings.sidebar_width,
             };
         }
-        let panels = self.panels.get(&self.active_chat);
+        let panels = self.panels.get(self.fit_panels_key());
         let on_chat = !self.active_chat.is_empty();
         // A closing column keeps its slot while it still paints: one the fit
         // had already hidden closes from zero and claims nothing.
@@ -225,7 +225,7 @@ impl Shell {
         let previous = self
             .painted_columns
             .as_ref()
-            .filter(|(chat, ..)| *chat == self.active_chat)
+            .filter(|(key, ..)| key == self.fit_panels_key())
             .map(|(_, fit, columns)| (*fit, *columns));
         // A live window resize or divider drag is direct manipulation: a
         // column the fit hides or brings back, and the sidebar's allowance,
@@ -243,7 +243,7 @@ impl Shell {
         }
         if let Some((previous, painted)) = previous.filter(|_| !direct) {
             // Closing columns count too: the fit may hide one mid-close.
-            let panels = self.panels.get(&self.active_chat);
+            let panels = self.panels.get(self.fit_panels_key());
             let open = [
                 !self.settings.sidebar_collapsed || self.tween_active(self.sidebar_tween),
                 panels.changes_open || self.tween_active(self.right_tween),
@@ -312,11 +312,12 @@ impl Shell {
             (self.files_visible_width(cx), self.files_content_width(cx)),
         ];
         self.motion_active.set(animating);
+        let layout = self.fit_panels_key().to_string();
         match &mut self.painted_columns {
-            Some((chat, painted_fit, painted)) if *chat == self.active_chat => {
+            Some((key, painted_fit, painted)) if *key == layout => {
                 (*painted_fit, *painted) = (fit, columns);
             }
-            slot => *slot = Some((self.active_chat.clone(), fit, columns)),
+            slot => *slot = Some((layout, fit, columns)),
         }
     }
 
@@ -471,7 +472,7 @@ impl Shell {
             return false;
         }
         let before = self.painted_panels(cx);
-        let key = self.panel_key(cx);
+        let key = self.layout_key(cx);
         let rank = (self.panel_open_sequence, self.panel_opened_at(panel, &key));
         self.record_panel_open(panel, &key);
         if !shown(self.horizontal_fit()) {

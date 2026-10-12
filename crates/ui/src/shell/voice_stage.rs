@@ -114,7 +114,7 @@ impl Shell {
         let focus = if open {
             self.voice_stage_focus.clone()
         } else {
-            self.composer.focus_handle(cx)
+            self.active_composer().focus_handle(cx)
         };
         if window.is_window_active() {
             window.focus(&focus, cx);

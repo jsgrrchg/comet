@@ -814,6 +814,18 @@ impl SessionPanels {
         entry.changes_open
     }
 
+    /// Give `to` the columns `from` shows — open flags, open order and
+    /// takeover — keeping its own surface pick. A chat joining or leaving a
+    /// split keeps the columns on screen as they were.
+    fn carry_layout(&mut self, from: &str, to: &str) {
+        let from = self.get(from);
+        let entry = self.map.entry(to.to_string()).or_default();
+        *entry = ChatPanels {
+            right_active: entry.right_active,
+            ..from
+        };
+    }
+
     /// Mutate `key`'s flags in place (right-pane surface bookkeeping).
     pub fn update(&mut self, key: &str, f: impl FnOnce(&mut ChatPanels)) {
         let panel = self.map.entry(key.to_string()).or_default();

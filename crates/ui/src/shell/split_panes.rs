@@ -58,6 +58,7 @@ impl Shell {
         update: impl FnOnce(&mut Vec<SplitView>) -> R,
     ) -> Option<R> {
         let key = self.active_sidebar_pin_profile_key(cx)?;
+        let layout_before = self.layout_key(cx);
         let views = self
             .settings
             .split_views_by_profile
@@ -71,6 +72,12 @@ impl Shell {
         }
         if changed {
             self.refresh_split_layout(cx);
+            // The conversation on screen joined or left a split: its columns
+            // stay as they are rather than switching to another entry's.
+            let layout_after = self.layout_key(cx);
+            if layout_after != layout_before && !self.active_chat.is_empty() {
+                self.panels.carry_layout(&layout_before, &layout_after);
+            }
             self.schedule_save(cx);
             cx.notify();
         }

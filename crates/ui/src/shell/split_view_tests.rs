@@ -507,3 +507,34 @@ fn split_panes_claim_room_in_the_window_fit() {
     );
     assert!(!three.sidebar && three.right);
 }
+
+/// Splitting the conversation on screen, and closing back down to it, keeps
+/// the columns it shows.
+#[gpui::test]
+fn joining_and_leaving_a_split_keeps_the_columns(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = shell_window(dir.path(), cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.toggle_right_pane(cx);
+            assert!(shell.right_pane_open(cx));
+            shell.open_chat_in_split("b".into(), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.shown_split(cx).is_some());
+            assert!(shell.right_pane_open(cx), "the split keeps a's right pane");
+            shell.close_split_pane("a", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert!(shell.shown_split(cx).is_none());
+            assert_eq!(shell.active_chat, "b");
+            assert!(shell.right_pane_open(cx), "b keeps the split's right pane");
+        })
+        .unwrap();
+}

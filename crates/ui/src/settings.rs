@@ -868,6 +868,10 @@ pub struct UiSettings {
     /// Device-local pins for local profiles; synced profiles use registry pins.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub sidebar_pinned_session_ids_by_profile: HashMap<String, Vec<String>>,
+    /// Chats shown side by side, per account profile. Device-local like the
+    /// tabs were: another device's window has room for other splits.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub split_views_by_profile: HashMap<String, Vec<crate::split_view::SplitView>>,
     /// Legacy: per-space tab order, from when tabs were the selected space's
     /// non-archived sessions. Kept for file compatibility; no longer read.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -1034,6 +1038,7 @@ impl Default for UiSettings {
             open_tabs: None,
             space_filter: None,
             sidebar_pinned_session_ids_by_profile: HashMap::new(),
+            split_views_by_profile: HashMap::new(),
             sidebar_sections_by_profile: HashMap::new(),
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
@@ -1686,6 +1691,7 @@ impl UiSettings {
             space_filter,
             sidebar_sections_by_profile,
             sidebar_pinned_session_ids_by_profile,
+            split_views_by_profile,
             tab_order,
             space_order,
             sound_enabled,
@@ -2725,6 +2731,15 @@ mod tests {
                     vec!["synced-1".to_string()],
                 ),
             ]),
+            split_views_by_profile: HashMap::from([(
+                "local".to_string(),
+                vec![crate::split_view::SplitView {
+                    id: "split-1".into(),
+                    chats: vec!["local-1".into(), "local-2".into()],
+                    ratios: vec![0.6, 0.4],
+                    focused: Some("local-2".into()),
+                }],
+            )]),
             tab_order: std::collections::HashMap::from([(
                 "space-1".to_string(),
                 vec!["b".to_string(), "a".to_string()],

@@ -67,6 +67,7 @@ pub mod running_pill;
 pub mod settings;
 pub mod shell;
 pub mod sound;
+pub mod split_view;
 pub mod state;
 pub(crate) mod surface_chrome;
 pub mod syntax_cache;

@@ -524,16 +524,10 @@ impl Shell {
         popover::picker_row(theme, false, false, key.clone())
             .id(SharedString::from(key.clone()))
             .aria_label(SharedString::from(format!("Open side chat {}", row.title)))
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
+            .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
-                // The first click opened the tab; the second edits the title
-                // in place.
-                if event.click_count() >= 2 {
-                    this.open_rename_chat(open_id.clone(), cx);
-                } else {
-                    this.close_session_info_overlay(cx);
-                    this.open_child_chat_tab(&open_id, cx);
-                }
+                this.close_session_info_overlay(cx);
+                this.open_child_chat_tab(&open_id, cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,

@@ -790,3 +790,63 @@ fn clicking_an_image_chip_opens_the_picture_full_size(cx: &mut gpui::TestAppCont
         })
         .unwrap();
 }
+
+/// `@` with a query offers sessions by title, after staged attachments and
+/// before files, and accepting one inserts its chat chip.
+#[gpui::test]
+fn at_completion_offers_sessions_by_title(cx: &mut gpui::TestAppContext) {
+    let (dir, handle) = composer_focus_window(cx);
+    handle
+        .update(cx, |composer, _, cx| {
+            composer.state.update(cx, |state, _| {
+                state.chats = [
+                    ("deploy", "Fix the deploy script", None, false),
+                    ("deploy-side", "Deploy side chat", Some("deploy"), false),
+                    ("old", "Deploy notes", None, true),
+                    ("other", "Polish the palette", None, false),
+                ]
+                .into_iter()
+                .map(|(id, title, parent, archived)| {
+                    serde_json::from_value(serde_json::json!({
+                        "id": id, "title": title, "deviceId": "local",
+                        "parentChatId": parent, "archived": archived,
+                        "createdAt": chrono::Utc::now(),
+                    }))
+                    .unwrap()
+                })
+                .collect();
+            });
+        })
+        .unwrap();
+    add_file(&handle, cx, write_file(&dir, "deploy.md"));
+    append(&handle, cx, " @deploy");
+    handle
+        .update(cx, |composer, _, cx| {
+            // Only top-level, unarchived sessions; the attachment comes first.
+            let chats = composer.mention_chat_matches(cx);
+            assert_eq!(
+                chats
+                    .iter()
+                    .map(|row| row.chat_id.as_str())
+                    .collect::<Vec<_>>(),
+                ["deploy"]
+            );
+            assert_eq!(composer.mention_pinned_count(cx), 2);
+            composer.mention.active = Some(1);
+            composer.accept_mention(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        text(&handle, cx).contains("[Fix the deploy script](zeron-chat:deploy)"),
+        "{}",
+        text(&handle, cx)
+    );
+    // A bare `@` stays the file list.
+    append(&handle, cx, " @");
+    handle
+        .update(cx, |composer, _, cx| {
+            assert!(composer.mention_chat_matches(cx).is_empty())
+        })
+        .unwrap();
+}

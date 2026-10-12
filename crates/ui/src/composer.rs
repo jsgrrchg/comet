@@ -528,6 +528,16 @@ impl ChatDraft {
     }
 }
 
+/// A session offered by the `@` list, to mention as a chat chip.
+struct ChatMentionRow {
+    chat_id: String,
+    title: String,
+    harness: Option<HarnessId>,
+}
+
+/// Sessions the `@` list offers at most, between attachments and files.
+const MENTION_CHAT_ROWS: usize = 5;
+
 /// A staged attachment offered by the `@` list.
 struct AttachmentRow {
     index: u32,
@@ -7764,7 +7774,7 @@ impl Composer {
         self.mention.token = token.clone();
         if !refining {
             self.mention.results.clear();
-            self.mention.active = (!self.mention_attachment_matches().is_empty()).then_some(0);
+            self.mention.active = (self.mention_pinned_count(cx) > 0).then_some(0);
             // Fresh open: the row stack restarts at the top.
             crate::popover::reset_menu_scroll(&self.mention_scroll, &mut self.popup_bar);
         }
@@ -7819,8 +7829,8 @@ impl Composer {
                             results.retain(|result| local_path_is_safe(&result.path));
                             composer.mention.error = None;
                             composer.mention.active = (!results.is_empty()
-                                || !composer.mention_attachment_matches().is_empty())
-                            .then_some(0);
+                                || composer.mention_pinned_count(cx) > 0)
+                                .then_some(0);
                             composer.mention.results = results;
                             // New result set: the row stack restarts at the top.
                             crate::popover::reset_menu_scroll(
@@ -7834,7 +7844,7 @@ impl Composer {
                         tracing::warn!(%err, "file mention search failed");
                         composer.mention.results.clear();
                         composer.mention.active =
-                            (!composer.mention_attachment_matches().is_empty()).then_some(0);
+                            (composer.mention_pinned_count(cx) > 0).then_some(0);
                         composer.mention.error = Some(mention_error_message(&err));
                     }
                 }
@@ -7847,7 +7857,7 @@ impl Composer {
     }
 
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let rows = self.mention_attachment_matches().len() + self.mention.results.len();
+        let rows = self.mention_pinned_count(cx) + self.mention.results.len();
         self.mention.active = crate::popover::menu_step(self.mention.active, rows, delta);
         if let Some(active) = self.mention.active {
             // Keep the keyboard cursor visible in the scrolled row stack.
@@ -7872,6 +7882,49 @@ impl Composer {
     /// Staged attachments that match the typed `@` query, pinned above file
     /// results. Matching ignores case and spaces, so `@im`, `@image2` and
     /// `@2` all find "Image 2", and `@note` finds "notes.md".
+    /// Sessions whose title matches the typed `@` query (not an empty one,
+    /// which stays the file list), most recent first: mentioning one is the
+    /// keyboard way to do what dropping its sidebar row on the composer does.
+    fn mention_chat_matches(&self, cx: &App) -> Vec<ChatMentionRow> {
+        let Some(token) = self.mention.token.as_ref() else {
+            return Vec::new();
+        };
+        let wanted = token.query.to_lowercase();
+        if wanted.trim().is_empty() {
+            return Vec::new();
+        }
+        let state = self.state.read(cx);
+        let mut chats: Vec<_> = state
+            .chats
+            .iter()
+            .filter(|chat| {
+                !chat.archived && chat.parent_chat_id.is_none() && chat.id != self.current_key
+            })
+            .filter_map(|chat| {
+                let title = chat.title.clone()?;
+                title
+                    .to_lowercase()
+                    .contains(&wanted)
+                    .then(|| (chat.last_message_at.unwrap_or(chat.created_at), chat, title))
+            })
+            .collect();
+        chats.sort_by(|left, right| right.0.cmp(&left.0));
+        chats
+            .into_iter()
+            .take(MENTION_CHAT_ROWS)
+            .map(|(_, chat, title)| ChatMentionRow {
+                chat_id: chat.id.clone(),
+                title,
+                harness: chat.config.as_ref().map(|config| config.harness),
+            })
+            .collect()
+    }
+
+    /// Rows pinned above the file results: staged attachments, then sessions.
+    fn mention_pinned_count(&self, cx: &App) -> usize {
+        self.mention_attachment_matches().len() + self.mention_chat_matches(cx).len()
+    }
+
     fn mention_attachment_matches(&self) -> Vec<AttachmentRow> {
         let Some(token) = self.mention.token.as_ref() else {
             return Vec::new();
@@ -7909,6 +7962,7 @@ impl Composer {
             return;
         };
         let rows = self.mention_attachment_matches();
+        let chats = self.mention_chat_matches(cx);
         let Some(active) = self.mention.active else {
             return;
         };
@@ -7920,7 +7974,16 @@ impl Composer {
             self.input.update(cx, |input, cx| {
                 input.replace_mention_link(token.range, &link, cx)
             });
-        } else if let Some(result) = self.mention.results.get(active - rows.len()) {
+        } else if let Some(row) = active.checked_sub(rows.len()).and_then(|ix| chats.get(ix)) {
+            let Some(link) =
+                zeron_proto::chat_mentions::chat_mention_link(&row.chat_id, &row.title)
+            else {
+                return;
+            };
+            self.input.update(cx, |input, cx| {
+                input.replace_mention_link(token.range, &link, cx)
+            });
+        } else if let Some(result) = self.mention.results.get(active - rows.len() - chats.len()) {
             let (path, is_dir) = (result.path.clone(), result.is_dir);
             self.input.update(cx, |input, cx| {
                 input.replace_mention(token.range, &path, is_dir, cx)
@@ -7950,7 +8013,9 @@ impl Composer {
             )
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
         let attachment_rows = self.mention_attachment_matches();
-        if self.mention.loading && self.mention.results.is_empty() && attachment_rows.is_empty() {
+        let chat_rows = self.mention_chat_matches(cx);
+        let pinned = attachment_rows.len() + chat_rows.len();
+        if self.mention.loading && self.mention.results.is_empty() && pinned == 0 {
             card = card.child(crate::popover::skeleton_rows(
                 "file-mention-loading",
                 theme,
@@ -7958,12 +8023,7 @@ impl Composer {
                 cx.entity_id(),
                 cx,
             ));
-        } else if let Some(error) = self
-            .mention
-            .error
-            .clone()
-            .filter(|_| attachment_rows.is_empty())
-        {
+        } else if let Some(error) = self.mention.error.clone().filter(|_| pinned == 0) {
             card = card.child(
                 div()
                     .px(px(12.0))
@@ -7972,7 +8032,7 @@ impl Composer {
                     .text_color(theme.danger_muted)
                     .child(error),
             );
-        } else if self.mention.results.is_empty() && attachment_rows.is_empty() {
+        } else if self.mention.results.is_empty() && pinned == 0 {
             card = card.child(
                 div()
                     .px(px(12.0))
@@ -7987,7 +8047,7 @@ impl Composer {
             );
         } else {
             let mut rows: Vec<gpui::AnyElement> =
-                Vec::with_capacity(attachment_rows.len() + self.mention.results.len());
+                Vec::with_capacity(pinned + self.mention.results.len());
             // Staged attachments stay pinned above every file result.
             for (ix, row) in attachment_rows.iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
@@ -8030,9 +8090,42 @@ impl Composer {
                     .into_any_element(),
                 );
             }
-            let attachment_count = attachment_rows.len();
+            // Sessions follow, then the workspace's files.
+            for (chat_ix, row) in chat_rows.iter().enumerate() {
+                let ix = attachment_rows.len() + chat_ix;
+                let selected = self.mention.active == Some(ix);
+                let icon = match row.harness.map(crate::pickers::harness_brand_icon) {
+                    Some((path, tint)) => crate::icons::icon(path)
+                        .size(px(14.0))
+                        .text_color(tint.unwrap_or(theme.text_muted)),
+                    None => crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                };
+                rows.push(
+                    crate::popover::menu_row(theme, selected, format!("chat-mention-result-{ix}"))
+                        .id(("chat-mention-result", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mention.active = Some(ix);
+                            this.accept_mention(cx);
+                        }))
+                        .child(crate::popover::completion_row_content(
+                            theme,
+                            div()
+                                .size(px(16.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(icon)
+                                .into_any_element(),
+                            row.title.clone().into(),
+                            "Session".into(),
+                        ))
+                        .into_any_element(),
+                );
+            }
             for (file_ix, result) in self.mention.results.iter().enumerate() {
-                let ix = attachment_count + file_ix;
+                let ix = pinned + file_ix;
                 let selected = self.mention.active == Some(ix);
                 let (directory, name) = match result.path.rsplit_once('/') {
                     Some((directory, name)) => (directory.to_string(), name.to_string()),

@@ -235,11 +235,13 @@ impl Shell {
         let actions = self.render_session_info_actions(&theme, cx);
 
         // ── What runs alongside it.
-        let lanes = self.render_session_lanes(&chat, !docked, &theme, cx);
+        // It stops at half the window's height, however much runs.
+        let lanes_height = self.viewport_height / 2.0;
+        let lanes = self.render_session_lanes(&chat, !docked, lanes_height, &theme, cx);
 
         let body = div()
             .id("session-info-body")
-            .min_h_0()
+            .max_h(px(max_height.max(120.0)))
             .overflow_y_scroll()
             // The card's inset lives inside the scroller, so dividers can
             // bleed through it edge to edge without being clipped.
@@ -252,9 +254,10 @@ impl Shell {
             .children(branch_row)
             .children(actions);
 
+        // The session card keeps its height; only the lanes under it give.
         let card = div()
             .w(px(SESSION_CARD_WIDTH))
-            .min_h_0()
+            .flex_shrink_0()
             .flex()
             .flex_col()
             .rounded(px(popover::CARD_RADIUS))
@@ -283,8 +286,8 @@ impl Shell {
                 .absolute()
                 .top(px(Theme::TITLEBAR_HEIGHT + 12.0 + dy))
                 .right(px(SESSION_CARD_INSET - dx))
-                // The two cards share the height below the titlebar, each
-                // scrolling inside what it gets.
+                // The lanes card scrolls inside what the session card leaves
+                // it below the titlebar.
                 .max_h(px(max_height.max(240.0)))
                 .flex()
                 .flex_col()

@@ -322,12 +322,14 @@ impl Shell {
         true
     }
 
-    /// The lanes card for the open chat; `floating` over the transcript, it
-    /// casts the popover's shadow.
+    /// The lanes card for the open chat, at most `max_height` tall and
+    /// scrolling past it; `floating` over the transcript, it casts the
+    /// popover's shadow.
     pub(super) fn render_session_lanes(
         &mut self,
         chat: &Chat,
         floating: bool,
+        max_height: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -458,6 +460,7 @@ impl Shell {
             .id("session-lanes")
             .debug_selector(|| "session-lanes".into())
             .w(px(SESSION_CARD_WIDTH))
+            .max_h(px(max_height))
             .min_h_0()
             .flex()
             .flex_col()

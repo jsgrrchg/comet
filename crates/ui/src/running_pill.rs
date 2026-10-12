@@ -9,7 +9,6 @@ use gpui::{
     prelude::*, px, size,
 };
 
-use crate::loaders;
 use crate::motion::{self, ZERON_PULSE};
 use crate::theme::Theme;
 
@@ -30,8 +29,6 @@ const PLUS_TRIM: f32 = 1.0;
 const DIGIT_MID: f32 = 0.355;
 /// Height of the count badge on the titlebar button.
 const BADGE: f32 = 13.0;
-/// Corner radius of the titlebar's icon buttons.
-const BUTTON_RADIUS: f32 = 6.0;
 /// Past this the count would outgrow the pill; it reads "99+".
 const COUNT_CAP: u32 = 99;
 
@@ -249,11 +246,12 @@ fn paint_pill(
     let _ = line.paint(text_origin, height, TextAlign::Left, None, window, cx);
 }
 
-/// Marks the titlebar's explorer button while subagents run, so they can be
-/// found with the panel closed: the button's face breathes in the activity
-/// tone, and a small count badge sits on its corner. Both are drawn over the
-/// button, so it keeps its size and position among the titlebar controls.
-pub fn mark_files_button(
+/// Marks a titlebar button while subagents run behind it, so they can be
+/// found with its card or panel closed: a small count badge in the activity
+/// tone sits on its corner, drawn over the button so it keeps its size and
+/// position among the titlebar controls. It holds still; the count is the
+/// signal.
+pub fn mark_titlebar_button(
     button: gpui::Stateful<gpui::Div>,
     count: u32,
     theme: &Theme,
@@ -261,13 +259,6 @@ pub fn mark_files_button(
     let tone = theme.busy;
     button
         .relative()
-        .child(div().absolute().inset_0().child(loaders::pulse_glow(
-            "files-button-glow",
-            BUTTON_RADIUS,
-            tone,
-            0.10,
-            0.30,
-        )))
         .child(
             div()
                 .absolute()

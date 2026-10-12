@@ -1,5 +1,6 @@
-//! The session card: where this chat runs (device, project, branch), its
-//! side-chat actions, and the project's run actions, in one toggleable card.
+//! The session card: where this chat runs (device, project, branch) and the
+//! project's run actions, with the lanes card (its side chats and subagents,
+//! see `session_lanes`) stacked under it, both behind one toggle.
 //! While the column has room, the card shows at its right on its own (until
 //! the user hides it), the transcript and composer shifting left as needed
 //! to clear it. Once clearing it would narrow the transcript, the card hides,
@@ -13,6 +14,8 @@ use crate::project_actions::{ProjectActionsStatus, action_icon};
 pub(super) const SESSION_CARD_WIDTH: f32 = 272.0;
 const SESSION_CARD_INSET: f32 = 12.0;
 const SESSION_CARD_GAP: f32 = 24.0;
+/// The gap between the session card and the lanes card under it.
+const SESSION_CARDS_GAP: f32 = 8.0;
 /// The transcript's own side gutters (its rows pad 48px each side).
 const TRANSCRIPT_GUTTER: f32 = 48.0;
 
@@ -101,9 +104,20 @@ impl Shell {
         cx.notify();
     }
 
+    /// Show the card: beside the transcript when it fits there, else over it.
+    pub(super) fn show_session_info(&mut self, cx: &mut Context<Self>) {
+        if !self.session_info_fits(cx) {
+            self.session_info_overlay = true;
+        } else if self.settings.session_info_hidden {
+            self.settings.session_info_hidden = false;
+            self.schedule_save(cx);
+        }
+        cx.notify();
+    }
+
     /// Dismiss the card floating over the transcript; one shown beside it
     /// stays put.
-    fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
         if self.session_info_overlay {
             self.session_info_overlay = false;
             cx.notify();
@@ -217,35 +231,15 @@ impl Shell {
                 .tooltip(crate::settings::widgets::text_tooltip(branch))
         });
 
-        // ── This conversation.
-        let busy = self.side_chat_creating;
-        let side_chat = popover::picker_row(&theme, false, false, "session-info-side-chat")
-            .id("session-info-side-chat")
-            .debug_selector(|| "session-info-side-chat".into())
-            .when(busy, |row| row.opacity(0.5))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.close_session_info_overlay(cx);
-                this.create_child_chat(None, cx)
-            }))
-            .child(popover::picker_icon_slot(row_glyph(icons::PLUS, &theme)))
-            .child(div().flex_1().child("New side chat"));
-        let fork = popover::picker_row(&theme, false, false, "session-info-fork")
-            .id("session-info-fork")
-            .debug_selector(|| "session-info-fork".into())
-            .when(busy, |row| row.opacity(0.5))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.close_session_info_overlay(cx);
-                this.create_side_chat(cx)
-            }))
-            .child(popover::picker_icon_slot(row_glyph(icons::FORK, &theme)))
-            .child(div().flex_1().child("Fork chat"));
-
         // ── The project's run actions.
         let actions = self.render_session_info_actions(&theme, cx);
 
+        // ── What runs alongside it.
+        let lanes = self.render_session_lanes(&chat, !docked, &theme, cx);
+
         let body = div()
             .id("session-info-body")
-            .max_h(px(max_height.max(120.0)))
+            .min_h_0()
             .overflow_y_scroll()
             // The card's inset lives inside the scroller, so dividers can
             // bleed through it edge to edge without being clipped.
@@ -256,13 +250,13 @@ impl Shell {
             .child(device_row)
             .child(project_row)
             .children(branch_row)
-            .child(popover::picker_divider())
-            .child(side_chat)
-            .child(fork)
             .children(actions);
 
         let card = div()
             .w(px(SESSION_CARD_WIDTH))
+            .min_h_0()
+            .flex()
+            .flex_col()
             .rounded(px(popover::CARD_RADIUS))
             .overflow_hidden()
             .border_1()
@@ -270,6 +264,8 @@ impl Shell {
             .bg(popover::surface_bg(&theme))
             .when(!docked && !theme.is_frost(), |card| card.shadow_lg())
             .child(body);
+        let frosted =
+            |card| crate::frost::frosted(popover::CARD_RADIUS, crate::frost::MENU_BLUR, card);
 
         // Docked, the card slides in from the right beside the column;
         // floating, it drops in from just above. Either way it is placed from
@@ -287,6 +283,12 @@ impl Shell {
                 .absolute()
                 .top(px(Theme::TITLEBAR_HEIGHT + 12.0 + dy))
                 .right(px(SESSION_CARD_INSET - dx))
+                // The two cards share the height below the titlebar, each
+                // scrolling inside what it gets.
+                .max_h(px(max_height.max(240.0)))
+                .flex()
+                .flex_col()
+                .gap(px(SESSION_CARDS_GAP))
                 .opacity(ease)
                 .occlude()
                 // Over the transcript it is a popover: a press elsewhere, or
@@ -296,11 +298,8 @@ impl Shell {
                         cx.listener(|this, _, _, cx| this.close_session_info_overlay(cx)),
                     )
                 })
-                .child(crate::frost::frosted(
-                    popover::CARD_RADIUS,
-                    crate::frost::MENU_BLUR,
-                    card,
-                ))
+                .child(frosted(card.into_any_element()))
+                .child(frosted(lanes))
                 .into_any_element(),
         )
     }

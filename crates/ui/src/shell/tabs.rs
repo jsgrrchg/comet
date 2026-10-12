@@ -544,15 +544,6 @@ impl Shell {
                                 .aria_label(files_panel_label)
                                 .when(self.files_panel_open(cx) && fit.files, |button| {
                                     button.bg(crate::theme::wash(0.09))
-                                })
-                                // Running subagents live in this panel: mark the
-                                // button so they are findable while it is closed.
-                                .when(running_subagents > 0, |button| {
-                                    crate::running_pill::mark_files_button(
-                                        button,
-                                        running_subagents,
-                                        &theme,
-                                    )
                                 }),
                             )
                             .child(header_icon_button_with(
@@ -600,6 +591,15 @@ impl Shell {
                 cx.listener(|this, _, _, _| this.note_session_info_press()),
             )
             .when(open, |button| button.bg(crate::theme::wash(0.09)))
+            // Running subagents ride the card's lanes: mark the button so
+            // they are findable while the card is closed.
+            .when(!open && running_subagents > 0, |button| {
+                crate::running_pill::mark_titlebar_button(
+                    button,
+                    running_subagents,
+                    &theme,
+                )
+            })
         });
         let inner = div()
             .size_full()

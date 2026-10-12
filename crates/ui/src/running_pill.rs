@@ -246,30 +246,27 @@ fn paint_pill(
     let _ = line.paint(text_origin, height, TextAlign::Left, None, window, cx);
 }
 
-/// Marks a titlebar button while subagents run behind it, so they can be
-/// found with its card or panel closed: a small count badge in the activity
-/// tone sits on its corner, drawn over the button so it keeps its size and
-/// position among the titlebar controls. It holds still; the count is the
-/// signal.
+/// Marks a titlebar button while work runs behind it: a small count badge
+/// in the activity tone sits on its corner, drawn over the button so it
+/// keeps its size and position among the titlebar controls. It holds still;
+/// the count is the signal.
 pub fn mark_titlebar_button(
     button: gpui::Stateful<gpui::Div>,
     count: u32,
     theme: &Theme,
 ) -> gpui::Stateful<gpui::Div> {
     let tone = theme.busy;
-    button
-        .relative()
-        .child(
-            div()
-                .absolute()
-                .top(px(-3.0))
-                .right(px(-3.0))
-                .child(CountBadge {
-                    count,
-                    tone,
-                    family: theme.font_mono.clone(),
-                }),
-        )
+    button.relative().child(
+        div()
+            .absolute()
+            .top(px(-3.0))
+            .right(px(-3.0))
+            .child(CountBadge {
+                count,
+                tone,
+                family: theme.font_mono.clone(),
+            }),
+    )
 }
 
 /// The count badge on the titlebar button, painted rather than laid out so

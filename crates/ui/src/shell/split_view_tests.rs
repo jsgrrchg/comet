@@ -238,3 +238,94 @@ fn closing_panes_dissolves_the_split_and_full_splits_refuse(cx: &mut TestAppCont
         })
         .unwrap();
 }
+
+struct SplitHost {
+    shell: Entity<Shell>,
+    _data_dir: tempfile::TempDir,
+}
+
+impl Render for SplitHost {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.shell.update(cx, |shell, cx| {
+            let main = shell.render_main(window, 900., 900., cx);
+            div()
+                .size_full()
+                .flex()
+                .child(div().w(px(900.)).h_full().flex().child(main))
+        })
+    }
+}
+
+#[gpui::test]
+fn panes_render_side_by_side_and_dividers_resize_them(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = shell_window(dir.path(), cx);
+    let shell = window.root(cx).unwrap();
+    window
+        .update(cx, |shell, _, cx| shell.open_chat_in_split("b".into(), cx))
+        .unwrap();
+    cx.run_until_parked();
+    let (_, cx) = cx.add_window_view(|_, _| SplitHost {
+        shell: shell.clone(),
+        _data_dir: dir,
+    });
+    cx.update(|window, cx| window.draw(cx).clear());
+    let a = cx.debug_bounds("split-pane-a").expect("pane a renders");
+    let b = cx.debug_bounds("split-pane-b").expect("pane b renders");
+    assert!(a.right() <= b.left(), "a sits left of b");
+    assert!((f32::from(a.size.width) - 449.5).abs() < 1.0);
+    let divider = cx.debug_bounds("split-divider-0").unwrap().center();
+    cx.simulate_mouse_down(divider, MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_move(
+        gpui::point(divider.x + px(30.), divider.y),
+        Some(MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        gpui::point(px(600.), divider.y),
+        Some(MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        gpui::point(px(600.), divider.y),
+        MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.update(|window, cx| window.draw(cx).clear());
+    let ratios = shell.read_with(cx, |shell, cx| {
+        shell.shown_split(cx).unwrap().normalized_ratios()
+    });
+    assert!((ratios[0] - 600. / 900.).abs() < 0.01, "{ratios:?}");
+    let a = cx.debug_bounds("split-pane-a").unwrap();
+    assert!((f32::from(a.size.width) - 599.).abs() < 2.0, "{a:?}");
+    // Dragging never squeezes a pane under its minimum.
+    let divider = cx.debug_bounds("split-divider-0").unwrap().center();
+    cx.simulate_mouse_down(divider, MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_move(
+        gpui::point(px(890.), divider.y),
+        Some(MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        gpui::point(px(890.), divider.y),
+        MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    let ratios = shell.read_with(cx, |shell, cx| {
+        shell.shown_split(cx).unwrap().normalized_ratios()
+    });
+    assert!(ratios[1] * 900. >= 239., "{ratios:?}");
+    // Clicking into a pane focuses it.
+    let b = cx.debug_bounds("split-pane-b").unwrap().center();
+    cx.simulate_click(b, gpui::Modifiers::default());
+    shell.read_with(cx, |shell, cx| {
+        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("b"))
+    });
+    let a = cx.debug_bounds("split-pane-a").unwrap().center();
+    cx.simulate_click(a, gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |shell, cx| {
+        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("a"));
+        assert_eq!(shell.active_chat, "a");
+    });
+}

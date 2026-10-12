@@ -17,6 +17,18 @@ pub(super) struct ChatPane {
 /// The hairline between two panes.
 pub(super) const SPLIT_DIVIDER_WIDTH: f32 = 1.0;
 
+/// Narrowest a pane gets from dragging a divider.
+const SPLIT_PANE_MIN: f32 = 240.0;
+
+/// Half the divider's grab target, either side of the hairline.
+const SPLIT_DIVIDER_HITBOX_HALF: f32 = 4.0;
+
+/// Drag marker for the divider after pane `divider` of split `split`.
+pub(super) struct SplitDividerDrag {
+    split: String,
+    divider: usize,
+}
+
 /// Per-pane animation keys for the jump pill (they must be `'static`).
 const JUMP_KEYS: [(&str, &str); split_view::SPLIT_MAX_PANES] = [
     ("split-jump-0", "split-jump-pill-0"),
@@ -460,19 +472,14 @@ impl Shell {
             let pane =
                 self.render_split_pane(ix, chat_id, pane_width, last, transcript_setting, cx);
             if ix > 0 {
-                row = row.child(
-                    div()
-                        .w(px(SPLIT_DIVIDER_WIDTH))
-                        .h_full()
-                        .flex_none()
-                        .bg(theme.border),
-                );
+                row = row.child(self.render_split_divider(&view.id, ix - 1, &theme, cx));
             }
             row = row.child(pane);
         }
         div()
             .id("split-view")
             .debug_selector(|| "split-view".into())
+            .on_drag_move::<SplitDividerDrag>(cx.listener(Self::drag_split_divider))
             .track_focus(&self.navigation_focus.main)
             .on_key_down(|event, _, cx| navigation_focus::copy_transcript_selection(event, cx))
             .relative()
@@ -484,6 +491,87 @@ impl Shell {
             .child(row)
             .child(self.render_terminal_container(terminal_geometry, window, cx))
             .into_any_element()
+    }
+
+    /// The hairline between two panes, with a wider grab target over it.
+    /// Dragging moves it; a double-click shares the width out evenly again.
+    fn render_split_divider(
+        &self,
+        split: &str,
+        divider: usize,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hover_key = format!("split-divider-{divider}");
+        let highlight = motion::hover_blend(&hover_key, theme.border, theme.border_strong);
+        let (drag_split, reset_split) = (split.to_string(), split.to_string());
+        div()
+            .w(px(SPLIT_DIVIDER_WIDTH))
+            .h_full()
+            .flex_none()
+            .relative()
+            .bg(highlight)
+            .child(
+                div()
+                    .id(("split-divider", divider))
+                    .debug_selector(move || format!("split-divider-{divider}"))
+                    .absolute()
+                    .top(px(Theme::TITLEBAR_HEIGHT))
+                    .bottom_0()
+                    .left(px(-SPLIT_DIVIDER_HITBOX_HALF))
+                    .w(px(SPLIT_DIVIDER_HITBOX_HALF * 2.0 + SPLIT_DIVIDER_WIDTH))
+                    .occlude()
+                    .cursor_col_resize()
+                    .on_hover(motion::hover_listener(hover_key))
+                    .on_drag(
+                        SplitDividerDrag {
+                            split: drag_split,
+                            divider,
+                        },
+                        |_, _point: Point<Pixels>, _, cx| {
+                            cx.stop_propagation();
+                            cx.new(|_| DragGhost)
+                        },
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                            if event.click_count == 2 {
+                                let id = reset_split.clone();
+                                this.update_split_views(cx, |views| {
+                                    if let Some(view) = views.iter_mut().find(|v| v.id == id) {
+                                        view.ratios.clear();
+                                    }
+                                });
+                            }
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn drag_split_divider(
+        &mut self,
+        event: &gpui::DragMoveEvent<SplitDividerDrag>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let drag = event.drag(cx);
+        let (split, divider) = (drag.split.clone(), drag.divider);
+        let width = f32::from(event.bounds.size.width);
+        if width <= 0.0 {
+            return;
+        }
+        let pointer = (f32::from(event.event.position.x) - f32::from(event.bounds.left())) / width;
+        self.update_split_views(cx, |views| {
+            let Some(view) = views.iter_mut().find(|view| view.id == split) else {
+                return;
+            };
+            let ratios = view.normalized_ratios();
+            let edge: f32 = ratios.iter().take(divider + 1).sum();
+            let min = (SPLIT_PANE_MIN / width).min(0.9 / ratios.len().max(1) as f32);
+            view.resize(divider, pointer - edge, min);
+        });
     }
 
     #[allow(clippy::too_many_arguments)]

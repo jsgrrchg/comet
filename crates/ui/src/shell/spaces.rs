@@ -4844,6 +4844,8 @@ impl Shell {
             .chain(ordered)
             .collect::<Vec<_>>();
         let mut visible = project_pinned_first(&ordered, pinned_order);
+        // A split takes one slot, its first member's — as its row does.
+        self.collapse_split_rows(&mut visible, |id| id.as_str(), cx);
         if !self.sessions_open
             && self.settings.sidebar_organization == SidebarOrganization::InOneList
         {
@@ -5071,17 +5073,22 @@ impl Shell {
                 .copied()
                 .unwrap_or(usize::MAX)
         });
-        let active: HashSet<&str> = base_ids.iter().map(String::as_str).collect();
-        let pinned_count = pinned_order
+        // A split lists once, where its first member would.
+        let filtered_in: HashSet<String> = base_ids.iter().cloned().collect();
+        let split_anchors = self.collapse_split_rows(&mut rows, |row| row.chat.id.as_str(), cx);
+        let pinned_set: HashSet<&str> = pinned_order.iter().map(String::as_str).collect();
+        let pinned_count = rows
             .iter()
-            .filter(|id| active.contains(id.as_str()))
-            .collect::<HashSet<_>>()
-            .len();
+            .filter(|row| pinned_set.contains(row.chat.id.as_str()))
+            .count();
         let regular_rows = rows.split_off(pinned_count);
         let pinned_rows = rows;
         self.sidebar_pinned_heights = pinned_rows
             .iter()
             .map(|row| {
+                if split_anchors.contains_key(&row.chat.id) {
+                    return split_rows::split_row_height(self.settings.sidebar_compact);
+                }
                 sidebar_row_height(
                     self.settings.sidebar_compact,
                     self.settings.sidebar_show_project_label,
@@ -5297,12 +5304,17 @@ impl Shell {
                     .sidebar_show_harness
                     .then(|| chat.config.as_ref().map(|c| c.harness))
                     .flatten();
-                let height = sidebar_row_height(
-                    self.settings.sidebar_compact,
-                    self.settings.sidebar_show_project_label,
-                    branch.is_some(),
-                    change_request.is_some(),
-                );
+                let split = split_anchors.get(&chat.id);
+                let height = if split.is_some() {
+                    split_rows::split_row_height(self.settings.sidebar_compact)
+                } else {
+                    sidebar_row_height(
+                        self.settings.sidebar_compact,
+                        self.settings.sidebar_show_project_label,
+                        branch.is_some(),
+                        change_request.is_some(),
+                    )
+                };
                 // Only rows a jump slot can reach wear a chip; row 10 onward
                 // keeps its time-ago.
                 let jump_slot = visible_slots.get(&chat.id).copied();
@@ -5312,7 +5324,8 @@ impl Shell {
                 } else {
                     None
                 };
-                let drag = (self.pinned_open || slot >= pinned_count)
+                // A split's row is not dragged as a whole.
+                let drag = (split.is_none() && (self.pinned_open || slot >= pinned_count))
                     .then(|| {
                         profile_key.as_ref().map(|profile_key| SidebarSessionDrag {
                             chat_id: chat.id.clone(),
@@ -5346,28 +5359,32 @@ impl Shell {
                     .filter(|drag| drag.payload.chat_id == chat.id)
                     .map_or(0.0, |drag| drag.collapsed_height);
                 let slot_height = height - removed;
-                let element = self.render_chat_row(
-                    chat.id.clone(),
-                    transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                let element = if let Some(view) = split {
+                    self.render_split_row(view, &filtered_in, jump_label, theme, cx)
+                } else {
+                    self.render_chat_row(
+                        chat.id.clone(),
+                        transcript::single_line(
+                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        )
+                        .into(),
+                        time_ago,
+                        folder.into(),
+                        branch.map(SharedString::from),
+                        change_request,
+                        harness,
+                        status,
+                        is_selected,
+                        false,
+                        is_moving,
+                        if is_moving { None } else { drag },
+                        jump_label,
+                        self.settings.sidebar_show_project_icon && !project_group,
+                        None,
+                        theme,
+                        cx,
                     )
-                    .into(),
-                    time_ago,
-                    folder.into(),
-                    branch.map(SharedString::from),
-                    change_request,
-                    harness,
-                    status,
-                    is_selected,
-                    false,
-                    is_moving,
-                    if is_moving { None } else { drag },
-                    jump_label,
-                    self.settings.sidebar_show_project_icon && !project_group,
-                    None,
-                    theme,
-                    cx,
-                );
+                };
                 // The source slot shrinks when its vacancy moves across sections.
                 // Its zero-height anchor still tracks the live activity position.
                 let element = if let Some(origin) = origin {
@@ -5430,7 +5447,11 @@ impl Shell {
                         },
                     ))
                     .into_any_element();
-                rendered_rows.push((format!("c:{}", chat.id), slot_height, element));
+                let key = match split {
+                    Some(view) => format!("sg:{}", view.id),
+                    None => format!("c:{}", chat.id),
+                };
+                rendered_rows.push((key, slot_height, element));
             }
 
             let Some((key, label)) = group else {

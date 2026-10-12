@@ -87,6 +87,7 @@ mod sidebar_pins;
 mod sidebar_sections;
 mod search_warm;
 mod split_panes;
+mod split_rows;
 #[cfg(test)]
 mod split_view_tests;
 pub(crate) mod spaces;
@@ -6214,6 +6215,7 @@ impl Shell {
             return;
         };
         // Same path a click on that row takes.
+        let chat_id = self.sidebar_landing_chat(&chat_id, cx);
         self.open_chat(chat_id, cx);
     }
 

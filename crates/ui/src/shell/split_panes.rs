@@ -286,17 +286,6 @@ impl Shell {
         cx.notify();
     }
 
-    /// Dissolve the split holding `chat_id`; its chats go back to ordinary
-    /// rows and the focused one stays on screen.
-    pub(super) fn dissolve_split(&mut self, chat_id: &str, cx: &mut Context<Self>) {
-        let Some(id) = self.split_of_chat(chat_id, cx).map(|view| view.id.clone()) else {
-            return;
-        };
-        self.update_split_views(cx, |views| views.retain(|view| view.id != id));
-        self.sync_split_panes(cx);
-        cx.notify();
-    }
-
     /// Focus a pane of the split on screen.
     pub(super) fn focus_split_pane(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id) {
@@ -388,7 +377,13 @@ impl Shell {
         transcript.update(cx, |transcript, _| {
             transcript.set_workspace_link_handler(links)
         });
-        let composer = cx.new(|cx| Composer::new(state.clone(), cx));
+        let composer = cx.new(|cx| {
+            let mut composer = Composer::new(state.clone(), cx);
+            // Only the selected chat's pane takes focus (see
+            // `sync_split_panes`), not every pane as it mounts.
+            composer.focus_pending = false;
+            composer
+        });
         let events = vec![
             cx.subscribe(&transcript, Self::on_transcript_event),
             cx.subscribe(&composer, {

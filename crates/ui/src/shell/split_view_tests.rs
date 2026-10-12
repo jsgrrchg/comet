@@ -329,3 +329,73 @@ fn panes_render_side_by_side_and_dividers_resize_them(cx: &mut TestAppContext) {
         assert_eq!(shell.active_chat, "a");
     });
 }
+
+#[gpui::test]
+fn the_sidebar_lists_a_split_once_where_its_first_member_would(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = shell_window(dir.path(), cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.settings.sidebar_organization = SidebarOrganization::InOneList;
+            // Newest first: a, b, c, d.
+            assert_eq!(shell.sidebar_visible_order(cx), ["a", "b", "c", "d"]);
+            shell.open_chat("c".into(), cx);
+            shell.open_chat_in_split("a".into(), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            // The split's slot is a's; c no longer lists on its own.
+            assert_eq!(shell.sidebar_visible_order(cx), ["a", "b", "d"]);
+            // Focus c, then step: from the split's slot to b, and back to
+            // the split's last focused pane.
+            shell.focus_split_pane("c", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| shell.cycle_session(true, cx))
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(shell.active_chat, "b");
+            shell.cycle_session(false, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(
+                shell.active_chat, "c",
+                "the split reopens on its focused pane"
+            );
+            assert!(shell.shown_split(cx).is_some());
+            shell.jump_to_session(2, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(shell.active_chat, "d");
+            // A pinned member pins the split's row.
+            shell
+                .settings
+                .sidebar_pins_mut("local".into())
+                .push("d".into());
+            shell.open_chat_in_split("b".into(), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(shell.sidebar_visible_order(cx), ["d", "a"]);
+            shell.jump_to_session(1, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| assert_eq!(shell.active_chat, "c"))
+        .unwrap();
+}

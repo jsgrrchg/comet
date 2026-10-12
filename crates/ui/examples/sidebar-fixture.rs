@@ -1,5 +1,6 @@
 //! Isolated native sidebar review fixture. ZERON_SIDEBAR_COMPACT / ZERON_SIDEBAR_HIDE_LABEL select layout;
 //! ZERON_SIDEBAR_BY_PROJECT groups by project, with a remote clone of the local repository.
+//! ZERON_SIDEBAR_SPLIT opens the selected session in a split view beside another.
 use gpui::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use zeron_ui::*;
 
@@ -19,10 +20,19 @@ fn main() -> anyhow::Result<()> {
         settings.sidebar_organization = if by_project { settings::SidebarOrganization::ByProject } else { settings::SidebarOrganization::InOneList };
         settings.sidebar_width = 310.0;
         settings.sidebar_pins_mut("local".into()).extend(["chat-0".into(), "chat-1".into()]);
+        if std::env::var_os("ZERON_SIDEBAR_SPLIT").is_some() {
+            settings.split_views_by_profile.insert("local".into(), vec![split_view::SplitView {
+                id: "fixture-split".into(),
+                chats: vec!["browser-fixture".into(), "chat-4".into()],
+                ratios: Vec::new(),
+                focused: Some("browser-fixture".into()),
+            }]);
+        }
         let project_path = data.join("fieldnotes");
         std::fs::create_dir_all(project_path.join("public")).unwrap();
         std::fs::write(project_path.join("public/favicon.svg"), r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="1" y="1" width="22" height="22" rx="6" fill="#668cf5"/><path d="M7 6h11v3h-8v3h6v3h-6v4H7Z" fill="white"/></svg>"##).unwrap();
-        settings.surface = zeron_theme::SurfacePreference::Frosted;
+        // Opaque for capture on a server without a compositor (Xvfb).
+        settings.surface = if std::env::var_os("ZERON_FIXTURE_OPAQUE").is_some() { zeron_theme::SurfacePreference::Opaque } else { zeron_theme::SurfacePreference::Frosted };
         settings.save(&data).unwrap();
         settings::init(settings.clone(), data.clone(), cx);
         let fonts = typography::register_fonts(cx);

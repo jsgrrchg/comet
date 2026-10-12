@@ -191,8 +191,16 @@ impl Shell {
         // The same list `render_active_rows` draws and the jump shortcuts
         // count — one function, so neither can drift from the screen.
         let order = self.sidebar_visible_order(cx);
-        let selected = self.state.read(cx).selected_chat.clone();
+        // A split's slot is its first member's: step from the slot of the
+        // split on screen, and land on a split's last focused pane.
+        let selected = self.state.read(cx).selected_chat.clone().map(|id| {
+            self.split_of_chat(&id, cx)
+                .and_then(|view| view.chats.iter().find(|member| order.contains(member)))
+                .cloned()
+                .unwrap_or(id)
+        });
         if let Some(target) = cycle_target(&order, selected.as_deref(), forward) {
+            let target = self.sidebar_landing_chat(&target, cx);
             self.open_chat(target, cx);
         }
     }

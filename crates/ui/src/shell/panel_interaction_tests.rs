@@ -393,3 +393,44 @@ fn panels_share_space_and_keep_rendered_geometry_through_their_lifecycle(cx: &mu
         expect(settled(&shell, cx), landed.widths);
     }
 }
+
+#[gpui::test]
+fn side_chat_menu_rename_keeps_the_editor_visible_without_opening_files(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    change(&shell, cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "side", "title": "Side chat", "parentChatId": "a",
+                    "deviceId": "local", "archived": false, "createdAt": Utc::now(),
+                }))
+                .unwrap(),
+            );
+            cx.notify();
+        });
+        shell.chat_menu.open(ChatMenuState {
+            chat_id: "side".into(),
+            tab: None,
+            position: gpui::point(px(800.0), px(200.0)),
+            page: ChatMenuPage::Root,
+        });
+    });
+    settled(&shell, cx);
+    assert!(shell.read_with(cx, |shell, cx| !shell.files_panel_open(cx)));
+
+    let rename = cx.debug_bounds("chat-menu-rename").unwrap();
+    cx.simulate_click(rename.center(), Default::default());
+    settled(&shell, cx);
+
+    shell.read_with(cx, |shell, cx| {
+        assert!(
+            !shell.files_panel_open(cx),
+            "Rename must not open the explorer"
+        );
+        assert!(shell.session_info_visible(cx));
+        assert_eq!(shell.chat_rename.as_ref().unwrap().chat_id, "side");
+    });
+    let field = cx.debug_bounds("session-lanes-chat-side-title-editor").unwrap();
+    let card = cx.debug_bounds("session-lanes").unwrap();
+    assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
+}

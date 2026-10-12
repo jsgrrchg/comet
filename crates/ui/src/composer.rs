@@ -509,6 +509,25 @@ struct AttachmentDraft {
     unstaged: Vec<StagedAttachment>,
 }
 
+/// One chat's unsent draft, handed between composers that show the chat in
+/// turn (the main column and a split pane).
+#[derive(Default)]
+pub(crate) struct ChatDraft {
+    text: String,
+    attachments: Vec<StagedAttachment>,
+    attachment_draft: Option<AttachmentDraft>,
+    appshots: Vec<CapturedAppshot>,
+}
+
+impl ChatDraft {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.text.is_empty()
+            && self.attachments.is_empty()
+            && self.attachment_draft.is_none()
+            && self.appshots.is_empty()
+    }
+}
+
 /// A staged attachment offered by the `@` list.
 struct AttachmentRow {
     index: u32,
@@ -6935,6 +6954,84 @@ impl Composer {
         self.state.update(cx, |state, _| {
             state.purge_review_comments(chat_id);
         });
+    }
+
+    /// Move `chat_id`'s draft out of this composer — text, staged
+    /// attachments and their chip numbering, appshots — so another composer
+    /// showing the same chat (a split pane) continues it. The draft the input
+    /// is showing comes out of the input, which is left empty.
+    pub(crate) fn take_chat_draft(&mut self, chat_id: &str, cx: &mut Context<Self>) -> ChatDraft {
+        let text = if self.current_key == chat_id && self.wizard.is_none() {
+            let text = self.input.read(cx).text().to_string();
+            if !text.is_empty() {
+                self.input
+                    .update(cx, |input, cx| input.set_text(String::new(), cx));
+            }
+            self.drafts.remove(chat_id);
+            text
+        } else {
+            self.drafts.remove(chat_id).unwrap_or_default()
+        };
+        cx.notify();
+        ChatDraft {
+            text,
+            attachments: self.attachments.remove(chat_id).unwrap_or_default(),
+            attachment_draft: self.attachment_drafts.remove(chat_id),
+            appshots: self.appshots.remove(chat_id).unwrap_or_default(),
+        }
+    }
+
+    /// Continue a draft another composer handed over with
+    /// [`Self::take_chat_draft`]. What this composer already holds for the
+    /// chat is kept beside it rather than overwritten.
+    pub(crate) fn restore_chat_draft(
+        &mut self,
+        chat_id: &str,
+        draft: ChatDraft,
+        cx: &mut Context<Self>,
+    ) {
+        if draft.is_empty() {
+            return;
+        }
+        let shown = self.current_key == chat_id && self.wizard.is_none();
+        let existing = if shown {
+            self.input.read(cx).text().to_string()
+        } else {
+            self.drafts.get(chat_id).cloned().unwrap_or_default()
+        };
+        let text = [existing, draft.text]
+            .into_iter()
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        if shown {
+            self.input.update(cx, |input, cx| input.set_text(text, cx));
+        } else if text.is_empty() {
+            self.drafts.remove(chat_id);
+        } else {
+            self.drafts.insert(chat_id.to_string(), text);
+        }
+        if !draft.attachments.is_empty() {
+            self.attachments
+                .entry(chat_id.to_string())
+                .or_default()
+                .extend(draft.attachments);
+        }
+        if let Some(handed) = draft.attachment_draft {
+            let own = self
+                .attachment_drafts
+                .entry(chat_id.to_string())
+                .or_default();
+            own.next = own.next.max(handed.next);
+            own.unstaged.extend(handed.unstaged);
+        }
+        if !draft.appshots.is_empty() {
+            self.appshots
+                .entry(chat_id.to_string())
+                .or_default()
+                .extend(draft.appshots);
+        }
+        cx.notify();
     }
 
     /// Staged in `AppState` because the changes pane writes them.
@@ -16133,6 +16230,56 @@ mod tests {
                 c.drafts.get("b").map(String::as_str),
                 Some("ordinary draft b")
             );
+        });
+    }
+
+    /// A split pane continues the draft the main composer held for its chat,
+    /// and hands it back when the chat leaves the split.
+    #[gpui::test]
+    fn chat_drafts_hand_over_between_composers(cx: &mut gpui::TestAppContext) {
+        let main_state = cx.new(|_| AppState::new());
+        let pane_state = cx.new(|_| AppState::new());
+        let main = cx.new(|cx| Composer::new(main_state.clone(), cx));
+        let pane = cx.new(|cx| Composer::new(pane_state.clone(), cx));
+        main_state.update(cx, |s, _| s.selected_chat = Some("a".into()));
+        pane_state.update(cx, |s, _| s.selected_chat = Some("a".into()));
+        main.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            c.input.update(cx, |i, cx| i.set_text("draft a", cx));
+            c.stage_appshot(crate::appshots::tests::shot(), cx);
+        });
+        pane.update(cx, |c, cx| c.on_state_changed(cx));
+        let draft = main.update(cx, |c, cx| c.take_chat_draft("a", cx));
+        assert!(!draft.is_empty());
+        main.update(cx, |c, cx| {
+            assert!(c.input.read(cx).text().is_empty());
+            assert!(c.staged_appshots().is_empty());
+            assert!(!c.has_draft(cx));
+        });
+        pane.update(cx, |c, cx| {
+            c.restore_chat_draft("a", draft, cx);
+            assert_eq!(c.input.read(cx).text(), "draft a");
+            assert_eq!(c.staged_appshots().len(), 1);
+            c.input
+                .update(cx, |i, cx| i.set_text("draft a, continued", cx));
+        });
+        // Back to the main composer, which has moved on to another chat.
+        main_state.update(cx, |s, _| s.selected_chat = Some("b".into()));
+        main.update(cx, |c, cx| c.on_state_changed(cx));
+        let draft = pane.update(cx, |c, cx| c.take_chat_draft("a", cx));
+        main.update(cx, |c, cx| {
+            c.restore_chat_draft("a", draft, cx);
+            assert!(c.input.read(cx).text().is_empty(), "b shows its own draft");
+            assert_eq!(
+                c.drafts.get("a").map(String::as_str),
+                Some("draft a, continued")
+            );
+            assert_eq!(c.appshots.get("a").map(Vec::len), Some(1));
+        });
+        main_state.update(cx, |s, _| s.selected_chat = Some("a".into()));
+        main.update(cx, |c, cx| {
+            c.on_state_changed(cx);
+            assert_eq!(c.input.read(cx).text(), "draft a, continued");
         });
     }
 

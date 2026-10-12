@@ -288,10 +288,25 @@ impl Shell {
 
     /// Focus a pane of the split on screen.
     pub(super) fn focus_split_pane(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        self.select_split_pane(chat_id, true, cx);
+    }
+
+    /// A press inside a pane focuses whatever it lands on, so only the
+    /// keyboard and the titlebar move the caret into the pane's composer.
+    fn select_split_pane(&mut self, chat_id: &str, focus_composer: bool, cx: &mut Context<Self>) {
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id) {
             return;
         }
-        self.open_chat(chat_id.to_string(), cx);
+        if focus_composer {
+            self.open_chat(chat_id.to_string(), cx);
+            return;
+        }
+        self.nav.push(NavEntry::Chat(chat_id.to_string()));
+        self.state.update(cx, |state, cx| {
+            state.select_chat(Some(chat_id.to_string()), cx)
+        });
+        self.sync_split_panes(cx);
+        cx.notify();
     }
 
     /// Move focus to the pane left or right of the focused one, stopping at
@@ -495,6 +510,9 @@ impl Shell {
             .debug_selector(|| "split-view".into())
             .on_drag_move::<SplitDividerDrag>(cx.listener(Self::drag_split_divider))
             .track_focus(&self.navigation_focus.main)
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                this.capture_navigation_focus(false, false, window, cx);
+            }))
             .on_key_down(|event, _, cx| navigation_focus::copy_transcript_selection(event, cx))
             .relative()
             .flex_1()
@@ -634,7 +652,7 @@ impl Shell {
             move || format!("split-pane-{id}")
         })
         .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
-            this.focus_split_pane(&focus_id, cx);
+            this.select_split_pane(&focus_id, false, cx);
         }))
         .h_full()
         .min_w_0()

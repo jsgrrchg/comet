@@ -342,7 +342,7 @@ impl Shell {
                     cx,
                 ))
         });
-        self.chat_dropzone(("side-chat-dropzone", id), composer.clone(), cx)
+        self.chat_dropzone(("side-chat-dropzone", id), composer.clone(), None, cx)
             .size_full()
             .flex()
             .flex_col()

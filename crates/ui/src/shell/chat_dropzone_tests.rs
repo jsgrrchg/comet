@@ -32,32 +32,70 @@ impl Render for DropHost {
                 // Supply the tree/search payload without needing an engine
                 // to enumerate a checkout. Targets and file tabs are real UI.
                 .child(
-                    div().h(px(24.)).flex().children(
-                        [
-                            ("file", "src/tree.rs", false, origin.clone()),
-                            ("directory", "src", true, origin),
-                            ("stale", "src/stale.rs", false, None),
-                        ]
-                        .into_iter()
-                        .map(|(id, path, directory, origin)| {
+                    div()
+                        .h(px(24.))
+                        .flex()
+                        .children(
+                            [
+                                ("file", "src/tree.rs", false, origin.clone()),
+                                ("directory", "src", true, origin),
+                                ("stale", "src/stale.rs", false, None),
+                            ]
+                            .into_iter()
+                            .map(|(id, path, directory, origin)| {
+                                div()
+                                    .id(id)
+                                    .debug_selector(move || id.into())
+                                    .w(px(100.))
+                                    .h_full()
+                                    .on_drag(
+                                        WorkspacePathDrag::new(path.into(), directory).with_origin(
+                                            origin,
+                                            crate::files::WorkspacePathSource::Tree,
+                                            None,
+                                        ),
+                                        |payload, _, _, cx| {
+                                            crate::files::workspace_path_drag_ghost(payload, cx)
+                                        },
+                                    )
+                                    .child(id)
+                            }),
+                        )
+                        // A sidebar row and a split pill, carrying the chat "other".
+                        .child(
                             div()
-                                .id(id)
-                                .debug_selector(move || id.into())
-                                .w(px(100.))
+                                .id("session")
+                                .debug_selector(|| "session".into())
+                                .w(px(60.))
                                 .h_full()
                                 .on_drag(
-                                    WorkspacePathDrag::new(path.into(), directory).with_origin(
-                                        origin,
-                                        crate::files::WorkspacePathSource::Tree,
-                                        None,
-                                    ),
-                                    |payload, _, _, cx| {
-                                        crate::files::workspace_path_drag_ghost(payload, cx)
+                                    SidebarSessionDrag {
+                                        chat_id: "other".into(),
+                                        visible_ids: Default::default(),
+                                        filter: None,
+                                        profile_key: "local".into(),
                                     },
-                                )
-                                .child(id)
-                        }),
-                    ),
+                                    |_, _, _, cx| cx.new(|_| DragGhost),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("pill")
+                                .debug_selector(|| "pill".into())
+                                .w(px(60.))
+                                .h_full()
+                                .on_drag(
+                                    chat_dropzone::SplitPillDrag {
+                                        chat_id: "other".into(),
+                                        title: "Other".into(),
+                                    },
+                                    |payload, _, _, cx| {
+                                        cx.new(|_| chat_dropzone::SplitPillGhost {
+                                            title: payload.title.clone(),
+                                        })
+                                    },
+                                ),
+                        ),
                 )
                 .child(
                     div()
@@ -118,13 +156,16 @@ fn setup_with_shell(
                 state.connection = ConnectionStatus::Ready;
                 state.local_device_id = Some("local".into());
                 state.no_project = true;
-                state.chats = vec![
-                    serde_json::from_value(serde_json::json!({
-                        "id": "parent", "deviceId": "local", "archived": false,
-                        "createdAt": Utc::now(),
-                    }))
-                    .unwrap(),
-                ];
+                state.chats = ["parent", "other"]
+                    .into_iter()
+                    .map(|id| {
+                        serde_json::from_value(serde_json::json!({
+                            "id": id, "title": id, "deviceId": "local", "archived": false,
+                            "createdAt": Utc::now(),
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
                 state.selected_chat = Some("parent".into());
             });
             shell.active_chat = "parent".into();
@@ -442,4 +483,67 @@ fn external_file_drops_stage_files_and_refuse_folders_and_oversize_files(cx: &mu
             }
         });
     }
+}
+
+/// Carry `source` to `to`, painting each frame, without letting go.
+fn carry(cx: &mut VisualTestContext, source: &'static str, to: Point<Pixels>) {
+    let from = cx.debug_bounds(source).unwrap().center();
+    cx.simulate_mouse_down(from, MouseButton::Left, gpui::Modifiers::default());
+    for _ in 0..2 {
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), gpui::Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+    }
+}
+
+fn release(cx: &mut VisualTestContext, at: Point<Pixels>) {
+    cx.simulate_mouse_up(at, MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear());
+}
+
+/// A session carried over a conversation mentions it from the composer and
+/// opens beside it from either half of the transcript; a pill does too.
+#[gpui::test]
+fn carried_sessions_mention_from_the_composer_and_split_from_the_transcript(
+    cx: &mut TestAppContext,
+) {
+    let (shell, cx) = setup(cx);
+    let composer = cx.debug_bounds("persistent-composer").unwrap().center();
+    carry(cx, "session", composer);
+    assert!(cx.debug_bounds("chat-drop-mention").is_some());
+    assert!(cx.debug_bounds("chat-drop-right").is_none());
+    release(cx, composer);
+    shell.read_with(cx, |shell, cx| {
+        assert!(text(&shell.composer, cx).contains("[other](zeron-chat:other)"));
+        assert!(shell.split_views(cx).is_empty());
+    });
+    assert!(
+        cx.debug_bounds("chat-drop-mention").is_none(),
+        "gone with the drag"
+    );
+
+    let column = cx.debug_bounds("chat-dropzone").unwrap();
+    let right = gpui::point(column.right() - px(60.), column.top() + px(120.));
+    carry(cx, "session", right);
+    assert!(cx.debug_bounds("chat-drop-right").is_some());
+    let left = gpui::point(column.left() + px(60.), column.top() + px(120.));
+    cx.simulate_mouse_move(left, Some(MouseButton::Left), gpui::Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear());
+    assert!(cx.debug_bounds("chat-drop-left").is_some());
+    assert!(cx.debug_bounds("chat-drop-right").is_none());
+    release(cx, left);
+    shell.read_with(cx, |shell, cx| {
+        assert_eq!(shell.split_views(cx)[0].chats, ["other", "parent"]);
+        assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("other"));
+    });
+
+    // A pill carried to the other side of its neighbour moves its pane.
+    let parent = cx.debug_bounds("split-pane-parent").unwrap();
+    let right = gpui::point(parent.right() - px(30.), parent.top() + px(120.));
+    carry(cx, "pill", right);
+    assert!(cx.debug_bounds("chat-drop-right").is_some());
+    release(cx, right);
+    shell.read_with(cx, |shell, cx| {
+        assert_eq!(shell.split_views(cx)[0].chats, ["parent", "other"]);
+    });
 }

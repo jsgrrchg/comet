@@ -147,7 +147,7 @@ impl Shell {
     }
 
     /// Chats that may join a split: listed, unarchived, top-level sessions.
-    fn splittable(&self, chat_id: &str, cx: &App) -> bool {
+    pub(super) fn splittable(&self, chat_id: &str, cx: &App) -> bool {
         self.state
             .read(cx)
             .chats
@@ -601,45 +601,54 @@ impl Shell {
                 .child(self.jump_pill(anim, hover, transcript.clone(), cx))
         });
         let focus_id = chat_id.to_string();
-        let theme = Theme::of(cx);
-        let (attach_overlay, mention_overlay) = (
-            Self::attachment_drop_overlay(theme),
-            Self::mention_drop_overlay(theme),
-        );
-        self.chat_dropzone(("split-pane", ix), composer.clone(), cx)
-            .debug_selector({
-                let id = chat_id.to_string();
-                move || format!("split-pane-{id}")
-            })
-            .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
-                this.focus_split_pane(&focus_id, cx);
-            }))
-            .h_full()
-            .min_w_0()
-            .when(last, |el| el.flex_1())
-            .when(!last, |el| el.w(px(width)).flex_none())
-            .flex()
-            .flex_col()
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(
-                        crate::edge_fade::edge_faded(
-                            Theme::TRANSCRIPT_FADE_BAND,
-                            true,
-                            false,
-                            div().size_full().child(transcript),
-                        )
-                        .inset_top(Theme::TITLEBAR_HEIGHT),
+        let attach_overlay = Self::attachment_drop_overlay(Theme::of(cx));
+        let drop_overlay = self.chat_drop_overlay(chat_id, cx);
+        let composer_probe = self.chat_drop_composer_probe(chat_id);
+        self.chat_dropzone(
+            ("split-pane", ix),
+            composer.clone(),
+            Some(chat_id.to_string()),
+            cx,
+        )
+        .debug_selector({
+            let id = chat_id.to_string();
+            move || format!("split-pane-{id}")
+        })
+        .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
+            this.focus_split_pane(&focus_id, cx);
+        }))
+        .h_full()
+        .min_w_0()
+        .when(last, |el| el.flex_1())
+        .when(!last, |el| el.w(px(width)).flex_none())
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex_1()
+                .min_h_0()
+                .relative()
+                .child(
+                    crate::edge_fade::edge_faded(
+                        Theme::TRANSCRIPT_FADE_BAND,
+                        true,
+                        false,
+                        div().size_full().child(transcript),
                     )
-                    .children(pill),
-            )
-            .child(div().flex_none().child(composer))
-            .child(attach_overlay)
-            .child(mention_overlay)
-            .into_any_element()
+                    .inset_top(Theme::TITLEBAR_HEIGHT),
+                )
+                .children(pill),
+        )
+        .child(
+            div()
+                .flex_none()
+                .relative()
+                .child(composer_probe)
+                .child(composer),
+        )
+        .child(attach_overlay)
+        .children(drop_overlay)
+        .into_any_element()
     }
 
     /// The titlebar over a split: each pane's title above it, the focused

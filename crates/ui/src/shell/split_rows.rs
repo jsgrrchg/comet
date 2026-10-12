@@ -294,6 +294,10 @@ impl Shell {
         let open_id = chat_id.clone();
         let menu_id = chat_id.clone();
         let close_id = chat_id.clone();
+        let drag = chat_dropzone::SplitPillDrag {
+            chat_id: chat_id.clone(),
+            title: title.clone(),
+        };
         crate::surface_chrome::tab(SharedString::from(pill_id.clone()), focused, theme)
             .debug_selector({
                 let id = chat_id.clone();
@@ -343,6 +347,14 @@ impl Shell {
                     cx.notify();
                 }),
             )
+            // Carried out: onto the list it leaves the split, onto a
+            // conversation it opens beside it (or moves within the split).
+            .on_drag(drag, |payload, _, _, cx| {
+                cx.stop_propagation();
+                cx.new(|_| chat_dropzone::SplitPillGhost {
+                    title: payload.title.clone(),
+                })
+            })
             .into_any_element()
     }
 }

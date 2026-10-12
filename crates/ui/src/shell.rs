@@ -2033,6 +2033,13 @@ pub struct Shell {
     split_panes: std::collections::HashMap<String, split_panes::ChatPane>,
     /// The shown split's layout key, cached for the window fit.
     split_layout: Option<String>,
+    /// Where a chat carried over a conversation would land.
+    chat_drop_zone: Option<chat_dropzone::ChatDropZone>,
+    /// Each conversation's composer bounds as last painted, by chat id.
+    chat_drop_composers: std::collections::HashMap<
+        String,
+        std::rc::Rc<std::cell::Cell<Option<gpui::Bounds<Pixels>>>>,
+    >,
     side_chat_creating: bool,
     browsers: std::collections::HashMap<u64, Entity<crate::browser::BrowserSurface>>,
     browser_subs: std::collections::HashMap<u64, Subscription>,
@@ -2556,6 +2563,8 @@ impl Shell {
             side_chat_seq: 0,
             split_panes: std::collections::HashMap::new(),
             split_layout: None,
+            chat_drop_zone: None,
+            chat_drop_composers: std::collections::HashMap::new(),
             side_chat_creating: false,
             browsers: std::collections::HashMap::new(),
             browser_subs: std::collections::HashMap::new(),
@@ -9303,6 +9312,12 @@ impl Shell {
                             this.cancel_sidebar_session_transfer(cx);
                         },
                     ))
+                    // A pill dropped back on the list leaves its split.
+                    .on_drop::<chat_dropzone::SplitPillDrag>(cx.listener(
+                        |this, payload: &chat_dropzone::SplitPillDrag, _, cx| {
+                            this.close_split_pane(&payload.chat_id, cx);
+                        },
+                    ))
                     .px(px(Theme::SPACE_SM))
                     .flex()
                     .flex_col()
@@ -11259,7 +11274,17 @@ impl Shell {
                 - 24.0,
             cx,
         );
-        self.chat_dropzone("chat-dropzone", self.composer.clone(), cx)
+        // A session carried over an open chat may open beside it.
+        let drop_anchor =
+            (has_selection && !self.active_chat.is_empty()).then(|| self.active_chat.clone());
+        let session_overlay = match &drop_anchor {
+            Some(anchor) => self.chat_drop_overlay(anchor, cx),
+            None => Some(Self::mention_drop_overlay(theme).into_any_element()),
+        };
+        let composer_probe = drop_anchor
+            .as_deref()
+            .map(|anchor| self.chat_drop_composer_probe(anchor));
+        self.chat_dropzone("chat-dropzone", self.composer.clone(), drop_anchor, cx)
             .debug_selector(|| "chat-dropzone".into())
             .track_focus(&self.navigation_focus.main)
             .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
@@ -11397,10 +11422,12 @@ impl Shell {
                             crate::composer_dock::docked_composer(
                                 div()
                                     .id("persistent-composer")
+                                    .debug_selector(|| "persistent-composer".into())
                                     .relative()
                                     .w(px(composer_width))
                                     .opacity(composer_opacity)
                                     .mx_auto()
+                                    .children(composer_probe)
                                     .child(self.composer.clone())
                                     .children(if has_selection {
                                         self.render_jump_to_bottom(cx)
@@ -11421,7 +11448,7 @@ impl Shell {
                     .child(self.render_terminal_container(terminal_geometry, window, cx))
             })
             .child(Self::attachment_drop_overlay(theme))
-            .child(Self::mention_drop_overlay(theme))
+            .children(session_overlay)
             .into_any_element()
     }
 
@@ -13640,6 +13667,10 @@ impl Render for Shell {
             .on_drag_move::<SidebarSessionDrag>(cx.listener(Self::contain_pinned_session_drag))
             .on_drop::<SidebarSessionDrag>(cx.listener(|this, _, _, cx| {
                 this.cancel_sidebar_session_transfer(cx);
+            }))
+            .on_drop::<chat_dropzone::SplitPillDrag>(cx.listener(|this, _, _, cx| {
+                this.chat_drop_zone = None;
+                cx.notify();
             }))
             .on_mouse_up(
                 MouseButton::Left,
@@ -18627,11 +18658,11 @@ mod settings_modal_regressions {
     /// The full shell draws its sidebar as a cached view after its own
     /// render, so the lifted row must be built and drawn within one frame.
     /// Carried out of the sidebar it follows the pointer, and dropped on a
-    /// conversation it becomes a chat chip in that composer.
+    /// conversation's transcript it opens beside it, on the side it was
+    /// dropped (its composer mentions it instead: see
+    /// `carried_sessions_mention_from_the_composer_and_split_from_the_transcript`).
     #[gpui::test]
-    fn a_dragged_session_leaves_the_sidebar_and_drops_as_a_chat_mention(
-        cx: &mut TestAppContext,
-    ) {
+    fn a_dragged_session_leaves_the_sidebar_and_drops_beside_the_chat(cx: &mut TestAppContext) {
         let dir = tempfile::tempdir().unwrap();
         init_settings_test(settings::UiSettings::default(), dir.path(), cx);
         let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
@@ -18690,11 +18721,9 @@ mod settings_modal_regressions {
         cx.run_until_parked();
         cx.update(|window, cx| window.draw(cx).clear());
         shell.read_with(cx, |shell, cx| {
-            let text = shell.composer.read(cx).input.read(cx).text().to_owned();
-            assert!(
-                text.contains("[Chat older](zeron-chat:older)"),
-                "the drop mentions the chat: {text:?}"
-            );
+            assert_eq!(shell.split_views(cx)[0].chats, ["newer", "older"]);
+            assert_eq!(shell.state.read(cx).selected_chat.as_deref(), Some("older"));
+            assert!(shell.composer.read(cx).input.read(cx).text().is_empty());
             assert!(shell.sidebar_session_transfer.is_none());
         });
     }

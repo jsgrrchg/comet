@@ -396,6 +396,6 @@ fn the_sidebar_lists_a_split_once_where_its_first_member_would(cx: &mut TestAppC
         .unwrap();
     cx.run_until_parked();
     window
-        .update(cx, |shell, _, cx| assert_eq!(shell.active_chat, "c"))
+        .update(cx, |shell, _, _| assert_eq!(shell.active_chat, "c"))
         .unwrap();
 }

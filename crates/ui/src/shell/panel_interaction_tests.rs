@@ -434,3 +434,66 @@ fn side_chat_menu_rename_keeps_the_editor_visible_without_opening_files(cx: &mut
     let card = cx.debug_bounds("session-lanes").unwrap();
     assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
 }
+
+fn check_side_chat_rename_scroll(cx: &mut TestAppContext, width: f32, reduced_motion: bool) {
+    let (_dir, shell, cx) = setup(cx);
+    cx.simulate_resize(gpui::size(px(width), px(900.0)));
+    cx.update(|_, cx| motion::set_reduced_motion(cx, reduced_motion));
+    change(&shell, cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            let now = Utc::now();
+            for index in 0..40 {
+                state.chats.push(
+                    serde_json::from_value(serde_json::json!({
+                        "id": format!("side-{index}"), "title": format!("Side {index}"),
+                        "parentChatId": "a", "deviceId": "local", "archived": false,
+                        "createdAt": now - chrono::Duration::minutes(index),
+                    }))
+                    .unwrap(),
+                );
+            }
+            cx.notify();
+        });
+    });
+    settled(&shell, cx);
+    assert!(cx.debug_bounds("session-lanes").is_none());
+
+    // Reveal a paged-out row from a hidden card, then a row above the new
+    // scroll position. Both directions must leave the whole editor visible.
+    for (chat, selector) in [
+        ("side-39", "session-lanes-chat-side-39-title-editor"),
+        ("side-0", "session-lanes-chat-side-0-title-editor"),
+    ] {
+        change(&shell, cx, |shell, _, cx| {
+            shell.open_rename_chat(chat.into(), cx);
+        });
+        settled(&shell, cx);
+        for _ in 0..4 {
+            cx.run_until_parked();
+            draw(&shell, cx, 100);
+        }
+        let field = cx.debug_bounds(selector).unwrap();
+        let card = cx.debug_bounds("session-lanes").unwrap();
+        assert!(
+            field.top() >= card.top() && field.bottom() <= card.bottom(),
+            "{chat}'s editor {field:?} is outside the card {card:?}"
+        );
+        cx.update(|window, cx| {
+            shell.read_with(cx, |shell, cx| {
+                let rename = shell.chat_rename.as_ref().unwrap();
+                assert_eq!(rename.chat_id, chat);
+                assert!(rename.input.focus_handle(cx).is_focused(window));
+            });
+        });
+    }
+}
+
+#[gpui::test]
+fn side_chat_rename_scrolls_to_its_row_in_a_docked_card(cx: &mut TestAppContext) {
+    check_side_chat_rename_scroll(cx, 1600.0, false);
+}
+
+#[gpui::test]
+fn side_chat_rename_scrolls_to_its_row_in_a_floating_card_without_motion(cx: &mut TestAppContext) {
+    check_side_chat_rename_scroll(cx, 1000.0, true);
+}

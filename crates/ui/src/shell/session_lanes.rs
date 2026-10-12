@@ -31,6 +31,7 @@ pub(super) struct LaneState {
     finished_open: bool,
     shown_chats: usize,
     shown_finished: usize,
+    scroll: gpui::ScrollHandle,
 }
 
 impl LaneState {
@@ -322,6 +323,34 @@ impl Shell {
         true
     }
 
+    /// Reveal the editor using the laid-out row, including while the card
+    /// opens. Paging alone can leave the focused field below the viewport.
+    fn keep_session_lane_rename_in_view(
+        &mut self,
+        row: gpui::Bounds<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.chat_rename_revealing() {
+            return;
+        }
+        let scroll = &self.session_lanes.scroll;
+        let viewport = scroll.bounds();
+        let inset = px(popover::CARD_INSET);
+        let delta = if row.top() < viewport.top() + inset {
+            row.top() - (viewport.top() + inset)
+        } else if row.bottom() > viewport.bottom() - inset {
+            row.bottom() - (viewport.bottom() - inset)
+        } else {
+            return;
+        };
+        let offset = scroll.offset();
+        let y = (offset.y - delta).clamp(-scroll.max_offset().y, px(0.0));
+        if y != offset.y {
+            scroll.set_offset(gpui::point(offset.x, y));
+            cx.notify();
+        }
+    }
+
     /// The lanes card for the open chat, at most `max_height` tall and
     /// scrolling past it; `floating` over the transcript, it casts the
     /// popover's shadow.
@@ -449,6 +478,7 @@ impl Shell {
             .id("session-lanes-body")
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.session_lanes.scroll)
             // The inset lives inside the scroller, so dividers bleed edge to
             // edge as they do in the session card.
             .p(px(popover::CARD_INSET))
@@ -483,7 +513,9 @@ impl Shell {
     ) -> gpui::Stateful<gpui::Div> {
         let key = format!("session-lanes-chat-{}", row.chat_id);
         let mark = status_mark(key.clone(), row.status, view, theme, cx);
-        let title = match self.rename_input_for(&row.chat_id, ChatRenameSurface::SessionCard) {
+        let rename_input = self.rename_input_for(&row.chat_id, ChatRenameSurface::SessionCard);
+        let revealing = rename_input.is_some() && self.chat_rename_revealing();
+        let title = match rename_input {
             Some(input) => chat_title_editor(format!("{key}-title-editor").into(), input, theme),
             None => row_title(format!("{key}-title"), row.title.clone()),
         };
@@ -518,6 +550,25 @@ impl Shell {
             )
             .child(popover::picker_icon_slot(mark))
             .child(title)
+            .when(revealing, |row| {
+                let shell = cx.weak_entity();
+                row.child(
+                    gpui::canvas(
+                        |_, _, _| {},
+                        move |bounds, _, window, cx| {
+                            window.defer(cx, move |_, cx| {
+                                shell
+                                    .update(cx, |this, cx| {
+                                        this.keep_session_lane_rename_in_view(bounds, cx)
+                                    })
+                                    .ok();
+                            });
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
             .children(row.change_request.clone().map(|summary| {
                 crate::change_requests::pull_request_badge(
                     format!("{key}-pr").into(),

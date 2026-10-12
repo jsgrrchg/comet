@@ -344,6 +344,10 @@ impl Shell {
     /// the selected chat's split and none otherwise. Each chat's draft moves
     /// between the main composer and its pane as it enters or leaves.
     pub(super) fn sync_split_panes(&mut self, cx: &mut Context<Self>) {
+        // Runs on every app-state change: nothing to do without splits.
+        if self.split_panes.is_empty() && self.split_views(cx).is_empty() {
+            return;
+        }
         let (synced, keep) = {
             let state = self.state.read(cx);
             let keep = state

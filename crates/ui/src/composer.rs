@@ -7908,7 +7908,7 @@ impl Composer {
                     .then(|| (chat.last_message_at.unwrap_or(chat.created_at), chat, title))
             })
             .collect();
-        chats.sort_by(|left, right| right.0.cmp(&left.0));
+        chats.sort_by_key(|(at, ..)| std::cmp::Reverse(*at));
         chats
             .into_iter()
             .take(MENTION_CHAT_ROWS)

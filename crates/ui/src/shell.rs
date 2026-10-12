@@ -13912,13 +13912,20 @@ impl Render for Shell {
                 // live while the window is active (idempotent guard inside;
                 // one extra frame settles it).
                 if window_active {
-                    let unseen_selected = {
+                    // Every pane of a split on screen is being looked at.
+                    let unseen = {
                         let s = self.state.read(cx);
-                        s.selected_chat_row()
-                            .filter(|c| c.unseen())
+                        s.chats
+                            .iter()
+                            .filter(|c| {
+                                (s.selected_chat.as_deref() == Some(c.id.as_str())
+                                    || self.split_panes.contains_key(&c.id))
+                                    && c.unseen()
+                            })
                             .map(|c| c.id.clone())
+                            .collect::<Vec<_>>()
                     };
-                    if let Some(chat_id) = unseen_selected {
+                    for chat_id in unseen {
                         self.state
                             .update(cx, |s, cx| s.mark_chat_seen(&chat_id, cx));
                     }

@@ -399,3 +399,61 @@ fn the_sidebar_lists_a_split_once_where_its_first_member_would(cx: &mut TestAppC
         .update(cx, |shell, _, _| assert_eq!(shell.active_chat, "c"))
         .unwrap();
 }
+
+/// A turn that finishes in an unfocused pane is seen there: no Done badge
+/// waits for a click on a chat that is on screen.
+#[gpui::test]
+fn chats_in_every_pane_are_marked_seen(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = shell_window(dir.path(), cx);
+    window
+        .update(cx, |shell, window, cx| {
+            shell.debug_gate = Some(GatePhase::Ready);
+            shell.splash = SplashPhase::Gone;
+            shell.open_chat_in_split("b".into(), cx);
+            shell.focus_split_pane("a", cx);
+            window.activate_window();
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            shell.state.update(cx, |state, cx| {
+                for chat in state
+                    .chats
+                    .iter_mut()
+                    .filter(|c| c.id == "b" || c.id == "c")
+                {
+                    chat.last_message_at = Some(Utc::now());
+                    chat.last_seen_at = None;
+                }
+                cx.notify();
+            });
+            assert!(
+                shell
+                    .state
+                    .read(cx)
+                    .chats
+                    .iter()
+                    .any(|c| c.id == "b" && c.unseen())
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear())
+        .unwrap();
+    window
+        .update(cx, |shell, _, cx| {
+            let unseen = |id: &str| {
+                shell
+                    .state
+                    .read(cx)
+                    .chats
+                    .iter()
+                    .any(|c| c.id == id && c.unseen())
+            };
+            assert!(!unseen("b"), "b is on screen beside a");
+            assert!(unseen("c"), "c is not");
+        })
+        .unwrap();
+}

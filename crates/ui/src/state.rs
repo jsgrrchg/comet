@@ -876,6 +876,9 @@ pub struct AppState {
     /// the engine LRU — closing a tab MUST go through
     /// [`Self::unwatch_subagent_doc`].
     sub_watch_tasks: HashMap<String, Task<()>>,
+    /// A chat view's state follows its parent's workspace lists (see
+    /// [`Self::mirror_parent`]).
+    parent_mirror: Option<gpui::Subscription>,
 }
 
 /// Text/reasoning growth changes the transcript without changing session
@@ -974,6 +977,7 @@ impl AppState {
             change_requests_visible: true,
             sub_transcripts: HashMap::new(),
             sub_watch_tasks: HashMap::new(),
+            parent_mirror: None,
             auto_selected: false,
             chats_synced: false,
             spaces_synced: false,
@@ -2439,25 +2443,134 @@ impl AppState {
         unsaved: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        let source = parent.read(cx);
-        let engine = source.engine.clone();
         let mut state = Self::new();
-        state.chats = source.chats.clone();
-        if !state.chats.iter().any(|c| c.id == chat.id) {
-            state.chats.push(chat.clone());
-        }
-        state.spaces = source.spaces.clone();
-        state.devices = source.devices.clone();
-        state.data_dir = source.data_dir.clone();
         state.auto_selected = true;
         state.pending_side_chat = Some(chat.clone());
         state.unsaved_side_chat = unsaved;
-        if let Some(engine) = engine {
-            state.attach_engine(engine, cx);
+        state.mirror_parent(parent, cx);
+        if !state.chats.iter().any(|c| c.id == chat.id) {
+            state.chats.push(chat.clone());
         }
+        state.parent_mirror = Some(cx.observe(parent, |state, parent, cx| {
+            if state.mirror_parent(&parent, cx) {
+                cx.notify();
+            }
+        }));
         state.select_chat(Some(chat.id), cx);
         state.watch_clock_transitions(cx);
         state
+    }
+
+    /// A chat view's state (a side chat, a split pane) shares the parent's
+    /// engine and copies its workspace lists rather than standing up watches
+    /// of its own: only its chat's transcript and queue are its own streams.
+    /// Returns whether anything observable changed.
+    fn mirror_parent(&mut self, parent: &Entity<Self>, cx: &mut Context<Self>) -> bool {
+        // Copy only what moved: the parent notifies on every selection,
+        // presence and transcript change, most of which leave these alone.
+        let p = parent.read(cx);
+        let differs = |own: bool| own.then_some(());
+        let engine = p.engine.clone();
+        let connection = differs(self.connection != p.connection).map(|_| p.connection.clone());
+        let workspace_scope = p.workspace_scope;
+        let local_device_id =
+            differs(self.local_device_id != p.local_device_id).map(|_| p.local_device_id.clone());
+        let data_dir = differs(self.data_dir != p.data_dir).map(|_| p.data_dir.clone());
+        let auth = p
+            .auth
+            .clone()
+            .filter(|auth| self.auth.as_ref() != Some(auth));
+        let chats = differs(self.chats != p.chats || self.chats_synced != p.chats_synced)
+            .map(|_| (p.chats_synced, p.chats.clone()));
+        let spaces = differs(self.spaces != p.spaces || self.spaces_synced != p.spaces_synced)
+            .map(|_| (p.spaces_synced, p.spaces.clone()));
+        let devices = differs(self.devices != p.devices).map(|_| p.devices.clone());
+        let sessions = differs(self.sessions != p.sessions).map(|_| p.sessions.clone());
+        let connectivity = (p.connectivity_observed
+            && (!self.connectivity_observed || self.connectivity != p.connectivity))
+            .then(|| p.connectivity.clone());
+        let sidebar_preferences = differs(self.sidebar_preferences != p.sidebar_preferences)
+            .map(|_| p.sidebar_preferences.clone());
+        let transfers = differs(self.transfers != p.transfers).map(|_| p.transfers.clone());
+        let harness_updates =
+            differs(self.harness_updates != p.harness_updates).map(|_| p.harness_updates.clone());
+
+        let mut changed = false;
+        match (&self.engine, &engine) {
+            (Some(own), Some(theirs)) if own.same_connection(theirs) => {}
+            (_, Some(theirs)) => {
+                // A (re)attached runtime: re-open the chat's streams on it.
+                self.engine = Some(theirs.clone());
+                if let Some(chat_id) = self.selected_chat.clone()
+                    && !self.is_unsaved_side_chat(&chat_id)
+                {
+                    self.start_chat_watches(chat_id, cx);
+                }
+                changed = true;
+            }
+            (Some(_), None) => {
+                self.engine = None;
+                self.transcript_task = None;
+                self.queue_task = None;
+                changed = true;
+            }
+            (None, None) => {}
+        }
+        if let Some(connection) = connection {
+            self.connection = connection;
+            changed = true;
+        }
+        if self.workspace_scope != workspace_scope {
+            self.workspace_scope = workspace_scope;
+            changed = true;
+        }
+        if let Some(local_device_id) = local_device_id {
+            self.local_device_id = local_device_id;
+            self.link_roots_revision = self.link_roots_revision.wrapping_add(1);
+            changed = true;
+        }
+        if let Some(data_dir) = data_dir {
+            self.data_dir = data_dir;
+        }
+        if let Some(auth) = auth {
+            changed |= self.apply_auth(auth);
+        }
+        match chats {
+            Some((true, chats)) => changed |= self.apply_chats(chats),
+            Some((false, chats)) if self.chats.is_empty() => {
+                self.chats = chats;
+                changed = true;
+            }
+            _ => {}
+        }
+        match spaces {
+            Some((true, spaces)) => changed |= self.apply_spaces(spaces),
+            Some((false, spaces)) if self.spaces.is_empty() => {
+                self.spaces = spaces;
+                changed = true;
+            }
+            _ => {}
+        }
+        if let Some(devices) = devices {
+            changed |= self.apply_devices(devices);
+        }
+        if let Some(sessions) = sessions {
+            changed |= self.apply_sessions(sessions);
+        }
+        if let Some(connectivity) = connectivity {
+            changed |= self.apply_connectivity(connectivity);
+        }
+        if let Some(preferences) = sidebar_preferences {
+            changed |= self.apply_sidebar_preferences(preferences);
+        }
+        if let Some(transfers) = transfers {
+            self.transfers = transfers;
+            changed = true;
+        }
+        if let Some(statuses) = harness_updates {
+            changed |= self.apply_harness_updates(statuses);
+        }
+        changed
     }
 
     /// This is a side chat's state whose chat its first send has yet to mint.
@@ -5434,6 +5547,41 @@ mod tests {
             state.selected_chat_row().unwrap().parent_chat_id.as_deref(),
             Some("main")
         );
+    }
+
+    /// A chat view follows its parent's lists without watches of its own,
+    /// and drops its selection when the parent's list loses the chat.
+    #[gpui::test]
+    fn chat_view_state_mirrors_its_parent(cx: &mut gpui::TestAppContext) {
+        let parent = cx.new(|_| {
+            let mut state = AppState::new();
+            state.apply_chats(vec![chat("main", 0, None), chat("other", 1, None)]);
+            state
+        });
+        let view =
+            cx.new(|cx| AppState::side_chat_state(&parent, chat("other", 1, None), false, cx));
+        view.read_with(cx, |view, _| {
+            assert!(view.watch_tasks.is_empty());
+            assert_eq!(view.selected_chat.as_deref(), Some("other"));
+            assert_eq!(view.chats.len(), 2);
+        });
+        parent.update(cx, |state, cx| {
+            let mut renamed = chat("other", 1, None);
+            renamed.title = Some("Renamed".into());
+            state.apply_chats(vec![chat("main", 0, None), renamed]);
+            cx.notify();
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.selected_chat_row().and_then(|c| c.title.as_deref()),
+                Some("Renamed")
+            );
+        });
+        parent.update(cx, |state, cx| {
+            state.apply_chats(vec![chat("main", 0, None)]);
+            cx.notify();
+        });
+        view.read_with(cx, |view, _| assert_eq!(view.selected_chat, None));
     }
 
     #[test]

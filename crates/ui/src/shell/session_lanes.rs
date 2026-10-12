@@ -161,13 +161,6 @@ impl SubagentLane {
         Self { active, finished }
     }
 
-    pub fn running(&self) -> usize {
-        self.active
-            .iter()
-            .filter(|row| row.status == Some(SubagentStatus::Running))
-            .count()
-    }
-
     pub fn failed(&self) -> usize {
         self.finished
             .iter()
@@ -310,17 +303,6 @@ fn row_title(id: String, title: SharedString) -> AnyElement {
         .into_any_element()
 }
 
-/// A section heading, with any badge trailing its label.
-fn heading(theme: &Theme, label: &str, badge: Option<AnyElement>) -> AnyElement {
-    popover::menu_heading(theme, label)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.0))
-        .children(badge)
-        .into_any_element()
-}
-
 impl Shell {
     /// Show the card with `chat_id`'s side-chat row paged in, so an inline
     /// rename has its row on screen; false when it is not one of the open
@@ -360,7 +342,8 @@ impl Shell {
         };
         let rail = theme.text_muted.opacity(0.25);
         let view = cx.entity_id();
-        let mut rows: Vec<AnyElement> = vec![heading(theme, "Side chats", None)];
+        let mut rows: Vec<AnyElement> =
+            vec![popover::menu_heading(theme, "Side chats").into_any_element()];
 
         // ── Side chats, then the two ways to start one.
         let shown = LaneState::shown(self.session_lanes.shown_chats);
@@ -412,13 +395,9 @@ impl Shell {
 
         // ── Subagents: what runs rides the lane, the settled fold away.
         if !subagents.is_empty() {
-            let running = subagents.running();
             let failed = subagents.failed();
-            let pill = (running > 0).then(|| {
-                crate::running_pill::running_pill("session-lanes-subagents", running as u32, theme)
-            });
             rows.push(popover::picker_divider().into_any_element());
-            rows.push(heading(theme, "Subagents", pill));
+            rows.push(popover::menu_heading(theme, "Subagents").into_any_element());
             let SubagentLane { active, finished } = subagents;
             let open = self.session_lanes.finished_open;
             let shown = LaneState::shown(self.session_lanes.shown_finished);
@@ -826,7 +805,7 @@ mod tests {
                 "main--sub--old-done"
             ]
         );
-        assert_eq!((lane.running(), lane.failed()), (3, 1));
+        assert_eq!(lane.failed(), 1);
     }
 
     #[test]

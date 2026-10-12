@@ -17,8 +17,9 @@ pub(super) struct ChatPane {
 /// The hairline between two panes.
 pub(super) const SPLIT_DIVIDER_WIDTH: f32 = 1.0;
 
-/// Narrowest a pane gets from dragging a divider.
-const SPLIT_PANE_MIN: f32 = 240.0;
+/// Narrowest a pane gets from dragging a divider, and the room each pane
+/// claims in the window fit.
+pub(super) const SPLIT_PANE_MIN: f32 = 240.0;
 
 /// Half the divider's grab target, either side of the hairline.
 const SPLIT_DIVIDER_HITBOX_HALF: f32 = 4.0;
@@ -102,7 +103,18 @@ impl Shell {
     /// The panels entry the window fit reads (it runs without an `App`):
     /// the shown split's, else the active chat's.
     pub(super) fn fit_panels_key(&self) -> &str {
-        self.split_layout.as_deref().unwrap_or(&self.active_chat)
+        self.split_layout
+            .as_ref()
+            .map_or(&self.active_chat, |(key, _)| key)
+    }
+
+    /// The width the conversation column must keep: one chat's, or room
+    /// for each pane of the split on screen.
+    pub(super) fn conversation_min(&self) -> f32 {
+        match &self.split_layout {
+            Some((_, panes)) => (SPLIT_PANE_MIN * *panes as f32).max(CHAT_PANEL_MIN),
+            None => CHAT_PANEL_MIN,
+        }
     }
 
     /// Re-derive [`Self::fit_panels_key`] after the selection or the splits
@@ -111,7 +123,7 @@ impl Shell {
         self.split_layout = (!self.active_chat.is_empty())
             .then(|| self.split_of_chat(&self.active_chat, cx))
             .flatten()
-            .map(|view| split_layout_key(&view.id));
+            .map(|view| (split_layout_key(&view.id), view.chats.len()));
     }
 
     /// [`Self::layout_key`] for a chat that may not be the active one.

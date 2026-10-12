@@ -21,10 +21,12 @@ pub(super) fn panel_content_tween(current: f32, from: f32, to: f32) -> (f32, f32
 /// The surface host's half of `available`, the width the tools leave for
 /// the conversation and the host. When halves would break a minimum, the
 /// host keeps its own and the conversation keeps as much of its own as fits.
-pub(super) fn content_split(available: f32) -> f32 {
+/// `chat_min` is the conversation's own minimum: more than one chat's for a
+/// split's panes.
+pub(super) fn content_split(available: f32, chat_min: f32) -> f32 {
     (available / 2.0)
         .max(RIGHT_PANE_MIN)
-        .min((available - CHAT_PANEL_MIN).max(RIGHT_PANE_MIN))
+        .min((available - chat_min).max(RIGHT_PANE_MIN))
 }
 
 /// What the Files and surface host columns paint, read before an action
@@ -60,8 +62,10 @@ pub(super) struct HorizontalPanelFit {
 }
 
 /// Everything [`horizontal_panel_fit`] reads, in its argument order.
-pub(super) type FitInputs = (f32, f32, (bool, u64), (bool, u64), (bool, u64), bool);
+pub(super) type FitInputs = (f32, f32, (bool, u64), (bool, u64), (bool, u64), bool, f32);
 
+/// `chat_min` is the conversation's own minimum: a split's panes need more
+/// than one chat, so the side columns give way sooner.
 pub(super) fn horizontal_panel_fit(
     viewport: f32,
     sidebar_width: f32,
@@ -69,6 +73,7 @@ pub(super) fn horizontal_panel_fit(
     right: (bool, u64),
     files: (bool, u64),
     expanded: bool,
+    chat_min: f32,
 ) -> HorizontalPanelFit {
     let mut visible = [
         (AuxiliaryPanel::Sidebar, sidebar.0, sidebar.1),
@@ -80,7 +85,7 @@ pub(super) fn horizontal_panel_fit(
     // the ordinary fit for the other columns so expansion cannot resurrect a
     // hidden panel or widen a sidebar whose preferred width was squeezed.
     // Below the chat + right minima, the right pane alone may still take over.
-    let narrow_takeover = expanded && right.0 && viewport < CHAT_PANEL_MIN + RIGHT_PANE_MIN;
+    let narrow_takeover = expanded && right.0 && viewport < chat_min + RIGHT_PANE_MIN;
     if narrow_takeover {
         visible[0].1 = false;
         visible[2].1 = false;
@@ -92,7 +97,7 @@ pub(super) fn horizontal_panel_fit(
         let chat_floor = if right_open && narrow_takeover {
             0.0
         } else {
-            CHAT_PANEL_MIN
+            chat_min
         };
         let minimum = chat_floor
             + if sidebar_open { SIDEBAR_MIN } else { 0.0 }
@@ -198,6 +203,7 @@ impl Shell {
                 panels.files_opened_at,
             ),
             self.right_pane_expanded,
+            self.conversation_min(),
         );
         let memo = &self.fit_memo[usize::from(closing)];
         if let Some((memo, fit)) = memo.get()
@@ -205,8 +211,16 @@ impl Shell {
         {
             return fit;
         }
-        let (viewport, sidebar_width, sidebar, right, files, expanded) = inputs;
-        let fit = horizontal_panel_fit(viewport, sidebar_width, sidebar, right, files, expanded);
+        let (viewport, sidebar_width, sidebar, right, files, expanded, chat_min) = inputs;
+        let fit = horizontal_panel_fit(
+            viewport,
+            sidebar_width,
+            sidebar,
+            right,
+            files,
+            expanded,
+            chat_min,
+        );
         memo.set(Some((inputs, fit)));
         fit
     }
@@ -372,8 +386,10 @@ impl Shell {
             return false;
         }
         let files = self.files_width_for(fit, sidebar, cx);
-        self.settings.right_pane_width =
-            content_split((self.viewport_width - sidebar - files).max(0.0));
+        self.settings.right_pane_width = content_split(
+            (self.viewport_width - sidebar - files).max(0.0),
+            self.conversation_min(),
+        );
         true
     }
 
@@ -567,7 +583,7 @@ impl Shell {
                     let right = self
                         .settings
                         .right_pane_width
-                        .min((available - CHAT_PANEL_MIN).max(0.0));
+                        .min((available - self.conversation_min()).max(0.0));
                     (available - right).max(0.0)
                 });
             retained.max(target).min(available)

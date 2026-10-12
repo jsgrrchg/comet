@@ -2049,8 +2049,9 @@ pub struct Shell {
     side_chat_seq: u64,
     /// The panes of the split on screen, by chat id (see `split_panes.rs`).
     split_panes: std::collections::HashMap<String, split_panes::ChatPane>,
-    /// The shown split's layout key, cached for the window fit.
-    split_layout: Option<String>,
+    /// The shown split's layout key and pane count, cached for the window
+    /// fit.
+    split_layout: Option<(String, usize)>,
     /// Where a chat carried over a conversation would land.
     chat_drop_zone: Option<chat_dropzone::ChatDropZone>,
     /// Each conversation's composer bounds as last painted, by chat id.
@@ -3328,7 +3329,7 @@ impl Shell {
                 self.settings.right_pane_width.min(right_pane_max_width(
                     self.viewport_width - files,
                     sidebar,
-                    CHAT_PANEL_MIN,
+                    self.conversation_min(),
                 ))
             }
         }

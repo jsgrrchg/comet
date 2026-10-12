@@ -38,6 +38,7 @@ struct FilesPanelLayout {
 /// `surface_reveal` is how far the surface host is open, from 0 to 1. Files
 /// yields the host's minimum in step with its open/close tween rather than
 /// all at once when the flag flips.
+#[cfg(test)]
 fn files_panel_layout(
     viewport: f32,
     sidebar: f32,
@@ -45,6 +46,27 @@ fn files_panel_layout(
     visible: f32,
     surface_reveal: f32,
     expanded: bool,
+) -> FilesPanelLayout {
+    files_panel_layout_with(
+        viewport,
+        sidebar,
+        preferred,
+        visible,
+        surface_reveal,
+        expanded,
+        CHAT_PANEL_MIN,
+    )
+}
+
+/// [`files_panel_layout`] beside a conversation that needs `chat_min`.
+fn files_panel_layout_with(
+    viewport: f32,
+    sidebar: f32,
+    preferred: f32,
+    visible: f32,
+    surface_reveal: f32,
+    expanded: bool,
+    chat_min: f32,
 ) -> FilesPanelLayout {
     let surfaces_open = surface_reveal > 0.0;
     let available = (viewport - sidebar).max(0.0);
@@ -54,11 +76,11 @@ fn files_panel_layout(
     let surface_chat_min = if surfaces_open && expanded {
         0.0
     } else {
-        CHAT_PANEL_MIN
+        chat_min
     };
     let surface_min = RIGHT_PANE_MIN * surface_reveal.clamp(0.0, 1.0);
     let max_width = if preferred > 0.0 {
-        (available - CHAT_PANEL_MIN - surface_min).max(0.0)
+        (available - chat_min - surface_min).max(0.0)
     } else {
         0.0
     };
@@ -78,7 +100,7 @@ impl Shell {
 
     fn files_layout(&self, visible: f32, cx: &App) -> FilesPanelLayout {
         let fit = self.horizontal_fit();
-        files_panel_layout(
+        files_panel_layout_with(
             self.viewport_width,
             self.sidebar_now(),
             if fit.files && (self.files_panel_open(cx) || self.tween_active(self.files_tween)) {
@@ -95,6 +117,7 @@ impl Shell {
                     .map_or(0.0, |width| (width / RIGHT_PANE_MIN).clamp(0.0, 1.0))
             },
             self.right_pane_expanded && fit.right,
+            self.conversation_min(),
         )
     }
 
@@ -163,13 +186,14 @@ impl Shell {
             0.0
         };
         let right = fit.right && self.right_pane_open(cx);
-        files_panel_layout(
+        files_panel_layout_with(
             self.viewport_width,
             sidebar,
             preferred,
             preferred,
             if right { 1.0 } else { 0.0 },
             self.right_pane_expanded && right,
+            self.conversation_min(),
         )
         .width
     }

@@ -479,3 +479,31 @@ fn focus_steps_between_panes_and_stops_at_the_ends(cx: &mut TestAppContext) {
             .unwrap();
     }
 }
+
+/// A split's panes claim their room in the window fit: where one chat
+/// leaves space for the sidebar and the right pane, three panes evict the
+/// column opened first.
+#[test]
+fn split_panes_claim_room_in_the_window_fit() {
+    use panel_layout::horizontal_panel_fit;
+    let one = horizontal_panel_fit(
+        1100.0,
+        256.0,
+        (true, 1),
+        (true, 2),
+        (false, 0),
+        false,
+        300.0,
+    );
+    assert!(one.sidebar && one.right);
+    let three = horizontal_panel_fit(
+        1100.0,
+        256.0,
+        (true, 1),
+        (true, 2),
+        (false, 0),
+        false,
+        3.0 * split_panes::SPLIT_PANE_MIN,
+    );
+    assert!(!three.sidebar && three.right);
+}

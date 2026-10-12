@@ -457,3 +457,25 @@ fn chats_in_every_pane_are_marked_seen(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn focus_steps_between_panes_and_stops_at_the_ends(cx: &mut TestAppContext) {
+    let dir = tempfile::tempdir().unwrap();
+    let window = shell_window(dir.path(), cx);
+    window
+        .update(cx, |shell, _, cx| {
+            shell.open_chat_in_split("b".into(), cx);
+            shell.open_chat_in_split("c".into(), cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    for (forward, expected) in [(true, "c"), (false, "b"), (false, "a"), (false, "a")] {
+        window
+            .update(cx, |shell, _, cx| shell.step_split_focus(forward, cx))
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |shell, _, _| assert_eq!(shell.active_chat, expected))
+            .unwrap();
+    }
+}

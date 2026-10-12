@@ -294,6 +294,25 @@ impl Shell {
         self.open_chat(chat_id.to_string(), cx);
     }
 
+    /// Move focus to the pane left or right of the focused one, stopping at
+    /// the ends.
+    pub(super) fn step_split_focus(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(view) = self.shown_split(cx) else {
+            return;
+        };
+        let Some(at) = view.position(&self.active_chat) else {
+            return;
+        };
+        let target = if forward {
+            view.chats.get(at + 1)
+        } else {
+            at.checked_sub(1).and_then(|ix| view.chats.get(ix))
+        };
+        if let Some(target) = target.cloned() {
+            self.focus_split_pane(&target, cx);
+        }
+    }
+
     /// Keep the panes in step with the selection: a pane for each chat of
     /// the selected chat's split and none otherwise. Each chat's draft moves
     /// between the main composer and its pane as it enters or leaves.

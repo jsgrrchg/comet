@@ -681,12 +681,13 @@ pub fn modifier_send_label(is_macos: bool) -> &'static str {
 /// extends the match and appears on the page by construction
 /// (`every_shortcut_lands_in_a_rendered_group` holds the other half: its group
 /// name must be listed here).
-const GROUP_ORDER: [&str; 9] = [
+const GROUP_ORDER: [&str; 10] = [
     "Appearance",
     "Files",
     "Browser",
     "Panels",
     "Sessions",
+    "Split view",
     "Projects",
     "Jump to session",
     "Appshots",
@@ -711,6 +712,7 @@ fn group(id: ShortcutId) -> &'static str {
         | ShortcutId::NextSession
         | ShortcutId::PrevSession
         | ShortcutId::ArchiveSession => "Sessions",
+        ShortcutId::FocusPrevPane | ShortcutId::FocusNextPane => "Split view",
         ShortcutId::JumpSession(_) => "Jump to session",
     }
 }

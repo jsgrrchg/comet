@@ -128,7 +128,9 @@ actions!(
         OpenSettings,
         NextSession,
         PrevSession,
-        ArchiveSession
+        ArchiveSession,
+        FocusPrevPane,
+        FocusNextPane
     ]
 );
 
@@ -489,6 +491,22 @@ pub fn apply_keymap(
         KeyBinding::new(
             &valid_or_default(&keymap.archive_session, "mod-shift-a"),
             ArchiveSession,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.focus_prev_pane,
+                ShortcutId::FocusPrevPane.default_combo(),
+            ),
+            FocusPrevPane,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(
+                &keymap.focus_next_pane,
+                ShortcutId::FocusNextPane.default_combo(),
+            ),
+            FocusNextPane,
             None,
         ),
         KeyBinding::new(
@@ -13847,6 +13865,16 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ArchiveSession, _, cx| {
                 if matches!(this.route, Route::Chat) && !this.overlay_owns_keyboard(cx) {
                     this.archive_selected_chat(cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| {
+                if !this.overlay_owns_keyboard(cx) {
+                    this.step_split_focus(false, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| {
+                if !this.overlay_owns_keyboard(cx) {
+                    this.step_split_focus(true, cx);
                 }
             }))
             // A jump routes back to chat itself, so Settings is not a dead

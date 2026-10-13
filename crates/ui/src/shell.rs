@@ -83,6 +83,7 @@ use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_
 mod panel_interaction_tests;
 pub(crate) mod project_icon;
 mod pull_request_pane;
+mod session_hover_card;
 mod session_info;
 mod side_chats;
 mod sidebar_pins;
@@ -2131,6 +2132,8 @@ pub struct Shell {
     /// under a still pointer would otherwise never show its archive pill;
     /// while set, rows adopt the hover from a paint-time hit test instead.
     chat_hover_resync: bool,
+    /// The sidebar row whose hover card shows (or waits out its dwell).
+    session_hover_card: session_hover_card::SessionHoverCard,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
     /// In-flight reorder for the pinned section only.
@@ -2622,6 +2625,7 @@ impl Shell {
             project_icons: Default::default(),
             chat_status_hover: None,
             chat_hover_resync: false,
+            session_hover_card: Default::default(),
             sidebar_scroll: gpui::ScrollHandle::new(),
             pinned_session_drag: None,
             pinned_session_drag_generation: 0,
@@ -3290,6 +3294,7 @@ impl Shell {
         }
         let from = self.sidebar_now();
         let before = self.painted_panels(cx);
+        self.session_hover_card.dismiss();
         self.sidebar_edge_bounce = None;
         self.sidebar_resize_edge = None;
         self.pane_resize_active = None;
@@ -8329,6 +8334,22 @@ impl Shell {
         let rename_input = (search_query_none && !preview)
             .then(|| self.rename_input_for(&id, ChatRenameSurface::Sidebar))
             .flatten();
+        // Sidebar rows only: the palette's copy already spells out its row,
+        // and a row being renamed keeps the pointer's attention on the field.
+        let hover_card = (search_query_none
+            && !preview
+            && rename_input.is_none()
+            && self.session_hover_card.shown() == Some(id.as_str()))
+        .then(|| {
+            self.render_session_hover_card(
+                &id,
+                status_label.map(|label| (label, status_color)),
+                time_ago.clone(),
+                cx,
+            )
+        })
+        .flatten();
+        let card_id = id.clone();
         // Hover fades over transition-colors (zeron session-row.tsx) — both
         // the wash and the title brighten ride the same 150ms blend.
         let fade_key = format!("{row_id}-hover");
@@ -8386,6 +8407,9 @@ impl Shell {
                     cx.listener(move |this, hovered: &bool, window, cx| {
                         fade_hover(hovered, window, cx);
                         this.chat_hover_resync = false;
+                        if search_query_none {
+                            this.hover_session_card(&card_id, *hovered, cx);
+                        }
                         if *hovered {
                             if this.chat_status_hover.as_deref() != Some(hover_id.as_str()) {
                                 this.chat_status_hover = Some(hover_id.clone());
@@ -8398,6 +8422,13 @@ impl Shell {
                     })
                 })
                 .cursor_pointer()
+                // Pressing, scrolling or opening the menu puts the hover card
+                // away: the row has the pointer's intent now.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.dismiss_session_card(cx)),
+                )
+                .on_scroll_wheel(cx.listener(|this, _, _, cx| this.dismiss_session_card(cx)))
                 .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                     // The palette's copy of the row only opens; the sidebar's
                     // double-click edits the title in place.
@@ -8410,6 +8441,7 @@ impl Shell {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        this.dismiss_session_card(cx);
                         this.chat_menu.open(ChatMenuState {
                             tab: None,
                             chat_id: menu_id.clone(),
@@ -8483,6 +8515,35 @@ impl Shell {
                     .inset_0(),
                 )
             })
+            // gpui sends no hover-out to a row that unmounts or moves away
+            // under a still pointer (a collapsed sidebar, a resort), so the
+            // shown card re-checks its row by paint and hides once it lost it.
+            .when(hover_card.is_some(), |el| {
+                let shell = cx.weak_entity();
+                let chat_id = id.clone();
+                el.child(
+                    gpui::canvas(
+                        |bounds, window, _| {
+                            window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+                        },
+                        move |_, hitbox, window, cx| {
+                            if hitbox.is_hovered(window) {
+                                return;
+                            }
+                            window.defer(cx, move |_, cx| {
+                                shell
+                                    .update(cx, |this, cx| {
+                                        this.hover_session_card(&chat_id, false, cx)
+                                    })
+                                    .ok();
+                            });
+                        },
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+            })
+            .children(hover_card)
             // Line 1: "project @ device", status word / time-ago right.
             .when(!compact && show_label, |el| {
                 el.child(

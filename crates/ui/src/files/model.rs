@@ -146,14 +146,15 @@ impl FileTreeModel {
     }
 
     /// Selected entries without those already covered by a selected ancestor.
+    /// Rows call this while rendering, so it checks each path's ancestors
+    /// rather than comparing every pair in a large selection.
     pub fn selection_roots(&self) -> Vec<String> {
         self.selected_paths()
             .into_iter()
             .filter(|path| {
-                !self
-                    .selection
-                    .iter()
-                    .any(|other| is_descendant(path, other))
+                !path
+                    .match_indices('/')
+                    .any(|(end, _)| self.selection.contains(&path[..end]))
             })
             .collect()
     }
@@ -340,13 +341,17 @@ impl FileTreeModel {
         }
         if !self.expanded.remove(path) {
             self.expanded.insert(path.to_string());
-        } else if self
+        } else if let Some(cursor) = self
             .selected
-            .as_deref()
-            .is_some_and(|selected| is_descendant(selected, path))
+            .clone()
+            .filter(|selected| is_descendant(selected, path))
         {
+            // The folder replaces a selected cursor; a deselected cursor must
+            // not pull the folder into the selection.
             let folder = (!path.is_empty()).then(|| path.to_string());
-            if let Some(folder) = &folder {
+            if let Some(folder) = &folder
+                && self.selection.contains(&cursor)
+            {
                 self.selection.insert(folder.clone());
             }
             self.selected = folder;
@@ -1535,6 +1540,14 @@ mod tests {
         tree.toggle_selected("src/lib.rs");
         tree.toggle_expanded("src");
         assert_eq!(tree.selected_paths(), ["src", "b.txt"]);
+        assert_eq!(tree.selected(), Some("src"));
+        // A cursor the user deselected does not pull its folder in.
+        tree.toggle_expanded("src");
+        tree.select("b.txt");
+        tree.toggle_selected("src/lib.rs");
+        tree.toggle_selected("src/lib.rs");
+        tree.toggle_expanded("src");
+        assert_eq!(tree.selected_paths(), ["b.txt"]);
         assert_eq!(tree.selected(), Some("src"));
 
         tree.toggle_expanded("src");

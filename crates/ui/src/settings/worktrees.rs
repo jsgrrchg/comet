@@ -1,66 +1,46 @@
 //! Settings → General: device-addressed worktree destination settings.
 
-use gpui::{AnyElement, Context, Entity, Render, Subscription, Task, Window, div, prelude::*, px};
+use gpui::{AnyElement, Context, Entity, Render, Task, Window, div, prelude::*, px};
 use zeron_proto::{FolderListing, WorktreeSettings, WorktreeSettingsStatus};
 use zeron_rpc::methods;
 
 use super::widgets;
-use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons;
-use crate::popover::{self, Loadable};
+use crate::popover::Loadable;
 use crate::state::AppState;
 use crate::theme::Theme;
-use zeron_proto::device_paths::{
-    child_folder as child_path, expand_home, parent_folder as folder_parent,
-};
+use zeron_proto::device_paths::{child_folder as child_path, parent_folder as folder_parent};
 
 pub(super) struct WorktreeSettingsCard {
     state: Entity<AppState>,
     target: Option<String>,
     device_select: widgets::SelectState,
     settings: Loadable<WorktreeSettingsStatus>,
+    /// The switch, ahead of the saved settings while a folder is still to be
+    /// chosen.
     enabled: bool,
-    input: Entity<ComposerInput>,
     error: Option<String>,
     saving: bool,
     task: Option<Task<()>>,
     browsing: bool,
     folders: Loadable<FolderListing>,
     folder_task: Option<Task<()>>,
-    _input_events: Subscription,
 }
 
 impl WorktreeSettingsCard {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| {
-            ComposerInput::new("Folder on the selected device", cx)
-                .with_single_line()
-                .with_text_metrics(12.0, 20.0)
-        });
-        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                if this.browsing {
-                    this.browse_input(cx);
-                } else {
-                    this.save(cx);
-                }
-            }
-            cx.notify();
-        });
         let mut card = Self {
             state,
             target: None,
             device_select: widgets::SelectState::default(),
             settings: Loadable::Idle,
             enabled: false,
-            input,
             error: None,
             saving: false,
             task: None,
             browsing: false,
             folders: Loadable::Idle,
             folder_task: None,
-            _input_events: events,
         };
         card.load(None, cx);
         card
@@ -155,7 +135,6 @@ impl WorktreeSettingsCard {
         self.error = None;
         self.browsing = false;
         self.folders = Loadable::Idle;
-        self.input.update(cx, |input, cx| input.set_text("", cx));
         self.request(None, cx);
     }
 
@@ -197,8 +176,9 @@ impl WorktreeSettingsCard {
                 card.saving = false;
                 match result {
                     Ok(status) => {
+                        card.enabled = status.settings.use_custom_directory;
                         card.settings = Loadable::Ready(status);
-                        card.reset_draft(cx);
+                        card.browsing = false;
                     }
                     Err(error) if saving => card.error = Some(error),
                     Err(error) => card.settings = Loadable::Error(error),
@@ -210,62 +190,79 @@ impl WorktreeSettingsCard {
         cx.notify();
     }
 
-    fn reset_draft(&mut self, cx: &mut Context<Self>) {
-        if let Loadable::Ready(status) = &self.settings {
-            self.enabled = status.settings.use_custom_directory;
-            let path = status.settings.custom_directory.clone().unwrap_or_default();
-            self.input.update(cx, |input, cx| input.set_text(path, cx));
-        }
-        self.browsing = false;
-        self.folder_task = None;
-        self.error = None;
-        cx.notify();
-    }
-
-    fn draft(&self, cx: &Context<Self>) -> WorktreeSettings {
-        let path = self.input.read(cx).text().trim().to_owned();
-        WorktreeSettings {
-            use_custom_directory: self.enabled,
-            custom_directory: (!path.is_empty()).then_some(path),
+    fn saved(&self) -> Option<&WorktreeSettings> {
+        match &self.settings {
+            Loadable::Ready(status) if status.environment_override.is_none() => {
+                Some(&status.settings)
+            }
+            _ => None,
         }
     }
 
-    fn has_changes(&self, cx: &Context<Self>) -> bool {
-        let Loadable::Ready(status) = &self.settings else {
-            return false;
-        };
-        let draft = self.draft(cx);
-        draft.use_custom_directory != status.settings.use_custom_directory
-            || (draft.use_custom_directory
-                && draft.custom_directory != status.settings.custom_directory)
-    }
-
-    fn can_save(&self, cx: &Context<Self>) -> bool {
-        let Loadable::Ready(status) = &self.settings else {
-            return false;
-        };
-        !self.saving
-            && status.environment_override.is_none()
-            && (!self.enabled || self.draft(cx).custom_directory.is_some())
-            && self.has_changes(cx)
-    }
-
-    fn save(&mut self, cx: &mut Context<Self>) {
-        if !self.can_save(cx) {
+    fn save(&mut self, settings: WorktreeSettings, cx: &mut Context<Self>) {
+        if self.saving || self.saved().is_none() {
             return;
         }
         self.browsing = false;
-        self.folder_task = None;
-        self.request(Some(self.draft(cx)), cx);
+        self.request(Some(settings), cx);
     }
 
-    fn browse_input(&mut self, cx: &mut Context<Self>) {
+    /// Turning on reuses the remembered folder, or waits for Browse to pick
+    /// one; turning off keeps the folder for next time.
+    fn toggle(&mut self, cx: &mut Context<Self>) {
+        let Some(saved) = self.saved().cloned() else {
+            return;
+        };
+        self.enabled = !self.enabled;
+        self.browsing = false;
+        self.folder_task = None;
+        self.error = None;
+        if self.enabled != saved.use_custom_directory && saved.custom_directory.is_some() {
+            self.save(
+                WorktreeSettings {
+                    use_custom_directory: self.enabled,
+                    ..saved
+                },
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    fn reset(&mut self, cx: &mut Context<Self>) {
+        let Some(saved) = self.saved() else {
+            return;
+        };
+        let changed = *saved != WorktreeSettings::default();
+        self.enabled = false;
+        self.browsing = false;
+        self.folder_task = None;
+        self.error = None;
+        if changed {
+            self.save(WorktreeSettings::default(), cx);
+        }
+        cx.notify();
+    }
+
+    fn use_folder(&mut self, path: String, cx: &mut Context<Self>) {
+        self.save(
+            WorktreeSettings {
+                use_custom_directory: true,
+                custom_directory: Some(path),
+            },
+            cx,
+        );
+    }
+
+    fn browse_folder(&mut self, cx: &mut Context<Self>) {
         if self.target.is_none() {
             self.choose_local_folder(cx);
             return;
         }
-        let path = self.input.read(cx).text().trim().to_owned();
-        self.browse((!path.is_empty()).then_some(path), cx);
+        let start = self
+            .saved()
+            .and_then(|saved| saved.custom_directory.clone());
+        self.browse(start, cx);
     }
 
     fn choose_local_folder(&mut self, cx: &mut Context<Self>) {
@@ -281,20 +278,18 @@ impl WorktreeSettingsCard {
             prompt: Some("Choose Worktree Folder".into()),
         });
         // Retargeting the card cancels this task, so a local selection cannot
-        // overwrite the draft for a remote host.
+        // be saved to a remote host.
         self.folder_task = Some(cx.spawn(async move |this, cx| {
             let result = receiver.await;
             let _ = this.update(cx, |card, cx| {
                 match result {
                     Ok(Ok(Some(paths))) => {
                         if let Some(path) = paths.into_iter().next() {
-                            card.input.update(cx, |input, cx| {
-                                input.set_text(path.to_string_lossy().into_owned(), cx)
-                            });
+                            card.use_folder(path.to_string_lossy().into_owned(), cx);
                         }
                     }
                     Ok(Err(error)) => card.error = Some(error.to_string()),
-                    // Cancelling the system dialog keeps the current draft.
+                    // Cancelling the system dialog keeps the current settings.
                     Ok(Ok(None)) | Err(_) => {}
                 }
                 cx.notify();
@@ -315,24 +310,6 @@ impl WorktreeSettingsCard {
         let target = self.target.clone();
         self.folder_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<FolderListing, String> = async {
-                let mut path = path;
-                if let Some(query) = path
-                    .as_deref()
-                    .filter(|p| *p == "~" || p.starts_with("~/") || p.starts_with(r"~\"))
-                {
-                    let home = engine
-                        .client()
-                        .call(
-                            methods::LIST_FOLDERS,
-                            serde_json::json!({"targetDeviceId": target}),
-                        )
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let home: FolderListing =
-                        serde_json::from_value(home).map_err(|error| error.to_string())?;
-                    path =
-                        Some(expand_home(query, &home.path).unwrap_or_else(|| query.to_string()));
-                }
                 let value = engine
                     .client()
                     .call(
@@ -346,11 +323,7 @@ impl WorktreeSettingsCard {
             .await;
             this.update(cx, |card, cx| {
                 card.folders = match result {
-                    Ok(listing) => {
-                        card.input
-                            .update(cx, |input, cx| input.set_text(listing.path.clone(), cx));
-                        Loadable::Ready(listing)
-                    }
+                    Ok(listing) => Loadable::Ready(listing),
                     Err(error) => Loadable::Error(error),
                 };
                 cx.notify();
@@ -406,13 +379,6 @@ impl WorktreeSettingsCard {
                                 }))
                             })
                             .when(!has_parent, |el| el.opacity(0.5)),
-                    )
-                    .child(
-                        widgets::ghost_action(theme)
-                            .id("worktrees-open-path")
-                            .ml_auto()
-                            .child("Open path")
-                            .on_click(cx.listener(|card, _, _, cx| card.browse_input(cx))),
                     ),
             );
         match &self.folders {
@@ -478,7 +444,7 @@ impl WorktreeSettingsCard {
                 if listing.truncated {
                     browser = browser.child(div().px(px(14.0)).py(px(6.0)).child(description(
                         theme,
-                        "More folders exist. Enter a path to open one directly.",
+                        "More folders exist than are shown here.",
                     )));
                 }
                 browser = browser.child(
@@ -494,12 +460,9 @@ impl WorktreeSettingsCard {
                                 .child("Use this folder")
                                 .on_click(cx.listener(|card, _, _, cx| {
                                     if let Loadable::Ready(listing) = &card.folders {
-                                        card.input.update(cx, |input, cx| {
-                                            input.set_text(listing.path.clone(), cx)
-                                        });
+                                        let path = listing.path.clone();
+                                        card.use_folder(path, cx);
                                     }
-                                    card.browsing = false;
-                                    cx.notify();
                                 })),
                         ),
                 );
@@ -528,189 +491,141 @@ impl Render for WorktreeSettingsCard {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).for_settings_surface();
         let switcher = self.render_device_switcher(&theme, cx);
-        let mut card = widgets::section_card(&theme).mt(px(0.0)).child(
-            widgets::card_row(&theme, true)
-                .child(widgets::row_title(&theme, "Device"))
-                .child(switcher),
-        );
-        let Loadable::Ready(status) = &self.settings else {
-            let header = widgets::card_row(&theme, false)
-                .child(widgets::row_title(&theme, "Custom worktree location"));
-            card = card.child(header);
-            let card =
-                match &self.settings {
-                    Loadable::Error(error) => card.child(
-                        div()
-                            .px(px(16.0))
-                            .pb(px(14.0))
-                            .child(widgets::error_strip(&theme, error.clone()))
-                            .child(
-                                widgets::ghost_action(&theme)
-                                    .id("worktrees-retry")
-                                    .child("Retry")
-                                    .on_click(cx.listener(|card, _, _, cx| {
-                                        card.load(card.target.clone(), cx)
-                                    })),
-                            ),
-                    ),
-                    _ => card.child(
-                        div()
-                            .px(px(16.0))
-                            .pb(px(14.0))
-                            .child(description(&theme, "Loading worktree settings…")),
-                    ),
-                };
-            return widgets::section(&theme, "Worktrees", card).into_any_element();
-        };
-        let overridden = status.environment_override.is_some();
-        let interactive = !self.saving && !overridden;
+        let status = self.settings.ready();
+        let overridden = status.is_some_and(|s| s.environment_override.is_some());
+        let interactive = status.is_some() && !self.saving && !overridden;
         let enabled = self.enabled;
-        let can_save = self.can_save(cx);
-        let show_actions = !overridden && (self.has_changes(cx) || self.saving);
-        let show_editor = enabled && !overridden;
-        let subtitle = if !enabled && !overridden {
-            status.default_directory.clone()
-        } else {
-            status.effective_directory.clone()
-        };
-        card = card.child(
-            widgets::card_row(&theme, false)
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .child(widgets::row_title(&theme, "Custom worktree location"))
-                        .when(!show_editor, |el| {
-                            el.child(widgets::meta_line(
-                                &theme,
-                                vec![
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .child(subtitle)
-                                        .into_any_element(),
-                                ],
-                            ))
-                        }),
-                )
-                .child(
-                    widgets::toggle_switch(&theme, enabled, "worktrees-custom")
-                        .id("worktrees-custom-toggle")
-                        .flex_none()
-                        .role(gpui::Role::Switch)
-                        .aria_label("Custom worktree location")
-                        .aria_toggled(if enabled {
-                            gpui::Toggled::True
-                        } else {
-                            gpui::Toggled::False
-                        })
+        let mut meta = vec![match status {
+            Some(status) if overridden || (enabled && status.settings.use_custom_directory) => {
+                status.effective_directory.clone()
+            }
+            Some(_) if enabled => "Choose a folder for new worktrees".into(),
+            Some(status) => status.default_directory.clone(),
+            None if matches!(self.settings, Loadable::Error(_)) => {
+                "Couldn't load worktree settings".into()
+            }
+            None => "Loading…".into(),
+        }];
+        if overridden {
+            meta.push("Set by ZERON_WORKTREES_DIR".into());
+        }
+        let meta = meta
+            .into_iter()
+            .map(|text| div().truncate().child(text).into_any_element())
+            .collect();
+        let resettable = !overridden
+            && (enabled || status.is_some_and(|s| s.settings != WorktreeSettings::default()));
+
+        let controls = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .when(resettable, |row| {
+                row.child(
+                    widgets::action_button(&theme, widgets::ActionTone::Quiet)
+                        .id("worktrees-reset")
+                        .w(px(32.0))
+                        .px_0()
+                        .justify_center()
+                        .tab_index(0)
+                        .role(gpui::Role::Button)
+                        .aria_label("Use the default worktree location")
+                        .tooltip(widgets::text_tooltip("Reset to default"))
+                        .focus_visible(|s| s.border_2().border_color(theme.accent))
+                        .child(
+                            icons::icon(icons::REFRESH)
+                                .size(px(14.0))
+                                .text_color(theme.text_muted),
+                        )
                         .when(interactive, |el| {
-                            el.cursor_pointer()
-                                .tab_index(0)
-                                .focus_visible(|s| s.border_2().border_color(theme.accent))
-                                .on_click(cx.listener(|card, _, _, cx| {
-                                    card.enabled = !card.enabled;
-                                    card.browsing = false;
-                                    card.folder_task = None;
-                                    card.error = None;
-                                    cx.notify();
-                                }))
+                            el.on_click(cx.listener(|card, _, _, cx| card.reset(cx)))
                         })
                         .when(!interactive, |el| el.opacity(0.5)),
-                ),
-        );
+                )
+            })
+            .when(matches!(self.settings, Loadable::Error(_)), |row| {
+                row.child(
+                    widgets::text_action(&theme, widgets::ActionTone::Quiet, "Retry")
+                        .id("worktrees-retry")
+                        .tab_index(0)
+                        .role(gpui::Role::Button)
+                        .focus_visible(|s| s.border_2().border_color(theme.accent))
+                        .on_click(cx.listener(|card, _, _, cx| card.load(card.target.clone(), cx))),
+                )
+            })
+            .child(switcher)
+            .when(enabled && !overridden, |row| {
+                row.child(
+                    widgets::action_button(&theme, widgets::ActionTone::Filled)
+                        .id("worktrees-browse")
+                        .gap(px(6.0))
+                        .aria_label("Choose worktree folder")
+                        .child(
+                            icons::icon(icons::FOLDER)
+                                .size(px(14.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child("Browse")
+                        .when(interactive, |el| {
+                            el.tab_index(0)
+                                .role(gpui::Role::Button)
+                                .focus_visible(|s| s.border_2().border_color(theme.accent))
+                                .on_click(cx.listener(|card, _, _, cx| card.browse_folder(cx)))
+                        })
+                        .when(!interactive, |el| el.opacity(0.5)),
+                )
+            })
+            .child(
+                widgets::toggle_switch(&theme, enabled, "worktrees-custom")
+                    .id("worktrees-custom-toggle")
+                    .flex_none()
+                    .role(gpui::Role::Switch)
+                    .aria_label("Custom worktree location")
+                    .aria_toggled(if enabled {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                    .when(interactive, |el| {
+                        el.cursor_pointer()
+                            .tab_index(0)
+                            .focus_visible(|s| s.border_2().border_color(theme.accent))
+                            .on_click(cx.listener(|card, _, _, cx| card.toggle(cx)))
+                    })
+                    .when(!interactive, |el| el.opacity(0.5)),
+            );
 
+        let error = match &self.settings {
+            Loadable::Error(error) => Some(error.clone()),
+            _ => self.error.clone(),
+        };
         // Match the text inset of the shared settings block rows.
-        let mut detail = div().px(px(16.0)).pb(px(16.0));
-        if overridden {
-            return widgets::section(
-                &theme,
-                "Worktrees",
-                card.child(detail.child(description(
-                    &theme,
-                    "Location set by ZERON_WORKTREES_DIR on this device.",
-                ))),
-            )
-            .into_any_element();
-        }
-        if show_editor {
-            detail = detail.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
+        let detail = div()
+            .px(px(16.0))
+            .pb(px(16.0))
+            .when(self.browsing, |el| {
+                el.child(self.render_browser(&theme, cx))
+            })
+            .when_some(error.clone(), |el, error| {
+                el.child(widgets::error_strip(&theme, error).mt(px(8.0)))
+            });
+        let card = widgets::section_card(&theme)
+            .mt_0()
+            .child(
+                widgets::card_row(&theme, true)
                     .child(
                         div()
                             .flex_1()
-                            .min_w_0()
-                            .when(interactive, |el| {
-                                el.child(popover::dialog_field(
-                                    self.input.clone().into_any_element(),
-                                ))
-                            })
-                            .when(!interactive, |el| {
-                                el.child(description(&theme, self.input.read(cx).text()))
-                            }),
+                            .min_w(px(160.0))
+                            .child(widgets::row_title(&theme, "Custom worktree location"))
+                            .child(widgets::meta_line(&theme, meta)),
                     )
-                    .child(
-                        widgets::action_button(&theme, widgets::ActionTone::Filled)
-                            .id("worktrees-browse")
-                            .flex_none()
-                            .child("Browse…")
-                            .when(interactive, |el| {
-                                el.on_click(cx.listener(|card, _, _, cx| card.browse_input(cx)))
-                            })
-                            .when(!interactive, |el| el.opacity(0.5)),
-                    ),
-            );
-        }
-        if self.browsing {
-            detail = detail.child(self.render_browser(&theme, cx));
-        }
-        if let Some(error) = &self.error {
-            detail = detail.child(
-                div()
-                    .mt(px(8.0))
-                    .child(widgets::error_strip(&theme, error.clone())),
-            );
-        }
-        if show_actions {
-            detail = detail.child(
-                div()
-                    .mt(px(12.0))
-                    .flex()
-                    .justify_end()
-                    .items_center()
-                    .gap(px(6.0))
-                    .child(
-                        widgets::ghost_action(&theme)
-                            .id("worktrees-cancel")
-                            .child("Cancel")
-                            .when(interactive, |el| {
-                                el.on_click(cx.listener(|card, _, _, cx| card.reset_draft(cx)))
-                            })
-                            .when(!interactive, |el| el.opacity(0.5)),
-                    )
-                    .child(
-                        widgets::action_button(&theme, widgets::ActionTone::Solid)
-                            .id("worktrees-save")
-                            .child(if self.saving { "Saving…" } else { "Save" })
-                            .when(can_save, |el| {
-                                el.on_click(cx.listener(|card, _, _, cx| card.save(cx)))
-                            })
-                            .when(!can_save, |el| el.opacity(0.5)),
-                    ),
-            );
-        }
-        widgets::section(
-            &theme,
-            "Worktrees",
-            card.when(
-                show_editor || self.browsing || self.error.is_some() || show_actions,
-                |card| card.child(detail),
-            ),
-        )
-        .into_any_element()
+                    .child(controls),
+            )
+            .when(self.browsing || error.is_some(), |card| card.child(detail));
+        widgets::section(&theme, "Worktrees", card).into_any_element()
     }
 }
 

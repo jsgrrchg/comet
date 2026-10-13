@@ -109,7 +109,8 @@ impl WorktreePreferences {
             let mut current = self.settings.lock().unwrap_or_else(PoisonError::into_inner);
             // Disabling must work even if the previous disk is disconnected,
             // and preserve the last validated directory for the next enable.
-            if !next.use_custom_directory {
+            // Disabling without a folder is a reset and forgets it.
+            if !next.use_custom_directory && next.custom_directory.is_some() {
                 next.custom_directory = current.custom_directory.clone();
             }
             let parent = self.path.parent().expect("settings have a data directory");
@@ -201,7 +202,13 @@ mod tests {
         assert_eq!(prefs.status(), reloaded.status());
         // A disconnected location must not prevent reverting to the default.
         std::fs::remove_dir_all(&chosen).unwrap();
-        let disabled = reloaded.set(WorktreeSettings::default()).await.unwrap();
+        let disabled = reloaded
+            .set(WorktreeSettings {
+                use_custom_directory: false,
+                ..custom(&tmp.path().join("unvalidated"))
+            })
+            .await
+            .unwrap();
         assert!(!disabled.settings.use_custom_directory);
         assert_eq!(
             disabled.settings.custom_directory,
@@ -209,8 +216,15 @@ mod tests {
         );
         assert_eq!(reloaded.root(), default);
         assert!(!chosen.exists());
-        let restarted = WorktreePreferences::open(tmp.path(), default, None);
+        let restarted = WorktreePreferences::open(tmp.path(), default.clone(), None);
         assert_eq!(restarted.status(), disabled);
+        // Reset: disabling without a folder forgets the remembered one.
+        let reset = restarted.set(WorktreeSettings::default()).await.unwrap();
+        assert_eq!(reset.settings, WorktreeSettings::default());
+        assert_eq!(
+            WorktreePreferences::open(tmp.path(), default, None).status(),
+            reset
+        );
     }
 
     #[tokio::test]

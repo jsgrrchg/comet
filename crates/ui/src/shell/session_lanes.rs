@@ -184,6 +184,8 @@ pub(super) struct ChildChatRow {
     pub time_ago: SharedString,
     /// The chat's linked pull request, drawn as the sidebar's badge.
     pub change_request: Option<zeron_proto::ChangeRequestSummary>,
+    /// The harness it runs on, drawn as the sidebar's brand mark.
+    pub harness: Option<zeron_proto::HarnessId>,
     activity: DateTime<Utc>,
 }
 
@@ -207,6 +209,7 @@ pub(super) fn child_chat_rows(
                 status: state.display_status_for(chat, now),
                 time_ago: zeron_proto::view::format_time_ago(activity, now).into(),
                 change_request: state.change_request_for_chat(chat).cloned(),
+                harness: chat.config.as_ref().map(|config| config.harness),
                 activity,
             }
         })
@@ -543,6 +546,14 @@ impl Shell {
                 }),
             )
             .child(popover::picker_icon_slot(mark))
+            // The harness mark leads the title, as on the sidebar's rows.
+            .children(row.harness.map(|harness| {
+                let (path, tint) = crate::pickers::harness_brand_icon(harness);
+                icon(path)
+                    .size(px(13.0))
+                    .flex_none()
+                    .text_color(tint.unwrap_or(theme.text_muted).opacity(0.8))
+            }))
             .child(title)
             .when(revealing, |row| {
                 let shell = cx.weak_entity();

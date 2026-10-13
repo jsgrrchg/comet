@@ -1300,6 +1300,20 @@ impl Repos {
         // Snapshot the destination once per creation. Changes never relocate
         // existing worktrees or alter the cwd already stored on a chat.
         let base = self.inner.worktrees.root().join(&repo_name);
+        // A location that contains the repository (e.g. its parent folder)
+        // would nest checkouts inside the primary one, where they show up as
+        // untracked embedded repositories.
+        let root = self.inner.worktrees.root();
+        if let (Ok(root), Ok(repo)) = (
+            std::fs::canonicalize(&root),
+            std::fs::canonicalize(repo_path),
+        ) && root.join(&repo_name).starts_with(&repo)
+        {
+            return Err(EngineError::Other(format!(
+                "Worktrees for {repo_name} would be created inside the repository at {}. Choose a different worktree location in Settings.",
+                repo_path.display()
+            )));
+        }
         // Auto-generate a name colliding with neither an existing dir nor branch.
         let existing: HashSet<String> = self
             .branches(repo_path)
@@ -2513,6 +2527,55 @@ mod tests {
         }
         assert!(validate_windows_worktree_path(&format!("C:/{}", "日本語".repeat(80))).is_ok());
         assert!(validate_windows_worktree_path(&format!("C:/{}", "😀".repeat(129))).is_err());
+    }
+
+    #[tokio::test]
+    async fn worktree_location_containing_the_repository_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let code = tmp.path().join("code");
+        let repo = code.join("comet");
+        std::fs::create_dir_all(&repo).unwrap();
+        let repos = Repos::with_worktrees_root(&tmp.path().join("data"), "test", code.clone());
+        repos
+            .git(&["init", "-b", "main"], Some(&repo))
+            .await
+            .unwrap();
+        repos
+            .git(
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ],
+                Some(&repo),
+            )
+            .await
+            .unwrap();
+        let error = repos.create_worktree(&repo, "main").await.unwrap_err();
+        assert!(
+            error.to_string().contains("inside the repository"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read_dir(&repo).unwrap().count(), 1, "only .git");
+        assert!(
+            repos
+                .branches(&repo)
+                .await
+                .unwrap()
+                .iter()
+                .all(|b| !b.starts_with("zeron/"))
+        );
+
+        // A sibling location for the same parent is fine.
+        let sibling =
+            Repos::with_worktrees_root(&tmp.path().join("data2"), "test", code.join("wt"));
+        let worktree = sibling.create_worktree(&repo, "main").await.unwrap();
+        assert!(Path::new(&worktree.path).starts_with(code.join("wt").join("comet")));
     }
 
     async fn two_step_fixture(hook_exit: u8) -> (tempfile::TempDir, Repos, PathBuf) {

@@ -219,13 +219,16 @@ fn render_badge_model(
                     cx.stop_propagation();
                     crate::pull_request_detail::open_on_device(&url, device.clone(), window, cx);
                 })
-                .tooltip(move |_, cx| {
-                    cx.new(|_| ChangeRequestTooltip {
-                        model: tooltip_model.clone(),
-                    })
-                    .into()
+        })
+        // Sidebar rows spell the pull request out in their hover card.
+        .when(interactive && composer, |el| {
+            el.tooltip(move |_, cx| {
+                cx.new(|_| ChangeRequestTooltip {
+                    model: tooltip_model.clone(),
                 })
-                .tooltip_show_delay(std::time::Duration::from_millis(350))
+                .into()
+            })
+            .tooltip_show_delay(std::time::Duration::from_millis(350))
         })
         .child(
             crate::icons::icon(crate::icons::PULL_REQUEST)

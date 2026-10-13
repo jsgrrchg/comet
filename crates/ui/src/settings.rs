@@ -30,8 +30,11 @@ pub mod wallpaper;
 pub mod wallpaper_colors;
 pub mod widgets;
 
-/// Sidebar drag-resize bounds (px).
-pub const SIDEBAR_MIN: f32 = 224.0;
+/// Sidebar drag-resize bounds (px). The minimum keeps the sidebar options
+/// button inside the sidebar beside the titlebar controls: 88 (past the
+/// traffic lights) + 82 (toggle, back, forward) + 32 (new session) + 8 gap
+/// + 24 (options) + 8 inset.
+pub const SIDEBAR_MIN: f32 = 242.0;
 pub const SIDEBAR_MAX: f32 = 400.0;
 pub const SIDEBAR_DEFAULT: f32 = 256.0;
 
@@ -44,6 +47,9 @@ pub const FILES_PANEL_MAX: f32 = 440.0;
 /// for the conversation and any docked file explorer.
 pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
+/// The Pull requests route's side pane defaults wider than the chat's: the
+/// detail's Code tab needs room beside the board.
+pub const PULL_REQUEST_PANE_DEFAULT: f32 = 640.0;
 /// Minimum width retained for the conversation when the right pane is open.
 pub const CHAT_PANEL_MIN: f32 = 300.0;
 
@@ -286,6 +292,24 @@ pub enum SavePolicy {
     Immediate,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PullRequestDestination {
+    #[default]
+    Native,
+    External,
+}
+
+impl PullRequestDestination {
+    pub const ALL: [Self; 2] = [Self::Native, Self::External];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Native => "Pull request view",
+            Self::External => "Default browser",
+        }
+    }
+}
+
 /// The sole in-process owner and writer of `ui-settings.json`.
 ///
 /// Mutations land in `current` before any timer starts. Replacing a pending
@@ -331,6 +355,8 @@ impl SettingsStore {
 }
 
 pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
+    let data_dir = data_dir.into();
+    crate::dictation::init(data_dir.clone(), cx);
     cx.set_global(SettingsStore {
         current: settings,
         data_dir: data_dir.into(),
@@ -358,7 +384,7 @@ pub fn compact_model_picker(cx: &App) -> bool {
 /// the new-thread canvas background. A unique file name avoids stale image
 /// caches when the background is replaced.
 pub fn install_new_thread_composer_background(source: &Path, cx: &mut App) -> Result<(), String> {
-    let staged = crate::attachments::stage_file(source)?;
+    let staged = crate::attachments::stage_file_verbatim(source)?;
     // Do not persist the candidate or retire the old managed file until the
     // renderer's decoder has accepted the exact bytes we are about to save.
     let image = crate::new_thread_background_image::decode(staged.bytes()).map_err(|_| {
@@ -785,6 +811,11 @@ pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
+    pub dictation_enabled: bool,
+    /// Dictation microphone as a `zeron_voice::InputDevice` id; `None`
+    /// follows the system default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dictation_input: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub window_geometry: Option<WindowGeometry>,
     /// Submit using Enter or the platform modifier plus Enter.
@@ -812,6 +843,8 @@ pub struct UiSettings {
     pub sidebar_show_harness: bool,
     pub sidebar_show_branch: bool,
     pub sidebar_show_pull_request: bool,
+    /// The project filter row at the top of the sidebar.
+    pub sidebar_show_project_filter: bool,
     /// The sidebar's "Star on GitHub" banner was dismissed (its close button
     /// or following the link). Device-local; never shown again once set.
     pub github_star_banner_dismissed: bool,
@@ -866,6 +899,8 @@ pub struct UiSettings {
     /// remain enabled independently of this preference.
     pub agent_update_notifications: bool,
     pub right_pane_width: f32,
+    /// Width of the pull request pane beside the board.
+    pub pull_request_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
@@ -930,6 +965,13 @@ pub struct UiSettings {
     /// the narration between them) fold into one collapsed accordion, so only
     /// the reply text stays visible.
     pub transcript_compact_mode: bool,
+    /// Destination shared by PR badges and the pull-request board.
+    pub pull_request_destination: PullRequestDestination,
+    /// Last explicitly selected PR scope, restored when no project is selected.
+    pub last_pull_request_repository: Option<String>,
+    pub last_pull_request_device: Option<String>,
+    /// Device-local bookmarks, keyed by provider/repository/PR, never GitHub mutations.
+    pub pull_request_stars: Vec<String>,
     /// Save edited workspace files automatically after the configured delay.
     pub files_autosave_enabled: bool,
     /// Idle time before an edited workspace file is saved automatically.
@@ -938,6 +980,9 @@ pub struct UiSettings {
     pub files_word_wrap: bool,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
+    /// The user hid the session card (project, device, side chats, actions)
+    /// that otherwise shows beside a transcript with room for it.
+    pub session_info_hidden: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
@@ -958,6 +1003,12 @@ pub struct UiSettings {
     pub reduce_motion: crate::motion::ReduceMotion,
     /// Also snap animations while the main window is not focused.
     pub pause_animations_in_background: bool,
+    /// Stable native Codex voice id only; devices and microphone state are never persisted.
+    #[serde(default)]
+    pub codex_voice: Option<String>,
+    /// Local preference: never transfers an active call or credentials.
+    #[serde(default)]
+    pub codex_voice_device: Option<String>,
     /// Pre-theme settings used `accentColor`. Read it once, migrate to
     /// [`Self::accent`], and never write it again.
     #[serde(default, rename = "accentColor", skip_serializing)]
@@ -967,6 +1018,8 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
+            dictation_enabled: false,
+            dictation_input: None,
             window_geometry: None,
             sidebar_width: SIDEBAR_DEFAULT,
             sidebar_collapsed: false,
@@ -979,6 +1032,7 @@ impl Default for UiSettings {
             sidebar_show_harness: true,
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
+            sidebar_show_project_filter: true,
             github_star_banner_dismissed: false,
             last_space_id: None,
             last_project_action_by_space_id: std::collections::HashMap::new(),
@@ -997,6 +1051,7 @@ impl Default for UiSettings {
             files_panel_width: FILES_PANEL_DEFAULT,
             agent_update_notifications: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
+            pull_request_pane_width: PULL_REQUEST_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
@@ -1028,10 +1083,15 @@ impl Default for UiSettings {
             transcript_width: TRANSCRIPT_WIDTH_DEFAULT,
             open_web_links_in_zeron: true,
             transcript_compact_mode: false,
+            pull_request_destination: PullRequestDestination::Native,
+            last_pull_request_repository: None,
+            last_pull_request_device: None,
+            pull_request_stars: Vec::new(),
             files_autosave_enabled: false,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_show_all: false,
+            session_info_hidden: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
             new_thread_composer_background: None,
@@ -1043,6 +1103,8 @@ impl Default for UiSettings {
             new_thread_background_effect: NewThreadBackgroundEffect::None,
             reduce_motion: crate::motion::ReduceMotion::System,
             pause_animations_in_background: false,
+            codex_voice: None,
+            codex_voice_device: None,
             legacy_accent_color: None,
         }
     }
@@ -1077,6 +1139,7 @@ const JUMP_LABELS: [&str; JUMP_SLOTS] = [
 /// rather than panicking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ShortcutId {
+    ToggleDictation,
     CaptureAppshot,
     RandomWallpaper,
     SaveFile,
@@ -1095,7 +1158,8 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 14 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 15 + JUMP_SLOTS] = [
+        ShortcutId::ToggleDictation,
         ShortcutId::CaptureAppshot,
         ShortcutId::RandomWallpaper,
         ShortcutId::SaveFile,
@@ -1128,6 +1192,7 @@ impl ShortcutId {
     /// Row label (zeron lib/shortcuts.ts `SHORTCUT_DEFINITIONS`, verbatim).
     pub fn label(self) -> &'static str {
         match self {
+            ShortcutId::ToggleDictation => "Hold to dictate",
             ShortcutId::RandomWallpaper => "Random wallpaper",
             ShortcutId::CaptureAppshot => "Capture Appshot",
             ShortcutId::SaveFile => "Save file",
@@ -1155,6 +1220,7 @@ impl ShortcutId {
     /// this guards against only exists off macOS).
     pub fn default_combo_on(self, mac: bool) -> &'static str {
         match self {
+            ShortcutId::ToggleDictation => "mod-d",
             ShortcutId::RandomWallpaper => "mod-u",
             ShortcutId::CaptureAppshot if mac => "ctrl-alt-space",
             ShortcutId::CaptureAppshot => "mod-alt-space",
@@ -1203,6 +1269,7 @@ impl ShortcutId {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct KeymapConfig {
+    pub toggle_dictation: String,
     #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), serde(skip))]
     pub capture_appshot: String,
     pub random_wallpaper: String,
@@ -1269,6 +1336,7 @@ pub fn sidebar_pin_profile_key(
 impl Default for KeymapConfig {
     fn default() -> Self {
         Self {
+            toggle_dictation: ShortcutId::ToggleDictation.default_combo().into(),
             capture_appshot: ShortcutId::CaptureAppshot.default_combo().into(),
             random_wallpaper: ShortcutId::RandomWallpaper.default_combo().into(),
             save_file: ShortcutId::SaveFile.default_combo().into(),
@@ -1291,6 +1359,7 @@ impl Default for KeymapConfig {
 impl KeymapConfig {
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
+            ShortcutId::ToggleDictation => &self.toggle_dictation,
             ShortcutId::CaptureAppshot => &self.capture_appshot,
             ShortcutId::RandomWallpaper => &self.random_wallpaper,
             ShortcutId::SaveFile => &self.save_file,
@@ -1315,6 +1384,7 @@ impl KeymapConfig {
 
     pub fn set(&mut self, id: ShortcutId, combo: String) {
         match id {
+            ShortcutId::ToggleDictation => self.toggle_dictation = combo,
             ShortcutId::CaptureAppshot => self.capture_appshot = combo,
             ShortcutId::RandomWallpaper => self.random_wallpaper = combo,
             ShortcutId::SaveFile => self.save_file = combo,
@@ -1581,6 +1651,113 @@ impl UiSettings {
             }
     }
 
+    /// Three-way merge for a view that keeps a working copy of the settings:
+    /// fields `edited` changed since `base` win, every other field keeps
+    /// `current`. A stale copy therefore never reverts a choice another
+    /// surface saved meanwhile. The destructure is exhaustive, so a new field
+    /// does not compile until it is merged here too.
+    pub fn merge_changes(base: &Self, edited: &Self, mut current: Self) -> Self {
+        macro_rules! merge {
+            ($($field:ident),* $(,)?) => {{
+                let Self { $($field),* } = edited;
+                $(if *$field != base.$field {
+                    current.$field = $field.clone();
+                })*
+            }};
+        }
+        merge!(
+            dictation_enabled,
+            dictation_input,
+            window_geometry,
+            composer_send_behavior,
+            skills_in_slash_menu,
+            skill_completion_by_harness,
+            compact_model_picker,
+            sidebar_width,
+            sidebar_collapsed,
+            sidebar_grouped,
+            sidebar_organization,
+            sidebar_sort,
+            sidebar_show_project_label,
+            sidebar_compact,
+            sidebar_show_project_icon,
+            sidebar_show_harness,
+            sidebar_show_branch,
+            sidebar_show_pull_request,
+            sidebar_show_project_filter,
+            github_star_banner_dismissed,
+            last_space_id,
+            last_project_action_by_space_id,
+            open_tabs,
+            space_filter,
+            sidebar_sections_by_profile,
+            sidebar_pinned_session_ids_by_profile,
+            tab_order,
+            space_order,
+            sound_enabled,
+            sound_completion_enabled,
+            sound_input_enabled,
+            sound_attention_enabled,
+            notifications_enabled,
+            notifications_background_only,
+            files_panel_width,
+            agent_update_notifications,
+            right_pane_width,
+            pull_request_pane_width,
+            right_pane_open,
+            terminal_height,
+            terminal_open,
+            keymap,
+            appshots_enabled,
+            appshot_sound_enabled,
+            appshot_destination,
+            escape_stops_active_agent,
+            settings_section,
+            appearance,
+            git_history_columns,
+            git_history_column_widths,
+            git_history_column_order,
+            git_history_author_display,
+            ui_font_family,
+            ui_font_size,
+            terminal_font_family,
+            terminal_font_size,
+            code_font_family,
+            code_font_size,
+            theme_selection,
+            diff_split,
+            diff_wrap,
+            code_fences_fit_content,
+            transcript_width,
+            open_web_links_in_zeron,
+            transcript_compact_mode,
+            files_autosave_enabled,
+            files_autosave_delay_ms,
+            files_word_wrap,
+            files_show_all,
+            session_info_hidden,
+            accent,
+            surface,
+            new_thread_composer_background,
+            wallpaper_folder,
+            wallpaper_source,
+            wallpaper_history,
+            wallpaper_theme_colors,
+            wallpaper_color,
+            new_thread_background_effect,
+            reduce_motion,
+            pause_animations_in_background,
+            codex_voice,
+            codex_voice_device,
+            legacy_accent_color,
+            pull_request_destination,
+            last_pull_request_repository,
+            last_pull_request_device,
+            pull_request_stars,
+        );
+        current
+    }
+
     /// Clamp widths into their legal ranges (also heals NaN to defaults).
     pub fn clamped(mut self) -> Self {
         self.transcript_width = normalize_transcript_width(self.transcript_width);
@@ -1600,6 +1777,11 @@ impl UiSettings {
             FILES_PANEL_DEFAULT,
         );
         self.right_pane_width = min_or(self.right_pane_width, RIGHT_PANE_MIN, RIGHT_PANE_DEFAULT);
+        self.pull_request_pane_width = min_or(
+            self.pull_request_pane_width,
+            RIGHT_PANE_MIN,
+            PULL_REQUEST_PANE_DEFAULT,
+        );
         self.terminal_height = clamp_or(
             self.terminal_height,
             TERMINAL_MIN_HEIGHT,
@@ -1853,6 +2035,25 @@ mod tests {
     }
 
     #[test]
+    fn pull_request_destination_defaults_to_the_native_view_and_round_trips() {
+        let existing: UiSettings = serde_json::from_str(r#"{"sidebarWidth":300}"#).unwrap();
+        assert_eq!(
+            existing.pull_request_destination,
+            PullRequestDestination::Native
+        );
+        for destination in PullRequestDestination::ALL {
+            let settings = UiSettings {
+                pull_request_destination: destination,
+                ..existing.clone()
+            };
+            let loaded: UiSettings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(loaded.pull_request_destination, destination);
+            assert_eq!(loaded.sidebar_width, 300.0);
+        }
+    }
+
+    #[test]
     fn composer_send_behavior_is_opt_in_for_old_and_partial_settings() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -1893,6 +2094,7 @@ mod tests {
             height: 800.0,
         };
         let settings = UiSettings {
+            dictation_enabled: false,
             window_geometry: Some(geometry),
             ..Default::default()
         };
@@ -2499,7 +2701,11 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
+            dictation_enabled: false,
+            dictation_input: Some("coreaudio:usb-mic".into()),
             window_geometry: None,
+            codex_voice: Some("ember".into()),
+            codex_voice_device: Some("fedora".into()),
             sidebar_width: 300.0,
             sidebar_collapsed: true,
             sidebar_grouped: true,
@@ -2511,6 +2717,7 @@ mod tests {
             sidebar_show_harness: false,
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
+            sidebar_show_project_filter: false,
             github_star_banner_dismissed: true,
             last_space_id: Some("space-1".into()),
             last_project_action_by_space_id: std::collections::HashMap::from([(
@@ -2544,6 +2751,7 @@ mod tests {
             files_panel_width: 310.0,
             agent_update_notifications: false,
             right_pane_width: 700.0,
+            pull_request_pane_width: 820.0,
             right_pane_open: true,
             terminal_height: 320.0,
             terminal_open: true,
@@ -2596,6 +2804,10 @@ mod tests {
             transcript_width: 960.0,
             open_web_links_in_zeron: false,
             transcript_compact_mode: true,
+            pull_request_destination: PullRequestDestination::External,
+            last_pull_request_repository: Some("acme/zeron".into()),
+            last_pull_request_device: Some("remote-device".into()),
+            pull_request_stars: vec!["https://github.com/acme/zeron/pull/123".into()],
             files_autosave_enabled: true,
             files_autosave_delay_ms: 1_500,
             files_word_wrap: true,
@@ -2604,6 +2816,7 @@ mod tests {
             code_font_family: crate::typography::UiFontFamily::Geist,
             code_font_size: 11.0,
             files_show_all: true,
+            session_info_hidden: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             new_thread_composer_background: Some(NewThreadComposerBackground {
@@ -2731,10 +2944,12 @@ mod tests {
         assert!(settings.sidebar_compact);
         assert!(settings.sidebar_show_project_icon);
         assert!(settings.sidebar_show_project_label);
+        assert!(settings.sidebar_show_project_filter);
         let customized = UiSettings {
             sidebar_compact: false,
             sidebar_show_project_icon: false,
             sidebar_show_project_label: false,
+            sidebar_show_project_filter: false,
             sidebar_organization: SidebarOrganization::ByProject,
             ..settings
         };

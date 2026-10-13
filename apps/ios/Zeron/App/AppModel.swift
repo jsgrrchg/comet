@@ -10,6 +10,26 @@ final class AppModel {
         var folders: [FolderRowVM] = []
         var sessions: [SessionRowVM] = []
         var sectionSessions: [String: [SessionRowVM]] = [:]
+        /// `sessions` grouped by repository project, groups in recency order.
+        var projectGroups: [ProjectGroupVM] = []
+    }
+
+    struct ProjectGroupVM: Equatable {
+        /// Section id: `project:<group key>` (`home:<device>` without a project).
+        let id: String
+        var name: String
+        var sessions: [SessionRowVM]
+    }
+
+    /// The Sessions page groups its unsectioned sessions by project
+    /// (the desktop sidebar's "By project"). Local to this phone.
+    var groupByProject: Bool {
+        get { UserDefaults.standard.bool(forKey: "groupByProject") }
+        set {
+            guard newValue != groupByProject else { return }
+            UserDefaults.standard.set(newValue, forKey: "groupByProject")
+            observers.values.forEach { $0() }
+        }
     }
 
     struct LiveCounts: Equatable {
@@ -17,6 +37,7 @@ final class AppModel {
         var awaiting = 0
     }
 
+    @MainActor lazy var voice = RemoteVoiceController(app: self)
     private(set) var client: CoreClient?
     private(set) var frontPage = FrontPage()
     private(set) var archived: [SessionRowVM] = []
@@ -196,7 +217,8 @@ final class AppModel {
     }
 
     /// The user signing out: this device forgets the account's local docs.
-    func signOut() {
+    @MainActor func signOut() {
+        voice.stop()
         forgetOnSignOut = true
         onSignOut?()
     }
@@ -206,7 +228,10 @@ final class AppModel {
     /// keeps a different account out of it.
     private var forgetOnSignOut = false
 
-    func signOutLocally() {
+    @MainActor func signOutLocally() {
+        voice.stop()
+        endDeliveryBackgroundTask()
+        lastDeliveryActivity = .distantPast
         client?.shutdown()
         client = nil
         Credentials.clearStored()
@@ -228,8 +253,38 @@ final class AppModel {
         newSessionImages = []
     }
 
-    func didEnterBackground() { client?.onBackground() }
+    private var lastDeliveryActivity = Date.distantPast
+
+    func noteDeliveryActivity() { lastDeliveryActivity = Date() }
+
+    private var deliveryBackgroundTask: UIBackgroundTaskIdentifier = .invalid
+    private var deliveryBackgroundDeadline: DispatchWorkItem?
+
+    private func endDeliveryBackgroundTask() {
+        deliveryBackgroundDeadline?.cancel()
+        deliveryBackgroundDeadline = nil
+        guard deliveryBackgroundTask != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(deliveryBackgroundTask)
+        deliveryBackgroundTask = .invalid
+    }
+
+    func didEnterBackground() {
+        // Give the already-durable room outbox and host wake time to reach
+        // the edge when the user leaves immediately after tapping Send.
+        endDeliveryBackgroundTask()
+        if client != nil, !isDemo,
+           Date().timeIntervalSince(lastDeliveryActivity) < 120 || rows.values.contains(where: { $0.sendState == .sending || $0.sendState == .queued }) {
+            deliveryBackgroundTask = UIApplication.shared.beginBackgroundTask(withName: "Finish message delivery") { [weak self] in
+                self?.endDeliveryBackgroundTask()
+            }
+            let deadline = DispatchWorkItem { [weak self] in self?.endDeliveryBackgroundTask() }
+            deliveryBackgroundDeadline = deadline
+            DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: deadline)
+        }
+        client?.onBackground()
+    }
     func willEnterForeground() {
+        endDeliveryBackgroundTask()
         client?.onForeground()
         refreshWorkspace()
     }
@@ -330,6 +385,7 @@ final class AppModel {
             page.sectionSessions[s.id] = list
         }
         page.sessions = ws.front.recent.map(vm)
+        page.projectGroups = Self.projectGroups(ws.front.recent, page.sessions, projects: ws.projects)
         rawProjects = ws.projects
         // Sessions reachable only through their project still resolve by id.
         for p in ws.projects {
@@ -351,6 +407,34 @@ final class AppModel {
         frontPage = page
         archived = archivedVMs
         if changed { observers.values.forEach { $0() } }
+    }
+
+    /// Like the desktop's project grouping: checkouts of one repository
+    /// share a group (named for its representative), project-less sessions
+    /// group per device. Groups and rows keep the incoming recency order.
+    private static func projectGroups(_ rows: [SessionRow], _ vms: [SessionRowVM], projects: [ProjectView]) -> [ProjectGroupVM] {
+        let byId = Dictionary(projects.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var groups: [ProjectGroupVM] = []
+        var index: [String: Int] = [:]
+        for (row, vm) in zip(rows, vms) {
+            let id: String
+            let name: String
+            if let ref = row.project {
+                let project = byId[ref.id]
+                id = "project:" + (project?.groupKey ?? ref.id)
+                name = project?.groupName ?? ref.name
+            } else {
+                id = "home:" + row.deviceId
+                name = row.deviceName.map { "Home · \($0)" } ?? "Home"
+            }
+            if let i = index[id] {
+                groups[i].sessions.append(vm)
+            } else {
+                index[id] = groups.count
+                groups.append(ProjectGroupVM(id: id, name: name, sessions: [vm]))
+            }
+        }
+        return groups
     }
 
     static func status(_ i: ChatIndicator) -> SessionRowVM.Status {
@@ -436,11 +520,15 @@ final class AppModel {
 
     // MARK: Sessions
 
-    func sessionSource(_ chatId: String) -> SessionSource {
-        guard let client, let handle = try? client.openSession(chatId: chatId) else {
-            return FixtureSessionSource(title: "Unavailable", subtitle: "")
+    func sessionSource(_ chatId: String) -> SessionSource? {
+        guard let client else { return nil }
+        do {
+            let handle = try client.openSession(chatId: chatId)
+            return CoreSessionSource(app: self, client: client, handle: handle, chatId: chatId)
+        } catch {
+            NSLog("open session failed: \(error)")
+            return nil
         }
-        return CoreSessionSource(app: self, client: client, handle: handle, chatId: chatId)
     }
 
     // MARK: New session
@@ -476,7 +564,7 @@ final class AppModel {
     }
 
     var projectOptions: [ProjectOption] {
-        rawProjects.map { ProjectOption(id: $0.id, name: $0.name, device: $0.deviceId, deviceName: $0.deviceName ?? deviceName($0.deviceId), online: $0.deviceOnline, git: $0.gitDetected, colorIndex: Int($0.colorIndex)) }
+        rawProjects.map { ProjectOption(id: $0.id, name: $0.name, path: $0.path, device: $0.deviceId, deviceName: $0.deviceName ?? deviceName($0.deviceId), online: $0.deviceOnline, git: $0.gitDetected, groupKey: $0.groupKey, groupName: $0.groupName, colorIndex: Int($0.colorIndex)) }
     }
 
     var hostOptions: [HostOption] {
@@ -545,6 +633,7 @@ final class AppModel {
             let project = rawProjects.first { $0.id == draft.projectId }
             let worktree = draft.worktree ? project.map { WorktreeSpec(repoPath: $0.path, base: draft.branch ?? "HEAD", spaceId: $0.id) } : nil
             _ = try handle.send(request: SendRequest(text: text, attachments: images.map(\.outgoing), worktree: worktree, busy: .queue))
+            noteDeliveryActivity()
             refreshWorkspace()
             return chatId
         } catch {

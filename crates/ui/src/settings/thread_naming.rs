@@ -27,9 +27,12 @@ impl ThreadNamingCard {
             let state = state.clone();
             cx.new(|cx| Pickers::new_for_titles(state, TitleSettings::default(), cx))
         };
-        let picked = cx.subscribe(&picker, |this: &mut Self, _, event: &TitleModelPicked, cx| {
-            this.call(Some(event.0.clone()), cx);
-        });
+        let picked = cx.subscribe(
+            &picker,
+            |this: &mut Self, _, event: &TitleModelPicked, cx| {
+                this.call(Some(event.0.clone()), cx);
+            },
+        );
         // Settings can open before the engine connects: load once it does.
         let state_sub = cx.observe(&state, |this: &mut Self, _, cx| {
             if matches!(this.settings, Loadable::Idle) {
@@ -98,6 +101,7 @@ impl ThreadNamingCard {
 
 impl Render for ThreadNamingCard {
     fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let follows_session = self
             .settings
@@ -154,8 +158,5 @@ impl Render for ThreadNamingCard {
                     )
                     .child(control),
             )
-            .when_some(self.error.clone(), |card, error| {
-                card.child(widgets::card_row(&theme, false).child(widgets::error_strip(&theme, error)))
-            })
     }
 }

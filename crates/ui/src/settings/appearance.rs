@@ -1395,7 +1395,9 @@ fn surface_label(surface: SurfacePreference) -> &'static str {
 
 fn reduce_motion_helper(preference: ReduceMotion, system: bool) -> &'static str {
     match (preference, system) {
-        (ReduceMotion::System, true) => "Following the system, which currently reduces motion.",
+        (ReduceMotion::System, true) => {
+            "Following reduced system motion. Activity indicators use a gentle brightness pulse."
+        }
         (ReduceMotion::System, false) => "Following the system, which currently allows motion.",
         (ReduceMotion::On, _) => "Animations skip straight to their final state.",
         (ReduceMotion::Off, _) => "Animations play even if the system asks for less motion.",
@@ -1829,7 +1831,7 @@ impl AppearancePage {
                 let active = family == effective;
                 let focused = family == selected;
                 let label = SharedString::from(family.label().to_owned());
-                widgets::select_row(theme, active, focused, format!("{slug}-font-option-{ix}"))
+                popover::picker_row(theme, active, focused, format!("{slug}-font-option-{ix}"))
                     .id(SharedString::from(format!("{slug}-font-option-{ix}")))
                     .role(gpui::Role::MenuItemRadio)
                     .aria_label(label.clone())
@@ -1847,7 +1849,6 @@ impl AppearancePage {
                     })
                     .when(!available, |row| row.opacity(0.45))
                     .child(div().flex_1().min_w_0().truncate().child(label))
-                    .child(widgets::select_check(theme, active))
                     .into_any_element()
             })
             .collect();
@@ -3378,6 +3379,7 @@ impl EventEmitter<AppearanceSettingsEvent> for AppearancePage {}
 
 impl Render for AppearancePage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::toast::take_error(&mut self.background_error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let availability = typography::availability(cx);
         let fixed = theme.font_sans_fixed.clone();
@@ -3775,17 +3777,6 @@ impl Render for AppearancePage {
                             )),
                     )
                     .child(effect_control)
-                    .into_any_element(),
-            );
-        }
-        if let Some(error) = self.background_error.clone() {
-            settings_rows.push(
-                div()
-                    .mx(px(16.0))
-                    .py(px(10.0))
-                    .border_t_1()
-                    .border_color(widgets::row_divider(&theme))
-                    .child(widgets::error_strip(&theme, error).mt_0())
                     .into_any_element(),
             );
         }
@@ -4526,7 +4517,9 @@ mod tests {
         });
         let (_page, cx) = cx.add_window_view(|_, cx| AppearancePage::new(cx));
         cx.update(|window, cx| window.draw(cx).clear());
-        let trigger = cx.debug_bounds("appearance-surface").expect("glass trigger");
+        let trigger = cx
+            .debug_bounds("appearance-surface")
+            .expect("glass trigger");
         cx.simulate_click(trigger.center(), gpui::Modifiers::default());
         cx.update(|window, cx| window.draw(cx).clear());
         let frosted = cx

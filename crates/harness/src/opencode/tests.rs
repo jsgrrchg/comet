@@ -237,6 +237,8 @@ impl TurnWire {
                 .send(crate::SteerMessage {
                     prompt: "second".into(),
                     message_id: None,
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -255,6 +257,7 @@ impl TurnWire {
             server: Server::attached(base),
             event_tx,
             controls: RunControls {
+                realtime: None,
                 execution_lease: None,
                 request_input: Box::new(move |questions| {
                     let answer = answer.expect("fixture must not ask for input");
@@ -272,6 +275,7 @@ impl TurnWire {
                 }),
                 steering,
                 interrupt: interrupt.clone(),
+                turn: Default::default(),
             },
             request: serde_json::from_value(request).unwrap(),
             interrupt_grace: Duration::from_secs(2),
@@ -411,6 +415,8 @@ async fn completed_turn_keeps_mailbox_alive_for_the_next_queued_request() {
         .send(crate::SteerMessage {
             prompt: "after completion".into(),
             message_id: Some("second".into()),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -1333,13 +1339,22 @@ fn tool_names_type_the_common_calls() {
         "todowrite",
         &json!({"todos": [
             {"content": "step one", "status": "completed"},
-            {"content": "step two", "status": "pending"},
+            {"content": "step two", "status": "in_progress"},
+            {"content": "step three", "status": "pending"},
+            {"content": "step four", "status": "cancelled"},
         ]}),
     );
-    assert!(matches!(
-        &call,
-        ToolCall::Todo { items } if items.len() == 2 && items[0].done && !items[1].done
-    ));
+    assert_eq!(
+        call,
+        ToolCall::Todo {
+            items: vec![
+                TodoItem::new("step one", TodoStatus::Completed),
+                TodoItem::new("step two", TodoStatus::InProgress),
+                TodoItem::new("step three", TodoStatus::Pending),
+                TodoItem::new("step four", TodoStatus::Pending),
+            ]
+        }
+    );
     let call = oc_tool_call("mystery", &json!({"x": 1}));
     assert!(matches!(&call, ToolCall::Unknown { name, input: Some(_) } if name == "mystery"));
     assert!(!call.is_subagent_spawn());

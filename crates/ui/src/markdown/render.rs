@@ -109,8 +109,18 @@ pub struct TaskUi {
 
 #[derive(Clone)]
 pub struct MediaUi {
-    pub diagram: Option<Rc<dyn Fn(&str, SharedString, &Theme) -> DiagramUi>>,
-    pub image: Rc<dyn Fn(&super::parser::InlineImage, SharedString, &Theme) -> AnyElement>,
+    pub diagram: Option<Rc<dyn Fn(&str, SharedString, &Theme) -> DiagramView>>,
+    /// `None` keeps inline images in their ordinary text rendering.
+    pub image: Option<Rc<dyn Fn(&super::parser::InlineImage, SharedString, &Theme) -> AnyElement>>,
+}
+
+/// How a Mermaid fence presents itself on the owning surface.
+pub enum DiagramView {
+    /// The ordinary source fence, unchanged (no diagram is available yet).
+    Source,
+    /// The source fence, flagged with the reason it cannot be drawn.
+    Failed(SharedString),
+    Diagram(DiagramUi),
 }
 
 pub struct DiagramUi {
@@ -366,7 +376,7 @@ impl Render for CodeScrollbarDragGhost {
     }
 }
 
-struct CodeBlockTooltip(&'static str);
+struct CodeBlockTooltip(SharedString);
 
 impl Render for CodeBlockTooltip {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -379,9 +389,10 @@ impl Render for CodeBlockTooltip {
             .border_color(theme.border_strong)
             .bg(theme.surface_raised)
             .shadow_md()
+            .max_w(px(360.0))
             .text_size(px(11.0))
             .text_color(theme.text)
-            .child(self.0)
+            .child(self.0.clone())
     }
 }
 
@@ -917,7 +928,10 @@ fn render_table(
                 TableAlign::Center => cell.text_center(),
                 TableAlign::Right => cell.text_right(),
             };
-            if opts.media.is_some()
+            if opts
+                .media
+                .as_ref()
+                .is_some_and(|media| media.image.is_some())
                 && all[r]
                     .get(c)
                     .is_some_and(|runs| runs.iter().any(|run| run.style.image.is_some()))
@@ -1393,7 +1407,7 @@ pub(crate) fn selectable_text_wrap() -> Div {
     div().relative().cursor(CursorStyle::IBeam)
 }
 
-fn selectable_text_element(
+pub(crate) fn selectable_text_element(
     key: std::sync::Arc<str>,
     text: SharedString,
     runs: Vec<TextRun>,
@@ -1439,6 +1453,17 @@ thread_local! {
     static PAINTING_SURFACE: Cell<u64> = const { Cell::new(0) };
     /// Surfaces whose reset painted since the latest one's previous reset.
     static PAINTED_SURFACES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn selection_test_entry_count(prefix: &str) -> usize {
+    REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .iter()
+            .filter(|entry| entry.key.starts_with(prefix))
+            .count()
+    })
 }
 
 #[cfg(test)]
@@ -1532,6 +1557,9 @@ pub(crate) fn clear_selection_surface(prefix: &str) {
             .retain(|entry| !entry.key.starts_with(prefix))
     });
     if let Some(anchor) = super::selection::anchor_key().filter(|key| key.starts_with(prefix)) {
+        // Closing a surface can happen before mouse-up. Retire its active
+        // drag too, without disturbing a selection owned by another view.
+        super::selection::end_active_drag();
         super::selection::clear_if_owner(&anchor);
     }
 }
@@ -1805,7 +1833,7 @@ fn text_element(
     opts: &RenderOptions,
     theme: &Theme,
 ) -> AnyElement {
-    if let Some(media) = &opts.media {
+    if let Some(image_ui) = opts.media.as_ref().and_then(|media| media.image.as_ref()) {
         if runs.iter().any(|run| run.style.image.is_some()) {
             let mut elements = Vec::new();
             let mut start = 0;
@@ -1823,7 +1851,7 @@ fn text_element(
                             theme,
                         ));
                     }
-                    elements.push((media.image)(
+                    elements.push(image_ui(
                         image,
                         format!("{}-image-{ix}-{index}", opts.row_key).into(),
                         theme,
@@ -2020,7 +2048,27 @@ fn render_code_block(
     if language.is_some_and(|l| l.eq_ignore_ascii_case("mermaid")) {
         if let Some(handler) = opts.media.as_ref().and_then(|media| media.diagram.as_ref()) {
             let frame_id: SharedString = format!("{}-mermaid-{ix}", opts.row_key).into();
-            let diagram = handler(code, frame_id.clone(), theme);
+            let diagram = match handler(code, frame_id.clone(), theme) {
+                DiagramView::Source => {
+                    return render_code_block_source(
+                        language, code, top_ix, ix, opts, theme, highlight,
+                    );
+                }
+                DiagramView::Failed(reason) => {
+                    let notice = code_notice(format!("{frame_id}-failure").into(), reason, theme);
+                    return render_code_block_source_with_actions(
+                        language,
+                        code,
+                        top_ix,
+                        ix,
+                        opts,
+                        theme,
+                        highlight,
+                        vec![notice],
+                    );
+                }
+                DiagramView::Diagram(diagram) => diagram,
+            };
             let toggle = diagram.toggle_source.clone();
             let toggle_action = code_icon_action(
                 format!("{frame_id}-source-toggle").into(),
@@ -2084,11 +2132,31 @@ fn code_icon_action(
             cx.stop_propagation();
             handler(window, cx);
         })
-        .tooltip(move |_, cx| cx.new(move |_| CodeBlockTooltip(label)).into())
+        .tooltip(move |_, cx| cx.new(move |_| CodeBlockTooltip(label.into())).into())
         .child(
             crate::icons::icon(icon_path)
                 .size(px(13.0))
                 .text_color(theme.text_muted),
+        )
+        .into_any_element()
+}
+
+/// A passive header marker whose tooltip explains why a fence stays source.
+fn code_notice(id: SharedString, message: SharedString, theme: &Theme) -> AnyElement {
+    div()
+        .id(id)
+        .size(px(CODE_ACTION_SIZE))
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(move |_, cx| {
+            let message = message.clone();
+            cx.new(move |_| CodeBlockTooltip(message)).into()
+        })
+        .child(
+            crate::icons::icon(crate::icons::DANGER_TRIANGLE)
+                .size(px(13.0))
+                .text_color(theme.warning_muted),
         )
         .into_any_element()
 }
@@ -2126,7 +2194,7 @@ fn code_copy_button(
                 cx.stop_propagation();
                 handler(ix, code_text.clone(), window, cx);
             })
-            .tooltip(|_, cx| cx.new(|_| CodeBlockTooltip("Copy code")).into())
+            .tooltip(|_, cx| cx.new(|_| CodeBlockTooltip("Copy code".into())).into())
             .child(
                 crate::icons::icon(if copied {
                     crate::icons::CHECK
@@ -2314,11 +2382,14 @@ fn render_code_block_source_with_actions(
             })
             .tooltip(move |_, cx| {
                 cx.new(move |_| {
-                    CodeBlockTooltip(if fit_content {
-                        "Use horizontal scrolling"
-                    } else {
-                        "Fit content"
-                    })
+                    CodeBlockTooltip(
+                        if fit_content {
+                            "Use horizontal scrolling"
+                        } else {
+                            "Fit content"
+                        }
+                        .into(),
+                    )
                 })
                 .into()
             })

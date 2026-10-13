@@ -144,6 +144,10 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
     }
 
     private func toggled(_ id: String, _ on: Bool) {
+        if id == "groupByProject" {
+            app.groupByProject = on
+            return
+        }
         let push = PushNotifications.shared
         if id == "notify:enabled" {
             guard on else {
@@ -184,6 +188,10 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         ])
         s.appendSections(["Devices"])
         s.appendItems(app.hostOptions.map { Row(id: "device:\($0.id)", title: $0.name, subtitle: $0.online ? "Online" : "Offline", symbol: "desktopcomputer", accessory: .dot($0.online)) })
+        if app.voice.available {
+            s.appendSections(["Voice"])
+            s.appendItems([Row(id: "voice", title: "Voice", subtitle: app.voice.selectedStyle.map { "Codex voice · \($0.capitalized)" } ?? "Codex voice device and style", symbol: "waveform")])
+        }
         s.appendSections(["Notifications"])
         s.appendItems(notificationRows())
         s.appendSections(["Appearance"])
@@ -202,7 +210,10 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         }
         s.appendItems(wall)
         s.appendSections(["Sessions"])
-        s.appendItems([Row(id: "archived", title: "Archived Sessions", symbol: "archivebox")])
+        s.appendItems([
+            Row(id: "groupByProject", title: "Group by Project", subtitle: "Sessions outside your sections, under their project", symbol: "square.stack.3d.up", accessory: .toggle(app.groupByProject)),
+            Row(id: "archived", title: "Archived Sessions", symbol: "archivebox"),
+        ])
         s.appendSections([" "])
         s.appendItems([Row(id: "signout", title: "Sign Out", symbol: "rectangle.portrait.and.arrow.right", accessory: .none, destructive: true)])
         dataSource.apply(s, animatingDifferences: false)
@@ -212,6 +223,7 @@ final class MoreViewController: UIViewController, UICollectionViewDelegate {
         collectionView.deselectItem(at: path, animated: true)
         guard let row = dataSource.itemIdentifier(for: path) else { return }
         switch row.id {
+        case "voice": navigationController?.pushViewController(VoiceViewController(app: app), animated: true)
         case let id where id.hasPrefix("appearance:"):
             let style = Int(id.dropFirst(11)) ?? 0
             UserDefaults.standard.set(style, forKey: "appearance")

@@ -33,6 +33,7 @@ pub mod preview;
 mod rename;
 pub mod search;
 mod sections;
+mod subagents;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tree;
@@ -42,6 +43,15 @@ use client::{FilesRequestContext, WorkspaceFilesClient};
 use model::{DirectoryLoadState, FileTreeModel};
 use preview::FilePreviewState;
 use search::FileSearchState;
+
+/// File links use character columns; content search reports UTF-8 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileColumn {
+    /// One-based character column from a file link.
+    Character(u32),
+    /// Zero-based UTF-8 byte column from a content search match.
+    Byte(u64),
+}
 
 static NEXT_REVIEW_COMMENT_FLUSH_SOURCE: AtomicU64 = AtomicU64::new(1);
 use crate::surface_chrome::{
@@ -211,6 +221,8 @@ pub enum FilesEvent {
     },
     /// A footer row: open this side chat (by id) in the right pane.
     OpenChildChat(String),
+    /// A footer row's double-click: edit this side chat's title in place.
+    RenameChildChat(String),
     ChildChatContextMenu {
         chat_id: String,
         position: Point<Pixels>,
@@ -288,7 +300,7 @@ pub struct FilesSurface {
     watch_error: Option<SharedString>,
     preview: FilePreviewState,
     tree_context_menu: crate::popover::Popup<context_menu::TreeContextMenu>,
-    pending_line_navigation: Option<(u32, Option<u32>)>,
+    pending_line_navigation: Option<(u32, Option<FileColumn>)>,
     line_navigation_generation: u64,
     editor_context_menu: crate::popover::Popup<EditorContextMenu>,
     loads: HashMap<(String, Option<String>), Task<()>>,
@@ -369,7 +381,13 @@ impl FilesSurface {
                     let device = state
                         .device_name(&chat.device_id)
                         .unwrap_or(&chat.device_id);
-                    format!("Files in {} · {device}", chat.cwd.as_deref().unwrap_or("~"))
+                    // A projectless chat's folder is an implementation detail.
+                    match chat.cwd.as_deref() {
+                        Some(cwd) if !zeron_proto::projectless::is_projectless_cwd(Some(cwd)) => {
+                            format!("Files in {cwd} · {device}")
+                        }
+                        _ => format!("Files · {device}"),
+                    }
                 })
         };
         let phase = self.tree.node("").map(|root| root.load.clone());
@@ -606,6 +624,7 @@ impl FilesSurface {
             ComposerInputEvent::PastedImages(_)
             | ComposerInputEvent::PastedPaths(_)
             | ComposerInputEvent::PastedText { .. }
+            | ComposerInputEvent::OpenAttachment(_)
             | ComposerInputEvent::CursorMoved
             | ComposerInputEvent::ViewportChanged => {}
         });
@@ -877,6 +896,18 @@ impl FilesSurface {
         }
         self.started = true;
         self.load_directory(String::new(), None, cx);
+        // Opening the tree is a strong hint a search follows; start the
+        // host's index now.
+        if let (Some(engine), Some(context)) = (
+            self.state.read(cx).engine().cloned(),
+            self.request_context.clone(),
+        ) {
+            let client = WorkspaceFilesClient::new(engine, context);
+            cx.spawn(async move |_, _| {
+                client.hint_search_warm().await;
+            })
+            .detach();
+        }
     }
 
     pub fn retry_root(&mut self, cx: &mut Context<Self>) {

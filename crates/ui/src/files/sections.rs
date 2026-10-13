@@ -18,17 +18,19 @@ use std::hash::{Hash, Hasher};
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, Context, EntityId, MouseButton, ScrollHandle,
+    Animation, AnimationExt as _, AnyElement, Context, Entity, EntityId, MouseButton, ScrollHandle,
     SharedString, div, prelude::*, px,
 };
 use zeron_doc::{MessagePart, SubagentStatus};
 use zeron_proto::{Chat, ChatIndicator};
 
+use crate::composer::ComposerInput;
 use crate::icons::{self, icon};
 use crate::state::AppState;
 use crate::theme::Theme;
 use crate::{loaders, motion};
 
+use super::subagents::{Group, GroupState, SubagentPlan};
 use super::{FilesEvent, FilesSurface};
 
 const SECTION_HEADER_HEIGHT: f32 = 28.0;
@@ -46,10 +48,12 @@ const EMPTY_PAD: f32 = 10.0;
 const LIST_FADE_BAND: f32 = 16.0;
 /// Hover group of a section header (reveals its actions).
 const HEADER_GROUP: &str = "files-section-header";
+/// How far each level of the Finished dropdown steps in.
+const GROUP_INDENT: f32 = 10.0;
 /// Rows a section shows before "Show more" pages it, and the page size —
 /// the sidebar's Archived shelf numbers.
-const INITIAL_ROWS: usize = 10;
-const PAGE_ROWS: usize = 10;
+pub(super) const INITIAL_ROWS: usize = 10;
+pub(super) const PAGE_ROWS: usize = 10;
 /// An open section never shrinks below this, so one or two rows still
 /// leave the section room to breathe.
 const MIN_BODY_HEIGHT: f32 = 120.0;
@@ -119,10 +123,18 @@ pub(super) struct ExplorerSections {
     /// One scroll handle per section list, so the edge fades can read
     /// overflow at paint time.
     scroll: HashMap<Section, ScrollHandle>,
+    /// Open/closed and paging state of the Finished dropdown.
+    groups: GroupState,
     /// Hash of what the footer would draw, so the state observer only
     /// re-renders the explorer when a section's contents actually changed —
     /// not on every streamed transcript delta.
     fingerprint: u64,
+    /// The side chat whose title the shell is editing in place, and its
+    /// field — drawn over that row's title.
+    chat_rename: Option<(String, Entity<ComposerInput>)>,
+    /// A section opened to reveal a renamed row: its motion starts on the
+    /// render that knows the body height.
+    reveal: Option<Section>,
 }
 
 impl Default for ExplorerSections {
@@ -139,7 +151,10 @@ impl Default for ExplorerSections {
             ]
             .into_iter()
             .collect(),
+            groups: GroupState::default(),
             fingerprint: 0,
+            chat_rename: None,
+            reveal: None,
         }
     }
 }
@@ -175,6 +190,24 @@ impl ExplorerSections {
         );
         let open = self.is_open(section);
         self.open.insert(section, !open);
+    }
+
+    /// Start the opening motion of a section a reveal opened.
+    fn begin_reveal(&mut self, section: Section, height: f32) {
+        if self.reveal != Some(section) || !self.is_open(section) {
+            return;
+        }
+        self.reveal = None;
+        let epoch = self.motion.get(&section).map_or(1, |m| m.epoch + 1);
+        self.motion.insert(
+            section,
+            DisclosureMotion {
+                epoch,
+                from: 0.0,
+                to: height,
+                started: std::time::Instant::now(),
+            },
+        );
     }
 
     fn scroll(&self, section: Section) -> ScrollHandle {
@@ -281,6 +314,7 @@ pub(super) fn subagent_rows(state: &AppState, chat_id: &str) -> Vec<SubagentRow>
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct ChildChatRow {
     pub chat_id: String,
+    pub device_id: String,
     pub title: SharedString,
     pub status: ChatIndicator,
     pub time_ago: SharedString,
@@ -304,6 +338,7 @@ pub(super) fn child_chat_rows(
             let activity = chat.last_message_at.unwrap_or(chat.created_at);
             ChildChatRow {
                 chat_id: chat.id.clone(),
+                device_id: chat.device_id.clone(),
                 title: child_chat_title(chat).into(),
                 status: state.display_status_for(chat, now),
                 time_ago: zeron_proto::view::format_time_ago(activity, now).into(),
@@ -337,6 +372,7 @@ pub(super) fn fingerprint(state: &AppState, chat_id: &str, now: DateTime<Utc>) -
     0xC0FFEEu64.hash(&mut hasher);
     for row in child_chat_rows(state, chat_id, now) {
         row.chat_id.hash(&mut hasher);
+        row.device_id.hash(&mut hasher);
         row.title.as_ref().hash(&mut hasher);
         (row.status as u8).hash(&mut hasher);
         row.time_ago.as_ref().hash(&mut hasher);
@@ -367,8 +403,22 @@ fn content_height_unfloored(section: Section, count: usize, shown: usize) -> f32
     }
     let visible = count.min(shown);
     let more = if count > shown { 1 } else { 0 };
-    let slots = visible + more;
+    rows_height(visible + more)
+}
+
+/// The height of a list of `slots` row-sized items: the inset, the rows and
+/// the gaps between them.
+fn rows_height(slots: usize) -> f32 {
     SECTION_BODY_INSET + slots as f32 * ROW_HEIGHT + slots.saturating_sub(1) as f32 * ROW_GAP
+}
+
+/// The Subagents body's wanted height: its rows and group headers, or the
+/// empty-state copy when nothing is left to list.
+fn subagents_height(plan: &SubagentPlan, groups: &GroupState) -> f32 {
+    match plan.slots(groups) {
+        0 => content_height(Section::Subagents, 0, INITIAL_ROWS),
+        slots => rows_height(slots).max(MIN_BODY_HEIGHT),
+    }
 }
 
 /// Split the footer's body budget between two open sections: each may take
@@ -393,6 +443,47 @@ fn chrome_height() -> f32 {
 }
 
 impl FilesSurface {
+    /// Show (or clear) the shell's inline rename of one of the Chats rows.
+    pub(crate) fn set_chat_rename(
+        &mut self,
+        rename: Option<(String, Entity<ComposerInput>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = |rename: &Option<(String, Entity<ComposerInput>)>| {
+            rename
+                .as_ref()
+                .map(|(id, input)| (id.clone(), input.entity_id()))
+        };
+        if key(&self.sections.chat_rename) != key(&rename) {
+            if let Some((chat_id, _)) = &rename {
+                self.reveal_chat_row(chat_id, cx);
+            }
+            self.sections.chat_rename = rename;
+            cx.notify();
+        }
+    }
+
+    /// Open the Chats section, page it, and scroll its list so `chat_id`'s
+    /// row shows — the inline rename's field must never sit on a hidden row.
+    fn reveal_chat_row(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let rows = child_chat_rows(self.state.read(cx), &self.chat_id, Utc::now());
+        let Some(index) = rows.iter().position(|row| row.chat_id == chat_id) else {
+            return;
+        };
+        if !self.sections.is_open(Section::Chats) {
+            self.sections.open.insert(Section::Chats, true);
+            self.sections.reveal = Some(Section::Chats);
+        }
+        // Page in the same steps "Show more" takes.
+        if index >= self.sections.shown(Section::Chats) {
+            self.sections.shown.insert(
+                Section::Chats,
+                INITIAL_ROWS + (index + 1 - INITIAL_ROWS).div_ceil(PAGE_ROWS) * PAGE_ROWS,
+            );
+        }
+        self.sections.scroll(Section::Chats).scroll_to_item(index);
+    }
+
     /// Re-render only when the footer's contents changed.
     pub(super) fn refresh_sections(&mut self, cx: &mut Context<Self>) {
         let fingerprint = fingerprint(self.state.read(cx), &self.chat_id, Utc::now());
@@ -412,12 +503,9 @@ impl FilesSurface {
             )
         };
         self.sections.fingerprint = fingerprint(self.state.read(cx), &self.chat_id, now);
+        let plan = SubagentPlan::new(subagents);
         let wants = [
-            content_height(
-                Section::Subagents,
-                subagents.len(),
-                self.sections.shown(Section::Subagents),
-            ),
+            subagents_height(&plan, &self.sections.groups),
             content_height(
                 Section::Chats,
                 chats.len(),
@@ -431,7 +519,14 @@ impl FilesSurface {
         let budget = FOOTER_HEIGHT - chrome_height();
         let heights = body_budget(budget, wants, open);
         let view = cx.entity_id();
-        let subagent_body = self.render_subagent_rows(&subagents, view, theme, cx);
+        let subagent_body = self.render_subagent_rows(&plan, view, theme, cx);
+        let subagent_badge = (plan.running() > 0).then(|| {
+            crate::running_pill::running_pill(
+                "files-subagents-header",
+                plan.running() as u32,
+                theme,
+            )
+        });
         let chat_body = self.render_chat_rows(&chats, theme, cx);
         let chats_actions = self.render_chats_header_actions(theme, cx);
         div()
@@ -446,10 +541,11 @@ impl FilesSurface {
             .pb(px(FOOTER_PAD_BOTTOM))
             .child(self.render_section(
                 Section::Subagents,
-                subagents.len(),
+                plan.total(),
                 wants[0],
                 heights[0],
                 None,
+                subagent_badge,
                 subagent_body,
                 theme,
                 cx,
@@ -460,6 +556,7 @@ impl FilesSurface {
                 wants[1],
                 heights[1],
                 Some(chats_actions),
+                None,
                 chat_body,
                 theme,
                 cx,
@@ -495,7 +592,7 @@ impl FilesSurface {
             .child(
                 header_action(
                     "files-sections-fork",
-                    icons::GIT_BRANCH,
+                    icons::FORK,
                     "Fork this chat",
                     theme,
                 )
@@ -515,11 +612,13 @@ impl FilesSurface {
         wanted: f32,
         height: f32,
         actions: Option<AnyElement>,
+        badge: Option<AnyElement>,
         body: AnyElement,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.sections.is_open(section);
+        self.sections.begin_reveal(section, height);
         // The collapsed header carries the count; open, the rows speak.
         let label: SharedString = if open || count == 0 {
             section.label().into()
@@ -565,14 +664,25 @@ impl FilesSurface {
                 cx.notify();
             }))
             .child(
+                // The badge trails the title, not the caret: the title
+                // truncates first, the badge never does.
                 div()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .text_size(crate::typography::ui_rems(12.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.5))
-                    .child(label),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text_muted.opacity(0.5))
+                            .child(label),
+                    )
+                    .children(badge),
             )
             .children(actions)
             .child(self.render_chevron(section, open, theme));
@@ -667,40 +777,29 @@ impl FilesSurface {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .id(SharedString::from(format!(
-                "files-section-{}-more",
-                section.key()
-            )))
-            .role(gpui::Role::Button)
-            .flex_none()
-            .h(px(ROW_HEIGHT))
-            .flex()
-            .items_center()
-            .px(px(Theme::SPACE_SM))
-            .rounded(px(8.0))
-            .cursor_pointer()
-            .text_size(crate::typography::ui_rems(12.0))
-            .text_color(theme.text_muted.opacity(0.7))
-            .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text_muted))
-            .child(format!("Show {} more", remaining.min(PAGE_ROWS)))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.stop_propagation();
-                let shown = this.sections.shown(section) + PAGE_ROWS;
-                this.sections.shown.insert(section, shown);
-                cx.notify();
-            }))
-            .into_any_element()
+        show_more_row(
+            format!("files-section-{}-more", section.key()),
+            remaining,
+            0.0,
+            theme,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            let shown = this.sections.shown(section) + PAGE_ROWS;
+            this.sections.shown.insert(section, shown);
+            cx.notify();
+        }))
+        .into_any_element()
     }
 
     fn render_subagent_rows(
         &self,
-        rows: &[SubagentRow],
+        plan: &SubagentPlan,
         view: EntityId,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if rows.is_empty() {
+        if plan.total() == 0 {
             return empty_state(
                 "Subagents will appear here when they are created",
                 None,
@@ -708,49 +807,190 @@ impl FilesSurface {
             );
         }
         let now = Utc::now();
-        let shown = self.sections.shown(Section::Subagents);
         let scroll = self.sections.scroll(Section::Subagents);
         let mut list = row_list("files-subagent-rows", &scroll);
-        for row in rows.iter().take(shown) {
-            let glyph = status_glyph(
-                format!("files-subagent-{}", row.doc_id),
-                row.indicator(),
-                view,
-                theme,
-                cx,
-            );
-            let open = row.clone();
-            list = list.child(
-                compact_row(format!("files-subagent-{}", row.doc_id), theme)
-                    .aria_label(SharedString::from(format!("Open subagent {}", row.title)))
-                    .on_click(cx.listener(move |_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.emit(FilesEvent::OpenSubagent {
-                            doc_id: open.doc_id.clone(),
-                            title: open.title.to_string(),
-                            frozen: open.frozen(),
-                        });
-                    }))
-                    .child(glyph)
-                    .child(row_title(
-                        format!("files-subagent-title-{}", row.doc_id),
-                        row.title.clone(),
-                    ))
-                    .child(time_ago_label(
-                        zeron_proto::view::format_time_ago(row.spawned_at, now).into(),
-                        theme,
-                    )),
-            );
+        for row in &plan.active {
+            list = list.child(self.render_subagent_row(row, 0.0, now, view, theme, cx));
         }
-        if rows.len() > shown {
-            list = list.child(self.render_show_more(
-                Section::Subagents,
-                rows.len() - shown,
+        if plan.finished() > 0 {
+            list = list.child(self.render_group_header(
+                Group::Finished,
+                plan.finished(),
+                0.0,
                 theme,
                 cx,
             ));
+            if self.sections.groups.is_open(Group::Finished) {
+                for group in [Group::Completed, Group::Failed] {
+                    let rows = plan.rows(group);
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    list = list.child(self.render_group_header(
+                        group,
+                        rows.len(),
+                        GROUP_INDENT,
+                        theme,
+                        cx,
+                    ));
+                    if !self.sections.groups.is_open(group) {
+                        continue;
+                    }
+                    let shown = self.sections.groups.shown(group);
+                    for row in rows.iter().take(shown) {
+                        list = list.child(self.render_subagent_row(
+                            row,
+                            2.0 * GROUP_INDENT,
+                            now,
+                            view,
+                            theme,
+                            cx,
+                        ));
+                    }
+                    if rows.len() > shown {
+                        list = list.child(self.render_group_show_more(
+                            group,
+                            rows.len() - shown,
+                            2.0 * GROUP_INDENT,
+                            theme,
+                            cx,
+                        ));
+                    }
+                }
+            }
         }
         faded_list(list, &scroll)
+    }
+
+    /// One subagent: status glyph, title, and the time it was last updated.
+    fn render_subagent_row(
+        &self,
+        row: &SubagentRow,
+        indent: f32,
+        now: DateTime<Utc>,
+        view: EntityId,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let glyph = status_glyph(
+            format!("files-subagent-{}", row.doc_id),
+            row.indicator(),
+            view,
+            theme,
+            cx,
+        );
+        let open = row.clone();
+        compact_row(format!("files-subagent-{}", row.doc_id), theme)
+            .pl(px(Theme::SPACE_SM + indent))
+            .aria_label(SharedString::from(format!("Open subagent {}", row.title)))
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.stop_propagation();
+                cx.emit(FilesEvent::OpenSubagent {
+                    doc_id: open.doc_id.clone(),
+                    title: open.title.to_string(),
+                    frozen: open.frozen(),
+                });
+            }))
+            .child(glyph)
+            .child(row_title(
+                format!("files-subagent-title-{}", row.doc_id),
+                row.title.clone(),
+            ))
+            .child(time_ago_label(
+                zeron_proto::view::format_time_ago(row.spawned_at, now).into(),
+                theme,
+            ))
+            .into_any_element()
+    }
+
+    /// A dropdown header inside the Subagents body: caret and
+    /// "Label (count)". Clicking toggles the group.
+    fn render_group_header(
+        &self,
+        group: Group,
+        count: usize,
+        indent: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let open = self.sections.groups.is_open(group);
+        let chevron = icon(icons::ALT_ARROW_RIGHT)
+            .size(px(12.0))
+            .text_color(theme.text_muted.opacity(0.5))
+            .with_transformation(gpui::Transformation::rotate(gpui::percentage(if open {
+                0.25
+            } else {
+                0.0
+            })));
+        div()
+            .id(SharedString::from(format!(
+                "files-subagent-group-{}",
+                group.key()
+            )))
+            .role(gpui::Role::Button)
+            .aria_label(SharedString::from(format!(
+                "{} {} subagents",
+                if open { "Collapse" } else { "Expand" },
+                group.label()
+            )))
+            .flex_none()
+            .h(px(ROW_HEIGHT))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0))
+            .rounded(px(8.0))
+            .pl(px(Theme::SPACE_SM + indent - 4.0))
+            .pr(px(4.0))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.glass_hover()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.sections.groups.toggle(group);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .size(px(16.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(chevron),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.7))
+                    .child(SharedString::from(format!("{} ({count})", group.label()))),
+            )
+            .into_any_element()
+    }
+
+    /// "Show N more" under one finished category, indented with its rows.
+    fn render_group_show_more(
+        &self,
+        group: Group,
+        remaining: usize,
+        indent: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        show_more_row(
+            format!("files-subagent-group-{}-more", group.key()),
+            remaining,
+            indent,
+            theme,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            cx.stop_propagation();
+            this.sections.groups.page_up(group);
+            cx.notify();
+        }))
+        .into_any_element()
     }
 
     fn render_chat_rows(
@@ -769,7 +1009,7 @@ impl FilesSurface {
                 .child(
                     pill_button(
                         "files-sections-empty-fork",
-                        icons::GIT_BRANCH,
+                        icons::FORK,
                         "Fork",
                         theme,
                     )
@@ -811,12 +1051,36 @@ impl FilesSurface {
             );
             let open_id = row.chat_id.clone();
             let menu_id = row.chat_id.clone();
+            let rename_input = self
+                .sections
+                .chat_rename
+                .as_ref()
+                .filter(|(id, _)| *id == row.chat_id)
+                .map(|(_, input)| input.clone());
+            let title = match rename_input {
+                Some(input) => crate::shell::chat_title_editor(
+                    format!("files-chat-title-editor-{}", row.chat_id).into(),
+                    input,
+                    theme,
+                ),
+                None => row_title(
+                    format!("files-chat-title-{}", row.chat_id),
+                    row.title.clone(),
+                )
+                .into_any_element(),
+            };
             list = list.child(
                 compact_row(format!("files-chat-{}", row.chat_id), theme)
                     .aria_label(SharedString::from(format!("Open side chat {}", row.title)))
-                    .on_click(cx.listener(move |_, _, _, cx| {
+                    .on_click(cx.listener(move |_, event: &gpui::ClickEvent, _, cx| {
                         cx.stop_propagation();
-                        cx.emit(FilesEvent::OpenChildChat(open_id.clone()));
+                        // The first click opened the tab; the second edits
+                        // the title in place.
+                        if event.click_count() >= 2 {
+                            cx.emit(FilesEvent::RenameChildChat(open_id.clone()));
+                        } else {
+                            cx.emit(FilesEvent::OpenChildChat(open_id.clone()));
+                        }
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
@@ -829,15 +1093,13 @@ impl FilesSurface {
                         }),
                     )
                     .child(glyph)
-                    .child(row_title(
-                        format!("files-chat-title-{}", row.chat_id),
-                        row.title.clone(),
-                    ))
+                    .child(title)
                     .children(row.change_request.clone().map(|summary| {
                         crate::change_requests::pull_request_badge(
                             format!("files-chat-pr-{}", row.chat_id).into(),
                             summary,
                             crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                            Some(row.device_id.clone()),
                             theme,
                         )
                     }))
@@ -882,6 +1144,31 @@ fn header_action(
                 .size(px(13.0))
                 .text_color(theme.text_muted.opacity(0.85)),
         )
+}
+
+/// A section's "Show N more" row (a page is [`PAGE_ROWS`]), indented to line
+/// up with the rows it pages.
+fn show_more_row(
+    id: String,
+    remaining: usize,
+    indent: f32,
+    theme: &Theme,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(id))
+        .role(gpui::Role::Button)
+        .flex_none()
+        .h(px(ROW_HEIGHT))
+        .flex()
+        .items_center()
+        .pl(px(Theme::SPACE_SM + indent))
+        .pr(px(Theme::SPACE_SM))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .text_size(crate::typography::ui_rems(12.0))
+        .text_color(theme.text_muted.opacity(0.7))
+        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text_muted))
+        .child(format!("Show {} more", remaining.min(PAGE_ROWS)))
 }
 
 /// The empty state's pill buttons — the explorer's Retry button shape.
@@ -1266,6 +1553,108 @@ mod tests {
         assert_eq!(rows[0].title.as_ref(), "New side chat");
         assert_eq!(rows[1].title.as_ref(), "Investigate caching");
         assert_eq!(rows[0].status, ChatIndicator::Idle);
+    }
+
+    #[gpui::test]
+    fn double_clicked_side_chat_asks_for_an_inline_rename(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, MouseDownEvent, MouseUpEvent};
+
+        let (files, cx) = super::super::test_support::setup(cx);
+        files.update(cx, |files, cx| {
+            files.state.update(cx, |state, _| {
+                let mut side = chat("side", Some("chat"), 1);
+                side.title = Some("Side work".into());
+                state.chats.push(side);
+            });
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = events.clone();
+        let _sub = cx.update(|_, cx| {
+            cx.subscribe(&files, move |_, event, _| {
+                recorded.borrow_mut().push(event.clone())
+            })
+        });
+        let row = cx.debug_bounds("files-chat-title-side").unwrap();
+        for click_count in [1, 2] {
+            cx.simulate_event(MouseDownEvent {
+                button: MouseButton::Left,
+                position: row.center(),
+                click_count,
+                ..Default::default()
+            });
+            cx.simulate_event(MouseUpEvent {
+                button: MouseButton::Left,
+                position: row.center(),
+                click_count,
+                ..Default::default()
+            });
+        }
+        cx.run_until_parked();
+        {
+            let events = events.borrow();
+            assert!(matches!(&events[..], [
+                FilesEvent::OpenChildChat(open),
+                FilesEvent::RenameChildChat(rename),
+            ] if open == "side" && rename == "side"));
+        }
+
+        // The shell's field replaces the row title while the edit is open.
+        let input = cx.update(|_, cx| cx.new(|cx| ComposerInput::new("Session title", cx)));
+        files.update(cx, |files, cx| {
+            files.set_chat_rename(Some(("side".into(), input)), cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("files-chat-title-editor-side").is_some());
+        assert!(cx.debug_bounds("files-chat-title-side").is_none());
+        files.update(cx, |files, cx| files.set_chat_rename(None, cx));
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("files-chat-title-side").is_some());
+    }
+
+    #[gpui::test]
+    fn inline_rename_reveals_a_side_chat_in_a_collapsed_paged_section(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::AppContext as _;
+
+        let (files, cx) = super::super::test_support::setup(cx);
+        files.update(cx, |files, cx| {
+            files.state.update(cx, |state, _| {
+                for ix in 0..12 {
+                    state
+                        .chats
+                        .push(chat(&format!("side-{ix:02}"), Some("chat"), ix));
+                }
+            });
+            files.sections.toggle(Section::Chats, 0.0, 0.0);
+            assert!(!files.sections.is_open(Section::Chats));
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+
+        // Newest first: side-11 is the twelfth row, past the first page.
+        let input = cx.update(|_, cx| cx.new(|cx| ComposerInput::new("Session title", cx)));
+        files.update(cx, |files, cx| {
+            files.set_chat_rename(Some(("side-11".into(), input)), cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        files.read_with(cx, |files, _| {
+            assert!(files.sections.is_open(Section::Chats));
+            assert_eq!(
+                files.sections.shown(Section::Chats),
+                INITIAL_ROWS + PAGE_ROWS
+            );
+            // The reveal became the section's opening motion.
+            assert_eq!(files.sections.reveal, None);
+            assert_eq!(files.sections.motion[&Section::Chats].from, 0.0);
+        });
+        assert!(cx.debug_bounds("files-chat-title-editor-side-11").is_some());
     }
 
     #[test]

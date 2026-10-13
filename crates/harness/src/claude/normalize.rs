@@ -2,7 +2,7 @@
 //! decoding, error-code mapping).
 
 use serde_json::Value;
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use zeron_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, TodoStatus, ToolCall};
 
 use super::wire::{ContentBlock, Frame};
 
@@ -106,9 +106,11 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
                 .map(|a| a.as_slice())
                 .unwrap_or_default()
                 .iter()
-                .map(|t| TodoItem {
-                    text: str_field(t, "content"),
-                    done: t.get("status").and_then(Value::as_str) == Some("completed"),
+                .map(|t| {
+                    TodoItem::new(
+                        str_field(t, "content"),
+                        TodoStatus::parse(t.get("status").and_then(Value::as_str).unwrap_or("")),
+                    )
                 })
                 .collect(),
         },
@@ -653,9 +655,10 @@ impl Normalizer {
             }
 
             // A claude.ai plan window was hit. A hard `rejected` blocks the
-            // turn — make it visible; allowed/allowed_warning stay quiet.
+            // turn — make it visible; allowed/allowed_warning stay quiet, and
+            // so does a reject the account's overage carries past.
             Frame::RateLimit(f) => {
-                if f.rate_limit_info.status != "rejected" {
+                if !f.rate_limit_info.blocks() {
                     return Vec::new();
                 }
                 let window =
@@ -768,7 +771,10 @@ impl Normalizer {
             }
 
             // Control frames are handled by the run loop, not normalized.
-            Frame::ControlRequest(_) | Frame::Other => Vec::new(),
+            Frame::ControlRequest(_)
+            | Frame::ControlResponse(_)
+            | Frame::CommandLifecycle(_)
+            | Frame::Other => Vec::new(),
         }
     }
 }
@@ -803,10 +809,27 @@ mod tests {
                 &json!({"todos": [{"content": "t", "status": "completed"}]})
             ),
             ToolCall::Todo {
-                items: vec![TodoItem {
-                    text: "t".into(),
-                    done: true
-                }]
+                items: vec![TodoItem::new("t", TodoStatus::Completed)]
+            }
+        );
+        // Claude's in-progress state survives; unknown/missing reads as pending.
+        assert_eq!(
+            decode_tool_use(
+                "TodoWrite",
+                &json!({"todos": [
+                    {"content": "a", "status": "completed"},
+                    {"content": "b", "status": "in_progress", "activeForm": "Doing b"},
+                    {"content": "c", "status": "pending"},
+                    {"content": "d"},
+                ]})
+            ),
+            ToolCall::Todo {
+                items: vec![
+                    TodoItem::new("a", TodoStatus::Completed),
+                    TodoItem::new("b", TodoStatus::InProgress),
+                    TodoItem::new("c", TodoStatus::Pending),
+                    TodoItem::new("d", TodoStatus::Pending),
+                ]
             }
         );
         assert_eq!(
@@ -826,6 +849,24 @@ mod tests {
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
         Normalizer::new().normalize(frame, false)
+    }
+
+    #[test]
+    fn a_rejected_window_carried_by_overage_is_not_an_error() {
+        let blocked = normalize_one(
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour","overageStatus":"rejected"}}"#,
+        );
+        assert!(matches!(blocked.as_slice(), [AgentEvent::Error { .. }]));
+        for overage in [
+            r#""overageStatus":"allowed""#,
+            r#""overageStatus":"allowed_warning""#,
+            r#""isUsingOverage":true"#,
+        ] {
+            let raw = format!(
+                r#"{{"type":"rate_limit_event","rate_limit_info":{{"status":"rejected","rateLimitType":"five_hour",{overage}}}}}"#
+            );
+            assert!(normalize_one(&raw).is_empty(), "{overage}");
+        }
     }
 
     fn result_done(raw: &str) -> AgentEvent {

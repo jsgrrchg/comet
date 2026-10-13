@@ -132,6 +132,7 @@ impl WorktreeSettingsCard {
         .options(options, selected)
         .menu_width(260.0)
         .heading("Devices")
+        .open_rightward()
         .on_select(move |page, ix, _, cx| {
             if let Some(target) = targets.get(ix) {
                 widgets::close_select(page, |card: &mut Self| &mut card.device_select, cx);

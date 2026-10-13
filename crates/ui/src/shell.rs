@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use gpui::{
     Action, AnyElement, App, ClipboardItem, Context, Empty, Entity, FocusHandle, Focusable as _,
     IntoElement, KeyBinding, Keystroke, ModifiersChangedEvent, MouseButton, MouseDownEvent,
-    MouseUpEvent, Pixels, Point, Render, SharedString, Subscription, Task, Window,
-    WindowControlArea, actions, div, prelude::*, px,
+    MouseUpEvent, NavigationDirection, Pixels, Point, Render, SharedString, Subscription, Task,
+    Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -29,7 +29,9 @@ use zeron_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent, DiscardWorkingTreeRequest};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
-use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
+use crate::files::{
+    FileColumn, FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag,
+};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{
@@ -85,7 +87,9 @@ mod session_info;
 mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
+mod search_warm;
 pub(crate) mod spaces;
+mod thread_search;
 use side_chats::SideChatTab;
 mod tabs;
 mod voice_stage;
@@ -303,6 +307,13 @@ fn titlebar_new_session_alpha(route: &Route, has_selected_chat: bool) -> f32 {
 #[action(namespace = shell, no_json)]
 pub struct JumpSession(pub usize);
 
+/// Show the command palette's tab at this (zero-based) position. Bound to
+/// mod-1…4 inside the palette's key context only, where it outranks the
+/// session jumps on the same keys while the palette is open.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = shell, no_json)]
+pub struct SelectPaletteTab(pub usize);
+
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
 // ---------------------------------------------------------------------------
@@ -505,6 +516,21 @@ pub fn apply_keymap(
             JumpSession(slot),
             None,
         ))
+    }));
+    // Context-free bindings (the jumps above) match at the full focus depth,
+    // so a palette binding must too: one for the palette's focused search
+    // input, one for the card itself. Bound after the jumps, they win the tie.
+    let palette_input = format!("{} > PaletteSearch", command_palette::KEY_CONTEXT);
+    cx.bind_keys((0..command_palette::Tab::ALL.len()).flat_map(|ix| {
+        let combo = platform_combo(&format!("mod-{}", ix + 1));
+        [
+            KeyBinding::new(&combo, SelectPaletteTab(ix), Some(&palette_input)),
+            KeyBinding::new(
+                &combo,
+                SelectPaletteTab(ix),
+                Some(command_palette::KEY_CONTEXT),
+            ),
+        ]
     }));
 }
 
@@ -2010,7 +2036,7 @@ pub struct Shell {
     chat_pull_requests: std::collections::HashMap<u64, chat_pull_requests::ChatPullRequest>,
     chat_pull_request_seq: u64,
     browser_context: crate::browser::BrowserContext,
-    browser_profile: Option<String>,
+    browser_profile: Option<crate::browser::profile::BrowserProfile>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -2082,6 +2108,10 @@ pub struct Shell {
     /// The New project palette's collapsed-breadcrumbs (`…`) menu.
     project_crumb_menu: popover::Popup<()>,
     command_palette: Option<command_palette::CommandPalette>,
+    /// The focus whose workspace search index was last warmed (see `search_warm`).
+    search_warm: Option<search_warm::SearchWarm>,
+    /// Per chat, the files opened in editor tabs, most recent first.
+    recent_files: std::collections::HashMap<String, std::collections::VecDeque<String>>,
     pending_workspace_command: Option<crate::composer::WorkspaceCommand>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
@@ -2188,6 +2218,18 @@ pub struct Shell {
     files_tween: Option<WidthTween>,
     /// The session card's reveal (0 closed → 1 open).
     session_info_tween: Option<WidthTween>,
+    /// Whether the card showed last frame; a change starts the reveal tween.
+    session_info_shown: bool,
+    /// The card opened over a transcript too narrow to show it beside.
+    session_info_overlay: bool,
+    /// Whether the card showed at the toggle's press (see
+    /// `note_session_info_press`).
+    session_info_pressed_open: Option<bool>,
+    /// The card last showed docked beside the transcript (else over it).
+    session_info_docked: bool,
+    /// The room the transcript last held free for the docked card, eased
+    /// back from as the card hides because the column stopped fitting it.
+    session_info_last_reserve: f32,
     files_content_tween: Option<WidthTween>,
     /// The last tracked frame: its chat, the window fit, and for each of
     /// `[sidebar, surface host, Files]` the width painted and the width its
@@ -2569,6 +2611,8 @@ impl Shell {
             add_space: None,
             project_crumb_menu: popover::Popup::default(),
             command_palette: None,
+            search_warm: None,
+            recent_files: std::collections::HashMap::new(),
             pending_workspace_command: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_bar: popover::MenuScrollbarState::default(),
@@ -2629,6 +2673,11 @@ impl Shell {
             sidebar_tween: None,
             files_tween: None,
             session_info_tween: None,
+            session_info_shown: false,
+            session_info_overlay: false,
+            session_info_pressed_open: None,
+            session_info_docked: false,
+            session_info_last_reserve: 0.0,
             files_content_tween: None,
             painted_columns: None,
             fit_exits: [None; 3],
@@ -2746,6 +2795,7 @@ impl Shell {
         }
         self.prune_file_explorers(cx);
         self.refresh_harness_update_watch(cx);
+        self.sync_search_warm(cx);
         if state.read(cx).engine().is_none() {
             self.side_chats.clear();
             self.side_chat_creating = false;
@@ -3582,6 +3632,10 @@ impl Shell {
             RightSurface::File(id) => {
                 if let Some(file) = self.file_surfaces.get(&id).cloned() {
                     file.update(cx, |file, cx| file.ensure_loaded(cx));
+                    if let Some(path) = self.file_surface_paths.get(&id).cloned() {
+                        let chat_id = file.read(cx).chat_id().to_owned();
+                        self.note_recent_file(&chat_id, &path);
+                    }
                 }
             }
             RightSurface::Terminal(tab) => {
@@ -3797,6 +3851,35 @@ impl Shell {
         outcome
     }
 
+    fn sync_browser_profile(&mut self, cx: &mut Context<Self>) {
+        let browser_profile = {
+            let state = self.state.read(cx);
+            crate::browser::profile::BrowserProfile::for_workspace(
+                &self.data_dir,
+                state.workspace_scope,
+                state.auth.as_ref(),
+                state.local_device_id.as_deref(),
+            )
+        };
+        if browser_profile != self.browser_profile {
+            for browser in self.browsers.values() {
+                browser.update(cx, |browser, cx| browser.close(cx));
+            }
+            self.browsers.clear();
+            self.browser_subs.clear();
+            self.browser_context = browser_profile
+                .clone()
+                .map(crate::browser::BrowserContext::for_profile)
+                .unwrap_or_default();
+            self.pull_request_cache = Default::default();
+            self.pull_requests_page = None;
+            self.reset_pull_request_pane();
+            // Their tabs read as closed; rows skip a missing surface.
+            self.chat_pull_requests.clear();
+            self.browser_profile = browser_profile;
+        }
+    }
+
     /// Browser tabs are independent instances owned by the current session.
     fn add_browser_surface(
         &mut self,
@@ -3807,6 +3890,7 @@ impl Shell {
         if self.active_chat.is_empty() {
             return;
         }
+        self.sync_browser_profile(cx);
         let key = self.panel_key(cx);
         let remote = {
             let state = self.state.read(cx);
@@ -3890,7 +3974,7 @@ impl Shell {
         &mut self,
         owner: (String, Entity<AppState>),
         path: String,
-        location: Option<(u32, Option<u32>)>,
+        location: Option<(u32, Option<FileColumn>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -4086,7 +4170,8 @@ impl Shell {
         self.add_file_surface_at(
             owner,
             link.path,
-            link.line.map(|line| (line, link.column)),
+            link.line
+                .map(|line| (line, link.column.map(FileColumn::Character))),
             window,
             cx,
         );
@@ -5340,7 +5425,8 @@ impl Shell {
         self.set_route(Route::PullRequests, cx);
         self.close_user_menu(cx);
         self.close_chat_menu(cx);
-        self.add_space = None;
+        // Through `close_add_space`, so the host's home index is released.
+        self.close_add_space(cx);
         self.close_right_plus(cx);
         if self.spaces_menu.begin_close() {
             popover::reap_popup(cx, |shell: &mut Self| &mut shell.spaces_menu);
@@ -8048,30 +8134,16 @@ impl Shell {
         let compact_jump_label = compact.then(|| jump_label.clone()).flatten();
         let corner_body: AnyElement = if let Some(label) = jump_label.filter(|_| !compact) {
             // The jump hint replaces the status/time corner while the modifier
-            // is held, cut to the sidebar PR badge's exact cloth
-            // (`pull_request_badge`, Sidebar surface): pinned 16px, px 4,
-            // rounded 4, borderless 0.08-fill with 0.85 text of one tone —
-            // neutral here — and the label in the badge's mono at 10 MEDIUM.
-            // Any other geometry reads as a second badge system on the row.
-            {
-                let tone = theme.text_muted;
-                div()
-                    .h(px(16.0))
-                    .flex_none()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .px(px(4.0))
-                    .rounded(px(4.0))
-                    .bg(tone.opacity(0.08))
-                    .whitespace_nowrap()
-                    .text_size(crate::typography::ui_rems(10.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(tone.opacity(0.85))
-                    .font_family(theme.font_mono.clone())
-                    .child(label)
-                    .into_any_element()
-            }
+            // is held, in the shared legend voice (the compact rows' plain
+            // muted text, `popover::kbd_hint`).
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .font_family(crate::popover::KEY_GLYPH_FONT)
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted.opacity(0.5))
+                .child(label)
+                .into_any_element()
         } else if corner_hovered {
             div()
                 .flex()
@@ -10367,8 +10439,7 @@ impl Shell {
             return true;
         }
         if self.add_space.is_some() {
-            self.add_space = None;
-            cx.notify();
+            self.close_add_space(cx);
             return true;
         }
         if self.spaces_menu.is_open() {
@@ -10943,26 +11014,10 @@ impl Shell {
         self.composer
             .update(cx, |composer, cx| composer.set_dock_frame(dock_frame, cx));
         // The session card: docked, the transcript holds its room free on
-        // the right and the composer follows the column left by half of it,
-        // so column and card center together.
-        let session_reveal = if has_selection {
-            self.session_info_reveal()
-        } else {
-            0.0
-        };
-        // The column's LIVE width: while the sidebar or a pane animates,
-        // `main_content_width` already holds the end width, and a reserve or
-        // card placed from it would jump ahead of the column and wait.
-        let live_main_width = (self.viewport_width
-            - self.sidebar_now()
-            - self.right_visible_width(cx)
-            - self.files_visible_width(cx))
-        .max(0.0);
-        let session_layout = session_info::session_card_layout(
-            live_main_width,
-            ui_settings.transcript_width,
-        );
-        let session_reserve = session_layout.reserve * session_reveal;
+        // the right and the composer follows the column left by half of it;
+        // over a column too tight for that, it floats once opened.
+        let (session_docked, session_reveal, session_reserve) =
+            self.session_info_frame(has_selection, cx);
         self.transcript
             .update(cx, |transcript, cx| transcript.set_right_reserve(session_reserve, cx));
         // Panel open/close glides the composer width; a window resize or a
@@ -11126,7 +11181,7 @@ impl Shell {
             .left(px(-session_reserve / 2.0))
             .child(self.render_status_strip(composer_width, cx));
         let session_card = self.render_session_info(
-            session_layout,
+            session_docked,
             session_reveal,
             self.viewport_height
                 - Theme::TITLEBAR_HEIGHT
@@ -11273,7 +11328,6 @@ impl Shell {
                                 div()
                                     .id("persistent-composer")
                                     .relative()
-                                    .left(px(-session_reserve / 2.0))
                                     .w(px(composer_width))
                                     .opacity(composer_opacity)
                                     .mx_auto()
@@ -11288,6 +11342,9 @@ impl Shell {
                                 self.reduced_motion,
                                 frame_time,
                             )
+                            // Centered on the transcript, which keeps the
+                            // session card's room free on its right.
+                            .shift_x(-session_reserve / 2.0)
                             .reserve_terminal(terminal_geometry.clone()),
                         )
                     })
@@ -13186,30 +13243,7 @@ impl Render for Shell {
             .clone()
             .unwrap_or_else(|| self.state.read(cx).gate());
 
-        let browser_profile = {
-            let state = self.state.read(cx);
-            crate::links::workspace_locator(
-                state.workspace_scope,
-                state.auth.as_ref(),
-                state.local_device_id.as_deref(),
-            )
-        };
-        if browser_profile.is_some() && browser_profile != self.browser_profile {
-            if self.browser_profile.is_some() {
-                for browser in self.browsers.values() {
-                    browser.update(cx, |browser, cx| browser.close(cx));
-                }
-                self.browsers.clear();
-                self.browser_subs.clear();
-                self.browser_context = crate::browser::BrowserContext::default();
-                self.pull_request_cache = Default::default();
-                self.pull_requests_page = None;
-                self.reset_pull_request_pane();
-                // Their tabs read as closed; rows skip a missing surface.
-                self.chat_pull_requests.clear();
-            }
-            self.browser_profile = browser_profile;
-        }
+        self.sync_browser_profile(cx);
         // Manual tween drive bookkeeping for this pass (see [`WidthTween`]).
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);
@@ -13380,6 +13414,16 @@ impl Render for Shell {
                         cx.notify();
                     }
                 }),
+            )
+            // Mouse side buttons walk the same history as the titlebar
+            // back/forward arrows (the browser surface keeps them to itself).
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _, _, cx| this.navigate_back(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
             )
             .capture_key_down(cx.listener(Self::on_key_down_capture))
             .on_key_down(cx.listener(Self::on_key_down))
@@ -13571,8 +13615,7 @@ impl Render for Shell {
                     return;
                 }
                 if this.add_space.is_some() {
-                    this.add_space = None;
-                    cx.notify();
+                    this.close_add_space(cx);
                 } else {
                     this.open_add_space(cx);
                 }
@@ -13916,8 +13959,7 @@ impl Render for Shell {
         // scheduling `with_animation` would have requested). Hover color fades
         // ride the same clock; their once-per-frame tick lives here (this is
         // the window's root render — it runs exactly once per frame).
-        if self.motion_active.get() | motion::hover_fades_active() | motion::state_morphs_active()
-        {
+        if self.motion_active.get() | motion::hover_fades_active() | motion::state_morphs_active() {
             window.request_animation_frame();
         }
 
@@ -17554,6 +17596,90 @@ mod exit_regressions {
                 })
                 .unwrap();
         }
+    }
+
+    #[gpui::test]
+    fn browser_profile_changes_clear_tabs_and_reselect_the_stable_identity(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| AppState::new());
+            Shell::new(
+                state,
+                EngineBootConfig {
+                    data_dir: dir.path().into(),
+                    ipc_port: 0,
+                    edge_url: "http://127.0.0.1:1".into(),
+                    edge_token: None,
+                    org_id: None,
+                    workos_client_id: None,
+                    default_harness: zeron_proto::HarnessId::Mock,
+                },
+                cx,
+            )
+        });
+        window
+            .update(cx, |shell, window, cx| {
+                shell.active_chat = "session".into();
+                shell.state.update(cx, |state, _| {
+                    state.workspace_scope = Some(zeron_proto::WorkspaceScope::Local);
+                    state.local_device_id = Some("device-a".into());
+                });
+                // Selecting the identity happens before navigation, without requiring a render.
+                shell.add_browser_surface(None, window, cx);
+                let original = shell.browser_profile.clone().unwrap();
+                let original_cache = shell.pull_request_cache.clone();
+                shell.pull_requests_page =
+                    Some(cx.new(|cx| PullRequestsPage::new(shell.state.clone(), cx)));
+                shell.active_chat = "another-chat".into();
+                shell.add_browser_surface(None, window, cx);
+                assert_eq!(shell.browsers.len(), 2);
+                assert_eq!(shell.browser_profile.as_ref(), Some(&original));
+                assert!(std::rc::Rc::ptr_eq(
+                    &shell.pull_request_cache,
+                    &original_cache
+                ));
+                assert!(shell.pull_requests_page.is_some());
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("device-b".into())
+                });
+                shell.sync_browser_profile(cx);
+                assert!(shell.browsers.is_empty());
+                assert!(shell.browser_subs.is_empty());
+                assert_ne!(shell.browser_profile.as_ref(), Some(&original));
+                assert!(!std::rc::Rc::ptr_eq(
+                    &shell.pull_request_cache,
+                    &original_cache
+                ));
+                assert!(shell.pull_requests_page.is_none());
+                shell.state.update(cx, |state, _| {
+                    state.local_device_id = Some("device-a".into())
+                });
+                shell.sync_browser_profile(cx);
+                assert_eq!(shell.browser_profile.as_ref(), Some(&original));
+                shell.add_browser_surface(None, window, cx);
+                let restored_cache = shell.pull_request_cache.clone();
+                shell.pull_requests_page =
+                    Some(cx.new(|cx| PullRequestsPage::new(shell.state.clone(), cx)));
+                shell
+                    .state
+                    .update(cx, |state, _| state.workspace_scope = None);
+                shell.sync_browser_profile(cx);
+                assert!(shell.browser_profile.is_none());
+                assert!(shell.browsers.is_empty());
+                assert!(!std::rc::Rc::ptr_eq(
+                    &shell.pull_request_cache,
+                    &restored_cache
+                ));
+                assert!(shell.pull_requests_page.is_none());
+            })
+            .unwrap();
     }
 
     #[gpui::test]

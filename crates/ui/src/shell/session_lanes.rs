@@ -345,10 +345,68 @@ impl Shell {
             )
         };
         let view = cx.entity_id();
-        let mut rows: Vec<AnyElement> =
-            vec![popover::menu_heading(theme, "Side chats").into_any_element()];
+        // ── The two ways to start a side chat: rows while the lane is empty,
+        // then icon buttons on the heading so the branches lead.
+        let busy = self.side_chat_creating;
+        let compact = !side_chats.is_empty();
+        let mut heading = div()
+            .flex()
+            .items_center()
+            .child(div().flex_1().child(popover::menu_heading(theme, "Side chats")));
+        let mut starters: Vec<AnyElement> = Vec::new();
+        for (id, path, label, fork) in [
+            (
+                "session-info-side-chat",
+                icons::PLUS,
+                "New side chat",
+                false,
+            ),
+            ("session-info-fork", icons::FORK, "Fork chat", true),
+        ] {
+            let start = cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.close_session_info_overlay(cx);
+                if fork {
+                    this.create_side_chat(cx);
+                } else {
+                    this.create_child_chat(None, cx);
+                }
+            });
+            if compact {
+                heading = heading.child(
+                    div()
+                        .id(id)
+                        .debug_selector(move || id.into())
+                        .size(px(22.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(5.0))
+                        .cursor_pointer()
+                        .when(busy, |button| button.opacity(0.5))
+                        .hover(|style| style.bg(crate::theme::ink(0.08)))
+                        .tooltip(crate::settings::widgets::text_tooltip(label))
+                        .on_click(start)
+                        .child(icon(path).size(px(14.0)).text_color(theme.text_muted)),
+                );
+            } else {
+                starters.push(
+                    popover::picker_row(theme, false, false, id)
+                        .id(id)
+                        .debug_selector(move || id.into())
+                        .when(busy, |row| row.opacity(0.5))
+                        .on_click(start)
+                        .child(popover::picker_icon_slot(glyph(path, theme)))
+                        .child(div().flex_1().child(label))
+                        .into_any_element(),
+                );
+            }
+        }
+        let mut rows: Vec<AnyElement> = vec![heading.pr(px(2.0)).into_any_element()];
+        rows.extend(starters);
 
-        // ── Side chats, then the two ways to start one.
+        // ── Side chats.
         let shown = LaneState::shown(self.session_lanes.shown_chats);
         let hidden = side_chats.len().saturating_sub(shown);
         for row in side_chats.into_iter().take(shown) {
@@ -368,35 +426,6 @@ impl Shell {
                 },
             ));
         }
-        let busy = self.side_chat_creating;
-        for (id, path, label, fork) in [
-            (
-                "session-info-side-chat",
-                icons::PLUS,
-                "New side chat",
-                false,
-            ),
-            ("session-info-fork", icons::FORK, "Fork chat", true),
-        ] {
-            rows.push(
-                popover::picker_row(theme, false, false, id)
-                    .id(id)
-                    .debug_selector(move || id.into())
-                    .when(busy, |row| row.opacity(0.5))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_session_info_overlay(cx);
-                        if fork {
-                            this.create_side_chat(cx);
-                        } else {
-                            this.create_child_chat(None, cx);
-                        }
-                    }))
-                    .child(popover::picker_icon_slot(glyph(path, theme)))
-                    .child(div().flex_1().child(label))
-                    .into_any_element(),
-            );
-        }
-
         // ── Subagents: what runs rides the lane, the settled fold away.
         if !subagents.is_empty() {
             let failed = subagents.failed();

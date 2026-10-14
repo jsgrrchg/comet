@@ -1077,6 +1077,13 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
     func executionDevices()  -> [DeviceView]
     
     /**
+     * Fork `source_id` through its latest completed response into a side
+     * chat (a side chat's fork is its sibling). Returns the new chat id; the
+     * error carries the host's reason (e.g. nothing completed yet).
+     */
+    func forkSideChat(sourceId: String) async throws  -> String
+    
+    /**
      * Threads page: pinned, sections, recent.
      */
     func frontPage()  -> FrontPage
@@ -1504,6 +1511,27 @@ open func executionDevices() -> [DeviceView]  {
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Fork `source_id` through its latest completed response into a side
+     * chat (a side chat's fork is its sibling). Returns the new chat id; the
+     * error carries the host's reason (e.g. nothing completed yet).
+     */
+open func forkSideChat(sourceId: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_fork_side_chat(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(sourceId)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_rust_buffer,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_rust_buffer,
+            freeFunc: ffi_zeron_mobile_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
     /**
@@ -6986,6 +7014,11 @@ public struct NewSession: Equatable, Hashable {
      */
     public var cwd: String?
     public var title: String?
+    /**
+     * A side chat of this chat: runs in its parent's checkout and host
+     * (`target`, `cwd`, `branch` ignored).
+     */
+    public var parentChatId: String?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -6995,12 +7028,17 @@ public struct NewSession: Equatable, Hashable {
          */branch: String?, 
         /**
          * Checkout override (an existing worktree's path).
-         */cwd: String?, title: String?) {
+         */cwd: String?, title: String?, 
+        /**
+         * A side chat of this chat: runs in its parent's checkout and host
+         * (`target`, `cwd`, `branch` ignored).
+         */parentChatId: String?) {
         self.target = target
         self.config = config
         self.branch = branch
         self.cwd = cwd
         self.title = title
+        self.parentChatId = parentChatId
     }
 
     
@@ -7023,7 +7061,8 @@ public struct FfiConverterTypeNewSession: FfiConverterRustBuffer {
                 config: FfiConverterOptionTypeChatConfig.read(from: &buf), 
                 branch: FfiConverterOptionString.read(from: &buf), 
                 cwd: FfiConverterOptionString.read(from: &buf), 
-                title: FfiConverterOptionString.read(from: &buf)
+                title: FfiConverterOptionString.read(from: &buf), 
+                parentChatId: FfiConverterOptionString.read(from: &buf)
         )
     }
 
@@ -7033,6 +7072,7 @@ public struct FfiConverterTypeNewSession: FfiConverterRustBuffer {
         FfiConverterOptionString.write(value.branch, into: &buf)
         FfiConverterOptionString.write(value.cwd, into: &buf)
         FfiConverterOptionString.write(value.title, into: &buf)
+        FfiConverterOptionString.write(value.parentChatId, into: &buf)
     }
 }
 
@@ -15372,6 +15412,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_execution_devices() != 15578) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_fork_side_chat() != 45854) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_front_page() != 3792) {

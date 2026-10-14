@@ -562,6 +562,27 @@ final class AppModel {
         }
     }
 
+    /// Fork `sourceId` through its last completed reply into a side chat on
+    /// its host. Nil (and a toast with the host's reason) when it can't.
+    @MainActor
+    func forkSideChat(of sourceId: String) async -> String? {
+        guard let client else { return nil }
+        do {
+            let id = try await client.forkSideChat(sourceId: sourceId)
+            refreshWorkspace()
+            return id
+        } catch {
+            let message: String = switch error as? CoreError {
+            case let .HostError(message)?: message
+            case let .HostUnavailable(message)?: "The host is unreachable (\(message))."
+            default: "Couldn't fork this session."
+            }
+            let window = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first
+            Toast.show(message, in: window)
+            return nil
+        }
+    }
+
     // MARK: New session
 
     /// Who's signed in, by name (never the WorkOS user / org ids).
@@ -646,11 +667,17 @@ final class AppModel {
         return refs.sorted { $0.current && !$1.current }.map(\.name)
     }
 
-    /// Create the chat, open it, and send the first message.
-    func createSession(draft: NewSessionDraft, text: String, images: [StagedImage]) -> String? {
+    /// Create the chat, open it, and send the first message. `sideOf` makes
+    /// it a side chat of that session (its checkout and host; the draft only
+    /// picks the model).
+    func createSession(draft: NewSessionDraft, text: String, images: [StagedImage], sideOf parentId: String? = nil) -> String? {
         guard let client else { return nil }
         let target: SessionTarget
-        if let p = draft.projectId {
+        if let parentId {
+            // Ignored by the core for a side chat; the parent's host fills it.
+            guard let parent = row(parentId) else { return nil }
+            target = .projectless(deviceId: parent.deviceId)
+        } else if let p = draft.projectId {
             target = .project(spaceId: p)
         } else if let h = draft.hostId {
             target = .projectless(deviceId: h)
@@ -659,10 +686,10 @@ final class AppModel {
         }
         let config = ChatConfig(harness: draft.harness, model: draft.model, reasoning: draft.effort, modelOptions: [:], sandbox: .workspaceWrite)
         do {
-            let chatId = try client.createSession(newSession: NewSession(target: target, config: config, branch: draft.worktree ? nil : draft.branch, cwd: nil, title: nil))
+            let chatId = try client.createSession(newSession: NewSession(target: target, config: config, branch: draft.worktree ? nil : draft.branch, cwd: nil, title: nil, parentChatId: parentId))
             let handle = try client.openSession(chatId: chatId)
             let project = rawProjects.first { $0.id == draft.projectId }
-            let worktree = draft.worktree ? project.map { WorktreeSpec(repoPath: $0.path, base: draft.branch ?? "HEAD", spaceId: $0.id) } : nil
+            let worktree = draft.worktree && parentId == nil ? project.map { WorktreeSpec(repoPath: $0.path, base: draft.branch ?? "HEAD", spaceId: $0.id) } : nil
             _ = try handle.send(request: SendRequest(text: text, attachments: images.map(\.outgoing), worktree: worktree, busy: .queue))
             noteDeliveryActivity()
             refreshWorkspace()

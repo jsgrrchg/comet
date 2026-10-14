@@ -77,6 +77,9 @@ pub(crate) struct DemoHost {
     processed: Mutex<HashSet<String>>,
     leases: Mutex<HashMap<String, Lease>>,
     uploads: Mutex<HashMap<String, Arc<Vec<u8>>>>,
+    /// History copied into forked side chats, by chat id (their docs are
+    /// built from it, like the fixtures).
+    forks: Mutex<HashMap<String, Vec<zeron_doc::SessionMessageEntry>>>,
     rng: Mutex<Rng>,
     cancel: Mutex<Option<CancellationToken>>,
 }
@@ -97,6 +100,7 @@ impl DemoHost {
             processed: Mutex::new(HashSet::new()),
             leases: Mutex::new(HashMap::new()),
             uploads: Mutex::new(HashMap::new()),
+            forks: Mutex::new(HashMap::new()),
             rng: Mutex::new(Rng(0x9e37_79b9_7f4a_7c15)),
             cancel: Mutex::new(None),
         })
@@ -212,6 +216,12 @@ impl DemoHost {
             .as_ref()
             .and_then(|c| c.last_message_at)
             .map_or_else(now_ms, |t| t.timestamp_millis());
+        if let Some(forked) = lock(&self.forks).get(chat_id) {
+            for entry in forked {
+                doc.push_message(entry).map_err(doc_err)?;
+            }
+            return Ok(doc);
+        }
         let entries = match (chat_id, self.options.transcript_scale.turns()) {
             ("chat-veil", Some(turns)) => {
                 transcripts::synthetic(turns, &host, now_ms() - turns as i64 * 60_000)
@@ -764,6 +774,9 @@ impl DemoHost {
             return Err(ClientError::HostUnavailable(device_id.to_owned()));
         }
         tokio::time::sleep(Duration::from_millis(80)).await;
+        if method == m::FORK_SIDE_CHAT {
+            return self.fork_side_chat(&client, &params);
+        }
         let chat_id = params["chatId"].as_str().unwrap_or_default().to_owned();
         let id = params["id"].as_str().unwrap_or_default().to_owned();
         let core = client
@@ -897,6 +910,72 @@ impl DemoHost {
             other => return Err(ClientError::Unsupported(other.to_owned())),
         };
         Ok(reply)
+    }
+
+    /// The engine's `ForkSideChat`: copy the source's history through its
+    /// latest completed response (plus the fork seam) into a new child row.
+    fn fork_side_chat(
+        &self,
+        client: &Arc<ClientInner>,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let field = |key: &str| params[key].as_str().unwrap_or_default().to_owned();
+        let (chat_id, source_id) = (field("chatId"), field("sourceChatId"));
+        let parent_id = Some(field("parentChatId"))
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| source_id.clone());
+        let source = client
+            .workspace
+            .chat(&source_id)
+            .ok_or_else(|| ClientError::HostError("Source chat no longer exists".into()))?;
+        let entries = match client.session_core(&source_id) {
+            Some(core) => core.doc().read_entries().map_err(doc_err)?,
+            None => self
+                .session_doc(&source_id)?
+                .read_entries()
+                .map_err(doc_err)?,
+        };
+        let boundary = entries
+            .iter()
+            .rposition(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
+            .ok_or_else(|| {
+                ClientError::HostError(
+                    "Wait for a completed response before starting a side chat".into(),
+                )
+            })?;
+        let mut copied = entries[..=boundary].to_vec();
+        let marker = format!("fork:{chat_id}");
+        copied.push(zeron_doc::SessionMessageEntry {
+            id: marker.clone(),
+            role: MessageRole::System,
+            parts: vec![MessagePart::Fork {
+                id: marker,
+                source_chat_id: source.id.clone(),
+                source_title: source.title.clone().unwrap_or_else(|| "New session".into()),
+            }],
+            created_at: now_ms(),
+            device_id: source.device_id.clone(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        });
+        lock(&self.forks).insert(chat_id.clone(), copied);
+        let mut chat = source.clone();
+        chat.id = chat_id;
+        chat.parent_chat_id = Some(parent_id);
+        chat.title = None;
+        chat.archived = false;
+        chat.created_at = Utc::now();
+        chat.last_message_at = None;
+        chat.last_message_preview = None;
+        chat.last_seen_at = None;
+        chat.harness_session_id = None;
+        chat.harness_session_cwd = None;
+        chat.room_gen = Some(2);
+        client.registry_write(|doc| doc.upsert_chat(&chat))?;
+        serde_json::to_value(&chat).map_err(|e| ClientError::Internal(e.to_string()))
     }
 
     pub(crate) async fn list_harnesses(&self, _device_id: &str) -> Vec<HarnessInfo> {

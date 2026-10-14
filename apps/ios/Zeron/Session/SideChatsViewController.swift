@@ -7,6 +7,9 @@ final class SideChatsViewController: SessionListController {
     private let parentId: String
     private let onOpen: (String) -> Void
     private var childrenToken: AnyObject?
+    /// "+": a new empty side chat, or a fork of the session.
+    var onNew: (() -> Void)?
+    var onFork: (() -> Void)?
 
     init(app: AppModel, parentId: String, onOpen: @escaping (String) -> Void) {
         self.parentId = parentId
@@ -24,6 +27,13 @@ final class SideChatsViewController: SessionListController {
         navigationItem.rightBarButtonItem = UIBarButtonItem(systemItem: .done, primaryAction: UIAction { [weak self] _ in
             self?.dismiss(animated: true)
         })
+        let add = UIBarButtonItem(image: UIImage(systemName: "plus"), menu: UIMenu(children: [
+            UIAction(title: "New Side Chat", image: UIImage(systemName: "plus.bubble")) { [weak self] _ in self?.onNew?() },
+            UIAction(title: "Fork into Side Chat", image: UIImage(systemName: "arrow.triangle.branch")) { [weak self] _ in self?.onFork?() },
+        ]))
+        add.accessibilityLabel = "Add side chat"
+        add.accessibilityIdentifier = "side-chats-add"
+        navigationItem.leftBarButtonItem = add
         collectionView.accessibilityIdentifier = "side-chats-list"
         // Children aren't on the front page: follow every workspace revision.
         childrenToken = app.observeWorkspace { [weak self] in

@@ -7,9 +7,10 @@ use std::time::{Duration, Instant};
 
 use zeron_client::events::NullListener;
 use zeron_client::{
-    ChatIndicator, Client, ClientConfig, Credentials, DemoFixture, DemoOptions, MessageRole,
-    MessageStatus, SendOutcome, SendRequest, StreamSpeed, TranscriptScale,
+    ChatConfig, ChatIndicator, Client, ClientConfig, Credentials, DemoFixture, DemoOptions,
+    MessageRole, MessageStatus, SendOutcome, SendRequest, StreamSpeed, TranscriptScale,
 };
+use zeron_proto::{HarnessId, SandboxLevel};
 
 fn demo(options: DemoOptions) -> (Client, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -165,6 +166,128 @@ fn spawn_chips_open_their_subagent_transcript() {
         runtime
             .block_on(client.open_subagent("chat-tabs", true))
             .is_err()
+    );
+}
+
+#[test]
+fn new_side_chats_inherit_the_checkout_but_pick_their_own_harness() {
+    let (client, _dir) = demo(fast());
+    let config = |harness| ChatConfig {
+        harness,
+        model: Some("gpt-5.6".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: SandboxLevel::ReadOnly,
+    };
+    let side = |parent: &str, harness| {
+        client
+            .create_session(zeron_client::NewSession {
+                // Ignored: a side chat runs where its parent does.
+                target: zeron_client::SessionTarget::Projectless {
+                    device_id: "dev-vps".into(),
+                },
+                config: Some(config(harness)),
+                branch: Some("elsewhere".into()),
+                cwd: Some("/tmp/elsewhere".into()),
+                title: None,
+                parent_chat_id: Some(parent.into()),
+            })
+            .unwrap()
+    };
+    let id = side("chat-veil", HarnessId::Codex);
+    let parent = client.workspace().session("chat-veil").unwrap().clone();
+    let row = client.workspace().session(&id).unwrap().clone();
+    assert_eq!(row.parent_chat_id.as_deref(), Some("chat-veil"));
+    assert_eq!(row.device_id, parent.device_id);
+    assert_eq!(row.cwd, parent.cwd);
+    assert_eq!(row.branch, parent.branch);
+    assert_eq!(
+        row.project.as_ref().map(|p| &p.id),
+        parent.project.as_ref().map(|p| &p.id)
+    );
+    assert_eq!(row.room_gen, 2);
+    let picked = client.session_config(&id).unwrap();
+    assert_eq!(picked.harness, HarnessId::Codex);
+    assert_ne!(
+        Some(picked.harness),
+        client.session_config("chat-veil").map(|c| c.harness)
+    );
+    // The sandbox is the parent's, not the pick's.
+    assert_eq!(
+        picked.sandbox,
+        client.session_config("chat-veil").unwrap().sandbox
+    );
+    assert!(ids(client.workspace().children("chat-veil")).contains(&id.as_str()));
+    // A side chat's side chat is its sibling.
+    let sibling = side(&id, HarnessId::ClaudeCode);
+    assert_eq!(
+        client
+            .workspace()
+            .session(&sibling)
+            .unwrap()
+            .parent_chat_id
+            .as_deref(),
+        Some("chat-veil")
+    );
+}
+
+#[test]
+fn forks_copy_history_through_the_last_completed_reply() {
+    let (client, _dir) = demo(fast());
+    let runtime = zeron_client::runtime::shared();
+    // chat-veil is mid-reply: the fork stops at its last completed answer.
+    let fork = runtime
+        .block_on(client.fork_side_chat("chat-veil"))
+        .unwrap();
+    let row = client.workspace().session(&fork).unwrap().clone();
+    assert_eq!(row.parent_chat_id.as_deref(), Some("chat-veil"));
+    let entries = client
+        .open_session(&fork)
+        .unwrap()
+        .snapshot()
+        .transcript_messages();
+    let last = entries.last().unwrap();
+    assert_eq!(last.role, MessageRole::System);
+    assert!(matches!(
+        last.parts[0],
+        zeron_client::MessagePart::Fork { .. }
+    ));
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.status != Some(MessageStatus::Streaming))
+    );
+    assert_eq!(entries[entries.len() - 2].role, MessageRole::Assistant);
+    // Forking a side chat makes a sibling.
+    let sibling = runtime
+        .block_on(client.fork_side_chat("chat-side"))
+        .unwrap();
+    assert_eq!(
+        client
+            .workspace()
+            .session(&sibling)
+            .unwrap()
+            .parent_chat_id
+            .as_deref(),
+        Some("chat-veil")
+    );
+    // Nothing completed yet: the host's reason, without the method name.
+    let empty = client
+        .create_session(zeron_client::NewSession {
+            target: zeron_client::SessionTarget::Project {
+                space_id: "space-edge".into(),
+            },
+            config: None,
+            branch: None,
+            cwd: None,
+            title: None,
+            parent_chat_id: None,
+        })
+        .unwrap();
+    let err = runtime.block_on(client.fork_side_chat(&empty)).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "host error: Wait for a completed response before starting a side chat"
     );
 }
 
@@ -405,6 +528,7 @@ fn new_sessions_are_born_on_chat2() {
             branch: None,
             cwd: None,
             title: None,
+            parent_chat_id: None,
         })
         .unwrap();
     let row = client.workspace().session(&id).unwrap().clone();

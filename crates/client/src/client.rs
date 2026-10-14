@@ -68,6 +68,10 @@ pub struct NewSession {
     /// Checkout override (an existing worktree's path).
     pub cwd: Option<String>,
     pub title: Option<String>,
+    /// A side chat of this chat: `target`, `cwd` and `branch` are ignored —
+    /// it runs in its parent's checkout on its parent's host. A side chat's
+    /// own side chats hang off its parent instead (siblings).
+    pub parent_chat_id: Option<String>,
 }
 
 pub(crate) enum Backend {
@@ -728,6 +732,9 @@ impl Client {
     /// Mint a chat row (born on chat2: `roomGen: 2`). The row is written
     /// before any session doc opens, so the host never reads it as legacy.
     pub fn create_session(&self, new: NewSession) -> Result<String> {
+        if let Some(parent_id) = &new.parent_chat_id {
+            return self.create_side_chat(parent_id, new.config, new.title);
+        }
         let (state, _) = self.inner.workspace.state();
         let id = crate::new_id();
         let now = Utc::now();
@@ -792,6 +799,96 @@ impl Client {
         let id = chat.id.clone();
         self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;
         Ok(id)
+    }
+
+    /// The chat side chats of `chat_id` hang off: itself, or its parent when
+    /// it is a side chat (a dangling parent leaves it as the root).
+    fn side_chat_root(&self, chat_id: &str) -> Result<Chat> {
+        let chat = self
+            .inner
+            .workspace
+            .chat(chat_id)
+            .ok_or_else(|| ClientError::NotFound(chat_id.to_owned()))?;
+        Ok(chat
+            .parent_chat_id
+            .as_deref()
+            .and_then(|parent| self.inner.workspace.chat(parent))
+            .unwrap_or(chat))
+    }
+
+    /// An empty side chat, minted the way the desktop's "New side chat"
+    /// does: the parent's row (host, project, checkout) with a fresh
+    /// identity. The run config is the caller's pick, but the sandbox stays
+    /// the parent's.
+    fn create_side_chat(
+        &self,
+        parent_id: &str,
+        config: Option<ChatConfig>,
+        title: Option<String>,
+    ) -> Result<String> {
+        let parent = self.side_chat_root(parent_id)?;
+        let mut chat = parent.clone();
+        chat.id = crate::new_id();
+        chat.parent_chat_id = Some(parent.id.clone());
+        chat.title = title.filter(|t| !t.trim().is_empty());
+        chat.archived = false;
+        chat.created_at = Utc::now();
+        chat.last_message_at = None;
+        chat.last_message_preview = None;
+        chat.last_seen_at = None;
+        chat.harness_session_id = None;
+        chat.harness_session_cwd = None;
+        chat.room_gen = Some(2);
+        if let Some(mut config) = config {
+            if let Some(sandbox) = parent.config.as_ref().map(|c| c.sandbox) {
+                config.sandbox = sandbox;
+            }
+            chat.config = Some(config);
+        }
+        let id = chat.id.clone();
+        self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;
+        Ok(id)
+    }
+
+    /// Fork `source_id` through its latest completed response into a side
+    /// chat, on the source's host (which copies the history). A side chat's
+    /// fork lists as its sibling. Fails with the host's reason when there is
+    /// no completed response yet.
+    pub async fn fork_side_chat(&self, source_id: &str) -> Result<String> {
+        let source = self
+            .inner
+            .workspace
+            .chat(source_id)
+            .ok_or_else(|| ClientError::NotFound(source_id.to_owned()))?;
+        let parent = self.side_chat_root(source_id)?;
+        let params = serde_json::json!({
+            "chatId": crate::new_id(),
+            "sourceChatId": source.id,
+            "parentChatId": parent.id,
+        });
+        let method = zeron_rpc::methods::FORK_SIDE_CHAT;
+        let reply = self
+            .inner
+            .host_rpc(&source.device_id, method, params)
+            .await
+            .map_err(|err| match err {
+                // The host's own words, without the method prefix.
+                ClientError::HostError(message) => ClientError::HostError(
+                    message
+                        .strip_prefix(&format!("{method}: "))
+                        .unwrap_or(&message)
+                        .to_owned(),
+                ),
+                err => err,
+            })?;
+        let chat: Chat = serde_json::from_value(reply)
+            .map_err(|err| ClientError::HostError(format!("unexpected fork reply: {err}")))?;
+        // The host published the row; this replica may not have it yet, and
+        // the caller opens the fork right away.
+        if self.inner.workspace.chat(&chat.id).is_none() {
+            self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;
+        }
+        Ok(chat.id)
     }
 
     fn chat_write(

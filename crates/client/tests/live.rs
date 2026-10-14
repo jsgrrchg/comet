@@ -816,6 +816,7 @@ async fn phone_born_sessions_reach_the_host_before_their_first_command() {
             branch: None,
             cwd: None,
             title: None,
+            parent_chat_id: None,
         })
         .unwrap();
     let session = client.open_session(&chat_id).unwrap();
@@ -982,6 +983,7 @@ async fn immediate_exit_after_first_send_recovers_new_chat_on_each_host_platform
                 branch: None,
                 cwd: None,
                 title: None,
+                parent_chat_id: None,
             })
             .unwrap();
         let session = client.open_session(&chat).unwrap();

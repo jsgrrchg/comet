@@ -219,6 +219,14 @@ impl CoreClient {
         Ok(self.client.create_session(new_session.try_into()?)?)
     }
 
+    /// Fork `source_id` through its latest completed response into a side
+    /// chat (a side chat's fork is its sibling). Returns the new chat id; the
+    /// error carries the host's reason (e.g. nothing completed yet).
+    pub async fn fork_side_chat(&self, source_id: String) -> CoreResult<String> {
+        let client = self.client.clone();
+        on_runtime(async move { client.fork_side_chat(&source_id).await }).await
+    }
+
     pub fn archive_session(&self, chat_id: String) -> CoreResult<()> {
         Ok(self.client.archive_session(&chat_id)?)
     }

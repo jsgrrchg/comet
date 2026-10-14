@@ -91,10 +91,12 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
         setAccessoryVisible(!Self.hidesAccessory(top), animated: animated)
     }
 
-    /// Sessions carry their own composer, subagent transcripts sit above one:
-    /// the accessory steps aside for both.
+    /// Sessions and a side chat's draft carry their own composer, subagent
+    /// transcripts sit above one: the accessory steps aside for all of them.
+    /// (The new-session page is a sheet here; on a tab's stack it's a side
+    /// chat's draft.)
     static func hidesAccessory(_ top: UIViewController?) -> Bool {
-        top is SessionViewController || top is SubagentViewController
+        top is SessionViewController || top is SubagentViewController || top is NewSessionViewController
     }
 
     /// Pushed sessions carry their own composer; the accessory steps aside.

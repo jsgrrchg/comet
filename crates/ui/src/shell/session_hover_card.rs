@@ -34,6 +34,11 @@ impl SessionHoverCard {
         self.shown.as_deref()
     }
 
+    pub(super) fn target(&self) -> Option<&str> {
+        self.shown()
+            .or_else(|| self.pending.as_ref().map(|(id, _)| id.as_str()))
+    }
+
     /// The pointer entered `chat_id`'s row. True when the card should show
     /// at once: another card is up, or one hid moments ago.
     fn enter(&mut self, chat_id: &str, now: Instant) -> bool {
@@ -101,6 +106,30 @@ fn time_label(time_ago: &str) -> String {
 }
 
 impl Shell {
+    /// Reconcile from the container as well as the row: an unmounted row
+    /// cannot report hover-out or run its paint-time hit test.
+    pub(super) fn reconcile_session_hover_card(
+        &mut self,
+        sidebar_visible: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !sidebar_visible {
+            self.dismiss_session_card(cx);
+            return;
+        }
+        let Some(target) = self.session_hover_card.target() else {
+            return;
+        };
+        if !self.sidebar_hover_card_row_visible(target, cx)
+            || self
+                .rename_input_for(target, ChatRenameSurface::Sidebar)
+                .is_some()
+            || cx.has_active_drag()
+        {
+            self.dismiss_session_card(cx);
+        }
+    }
+
     /// Row hover in or out (the row's own hover listener forwards here).
     pub(super) fn hover_session_card(
         &mut self,
@@ -138,6 +167,9 @@ impl Shell {
             }
         });
         self.session_hover_card.pending = Some((target, task));
+        // Mount the hit test while waiting too, so moving/clipping the row
+        // under a stationary pointer cancels the dwell before it settles.
+        cx.notify();
     }
 
     pub(super) fn dismiss_session_card(&mut self, cx: &mut Context<Self>) {
@@ -363,6 +395,276 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::{AppContext, TestAppContext, VisualTestContext};
+
+    fn test_chat(id: &str) -> zeron_proto::Chat {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "title": id, "deviceId": "local", "archived": false,
+            "createdAt": Utc::now(),
+        }))
+        .unwrap()
+    }
+
+    fn test_shell(data_dir: &std::path::Path, cx: &mut Context<Shell>) -> Shell {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.workspace_scope = Some(WorkspaceScope::Development);
+            state.connection = ConnectionStatus::Ready;
+            state.chats = vec![test_chat("hover-test"), test_chat("next")];
+            state
+        });
+        let mut shell = Shell::new(
+            state,
+            EngineBootConfig {
+                data_dir: data_dir.into(),
+                ipc_port: 0,
+                edge_url: "http://127.0.0.1:1".into(),
+                edge_token: None,
+                org_id: None,
+                workos_client_id: None,
+                default_harness: zeron_proto::HarnessId::Mock,
+            },
+            cx,
+        );
+        shell.debug_gate = Some(GatePhase::Ready);
+        shell.reduced_motion = true;
+        shell
+    }
+
+    fn init_test(cx: &mut TestAppContext, dir: &std::path::Path, compact: bool) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+            crate::app_menus::init(cx);
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            );
+            let mut ui_settings = settings::UiSettings::default();
+            ui_settings.sidebar_compact = compact;
+            settings::init(ui_settings, dir, cx);
+            motion::set_reduced_motion(cx, true);
+        });
+    }
+
+    struct RowHost {
+        shell: Entity<Shell>,
+        palette: bool,
+        _observation: Subscription,
+        _dir: tempfile::TempDir,
+    }
+
+    impl Render for RowHost {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let palette = self.palette;
+            self.shell.update(cx, |shell, cx| {
+                div().w(px(280.0)).h(px(200.0)).child(shell.render_chat_row(
+                    "hover-test".into(),
+                    "Hover test".into(),
+                    "now".into(),
+                    "Project".into(),
+                    None,
+                    Some(zeron_proto::ChangeRequestSummary {
+                        provider: "github".into(),
+                        number: 90,
+                        title: "Pull request title".into(),
+                        url: "https://github.com/acme/zeron/pull/90".into(),
+                        state: zeron_proto::ChangeRequestState::Open,
+                        base_ref: "main".into(),
+                        head_ref: "feature/pr".into(),
+                    }),
+                    None,
+                    zeron_proto::ChatIndicator::Idle,
+                    false,
+                    false,
+                    false,
+                    None,
+                    None,
+                    false,
+                    palette.then_some(""),
+                    &Theme::default(),
+                    cx,
+                ))
+            })
+        }
+    }
+
+    fn row_setup(
+        cx: &mut TestAppContext,
+        compact: bool,
+        palette: bool,
+    ) -> (Entity<Shell>, &mut VisualTestContext) {
+        let dir = tempfile::tempdir().unwrap();
+        init_test(cx, dir.path(), compact);
+        let (host, cx) = cx.add_window_view(|_, cx| {
+            let shell = cx.new(|cx| test_shell(dir.path(), cx));
+            let observation = cx.observe(&shell, |_, _, cx| cx.notify());
+            RowHost {
+                shell,
+                palette,
+                _observation: observation,
+                _dir: dir,
+            }
+        });
+        let shell = host.read_with(cx, |host, _| host.shell.clone());
+        redraw(cx);
+        (shell, cx)
+    }
+
+    fn redraw(cx: &mut VisualTestContext) {
+        cx.run_until_parked();
+        // Cached frames omit debug selectors; refresh before inspecting
+        // either the row's bounds or the absence of a floating card.
+        cx.refresh().unwrap();
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.run_until_parked();
+    }
+
+    fn wait_for_card(cx: &mut VisualTestContext) {
+        cx.executor()
+            .advance_clock(DWELL + Duration::from_millis(1));
+        redraw(cx);
+    }
+
+    #[gpui::test]
+    fn archive_press_cancels_pending_and_shown_cards_in_both_layouts(cx: &mut TestAppContext) {
+        for compact in [false, true] {
+            for shown in [false, true] {
+                let (shell, cx) = row_setup(cx, compact, false);
+                let row = cx.debug_bounds("chat-hover-test").unwrap().center();
+                cx.simulate_mouse_move(row, None, gpui::Modifiers::default());
+                redraw(cx);
+                if shown {
+                    wait_for_card(cx);
+                }
+                shell.read_with(cx, |shell, _| {
+                    assert_eq!(shell.session_hover_card.target(), Some("hover-test"));
+                    assert_eq!(shell.session_hover_card.shown().is_some(), shown);
+                });
+                let corner = if compact {
+                    "chat-time-hover-test"
+                } else {
+                    "chat-hover-test-corner"
+                };
+                let position = cx.debug_bounds(corner).unwrap().center();
+                cx.simulate_mouse_down(position, MouseButton::Left, gpui::Modifiers::default());
+                shell.read_with(cx, |shell, _| {
+                    assert_eq!(shell.session_hover_card.target(), None)
+                });
+                wait_for_card(cx);
+                assert!(cx.debug_bounds("session-hover-card-hover-test").is_none());
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn palette_pr_badge_keeps_its_tooltip_without_a_session_card(cx: &mut TestAppContext) {
+        let (shell, cx) = row_setup(cx, false, true);
+        let badge = cx
+            .debug_bounds("pull-request-badge-palette-chat-hover-test-pr")
+            .unwrap()
+            .center();
+        cx.simulate_mouse_move(badge, None, gpui::Modifiers::default());
+        redraw(cx);
+        wait_for_card(cx);
+        assert!(cx.debug_bounds("change-request-tooltip").is_some());
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.session_hover_card.target(), None)
+        });
+    }
+
+    #[gpui::test]
+    fn sidebar_pr_badge_uses_the_session_card_instead_of_a_second_tooltip(cx: &mut TestAppContext) {
+        let (_, cx) = row_setup(cx, false, false);
+        let badge = cx
+            .debug_bounds("pull-request-badge-chat-hover-test-pr")
+            .unwrap()
+            .center();
+        cx.simulate_mouse_move(badge, None, gpui::Modifiers::default());
+        redraw(cx);
+        wait_for_card(cx);
+        assert!(cx.debug_bounds("session-hover-card-hover-test").is_some());
+        assert!(cx.debug_bounds("change-request-tooltip").is_none());
+    }
+
+    fn shell_setup(
+        cx: &mut TestAppContext,
+    ) -> (Entity<Shell>, &mut VisualTestContext, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        init_test(cx, dir.path(), false);
+        let (shell, cx) = cx.add_window_view(|_, cx| test_shell(dir.path(), cx));
+        cx.simulate_resize(gpui::size(px(1400.0), px(800.0)));
+        redraw(cx);
+        (shell, cx, dir)
+    }
+
+    #[gpui::test]
+    fn removing_a_pending_row_cancels_its_dwell_and_keeps_the_next_card_cold(
+        cx: &mut TestAppContext,
+    ) {
+        let (shell, cx, _dir) = shell_setup(cx);
+        let row = cx.debug_bounds("chat-hover-test").unwrap().center();
+        cx.simulate_mouse_move(row, None, gpui::Modifiers::default());
+        redraw(cx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.session_hover_card.target(), Some("hover-test"))
+        });
+        shell.update(cx, |shell, cx| {
+            shell.state.update(cx, |state, cx| {
+                state.chats.retain(|chat| chat.id != "hover-test");
+                cx.notify();
+            });
+            cx.notify();
+        });
+        redraw(cx);
+        let next = cx.debug_bounds("chat-next").unwrap().center();
+        wait_for_card(cx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.session_hover_card.target(), None)
+        });
+        // Leave the old hit region before entering the surviving row.
+        cx.simulate_mouse_move(
+            gpui::point(px(600.0), px(700.0)),
+            None,
+            gpui::Modifiers::default(),
+        );
+        cx.simulate_mouse_move(next, None, gpui::Modifiers::default());
+        redraw(cx);
+        shell.read_with(cx, |shell, _| {
+            assert_eq!(shell.session_hover_card.target(), Some("next"));
+            assert_eq!(shell.session_hover_card.shown(), None);
+        });
+    }
+
+    #[gpui::test]
+    fn settings_navigation_cancels_pending_and_shown_cards(cx: &mut TestAppContext) {
+        for shown in [false, true] {
+            let (shell, cx, _dir) = shell_setup(cx);
+            let row = cx.debug_bounds("chat-hover-test").unwrap().center();
+            cx.simulate_mouse_move(row, None, gpui::Modifiers::default());
+            redraw(cx);
+            if shown {
+                wait_for_card(cx);
+            }
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(shell.session_hover_card.shown().is_some(), shown)
+            });
+            shell.update(cx, |shell, cx| {
+                shell.open_settings(SettingsSection::General, cx)
+            });
+            redraw(cx);
+            wait_for_card(cx);
+            shell.read_with(cx, |shell, _| {
+                assert_eq!(shell.session_hover_card.target(), None)
+            });
+            shell.update(cx, |shell, cx| shell.close_settings(cx));
+            redraw(cx);
+            assert!(cx.debug_bounds("session-hover-card-hover-test").is_none());
+        }
+    }
 
     fn card() -> SessionHoverCard {
         SessionHoverCard::default()

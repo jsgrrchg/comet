@@ -8058,6 +8058,11 @@ impl Shell {
             .find(|chat| chat.id == id)
             .map(|chat| chat.device_id.clone());
         let compact = search_query.is_none() && self.settings.sidebar_compact;
+        let pr_surface = if search_query.is_some() {
+            crate::change_requests::ChangeRequestBadgeSurface::Sidebar
+        } else {
+            crate::change_requests::ChangeRequestBadgeSurface::SessionRow
+        };
         let show_label = search_query.is_some() || self.settings.sidebar_show_project_label;
         let remote = self
             .state
@@ -8334,18 +8339,24 @@ impl Shell {
                 .items_center()
                 .when(!preview, |el| el.cursor_pointer())
                 .when(corner_hovered, |el| {
-                    el.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                    el.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            this.dismiss_session_card(cx);
                             cx.stop_propagation();
-                            this.chat_hover_resync = true;
-                            this.set_chat_archived(archive_id.clone(), !archived, cx);
-                        }))
-                        // Above the pill: below it the chip would cover the next row.
-                        .tooltip(crate::settings::widgets::text_tooltip_above(if archived {
-                            "Unarchive session"
-                        } else {
-                            ShortcutId::ArchiveSession.label()
-                        }))
+                        }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.chat_hover_resync = true;
+                        this.set_chat_archived(archive_id.clone(), !archived, cx);
+                    }))
+                    // Above the pill: below it the chip would cover the next row.
+                    .tooltip(crate::settings::widgets::text_tooltip_above(if archived {
+                        "Unarchive session"
+                    } else {
+                        ShortcutId::ArchiveSession.label()
+                    }))
                 })
                 .child(corner_body)
                 .into_any_element()
@@ -8544,34 +8555,40 @@ impl Shell {
                     .inset_0(),
                 )
             })
-            // gpui sends no hover-out to a row that unmounts or moves away
-            // under a still pointer (a collapsed sidebar, a resort), so the
-            // shown card re-checks its row by paint and hides once it lost it.
-            .when(hover_card.is_some(), |el| {
-                let shell = cx.weak_entity();
-                let chat_id = id.clone();
-                el.child(
-                    gpui::canvas(
-                        |bounds, window, _| {
-                            window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
-                        },
-                        move |_, hitbox, window, cx| {
-                            if hitbox.is_hovered(window) {
-                                return;
-                            }
-                            window.defer(cx, move |_, cx| {
-                                shell
-                                    .update(cx, |this, cx| {
-                                        this.hover_session_card(&chat_id, false, cx)
-                                    })
-                                    .ok();
-                            });
-                        },
+            // Check both shown and pending cards after layout/occlusion
+            // changes under a stationary pointer. Unmounted rows are handled
+            // by the container's reconciliation.
+            .when(
+                !preview
+                    && search_query_none
+                    && rename_input.is_none()
+                    && self.session_hover_card.target() == Some(id.as_str()),
+                |el| {
+                    let shell = cx.weak_entity();
+                    let chat_id = id.clone();
+                    el.child(
+                        gpui::canvas(
+                            |bounds, window, _| {
+                                window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal)
+                            },
+                            move |_, hitbox, window, cx| {
+                                if hitbox.is_hovered(window) {
+                                    return;
+                                }
+                                window.defer(cx, move |_, cx| {
+                                    shell
+                                        .update(cx, |this, cx| {
+                                            this.hover_session_card(&chat_id, false, cx)
+                                        })
+                                        .ok();
+                                });
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
                     )
-                    .absolute()
-                    .inset_0(),
-                )
-            })
+                },
+            )
             .children(hover_card)
             // Line 1: "project @ device", status word / time-ago right.
             .when(!compact && show_label, |el| {
@@ -8687,14 +8704,14 @@ impl Shell {
                                 crate::change_requests::pull_request_badge_preview(
                                     format!("{row_id}-compact-pr").into(),
                                     summary,
-                                    crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                                    pr_surface,
                                     theme,
                                 )
                             } else {
                                 crate::change_requests::pull_request_badge(
                                     format!("{row_id}-compact-pr").into(),
                                     summary,
-                                    crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                                    pr_surface,
                                     pr_device.clone(),
                                     theme,
                                 )
@@ -8726,9 +8743,13 @@ impl Shell {
                                 })
                                 .when(show_archive, |el| {
                                     el.cursor_pointer()
-                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                                            cx.stop_propagation()
-                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.dismiss_session_card(cx);
+                                                cx.stop_propagation();
+                                            }),
+                                        )
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             cx.stop_propagation();
                                             this.chat_hover_resync = true;
@@ -8805,14 +8826,14 @@ impl Shell {
                                 crate::change_requests::pull_request_badge_preview(
                                     format!("{row_id}-pr").into(),
                                     summary,
-                                    crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                                    pr_surface,
                                     theme,
                                 )
                             } else {
                                 crate::change_requests::pull_request_badge_with_query(
                                     format!("{row_id}-pr").into(),
                                     summary,
-                                    crate::change_requests::ChangeRequestBadgeSurface::Sidebar,
+                                    pr_surface,
                                     search_query,
                                     pr_device.clone(),
                                     theme,
@@ -8993,6 +9014,7 @@ impl Shell {
     }
 
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        self.reconcile_session_hover_card(true, cx);
         if self.sidebar_session_transfer.as_ref().is_some_and(|drag| {
             !cx.has_active_drag() || !self.sidebar_session_transfer_is_valid(&drag.payload, cx)
         }) {
@@ -13357,6 +13379,13 @@ impl Render for Shell {
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);
         self.track_horizontal_fit(cx);
+        self.reconcile_session_hover_card(
+            matches!(gate, GatePhase::Ready)
+                && !restart_required
+                && !matches!(self.route, Route::Settings(_))
+                && self.sidebar_target() > 0.0,
+            cx,
+        );
         self.suspend_hidden_right_images(cx);
         // After the fit tracking, which starts a fit exit this frame.
         let browser_active = matches!(gate, GatePhase::Ready)

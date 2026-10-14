@@ -1,6 +1,6 @@
 //! The session hover card: dwell on a sidebar row and a frosted card floats
 //! out beside it with what the row has no room for — the whole title, the
-//! device and project, the branch, and the pull request's title.
+//! device and project, the branch, and the pull request.
 //! Compact rows drop all of that, so the card is where it lives on.
 //!
 //! The card waits out a short dwell so sweeping the pointer down the list
@@ -276,6 +276,26 @@ impl Shell {
             project.clone().unwrap_or_else(|| "No project".into()),
         )
         .text_color(theme.text);
+        // ── The pull request as one more row under the branch: its state
+        // lives in the glyph's and number's color (the badge's).
+        let pull_request = change_request.map(|model| {
+            let tone = model.tone.color(&theme);
+            meta_row(
+                icon(icons::PULL_REQUEST)
+                    .size(px(13.0))
+                    .text_color(tone.opacity(0.9))
+                    .into_any_element(),
+                model.title,
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(crate::typography::ui_rems(11.0))
+                    .text_color(tone.opacity(0.85))
+                    .child(SharedString::from(format!("#{}", model.number))),
+            )
+        });
         let location = div()
             .flex()
             .flex_col()
@@ -283,48 +303,8 @@ impl Shell {
             .text_size(crate::typography::ui_rems(12.0))
             .text_color(muted)
             .child(project_row)
-            .children(branch.map(|branch| meta_row(glyph(icons::GIT_BRANCH), branch)));
-
-        // ── The pull request on one line: its state lives in the tint and
-        // the glyph's color (the badge's), so only the title and number
-        // need words.
-        let pull_request = change_request.map(|model| {
-            let tone = model.tone.color(&theme);
-            div()
-                .flex()
-                .flex_row()
-                .items_start()
-                .gap(px(7.0))
-                .px(px(9.0))
-                .py(px(7.0))
-                .rounded(px(8.0))
-                .bg(tone.opacity(0.08))
-                .text_size(crate::typography::ui_rems(12.0))
-                .line_height(px(16.0))
-                .child(
-                    div().h(px(16.0)).flex_none().flex().items_center().child(
-                        icon(icons::PULL_REQUEST)
-                            .size(px(12.0))
-                            .text_color(tone.opacity(0.9)),
-                    ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_color(theme.text)
-                        .line_clamp(2)
-                        .child(model.title),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_family(theme.font_mono.clone())
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(tone.opacity(0.85))
-                        .child(SharedString::from(format!("#{}", model.number))),
-                )
-        });
+            .children(branch.map(|branch| meta_row(glyph(icons::GIT_BRANCH), branch)))
+            .children(pull_request);
 
         let card = div()
             .w(px(CARD_WIDTH))
@@ -339,8 +319,7 @@ impl Shell {
             .bg(popover::surface_bg(&theme))
             .when(!theme.is_frost(), |card| card.shadow_lg())
             .child(header)
-            .child(location)
-            .children(pull_request);
+            .child(location);
         let card = div()
             .debug_selector({
                 let chat_id = chat_id.to_owned();

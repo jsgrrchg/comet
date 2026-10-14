@@ -2,25 +2,15 @@
 //! runs alongside the open chat — its **side chats** (forks, and chats an
 //! agent spawned through the Zeron MCP server) and its **subagents** (the
 //! spawn chips of its transcript, with their live status). Each lane is a
-//! section of session-card rows; the side chats' status marks sit on one
-//! thin track, the subagents list plainly. Clicking a row opens it in the
-//! right pane. Settled subagents fold into one "finished" row, closed until
-//! opened.
+//! section of session-card rows; clicking a row opens it in the right pane.
+//! Settled subagents fold into one "finished" row, closed until opened.
 
-use gpui::Hsla;
 use zeron_doc::{MessagePart, SubagentStatus};
 use zeron_proto::{Chat, ChatIndicator};
 
 use super::session_info::SESSION_CARD_WIDTH;
 use super::*;
 
-/// The track runs through the rows' icon slots (the picker row's 8px pad
-/// plus half the 16px slot), between their marks.
-const TRACK_X: f32 = 15.5;
-/// The middle of a picker row, where its mark sits.
-const ROW_MID: f32 = popover::PICKER_ROW_HEIGHT / 2.0;
-/// How far the track stops short of a mark's center.
-const TRACK_CLEARANCE: f32 = 8.0;
 /// Rows a lane shows before "Show more" pages it, and the page size.
 const INITIAL_ROWS: usize = 8;
 const PAGE_ROWS: usize = 10;
@@ -231,30 +221,6 @@ pub(super) fn child_chat_title(chat: &Chat) -> String {
         .unwrap_or_else(|| "New side chat".into())
 }
 
-/// A lane's track: the 1px rule through its rows' icon slots, broken
-/// around each status mark like a line between stations. `first` and `last`
-/// end it at the lane's first and last marks.
-fn track(
-    row: gpui::Stateful<gpui::Div>,
-    first: bool,
-    last: bool,
-    color: Hsla,
-) -> gpui::Stateful<gpui::Div> {
-    let segment = || div().absolute().left(px(TRACK_X)).w(px(1.0)).bg(color);
-    row.relative()
-        .when(!first, |row| {
-            // Up through the gap to the row above.
-            row.child(
-                segment()
-                    .top(px(-popover::MENU_GAP))
-                    .h(px(ROW_MID - TRACK_CLEARANCE + popover::MENU_GAP)),
-            )
-        })
-        .when(!last, |row| {
-            row.child(segment().top(px(ROW_MID + TRACK_CLEARANCE)).bottom_0())
-        })
-}
-
 /// A status mark in a row's icon slot: Working spins, Completed wears the
 /// check, the rest a dot in the status color.
 fn status_mark(
@@ -378,7 +344,6 @@ impl Shell {
                 SubagentLane::new(subagent_rows(state, &chat.id)),
             )
         };
-        let rail = theme.text_muted.opacity(0.25);
         let view = cx.entity_id();
         let mut rows: Vec<AnyElement> =
             vec![popover::menu_heading(theme, "Side chats").into_any_element()];
@@ -386,10 +351,11 @@ impl Shell {
         // ── Side chats, then the two ways to start one.
         let shown = LaneState::shown(self.session_lanes.shown_chats);
         let hidden = side_chats.len().saturating_sub(shown);
-        let lane = side_chats.len().min(shown);
-        for (i, row) in side_chats.into_iter().take(shown).enumerate() {
-            let row = self.render_side_chat_row(row, view, theme, cx);
-            rows.push(track(row, i == 0, i + 1 == lane, rail).into_any_element());
+        for row in side_chats.into_iter().take(shown) {
+            rows.push(
+                self.render_side_chat_row(row, view, theme, cx)
+                    .into_any_element(),
+            );
         }
         if hidden > 0 {
             rows.push(self.render_show_more(
@@ -450,7 +416,6 @@ impl Shell {
             } else {
                 Vec::new()
             };
-            // Subagents list plainly, with no track between their marks.
             for row in active {
                 rows.push(
                     self.render_subagent_row(row, view, theme, cx)

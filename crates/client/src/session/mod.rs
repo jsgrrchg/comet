@@ -297,6 +297,11 @@ impl SessionCore {
         lock(&self.room).clone()
     }
 
+    /// Served from a finished subagent's frozen blob: it never dials.
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.source == DocSource::Frozen
+    }
+
     /// Drop the room (deleted chat): its tasks stop and it flushes once.
     pub(crate) fn close_room(&self) {
         let room = lock(&self.room).take();

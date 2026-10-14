@@ -135,6 +135,15 @@ impl ClientInner {
         lock(&self.sessions).values().cloned().collect()
     }
 
+    /// Forget `core` (if it is still the one registered for `chat_id`): the
+    /// next open builds a fresh one. Views holding it keep their copy.
+    fn release_core(&self, chat_id: &str, core: &Arc<SessionCore>) {
+        let mut sessions = lock(&self.sessions);
+        if sessions.get(chat_id).is_some_and(|c| Arc::ptr_eq(c, core)) {
+            sessions.remove(chat_id);
+        }
+    }
+
     /// Register a freshly built core, or return the one a racing open
     /// registered first.
     fn adopt_core(&self, chat_id: &str, core: Arc<SessionCore>) -> Arc<SessionCore> {
@@ -1210,7 +1219,13 @@ impl Client {
         let parent = subagent_parent(doc_id)
             .ok_or_else(|| ClientError::InvalidArgument(format!("not a subagent doc: {doc_id}")))?;
         if let Some(core) = self.inner.session_core(doc_id) {
-            return Ok(SessionHandle { core });
+            // A frozen copy never dials, so it can't follow a subagent that
+            // runs (again — a resumed one keeps its doc): a live open
+            // replaces it with the live doc.
+            if frozen || !core.is_frozen() {
+                return Ok(SessionHandle { core });
+            }
+            self.inner.release_core(doc_id, &core);
         }
         let host = self
             .inner

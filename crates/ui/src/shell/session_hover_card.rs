@@ -1,6 +1,6 @@
 //! The session hover card: dwell on a sidebar row and a frosted card floats
 //! out beside it with what the row has no room for — the whole title, the
-//! project and device, the branch and worktree, and the pull request's title.
+//! project and device, the branch, and the pull request's title.
 //! Compact rows drop all of that, so the card is where it lives on.
 //!
 //! The card waits out a short dwell so sweeping the pointer down the list
@@ -91,25 +91,6 @@ impl SessionHoverCard {
     }
 }
 
-/// The checkout folder's name when the chat runs outside its project's own
-/// folder — a worktree — else `None`. A project-less chat in a plain folder,
-/// or one in a subfolder of its project, has no worktree worth naming.
-fn worktree_label(cwd: Option<&str>, project_path: Option<&str>) -> Option<String> {
-    let cwd = cwd?.trim_end_matches(['/', '\\']);
-    let project = project_path?.trim_end_matches(['/', '\\']);
-    let inside = crate::pickers::same_folder_path(cwd, project)
-        || cwd
-            .strip_prefix(project)
-            .is_some_and(|rest| rest.starts_with(['/', '\\']));
-    if cwd.is_empty() || inside {
-        return None;
-    }
-    cwd.rsplit(['/', '\\'])
-        .next()
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-}
-
 /// "21h ago" for the card's footer line ("now" stays as it is).
 fn time_label(time_ago: &str) -> String {
     if time_ago == "now" {
@@ -167,17 +148,16 @@ impl Shell {
 
     /// The card for `chat_id`'s row, mounted from the row itself: it floats
     /// from the row's right edge above everything else, clear of the
-    /// sidebar's clip. `status` is the row's own status word and color.
+    /// sidebar's clip.
     pub(super) fn render_session_hover_card(
         &self,
         chat_id: &str,
-        status: Option<(&'static str, gpui::Hsla)>,
         time_ago: SharedString,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).for_popup();
         let now = Utc::now();
-        let (title, project, device, local, online, branch, worktree, change_request) = {
+        let (title, project, device, local, online, branch, change_request) = {
             let state = self.state.read(cx);
             let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
             let space = state.space_for_chat(chat);
@@ -191,11 +171,6 @@ impl Shell {
                 .map(str::trim)
                 .filter(|branch| !branch.is_empty())
                 .map(|branch| SharedString::from(branch.to_owned()));
-            let worktree = worktree_label(
-                chat.cwd.as_deref(),
-                space.map(|space| space.path.as_str()),
-            )
-            .map(SharedString::from);
             let change_request = state
                 .change_request_for_chat(chat)
                 .map(ChangeRequestBadgeModel::from_summary);
@@ -213,7 +188,6 @@ impl Shell {
                 local,
                 online,
                 branch,
-                worktree,
                 change_request,
             )
         };
@@ -244,7 +218,7 @@ impl Shell {
                 .into_any_element()
         };
 
-        // ── Title, then status and age on one quiet line.
+        // ── Title, then its age on one quiet line.
         let header = div()
             .flex()
             .flex_col()
@@ -261,30 +235,12 @@ impl Shell {
             )
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(6.0))
                     .text_size(crate::typography::ui_rems(11.0))
                     .text_color(muted)
-                    .when_some(status, |el, (label, color)| {
-                        el.child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(5.0))
-                                .text_color(color)
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(div().size(px(6.0)).rounded_full().bg(color))
-                                .child(label),
-                        )
-                        .child(div().text_color(muted.opacity(0.6)).child("·"))
-                    })
                     .child(time_label(&time_ago)),
             );
 
-        // ── Where it runs: project and device, branch, worktree.
+        // ── Where it runs: project and device, branch.
         let project_row = meta_row(
             match &project {
                 Some(_) => self.render_project_icon(chat_id, 14.0, false, cx),
@@ -329,8 +285,7 @@ impl Shell {
             .text_size(crate::typography::ui_rems(12.0))
             .text_color(muted)
             .child(project_row)
-            .children(branch.map(|branch| meta_row(glyph(icons::GIT_BRANCH), branch)))
-            .children(worktree.map(|worktree| meta_row(glyph(icons::FOLDER), worktree)));
+            .children(branch.map(|branch| meta_row(glyph(icons::GIT_BRANCH), branch)));
 
         // ── The pull request on one line: its state lives in the tint and
         // the glyph's color (the badge's), so only the title and number
@@ -491,32 +446,6 @@ mod tests {
         assert!(card.dismiss());
         assert!(!card.enter("a", now));
         assert_eq!(card.shown(), None);
-    }
-
-    #[test]
-    fn only_a_checkout_outside_the_project_folder_is_a_worktree() {
-        assert_eq!(
-            worktree_label(
-                Some("/home/me/.zeron/worktrees/comet/swift-aspen"),
-                Some("/home/me/code/comet")
-            ),
-            Some("swift-aspen".to_owned())
-        );
-        assert_eq!(
-            worktree_label(Some("/home/me/code/comet/"), Some("/home/me/code/comet")),
-            None
-        );
-        assert_eq!(
-            worktree_label(Some("/home/me/code/comet/crates"), Some("/home/me/code/comet/")),
-            None
-        );
-        // A sibling folder sharing the name's prefix is not inside it.
-        assert_eq!(
-            worktree_label(Some("/home/me/code/comet-old"), Some("/home/me/code/comet")),
-            Some("comet-old".to_owned())
-        );
-        assert_eq!(worktree_label(Some("/tmp/scratch"), None), None);
-        assert_eq!(worktree_label(None, Some("/home/me/code/comet")), None);
     }
 
     #[test]

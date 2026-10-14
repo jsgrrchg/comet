@@ -8373,7 +8373,6 @@ impl Shell {
         .then(|| {
             self.render_session_hover_card(
                 &id,
-                status_label.map(|label| (label, status_color)),
                 time_ago.clone(),
                 cx,
             )

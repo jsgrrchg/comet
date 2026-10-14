@@ -3,13 +3,15 @@ import UIKit
 /// Everything hanging off one session, in a sheet over it: the subagents
 /// its agent is running (live tail), its side chats (forked, started by hand,
 /// or spawned through the Zeron MCP server), and the subagents that finished.
-/// Picking a row opens it on top of the session.
+/// Picking a row opens it on top of the session. Each section folds under
+/// its header (remembered across sheets).
 final class SideChatsViewController: UIViewController, UICollectionViewDelegate {
     private enum Section: String {
         case running, chats, finished
     }
 
     private enum Item: Hashable {
+        case header(Section)
         case agent(String)
         case chat(String)
     }
@@ -27,7 +29,9 @@ final class SideChatsViewController: UIViewController, UICollectionViewDelegate 
     private var dataSource: UICollectionViewDiffableDataSource<Section, Item>!
     private var chats: [String: SessionRowVM] = [:]
     private var agents: [String: SubagentInfo] = [:]
-    private var counts: [Section: Int] = [:]
+    private var headers: [Section: SectionHeaderCell.State] = [:]
+    private static let collapsedKey = "collapsedSideChatSections"
+    private var collapsed = Set((UserDefaults.standard.stringArray(forKey: collapsedKey) ?? []).compactMap(Section.init(rawValue:)))
     private var workspaceToken: AnyObject?
     private var sessionToken: AnyObject?
 
@@ -59,7 +63,6 @@ final class SideChatsViewController: UIViewController, UICollectionViewDelegate 
         var config = UICollectionLayoutListConfiguration(appearance: .plain)
         config.backgroundColor = .clear
         config.showsSeparators = false
-        config.headerMode = .supplementary
         config.trailingSwipeActionsConfigurationProvider = { [weak self] path in self?.trailingSwipe(path) }
         collectionView = UICollectionView(frame: view.bounds, collectionViewLayout: UICollectionViewCompositionalLayout.list(using: config))
         collectionView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
@@ -76,29 +79,16 @@ final class SideChatsViewController: UIViewController, UICollectionViewDelegate 
             guard let agent = self?.agents[id] else { return }
             cell.configure(agent)
         }
+        let headerReg = UICollectionView.CellRegistration<SectionHeaderCell, Section> { [weak self] cell, _, section in
+            guard let state = self?.headers[section] else { return }
+            cell.configure(state)
+        }
         dataSource = UICollectionViewDiffableDataSource(collectionView: collectionView) { cv, path, item in
             switch item {
+            case let .header(section): cv.dequeueConfiguredReusableCell(using: headerReg, for: path, item: section)
             case let .chat(id): cv.dequeueConfiguredReusableCell(using: chatReg, for: path, item: id)
             case let .agent(id): cv.dequeueConfiguredReusableCell(using: agentReg, for: path, item: id)
             }
-        }
-        let headerReg = UICollectionView.SupplementaryRegistration<UICollectionViewListCell>(elementKind: UICollectionView.elementKindSectionHeader) { [weak self] cell, _, path in
-            guard let self, let section = self.dataSource.sectionIdentifier(for: path.section) else { return }
-            var c = UIListContentConfiguration.plainHeader()
-            let name = switch section {
-            case .running: "Running"
-            case .chats: "Side chats"
-            case .finished: "Finished agents"
-            }
-            c.text = "\(name) · \(self.counts[section] ?? 0)"
-            c.textProperties.font = Fonts.ui(.sansSemibold, 13)
-            c.textProperties.color = Palette.secondary
-            c.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 14, leading: 20, bottom: 4, trailing: 20)
-            cell.contentConfiguration = c
-            cell.backgroundConfiguration = .clear()
-        }
-        dataSource.supplementaryViewProvider = { cv, _, path in
-            cv.dequeueConfiguredReusableSupplementary(using: headerReg, for: path)
         }
 
         reload(animated: false)
@@ -128,29 +118,42 @@ final class SideChatsViewController: UIViewController, UICollectionViewDelegate 
             if let old = agents[a.docId], old != a { changed.append(.agent(a.docId)) }
             nextAgents[a.docId] = a
         }
-        let nextCounts: [Section: Int] = [.running: running.count, .chats: chatRows.count, .finished: finished.count]
         var snapshot = NSDiffableDataSourceSnapshot<Section, Item>()
         for (section, items) in [(Section.running, running.map { Item.agent($0.docId) }), (.chats, chatRows.map { Item.chat($0.id) }), (.finished, finished.map { Item.agent($0.docId) })] where !items.isEmpty {
+            let title = switch section {
+            case .running: "Running"
+            case .chats: "Side chats"
+            case .finished: "Finished agents"
+            }
+            // Folded, Running still shows its spinner: something is live inside.
+            let header = SectionHeaderCell.State(id: section.rawValue, title: title, count: items.count, collapsed: collapsed.contains(section), live: section == .running ? .spinner : nil)
+            if let old = headers[section], old != header { changed.append(.header(section)) }
+            headers[section] = header
             snapshot.appendSections([section])
-            snapshot.appendItems(items, toSection: section)
+            snapshot.appendItems([.header(section)] + (header.collapsed ? [] : items), toSection: section)
         }
         let present = Set(snapshot.itemIdentifiers)
         snapshot.reconfigureItems(changed.filter { present.contains($0) })
-        let recounted = nextCounts != counts
         chats = nextChats
         agents = nextAgents
-        counts = nextCounts
-        if recounted { snapshot.reloadSections(snapshot.sectionIdentifiers) }
         dataSource.apply(snapshot, animatingDifferences: animated && view.window != nil)
     }
 
     func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: true)
         switch dataSource.itemIdentifier(for: indexPath) {
+        case let .header(section)?: toggle(section)
         case let .chat(id)?: onOpen(id)
         case let .agent(id)?: if let agent = agents[id] { onOpenAgent?(agent) }
         case nil: break
         }
+    }
+
+    private func toggle(_ section: Section) {
+        if collapsed.remove(section) == nil { collapsed.insert(section) }
+        UserDefaults.standard.set(collapsed.map(\.rawValue), forKey: Self.collapsedKey)
+        UISelectionFeedbackGenerator().selectionChanged()
+        reload(animated: true)
     }
 
     /// Side chats archive away; subagents belong to the transcript.

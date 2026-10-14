@@ -2,9 +2,10 @@
 //! runs alongside the open chat — its **side chats** (forks, and chats an
 //! agent spawned through the Zeron MCP server) and its **subagents** (the
 //! spawn chips of its transcript, with their live status). Each lane is a
-//! section of session-card rows whose status marks sit on one thin track;
-//! clicking a row opens it in the right pane. Settled subagents fold into one
-//! "finished" row, closed until opened.
+//! section of session-card rows; the side chats' status marks sit on one
+//! thin track, the subagents list plainly. Clicking a row opens it in the
+//! right pane. Settled subagents fold into one "finished" row, closed until
+//! opened.
 
 use gpui::Hsla;
 use zeron_doc::{MessagePart, SubagentStatus};
@@ -24,14 +25,17 @@ const TRACK_CLEARANCE: f32 = 8.0;
 const INITIAL_ROWS: usize = 8;
 const PAGE_ROWS: usize = 10;
 
-/// What the lanes card has unfolded or paged; it follows the open chat.
-#[derive(Debug, Default)]
+/// What the lanes card has unfolded or paged, and where it has scrolled; it
+/// follows the open chat.
+#[derive(Default)]
 pub(super) struct LaneState {
     chat_id: String,
     finished_open: bool,
     shown_chats: usize,
     shown_finished: usize,
     scroll: gpui::ScrollHandle,
+    /// The card's floating scrollbar, the file tree's treatment.
+    bar: popover::MenuScrollbarState,
 }
 
 impl LaneState {
@@ -446,23 +450,24 @@ impl Shell {
             } else {
                 Vec::new()
             };
-            // Running, the fold, and what the fold opens share one track.
-            let lane = active.len() + usize::from(folded > 0) + finished.len();
-            let mut i = 0;
+            // Subagents list plainly, with no track between their marks.
             for row in active {
-                let row = self.render_subagent_row(row, view, theme, cx);
-                rows.push(track(row, i == 0, i + 1 == lane, rail).into_any_element());
-                i += 1;
+                rows.push(
+                    self.render_subagent_row(row, view, theme, cx)
+                        .into_any_element(),
+                );
             }
             if folded > 0 {
-                let row = self.render_finished_fold(folded, failed, open, theme, cx);
-                rows.push(track(row, i == 0, i + 1 == lane, rail).into_any_element());
-                i += 1;
+                rows.push(
+                    self.render_finished_fold(folded, failed, open, theme, cx)
+                        .into_any_element(),
+                );
             }
             for row in finished {
-                let row = self.render_subagent_row(row, view, theme, cx);
-                rows.push(track(row, i == 0, i + 1 == lane, rail).into_any_element());
-                i += 1;
+                rows.push(
+                    self.render_subagent_row(row, view, theme, cx)
+                        .into_any_element(),
+                );
             }
             if hidden > 0 {
                 rows.push(self.render_show_more(
@@ -489,9 +494,21 @@ impl Shell {
             .flex_col()
             .gap(px(popover::MENU_GAP))
             .children(rows);
+        // The rail shows only once the lanes outgrow the card and scroll.
+        let scrollbar = popover::rail_for(
+            self,
+            popover::RailAccess {
+                bar: |this: &mut Self| &mut this.session_lanes.bar,
+                scroll: |this: &Self| this.session_lanes.scroll.clone(),
+            },
+            "session-lanes-scrollbar",
+            theme,
+            cx,
+        );
         div()
             .id("session-lanes")
             .debug_selector(|| "session-lanes".into())
+            .relative()
             .w(px(SESSION_CARD_WIDTH))
             .max_h(px(max_height))
             .min_h_0()
@@ -503,7 +520,13 @@ impl Shell {
             .border_color(theme.border)
             .bg(popover::surface_bg(theme))
             .when(floating && !theme.is_frost(), |card| card.shadow_lg())
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.session_lanes.bar.set_list_hovered(*hovered) {
+                    cx.notify();
+                }
+            }))
             .child(body)
+            .children(scrollbar)
             .into_any_element()
     }
 

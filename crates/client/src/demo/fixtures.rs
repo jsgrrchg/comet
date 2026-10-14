@@ -435,7 +435,8 @@ pub(crate) fn seed(
         if let Some(status) = demo.status {
             doc.upsert_session(&Session {
                 last_completed_turn: None,
-                running_subagents: 0,
+                // The working chat shows the sidebar's subagent badge.
+                running_subagents: u32::from(status == SessionStatus::Working) * 2,
                 chat_id: demo.id.into(),
                 device_id: demo.device.into(),
                 status,

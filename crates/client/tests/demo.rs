@@ -114,6 +114,49 @@ fn front_page_mirrors_the_desktop_sidebar() {
 }
 
 #[test]
+fn spawn_chips_open_their_subagent_transcript() {
+    let (client, _dir) = demo(fast());
+    assert_eq!(
+        zeron_client::subagent_parent("chat-tabs--sub--toolu_1"),
+        Some("chat-tabs")
+    );
+    assert_eq!(zeron_client::subagent_parent("chat-tabs"), None);
+    // The working chat badges its running subagents; idle ones don't.
+    let ws = client.workspace();
+    assert_eq!(ws.session("chat-veil").unwrap().running_subagents, 2);
+    assert_eq!(ws.session("chat-tabs").unwrap().running_subagents, 0);
+
+    let parent = client.open_session("chat-tabs").unwrap();
+    let doc_id = parent
+        .snapshot()
+        .transcript_messages()
+        .iter()
+        .flat_map(|entry| entry.parts.iter())
+        .find_map(|part| match part {
+            zeron_client::MessagePart::Tool { subagent_ref, .. } => subagent_ref.clone(),
+            _ => None,
+        })
+        .expect("chat-tabs carries a linked spawn chip");
+    let runtime = zeron_client::runtime::shared();
+    let sub = runtime
+        .block_on(client.open_subagent(&doc_id, true))
+        .unwrap();
+    let entries = sub.snapshot().transcript_messages();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].role, MessageRole::User);
+    // Opening again reuses the open doc; non-subagent ids are refused.
+    let again = runtime
+        .block_on(client.open_subagent(&doc_id, true))
+        .unwrap();
+    assert_eq!(again.chat_id(), doc_id);
+    assert!(
+        runtime
+            .block_on(client.open_subagent("chat-tabs", true))
+            .is_err()
+    );
+}
+
+#[test]
 fn sidebar_writes_reorder_the_front_page() {
     let (client, _dir) = demo(fast());
     client.pin_session("chat-home").unwrap();

@@ -317,6 +317,18 @@ impl CoreClient {
         Ok(SessionHandle::new(self.client.open_session(&chat_id)?))
     }
 
+    /// Open a subagent's transcript read-only (a spawn chip's doc id). A
+    /// `frozen` (finished) subagent reads its uploaded blob first.
+    pub async fn open_subagent(
+        &self,
+        doc_id: String,
+        frozen: bool,
+    ) -> CoreResult<Arc<SessionHandle>> {
+        let client = self.client.clone();
+        let handle = on_runtime(async move { client.open_subagent(&doc_id, frozen).await }).await?;
+        Ok(SessionHandle::new(handle))
+    }
+
     /// An already-open session.
     pub fn session(&self, chat_id: String) -> Option<Arc<SessionHandle>> {
         self.client.session(&chat_id).map(SessionHandle::new)

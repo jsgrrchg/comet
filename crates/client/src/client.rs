@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use chrono::{TimeZone, Utc};
 use tokio_util::sync::CancellationToken;
-use zeron_doc::RegistryDoc;
+use zeron_doc::{RegistryDoc, SessionDoc};
 use zeron_proto::{Chat, ChatConfig, SidebarPinChange, SidebarSectionChange};
 
 use crate::attachments::{self, AttachmentCache};
@@ -22,7 +22,9 @@ use crate::error::{ClientError, Result};
 use crate::events::{ClientEvent, ClientListener, EventPump};
 use crate::live::LiveBackend;
 use crate::rpc::{FolderListing, ProgressFn, QUEUED_ATTACHMENTS_MIN, RepoRef, capability};
-use crate::session::{HostCapabilities, OutgoingAttachment, RoomState, SessionCore, SessionHandle};
+use crate::session::{
+    DocSource, HostCapabilities, OutgoingAttachment, RoomState, SessionCore, SessionHandle,
+};
 use crate::workspace::{SearchHit, WorkspaceSnapshot, WorkspaceStore};
 use crate::{lock, now_ms, read, write};
 
@@ -36,6 +38,16 @@ const TICK: Duration = Duration::from_secs(1);
 pub const WARM_SESSION_CAP: usize = 6;
 /// Sessions `preload_sessions` warms (front page order).
 pub const PRELOAD_CAP: usize = 4;
+
+/// The chat a subagent doc (`{chatId}--sub--{id}`) belongs to — the
+/// top-level chat even for nested spawns (the engine names every subagent
+/// doc of a run off the run's own chat).
+pub fn subagent_parent(doc_id: &str) -> Option<&str> {
+    doc_id
+        .split_once("--sub--")
+        .map(|(parent, _)| parent)
+        .filter(|parent| !parent.is_empty())
+}
 
 /// Where a new session runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +129,15 @@ impl ClientInner {
 
     pub(crate) fn cores(&self) -> Vec<Arc<SessionCore>> {
         lock(&self.sessions).values().cloned().collect()
+    }
+
+    /// Register a freshly built core, or return the one a racing open
+    /// registered first.
+    fn adopt_core(&self, chat_id: &str, core: Arc<SessionCore>) -> Arc<SessionCore> {
+        lock(&self.sessions)
+            .entry(chat_id.to_owned())
+            .or_insert(core)
+            .clone()
     }
 
     pub(crate) fn network_online(&self) -> bool {
@@ -1056,14 +1077,8 @@ impl Client {
                 (local.doc, local.cursor, local.had_content)
             }
         };
-        let core = SessionCore::new(chat_id, &self.inner, doc, cursor);
-        let core = {
-            let mut sessions = lock(&self.inner.sessions);
-            sessions
-                .entry(chat_id.to_owned())
-                .or_insert_with(|| core.clone())
-                .clone()
-        };
+        let core = SessionCore::new(chat_id, &self.inner, doc, cursor, DocSource::Chat);
+        let core = self.inner.adopt_core(chat_id, core);
         if hydrated {
             core.set_hydrated();
         }
@@ -1087,6 +1102,88 @@ impl Client {
         }
         self.inner.evict_sessions();
         Ok(SessionHandle { core })
+    }
+
+    /// Open a subagent's transcript read-only: the doc a spawn chip's
+    /// `subagent_ref` names (`{chatId}--sub--{id}`). It has no registry row;
+    /// the parent chat's host serves its chat2 room. A `frozen` (done/failed)
+    /// subagent reads its uploaded blob first and never wakes the room; any
+    /// blob failure falls back to the live room.
+    pub async fn open_subagent(&self, doc_id: &str, frozen: bool) -> Result<SessionHandle> {
+        let parent = subagent_parent(doc_id)
+            .ok_or_else(|| ClientError::InvalidArgument(format!("not a subagent doc: {doc_id}")))?;
+        if let Some(core) = self.inner.session_core(doc_id) {
+            return Ok(SessionHandle { core });
+        }
+        let host = self
+            .inner
+            .workspace
+            .chat(parent)
+            .map(|chat| chat.device_id)
+            .ok_or_else(|| ClientError::NotFound(parent.to_owned()))?;
+        let (doc, cursor, source) = match self.inner.backend() {
+            Backend::Demo(demo) => (demo.session_doc(doc_id)?, 0, DocSource::Frozen),
+            Backend::Live(live) => {
+                let blob = if frozen {
+                    self.fetch_subagent_blob(parent, doc_id).await
+                } else {
+                    None
+                };
+                match blob {
+                    Some(doc) => (doc, 0, DocSource::Frozen),
+                    None => {
+                        let local = crate::live::room::load_local(&live.store, doc_id);
+                        (local.doc, local.cursor, DocSource::Subagent { host })
+                    }
+                }
+            }
+        };
+        let blob_served = source == DocSource::Frozen;
+        let core = SessionCore::new(doc_id, &self.inner, doc, cursor, source);
+        let core = self.inner.adopt_core(doc_id, core);
+        if blob_served {
+            core.set_hydrated();
+        }
+        core.ensure_room(&self.inner);
+        core.touch();
+        core.refresh();
+        self.inner.evict_sessions();
+        Ok(SessionHandle { core })
+    }
+
+    /// The frozen transcript blob (`blob/{chatId}/{docId}`: a JSON array of
+    /// entries) as a local doc. `None` on any failure — the upload is
+    /// best-effort host-side.
+    async fn fetch_subagent_blob(&self, chat_id: &str, doc_id: &str) -> Option<SessionDoc> {
+        let live = self.inner.live()?;
+        let url = format!(
+            "{}/blob/{}/{}",
+            live.edge.trim_end_matches('/'),
+            crate::live::urls::encode(chat_id),
+            crate::live::urls::encode(doc_id)
+        );
+        let token = crate::live::LiveBackend::bearer(&self.inner)
+            .get()
+            .await
+            .ok()?;
+        let response = crate::auth::http()
+            .get(&url)
+            .bearer_auth(&token)
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            tracing::debug!(doc = %doc_id, status = %response.status(), "subagent blob unavailable");
+            return None;
+        }
+        let entries: Vec<zeron_doc::SessionMessageEntry> =
+            serde_json::from_slice(&response.bytes().await.ok()?).ok()?;
+        let doc = SessionDoc::from_doc(loro::LoroDoc::new());
+        for entry in &entries {
+            doc.push_message(entry).ok()?;
+        }
+        Some(doc)
     }
 
     /// An already-open session, if any.

@@ -50,6 +50,7 @@ final class AppModel {
     private var workspaceRevision: UInt64 = 0
     private var observers: [UUID: () -> Void] = [:]
     private var sessionObservers: [String: [UUID: () -> Void]] = [:]
+    private var workspaceObservers: [UUID: () -> Void] = [:]
     private lazy var bridge = ListenerBridge(app: self)
     private var refreshScheduled = false
     private var clock: Timer?
@@ -326,6 +327,14 @@ final class AppModel {
         return Token { [weak self] in self?.observers[id] = nil }
     }
 
+    /// Every workspace revision, including changes no list on the front page
+    /// shows (a session's side chats): `observe` fires only when it changes.
+    func observeWorkspace(_ handler: @escaping () -> Void) -> AnyObject {
+        let id = UUID()
+        workspaceObservers[id] = handler
+        return Token { [weak self] in self?.workspaceObservers[id] = nil }
+    }
+
     func observeSession(_ chatId: String, _ handler: @escaping () -> Void) -> AnyObject {
         let id = UUID()
         sessionObservers[chatId, default: [:]][id] = handler
@@ -367,6 +376,7 @@ final class AppModel {
     private func refreshWorkspace() {
         guard let client else { return }
         let ws = client.workspace()
+        let revised = ws.revision != workspaceRevision
         workspaceRevision = ws.revision
         var all: [String: SessionRow] = [:]
         func vm(_ r: SessionRow) -> SessionRowVM {
@@ -407,6 +417,7 @@ final class AppModel {
         frontPage = page
         archived = archivedVMs
         if changed { observers.values.forEach { $0() } }
+        if revised { workspaceObservers.values.forEach { $0() } }
     }
 
     /// Like the desktop's project grouping: checkouts of one repository
@@ -469,7 +480,8 @@ final class AppModel {
             timeLabel: r.timeLabel,
             unseen: r.unseen,
             pinned: r.pinned,
-            sendFailed: r.sendState == .failed
+            sendFailed: r.sendState == .failed,
+            runningSubagents: Int(r.runningSubagents)
         )
     }
 
@@ -479,6 +491,12 @@ final class AppModel {
 
     func row(_ id: String) -> SessionRow? {
         rows[id] ?? client?.sessionRow(chatId: id)
+    }
+
+    /// Side chats and agent-spawned chats hanging off `chatId` (archived
+    /// ones left out), recency order.
+    func children(of chatId: String) -> [SessionRowVM] {
+        (client?.childSessions(parentId: chatId) ?? []).filter { !$0.archived }.map(Self.vm)
     }
 
     func sessions(inFolder id: String) -> [SessionRowVM] {
@@ -527,6 +545,19 @@ final class AppModel {
             return CoreSessionSource(app: self, client: client, handle: handle, chatId: chatId)
         } catch {
             NSLog("open session failed: \(error)")
+            return nil
+        }
+    }
+
+    /// A subagent's transcript (a spawn card's doc), read-only. Finished
+    /// subagents read their frozen copy, so this can wait on the network.
+    @MainActor
+    func openSubagent(docId: String, frozen: Bool) async -> SessionHandle? {
+        guard let client else { return nil }
+        do {
+            return try await client.openSubagent(docId: docId, frozen: frozen)
+        } catch {
+            NSLog("open subagent failed: \(error)")
             return nil
         }
     }

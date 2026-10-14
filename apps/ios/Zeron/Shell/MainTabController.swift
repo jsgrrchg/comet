@@ -88,7 +88,13 @@ final class MainTabController: UITabBarController, UITabBarControllerDelegate, A
     /// its own composer).
     func syncAccessory(animated: Bool = false) {
         let top = (selectedTab?.viewController as? UINavigationController)?.topViewController
-        setAccessoryVisible(!(top is SessionViewController), animated: animated)
+        setAccessoryVisible(!Self.hidesAccessory(top), animated: animated)
+    }
+
+    /// Sessions carry their own composer, subagent transcripts sit above one:
+    /// the accessory steps aside for both.
+    static func hidesAccessory(_ top: UIViewController?) -> Bool {
+        top is SessionViewController || top is SubagentViewController
     }
 
     /// Pushed sessions carry their own composer; the accessory steps aside.

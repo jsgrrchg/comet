@@ -46,22 +46,37 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         let voiceBar = VoiceBarItem(app: app, host: self)
         self.voiceBar = voiceBar
         let menu = navigationItem.rightBarButtonItem!
-        let syncVoice = { [weak self, weak voiceBar] in
+        // Side chats and agent-spawned chats of this session, once it has any.
+        let sideChats = UIBarButtonItem(image: UIImage(systemName: "bubble.left.and.bubble.right"), primaryAction: UIAction { [weak self] _ in
+            self?.showSideChats()
+        })
+        sideChats.accessibilityLabel = "Side chats"
+        sideChats.accessibilityIdentifier = "side-chats"
+        let syncBar = { [weak self, weak voiceBar] in
             guard let self, let voiceBar else { return }
-            let items = voiceBar.visible ? [menu, voiceBar.item] : [menu]
-            if self.navigationItem.rightBarButtonItems?.count != items.count {
+            let children = self.app.children(of: self.chatId).count
+            sideChats.badge = children > 0 ? .count(children) : nil
+            var items = [menu]
+            if voiceBar.visible { items.append(voiceBar.item) }
+            if children > 0 { items.append(sideChats) }
+            if self.navigationItem.rightBarButtonItems?.map(ObjectIdentifier.init) != items.map(ObjectIdentifier.init) {
                 self.navigationItem.setRightBarButtonItems(items, animated: self.view.window != nil)
             }
         }
-        voiceToken = app.voice.observe(syncVoice)
-        hostsToken = app.observe(syncVoice)
-        syncVoice()
+        voiceToken = app.voice.observe(syncBar)
+        hostsToken = app.observe(syncBar)
+        childrenToken = app.observeWorkspace(syncBar)
+        syncBar()
 
         list.frame = view.bounds
         list.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         list.accessibilityIdentifier = "transcript"
         list.imageLoader = { [weak self] ref, iv in self?.source.loadImage(ref, into: iv) }
         list.imageFetcher = { [weak self] ref in await self?.source.image(ref) }
+        list.onOpenSubagent = { [weak self] docId, title, frozen in
+            guard let self else { return }
+            self.navigationController?.pushViewController(SubagentViewController(app: self.app, docId: docId, title: title, frozen: frozen), animated: true)
+        }
         // Hidden while following (the runway glide and tail spring travel).
         list.onDistanceFromBottom = { [weak self] d in
             guard let self else { return }
@@ -183,6 +198,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     private var voiceBar: VoiceBarItem?
     private var voiceToken: AnyObject?
     private var hostsToken: AnyObject?
+    private var childrenToken: AnyObject?
 
     deinit {
         if let backgroundObserver { NotificationCenter.default.removeObserver(backgroundObserver) }
@@ -297,7 +313,10 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         // Leaving mid-edit: give the queued row back and the draft its place.
         if editingQueueId != nil { endEdit(commit: nil) }
         saveDraft()
-        if isMovingFromParent { setAccessory(visible: true) }
+        // Back to the list — not to the session this one hangs off.
+        if isMovingFromParent, !MainTabController.hidesAccessory(navigationController?.topViewController) {
+            setAccessory(visible: true)
+        }
     }
 
     /// Tear down only once the pop has really happened: an interactive
@@ -518,6 +537,24 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         } else {
             changes()
         }
+    }
+
+    /// This session's side chats in a sheet; picking one opens it on top.
+    private func showSideChats() {
+        let list = SideChatsViewController(app: app, parentId: chatId) { [weak self] childId in
+            guard let self else { return }
+            self.dismiss(animated: true)
+            guard let child = SessionViewController(app: self.app, chatId: childId) else {
+                return Toast.show("Couldn't open session. Try again.", in: self.view.window)
+            }
+            self.navigationController?.pushViewController(child, animated: true)
+        }
+        let sheet = UINavigationController(rootViewController: list)
+        if let s = sheet.sheetPresentationController {
+            s.detents = [.medium(), .large()]
+            s.prefersGrabberVisible = true
+        }
+        present(sheet, animated: true)
     }
 
     private func sessionMenu() -> UIMenu {

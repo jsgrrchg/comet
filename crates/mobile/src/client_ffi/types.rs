@@ -493,6 +493,8 @@ pub struct SessionRow {
     pub host_indicator: ChatIndicator,
     /// Run start of the live turn while Working/AwaitingInput.
     pub working_since_ms: Option<i64>,
+    /// Subagents of this chat streaming right now.
+    pub running_subagents: u32,
     pub last_activity_ms: i64,
     /// `now` / `34m` / `4h` / `2d` at derive time.
     pub time_label: String,
@@ -535,6 +537,7 @@ impl From<&zc::SessionRow> for SessionRow {
             indicator: r.indicator.into(),
             host_indicator: r.host_indicator.into(),
             working_since_ms: r.working_since_ms,
+            running_subagents: r.running_subagents,
             last_activity_ms: r.last_activity_ms,
             time_label: r.time_label.clone(),
             created_at_ms: r.created_at_ms,

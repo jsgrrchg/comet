@@ -1123,6 +1123,12 @@ public protocol CoreClientProtocol: AnyObject, Sendable {
      */
     func openSession(chatId: String) throws  -> SessionHandle
     
+    /**
+     * Open a subagent's transcript read-only (a spawn chip's doc id). A
+     * `frozen` (finished) subagent reads its uploaded blob first.
+     */
+    func openSubagent(docId: String, frozen: Bool) async throws  -> SessionHandle
+    
     func orgId()  -> String
     
     func pinSession(chatId: String) throws 
@@ -1653,6 +1659,26 @@ open func openSession(chatId: String)throws  -> SessionHandle  {
         FfiConverterString.lower(chatId),uniffiCallStatus
     )
 })
+}
+    
+    /**
+     * Open a subagent's transcript read-only (a spawn chip's doc id). A
+     * `frozen` (finished) subagent reads its uploaded blob first.
+     */
+open func openSubagent(docId: String, frozen: Bool)async throws  -> SessionHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_zeron_mobile_fn_method_coreclient_open_subagent(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(docId),FfiConverterBool.lower(frozen)
+                )
+            },
+            pollFunc: ffi_zeron_mobile_rust_future_poll_u64,
+            completeFunc: ffi_zeron_mobile_rust_future_complete_u64,
+            freeFunc: ffi_zeron_mobile_rust_future_free_u64,
+            liftFunc: FfiConverterTypeSessionHandle_lift,
+            errorHandler: FfiConverterTypeCoreError_lift
+        )
 }
     
 open func orgId() -> String  {
@@ -8491,6 +8517,10 @@ public struct SessionRow: Equatable, Hashable {
      * Run start of the live turn while Working/AwaitingInput.
      */
     public var workingSinceMs: Int64?
+    /**
+     * Subagents of this chat streaming right now.
+     */
+    public var runningSubagents: UInt32
     public var lastActivityMs: Int64
     /**
      * `now` / `34m` / `4h` / `2d` at derive time.
@@ -8538,7 +8568,10 @@ public struct SessionRow: Equatable, Hashable {
          */hostIndicator: ChatIndicator, 
         /**
          * Run start of the live turn while Working/AwaitingInput.
-         */workingSinceMs: Int64?, lastActivityMs: Int64, 
+         */workingSinceMs: Int64?, 
+        /**
+         * Subagents of this chat streaming right now.
+         */runningSubagents: UInt32, lastActivityMs: Int64, 
         /**
          * `now` / `34m` / `4h` / `2d` at derive time.
          */timeLabel: String, createdAtMs: Int64, unseen: Bool, archived: Bool, pinned: Bool, sectionId: String?, pullRequest: PullRequest?, 
@@ -8567,6 +8600,7 @@ public struct SessionRow: Equatable, Hashable {
         self.indicator = indicator
         self.hostIndicator = hostIndicator
         self.workingSinceMs = workingSinceMs
+        self.runningSubagents = runningSubagents
         self.lastActivityMs = lastActivityMs
         self.timeLabel = timeLabel
         self.createdAtMs = createdAtMs
@@ -8615,6 +8649,7 @@ public struct FfiConverterTypeSessionRow: FfiConverterRustBuffer {
                 indicator: FfiConverterTypeChatIndicator.read(from: &buf), 
                 hostIndicator: FfiConverterTypeChatIndicator.read(from: &buf), 
                 workingSinceMs: FfiConverterOptionInt64.read(from: &buf), 
+                runningSubagents: FfiConverterUInt32.read(from: &buf), 
                 lastActivityMs: FfiConverterInt64.read(from: &buf), 
                 timeLabel: FfiConverterString.read(from: &buf), 
                 createdAtMs: FfiConverterInt64.read(from: &buf), 
@@ -8649,6 +8684,7 @@ public struct FfiConverterTypeSessionRow: FfiConverterRustBuffer {
         FfiConverterTypeChatIndicator.write(value.indicator, into: &buf)
         FfiConverterTypeChatIndicator.write(value.hostIndicator, into: &buf)
         FfiConverterOptionInt64.write(value.workingSinceMs, into: &buf)
+        FfiConverterUInt32.write(value.runningSubagents, into: &buf)
         FfiConverterInt64.write(value.lastActivityMs, into: &buf)
         FfiConverterString.write(value.timeLabel, into: &buf)
         FfiConverterInt64.write(value.createdAtMs, into: &buf)
@@ -13189,6 +13225,12 @@ public enum WidgetKind: Equatable, Hashable {
     case toolToggle(detail: UInt64, `open`: Bool
     )
     /**
+     * Tap target over a subagent spawn card: opens the subagent's
+     * transcript (`doc_id`, read-only). `frozen` = it finished (done/failed).
+     */
+    case subagentLink(docId: String, title: String, frozen: Bool
+    )
+    /**
      * Shimmer sweep over the active group's title (text drawn by the canvas
      * underneath; the painter re-draws those runs brighter through a moving
      * gradient).
@@ -13246,7 +13288,10 @@ public struct FfiConverterTypeWidgetKind: FfiConverterRustBuffer {
         case 11: return .toolToggle(detail: try FfiConverterUInt64.read(from: &buf), open: try FfiConverterBool.read(from: &buf)
         )
         
-        case 12: return .shimmer
+        case 12: return .subagentLink(docId: try FfiConverterString.read(from: &buf), title: try FfiConverterString.read(from: &buf), frozen: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 13: return .shimmer
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -13318,8 +13363,15 @@ public struct FfiConverterTypeWidgetKind: FfiConverterRustBuffer {
             FfiConverterBool.write(`open`, into: &buf)
             
         
-        case .shimmer:
+        case let .subagentLink(docId,title,frozen):
             writeInt(&buf, Int32(12))
+            FfiConverterString.write(docId, into: &buf)
+            FfiConverterString.write(title, into: &buf)
+            FfiConverterBool.write(frozen, into: &buf)
+            
+        
+        case .shimmer:
+            writeInt(&buf, Int32(13))
         
         }
     }
@@ -15353,6 +15405,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_open_session() != 32134) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_method_coreclient_open_subagent() != 36931) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_method_coreclient_org_id() != 50248) {

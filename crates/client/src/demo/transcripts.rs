@@ -4,6 +4,7 @@
 //! groups, questions, errors, attachments), the synthetic big transcripts
 //! for benchmarks, and the scripted streaming reply.
 
+use zeron_doc::parts::SubagentStatus;
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, ToolDiffStat};
 use zeron_proto::{TodoItem, TodoStatus, ToolCall, UserInputQuestion};
 
@@ -58,6 +59,34 @@ fn edit(id: &str, path: &str, additions: u64, deletions: u64) -> MessagePart {
             additions,
             deletions,
         }]);
+    }
+    part
+}
+
+/// The finished subagent `chat-tabs` spawned (its chip links here).
+pub(crate) const TABS_SUBAGENT: &str = "chat-tabs--sub--toolu_demo_audit";
+
+/// A finished subagent spawn chip linking to `doc`.
+fn spawn(id: &str, description: &str, doc: &str, tail: &str) -> MessagePart {
+    let mut part = tool(
+        id,
+        ToolCall::Unknown {
+            name: format!("Agent: {description}"),
+            input: Some(serde_json::json!({ "subagent_type": "Explore" })),
+        },
+        false,
+        None,
+    );
+    if let MessagePart::Tool {
+        subagent_ref,
+        subagent_status,
+        subagent_tail,
+        ..
+    } = &mut part
+    {
+        *subagent_ref = Some(doc.into());
+        *subagent_status = Some(SubagentStatus::Done);
+        *subagent_tail = Some(tail.into());
     }
     part
 }
@@ -408,6 +437,12 @@ fn tabs(host: &str, now: i64) -> Vec<SessionMessageEntry> {
             host,
             now - 950_000,
             vec![
+                spawn(
+                    "k0",
+                    "Find every tool group header color",
+                    TABS_SUBAGENT,
+                    "3 call sites; only the header path picks up danger.",
+                ),
                 tool(
                     "k1",
                     ToolCall::Search {
@@ -433,6 +468,40 @@ fn tabs(host: &str, now: i64) -> Vec<SessionMessageEntry> {
                 text(
                     "t0",
                     "Done — the header keeps `text_muted` even on failure; only the chip label and the summary segment (\"1 failed\") pick up `danger`. Matches the desktop fix in `1749890`.",
+                ),
+            ],
+        ),
+    ]
+}
+
+/// The transcript `chat-tabs`' subagent wrote into its own doc.
+fn tabs_subagent(host: &str, now: i64) -> Vec<SessionMessageEntry> {
+    vec![
+        user(
+            "s1",
+            now - 990_000,
+            "Find every place a tool group header picks its color, and whether a failed child changes it.",
+        ),
+        assistant(
+            "s2",
+            host,
+            now - 980_000,
+            vec![
+                tool(
+                    "q1",
+                    ToolCall::Search {
+                        pattern: "group_header_color".into(),
+                        path: Some("crates/ui/src".into()),
+                    },
+                    false,
+                    Some(
+                        "crates/ui/src/shell/transcript.rs:812\ncrates/ui/src/shell/transcript.rs:1490\ncrates/ui/src/tool_group.rs:64",
+                    ),
+                ),
+                tool("q2", read("crates/ui/src/tool_group.rs"), false, None),
+                text(
+                    "t0",
+                    "Three call sites. Only `tool_group.rs:64` reacts to a failed child: it swaps `text_muted` for `danger` when `any_failed` is set. The other two read the theme's muted role unconditionally.",
                 ),
             ],
         ),
@@ -615,6 +684,7 @@ pub(crate) fn fixture(chat_id: &str, host: &str, last_activity: i64) -> Vec<Sess
         "chat-veil" => veil(host, crate::now_ms()),
         "chat-picker" => picker(host, now),
         "chat-tabs" => tabs(host, now),
+        TABS_SUBAGENT => tabs_subagent(host, now),
         "chat-errored" => errored(host, now),
         "chat-ios-scroll" => scroll(host, now),
         "chat-home" => home(host, now),

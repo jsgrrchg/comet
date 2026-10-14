@@ -5,11 +5,15 @@
 
 pub mod agent;
 pub mod attachment_mentions;
+pub mod chat_mentions;
+pub mod change_request_assessment;
+pub mod device_paths;
 pub mod entities;
 pub mod file_mentions;
 pub mod invocation;
 pub mod motion;
 pub mod preview;
+pub mod projectless;
 pub mod sidebar_pins;
 pub mod view;
 pub mod voice;

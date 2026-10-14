@@ -35,6 +35,7 @@ async fn main() -> anyhow::Result<()> {
                     let _ = tx.send(vec![]);
                     rx
                 }),
+                turn: Default::default(),
             },
         )
         .await?;
@@ -57,6 +58,8 @@ async fn main() -> anyhow::Result<()> {
                                     .send(SteerMessage {
                                         prompt: i.to_string(),
                                         message_id: Some(format!("digit-{i}")),
+                                        attachments: Vec::new(),
+                                        config: None,
                                     })
                                     .await
                                     .is_err()

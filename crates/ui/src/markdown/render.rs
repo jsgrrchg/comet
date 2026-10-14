@@ -1407,7 +1407,7 @@ pub(crate) fn selectable_text_wrap() -> Div {
     div().relative().cursor(CursorStyle::IBeam)
 }
 
-fn selectable_text_element(
+pub(crate) fn selectable_text_element(
     key: std::sync::Arc<str>,
     text: SharedString,
     runs: Vec<TextRun>,
@@ -1453,6 +1453,17 @@ thread_local! {
     static PAINTING_SURFACE: Cell<u64> = const { Cell::new(0) };
     /// Surfaces whose reset painted since the latest one's previous reset.
     static PAINTED_SURFACES: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn selection_test_entry_count(prefix: &str) -> usize {
+    REGISTRY.with(|registry| {
+        registry
+            .borrow()
+            .iter()
+            .filter(|entry| entry.key.starts_with(prefix))
+            .count()
+    })
 }
 
 #[cfg(test)]
@@ -1546,6 +1557,9 @@ pub(crate) fn clear_selection_surface(prefix: &str) {
             .retain(|entry| !entry.key.starts_with(prefix))
     });
     if let Some(anchor) = super::selection::anchor_key().filter(|key| key.starts_with(prefix)) {
+        // Closing a surface can happen before mouse-up. Retire its active
+        // drag too, without disturbing a selection owned by another view.
+        super::selection::end_active_drag();
         super::selection::clear_if_owner(&anchor);
     }
 }

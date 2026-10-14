@@ -800,6 +800,40 @@ async fn target_device_id_routes_over_the_relay() {
         "remote folder listing must come from B's filesystem: {names:?}"
     );
 
+    // Worktree preferences and their filesystem validation belong to B.
+    let a_settings = core_a.repos.worktree_settings();
+    let custom_worktrees = dirs.path().join("b-custom-worktrees");
+    let saved = client
+        .call(
+            methods::SET_WORKTREE_SETTINGS,
+            serde_json::json!({
+                "targetDeviceId": "device-b",
+                "useCustomDirectory": true,
+                "customDirectory": custom_worktrees,
+            }),
+        )
+        .await
+        .expect("save worktree location on B");
+    let remote_settings = client
+        .call(
+            methods::GET_WORKTREE_SETTINGS,
+            serde_json::json!({
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("read worktree location on B");
+    assert_eq!(saved, remote_settings);
+    assert_eq!(
+        core_a.repos.worktree_settings(),
+        a_settings,
+        "A's preferences are unchanged"
+    );
+    assert_eq!(
+        std::path::PathBuf::from(saved["effectiveDirectory"].as_str().unwrap()),
+        custom_worktrees.canonicalize().unwrap()
+    );
+
     // Streaming proxy: WatchDocMessages against B's doc from A's IPC surface.
     let mut stream = client
         .subscribe_scoped(
@@ -1040,6 +1074,7 @@ async fn target_device_id_routes_over_the_relay() {
             .as_str()
             .expect("remote setup worktree"),
     );
+    assert!(setup_worktree.starts_with(custom_worktrees.canonicalize().unwrap()));
     tokio::time::sleep(Duration::from_millis(250)).await;
     let mut setup_stream = client
         .subscribe(
@@ -1282,7 +1317,22 @@ async fn exercise_terminal_relay(projectless: bool) {
     };
     let terminal_id = session["id"].as_str().expect("terminal id").to_string();
     let expected_cwd = if projectless {
-        std::env::var("HOME").expect("HOME set in test env")
+        // B's own scratch folder for the chat, created when the terminal opened.
+        let chat = core_b.workspace.chat("chat-term").unwrap().unwrap();
+        let chat_cwd = chat.cwd.clone().unwrap();
+        assert!(
+            zeron_proto::projectless::is_scratch_cwd(&chat_cwd),
+            "{chat_cwd}"
+        );
+        assert_eq!(chat.space_id, None);
+        assert!(core_b.workspace.read_spaces().unwrap().is_empty());
+        let name = chat_cwd.rsplit('/').next().unwrap();
+        dirs.path()
+            .join("b")
+            .join("scratch")
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
     } else {
         cwd.to_string_lossy().into_owned()
     };
@@ -1291,12 +1341,6 @@ async fn exercise_terminal_relay(projectless: bool) {
         Some(expected_cwd.as_str()),
         "cwd from B's chat row"
     );
-    if projectless {
-        let chat = core_b.workspace.chat("chat-term").unwrap().unwrap();
-        assert_eq!(chat.cwd.as_deref(), Some("~"));
-        assert_eq!(chat.space_id, None);
-        assert!(core_b.workspace.read_spaces().unwrap().is_empty());
-    }
 
     // SubscribeTerminal: the stream is proxied item-by-item through the relay.
     let mut stream = client
@@ -1441,6 +1485,36 @@ async fn workspace_file_surface_proxies_over_the_relay() {
         .await
         .expect("remote search");
     assert_eq!(matches[0]["path"], "src/remote.rs");
+
+    let warm = client
+        .call(
+            methods::WARM_WORKSPACE_SEARCH,
+            serde_json::json!({
+                "chatId": "chat-files",
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("remote search warm-up");
+    assert!(matches!(warm["state"].as_str(), Some("building" | "ready")));
+
+    let content = client
+        .call(
+            methods::SEARCH_WORKSPACE_CONTENT,
+            serde_json::json!({
+                "chatId": "chat-files",
+                "query": "REMOTE",
+                "targetDeviceId": "device-b",
+            }),
+        )
+        .await
+        .expect("remote content search");
+    assert!(
+        content["matches"]
+            .as_array()
+            .is_some_and(|matches| matches.iter().any(|m| m["path"] == "src/remote.rs"))
+            || content["indexing"] == true
+    );
 
     let read = client
         .call(

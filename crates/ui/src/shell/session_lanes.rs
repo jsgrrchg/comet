@@ -156,13 +156,6 @@ impl SubagentLane {
         Self { active, finished }
     }
 
-    pub fn failed(&self) -> usize {
-        self.finished
-            .iter()
-            .filter(|row| row.status == Some(SubagentStatus::Failed))
-            .count()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.active.is_empty() && self.finished.is_empty()
     }
@@ -439,7 +432,6 @@ impl Shell {
         }
         // ── Subagents: what runs rides the lane, the settled fold away.
         if !subagents.is_empty() {
-            let failed = subagents.failed();
             rows.push(popover::picker_divider().into_any_element());
             rows.push(popover::menu_heading(theme, "Subagents").into_any_element());
             let SubagentLane { active, finished } = subagents;
@@ -464,7 +456,7 @@ impl Shell {
             }
             if folded > 0 {
                 rows.push(
-                    self.render_finished_fold(folded, failed, open, theme, cx)
+                    self.render_finished_fold(folded, open, theme, cx)
                         .into_any_element(),
                 );
             }
@@ -640,11 +632,10 @@ impl Shell {
             .child(time_label(time.into(), theme))
     }
 
-    /// The settled subagents' fold: the count, with any failures called out.
+    /// The settled subagents' fold, with their count.
     fn render_finished_fold(
         &mut self,
         count: usize,
-        failed: usize,
         open: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -678,15 +669,6 @@ impl Shell {
                     .text_color(theme.text_muted)
                     .child(SharedString::from(format!("{count} finished"))),
             )
-            .when(failed > 0, |row| {
-                row.child(
-                    div()
-                        .flex_none()
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .text_color(spaces::status_dot_color(ChatIndicator::Errored, theme))
-                        .child(SharedString::from(format!("{failed} failed"))),
-                )
-            })
     }
 
     /// "Show N more" under a paged lane, its label lined up with the rows'.
@@ -888,7 +870,6 @@ mod tests {
                 "main--sub--old-done"
             ]
         );
-        assert_eq!(lane.failed(), 1);
     }
 
     #[test]

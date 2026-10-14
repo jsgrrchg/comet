@@ -255,6 +255,15 @@ fn glyph(path: &'static str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
+/// The harness a row runs on, as the sidebar's brand mark.
+fn harness_mark(harness: zeron_proto::HarnessId, theme: &Theme) -> gpui::Svg {
+    let (path, tint) = crate::pickers::harness_brand_icon(harness);
+    icon(path)
+        .size(px(13.0))
+        .flex_none()
+        .text_color(tint.unwrap_or(theme.text_muted).opacity(0.8))
+}
+
 /// A row's trailing time, in the muted subline size.
 fn time_label(text: SharedString, theme: &Theme) -> gpui::Div {
     div()
@@ -345,6 +354,8 @@ impl Shell {
             )
         };
         let view = cx.entity_id();
+        // Subagents run on the session's own harness.
+        let harness = chat.config.as_ref().map(|config| config.harness);
         // ── The two ways to start a side chat: rows while the lane is empty,
         // then icon buttons on the heading so the branches lead.
         let busy = self.side_chat_creating;
@@ -447,7 +458,7 @@ impl Shell {
             };
             for row in active {
                 rows.push(
-                    self.render_subagent_row(row, view, theme, cx)
+                    self.render_subagent_row(row, harness, view, theme, cx)
                         .into_any_element(),
                 );
             }
@@ -459,7 +470,7 @@ impl Shell {
             }
             for row in finished {
                 rows.push(
-                    self.render_subagent_row(row, view, theme, cx)
+                    self.render_subagent_row(row, harness, view, theme, cx)
                         .into_any_element(),
                 );
             }
@@ -564,13 +575,7 @@ impl Shell {
             )
             .child(popover::picker_icon_slot(mark))
             // The harness mark leads the title, as on the sidebar's rows.
-            .children(row.harness.map(|harness| {
-                let (path, tint) = crate::pickers::harness_brand_icon(harness);
-                icon(path)
-                    .size(px(13.0))
-                    .flex_none()
-                    .text_color(tint.unwrap_or(theme.text_muted).opacity(0.8))
-            }))
+            .children(row.harness.map(|harness| harness_mark(harness, theme)))
             .child(title)
             .when(revealing, |row| {
                 let shell = cx.weak_entity();
@@ -606,6 +611,7 @@ impl Shell {
     fn render_subagent_row(
         &mut self,
         row: SubagentRow,
+        harness: Option<zeron_proto::HarnessId>,
         view: gpui::EntityId,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -629,6 +635,7 @@ impl Shell {
                 );
             }))
             .child(popover::picker_icon_slot(mark))
+            .children(harness.map(|harness| harness_mark(harness, theme)))
             .child(title)
             .child(time_label(time.into(), theme))
     }

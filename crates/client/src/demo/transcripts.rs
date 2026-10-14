@@ -65,6 +65,9 @@ fn edit(id: &str, path: &str, additions: u64, deletions: u64) -> MessagePart {
 
 /// The finished subagent `chat-tabs` spawned (its chip links here).
 pub(crate) const TABS_SUBAGENT: &str = "chat-tabs--sub--toolu_demo_audit";
+/// The finished subagent `chat-veil` spawned — the chat that also has a
+/// side chat.
+pub(crate) const VEIL_SUBAGENT: &str = "chat-veil--sub--toolu_demo_graphemes";
 
 /// A finished subagent spawn chip linking to `doc`.
 fn spawn(id: &str, description: &str, doc: &str, tail: &str) -> MessagePart {
@@ -313,6 +316,12 @@ fn veil(host: &str, now: i64) -> Vec<SessionMessageEntry> {
             host,
             now - 1_700_000,
             vec![
+                spawn(
+                    "k0",
+                    "Audit grapheme handling in the veil",
+                    VEIL_SUBAGENT,
+                    "Chunk splits cut ZWJ sequences; snap them to clusters.",
+                ),
                 tool(
                     "k1",
                     ToolCall::Glob {
@@ -468,6 +477,35 @@ fn tabs(host: &str, now: i64) -> Vec<SessionMessageEntry> {
                 text(
                     "t0",
                     "Done — the header keeps `text_muted` even on failure; only the chip label and the summary segment (\"1 failed\") pick up `danger`. Matches the desktop fix in `1749890`.",
+                ),
+            ],
+        ),
+    ]
+}
+
+/// The transcript `chat-veil`'s subagent wrote into its own doc.
+fn veil_subagent(host: &str, now: i64) -> Vec<SessionMessageEntry> {
+    vec![
+        user(
+            "s1",
+            now - 1_690_000,
+            "Check whether veil.rs splits chunks on grapheme cluster boundaries. Report any case that cuts a cluster.",
+        ),
+        assistant(
+            "s2",
+            host,
+            now - 1_680_000,
+            vec![
+                tool("q1", read("crates/ui/src/markdown/veil.rs"), false, None),
+                tool(
+                    "q2",
+                    exec("cargo test -p zeron-ui veil_graphemes"),
+                    true,
+                    Some("assertion failed: split 👩‍💻 at byte 4 (inside a ZWJ sequence)"),
+                ),
+                text(
+                    "t0",
+                    "Chunk splits use `char_indices`, so a ZWJ sequence like 👩‍💻 can be cut in half — the failing test above. CJK is fine (one char per cluster). Snap each split with `unicode-segmentation`'s `grapheme_indices` and the test passes.",
                 ),
             ],
         ),
@@ -685,6 +723,7 @@ pub(crate) fn fixture(chat_id: &str, host: &str, last_activity: i64) -> Vec<Sess
         "chat-picker" => picker(host, now),
         "chat-tabs" => tabs(host, now),
         TABS_SUBAGENT => tabs_subagent(host, now),
+        VEIL_SUBAGENT => veil_subagent(host, now),
         "chat-errored" => errored(host, now),
         "chat-ios-scroll" => scroll(host, now),
         "chat-home" => home(host, now),

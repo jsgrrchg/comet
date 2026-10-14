@@ -126,18 +126,30 @@ fn spawn_chips_open_their_subagent_transcript() {
     assert_eq!(ws.session("chat-veil").unwrap().running_subagents, 2);
     assert_eq!(ws.session("chat-tabs").unwrap().running_subagents, 0);
 
-    let parent = client.open_session("chat-tabs").unwrap();
-    let doc_id = parent
-        .snapshot()
-        .transcript_messages()
-        .iter()
-        .flat_map(|entry| entry.parts.iter())
-        .find_map(|part| match part {
-            zeron_client::MessagePart::Tool { subagent_ref, .. } => subagent_ref.clone(),
-            _ => None,
-        })
-        .expect("chat-tabs carries a linked spawn chip");
+    let spawned = |chat_id: &str| {
+        client
+            .open_session(chat_id)
+            .unwrap()
+            .snapshot()
+            .transcript_messages()
+            .iter()
+            .flat_map(|entry| entry.parts.iter())
+            .find_map(|part| match part {
+                zeron_client::MessagePart::Tool { subagent_ref, .. } => subagent_ref.clone(),
+                _ => None,
+            })
+    };
+    let doc_id = spawned("chat-tabs").expect("chat-tabs carries a linked spawn chip");
+    // One chat shows both: a side chat and a subagent.
+    assert_eq!(ids(ws.children("chat-veil")), ["chat-side"]);
+    let veil_sub = spawned("chat-veil").expect("chat-veil carries a linked spawn chip");
     let runtime = zeron_client::runtime::shared();
+    let veil_entries = runtime
+        .block_on(client.open_subagent(&veil_sub, true))
+        .unwrap()
+        .snapshot()
+        .transcript_messages();
+    assert_eq!(veil_entries.len(), 2);
     let sub = runtime
         .block_on(client.open_subagent(&doc_id, true))
         .unwrap();

@@ -156,11 +156,13 @@ impl DemoHost {
                 let live: Vec<Session> = state
                     .sessions
                     .iter()
+                    // Subagents outlive their parent's turn: a row counting
+                    // them stays fresh too, or its pill would go stale.
                     .filter(|s| {
                         matches!(
                             s.status,
                             SessionStatus::Working | SessionStatus::AwaitingInput
-                        )
+                        ) || s.running_subagents > 0
                     })
                     .cloned()
                     .collect();
@@ -446,18 +448,21 @@ impl DemoHost {
     ) {
         let host = self.host_of(client, chat_id);
         let now = Utc::now();
-        let started = client
+        let previous = client
             .workspace
             .state()
             .0
             .sessions
             .iter()
             .find(|s| s.chat_id == chat_id)
-            .and_then(|s| s.started_at);
+            .cloned();
+        let started = previous.as_ref().and_then(|s| s.started_at);
+        // The turn's status changes; the subagents it spawned keep running.
+        let running_subagents = previous.map_or(0, |s| s.running_subagents);
         let _ = client.registry_write(|doc| {
             doc.upsert_session(&Session {
                 last_completed_turn: completed.map(str::to_owned),
-                running_subagents: 0,
+                running_subagents,
                 chat_id: chat_id.to_owned(),
                 device_id: host,
                 status,

@@ -504,6 +504,29 @@ fn interrupt_aborts_the_live_turn() {
 }
 
 #[test]
+fn subagents_keep_their_pill_after_the_parent_turn_ends() {
+    let (client, _dir) = demo(fast());
+    let _veil = client.open_session("chat-veil").unwrap();
+    // Opening chat-veil finishes its live turn; its four subagents run on.
+    wait_for("chat-veil's turn ends", Duration::from_secs(10), || {
+        client
+            .workspace()
+            .session("chat-veil")
+            .unwrap()
+            .host_indicator
+            != ChatIndicator::Working
+    });
+    assert_eq!(
+        client
+            .workspace()
+            .session("chat-veil")
+            .unwrap()
+            .running_subagents,
+        4
+    );
+}
+
+#[test]
 fn opening_the_live_chat_finishes_its_stream() {
     let (client, _dir) = demo(fast());
     let session = client.open_session("chat-veil").unwrap();

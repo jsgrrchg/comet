@@ -1,6 +1,6 @@
 //! The session hover card: dwell on a sidebar row and a frosted card floats
 //! out beside it with what the row has no room for — the whole title, the
-//! project and device, the branch, and the pull request's title.
+//! device and project, the branch, and the pull request's title.
 //! Compact rows drop all of that, so the card is where it lives on.
 //!
 //! The card waits out a short dwell so sweeping the pointer down the list
@@ -157,14 +157,11 @@ impl Shell {
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).for_popup();
         let now = Utc::now();
-        let (title, project, device, local, online, branch, change_request) = {
+        let (title, project, local, online, branch, change_request) = {
             let state = self.state.read(cx);
             let chat = state.chats.iter().find(|chat| chat.id == chat_id)?;
             let space = state.space_for_chat(chat);
             let project = space.map(|space| SharedString::from(space.display_name().to_owned()));
-            let device = state
-                .device_name(&chat.device_id)
-                .map(|name| SharedString::from(name.to_owned()));
             let local = state.local_device_id.as_deref() == Some(chat.device_id.as_str());
             let online = state.device_online(&chat.device_id, now);
             let branch = crate::change_requests::conversation_branch(chat, &state.spaces)
@@ -184,7 +181,6 @@ impl Shell {
             (
                 title,
                 project,
-                device,
                 local,
                 online,
                 branch,
@@ -218,29 +214,60 @@ impl Shell {
                 .into_any_element()
         };
 
-        // ── Title, then its age on one quiet line.
+        // ── The title and its age on one quiet line, the device's glyph in
+        // the corner (this one, another, or out of reach).
+        let device = icon(if !online {
+            icons::WIFI_OFF
+        } else if local {
+            icons::LAPTOP
+        } else {
+            icons::REMOTE_SERVER
+        })
+        .size(px(13.0))
+        .text_color(if online {
+            muted.opacity(0.8)
+        } else {
+            theme.warning.opacity(0.8)
+        });
         let header = div()
             .flex()
-            .flex_col()
-            .gap(px(4.0))
+            .flex_row()
+            .items_start()
+            .gap(px(8.0))
             .child(
                 div()
-                    .w_full()
-                    .text_size(crate::typography::ui_rems(13.0))
-                    .line_height(px(18.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .line_clamp(3)
-                    .child(title),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(crate::typography::ui_rems(13.0))
+                            .line_height(px(18.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .line_clamp(3)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(11.0))
+                            .text_color(muted)
+                            .child(time_label(&time_ago)),
+                    ),
             )
             .child(
                 div()
-                    .text_size(crate::typography::ui_rems(11.0))
-                    .text_color(muted)
-                    .child(time_label(&time_ago)),
+                    .h(px(18.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .child(device),
             );
 
-        // ── Where it runs: project and device, branch.
+        // ── Where it runs: project and branch.
         let project_row = meta_row(
             match &project {
                 Some(_) => self.render_project_icon(chat_id, 14.0, false, cx),
@@ -248,36 +275,7 @@ impl Shell {
             },
             project.clone().unwrap_or_else(|| "No project".into()),
         )
-        .text_color(theme.text)
-        .when_some(device, |row, device| {
-            row.child(
-                div()
-                    .flex_none()
-                    .max_w(px(120.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(4.0))
-                    .text_color(muted)
-                    .child(
-                        icon(if !online {
-                            icons::WIFI_OFF
-                        } else if local {
-                            icons::LAPTOP
-                        } else {
-                            icons::REMOTE_SERVER
-                        })
-                        .size(px(12.0))
-                        .flex_none()
-                        .text_color(if online {
-                            muted.opacity(0.8)
-                        } else {
-                            theme.warning.opacity(0.8)
-                        }),
-                    )
-                    .child(div().min_w_0().truncate().child(device)),
-            )
-        });
+        .text_color(theme.text);
         let location = div()
             .flex()
             .flex_col()

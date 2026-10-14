@@ -43,8 +43,8 @@ Discover hosts with `list_devices`, then `list_projects {device}`, \
 `list_harnesses {device}` and `list_models {device, harness}`. A project fixes \
 its host; with both project and device it must belong to that device. Use listed \
 ids when names/paths repeat. Without project or device, creation uses the local engine. \
-To work in a folder that is not a project yet, `add_project {path, device}` adds one \
-inside that device's home. \
+To work in a folder that is not a project yet, `add_project {path}` adds one inside \
+the home of the device this chat runs on. \
 If a chat is `awaitingInput`, answer it with `respond_to_input`.";
 
 const PARSE_ERROR: i64 = -32700;

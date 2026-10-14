@@ -1520,8 +1520,6 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_DRIVES
             | methods::SEARCH_HOME_FOLDERS
             | methods::RELEASE_HOME_FOLDER_SEARCH
-            // The folder is checked on the disk of the device that will own it.
-            | methods::ADD_PROJECT
             | methods::SEARCH_FILES
             | methods::LIST_WORKSPACE_DIRECTORY
             | methods::SEARCH_WORKSPACE_FILES
@@ -3252,6 +3250,15 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({}))
             }
             methods::ADD_PROJECT => {
+                // Agents add projects on the device they run on, where they
+                // can see the disk; never on behalf of another one.
+                if let Some(target) = params.get("targetDeviceId").and_then(|v| v.as_str())
+                    && target != self.doc_host.device_id()
+                {
+                    return Err(RpcError::BadParams(
+                        "AddProject only adds projects on this device".into(),
+                    ));
+                }
                 let p: AddProjectParams = parse_params(params)?;
                 let home = session_home_dir().map_err(|e| RpcError::Failed(e.into()))?;
                 let workspace = self.workspace.clone();
@@ -4318,6 +4325,7 @@ mod tests {
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::ADD_PROJECT));
         assert!(!forwardable(methods::FOCUS_CHAT));
         assert!(!forwardable(methods::ENGINE_INFO));
         assert!(!forwardable(methods::ENGINE_READY));

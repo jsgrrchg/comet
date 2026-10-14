@@ -30,11 +30,6 @@ const MAX_WAIT: Duration = Duration::from_secs(3600);
 /// A session row older than this is not trusted to still be working
 /// (the UI's staleness window): a crashed host must not read as busy forever.
 const SESSION_STALE: chrono::Duration = chrono::Duration::seconds(45);
-/// How long `add_project` waits for a remote host's new row to sync here.
-#[cfg(not(test))]
-const PROJECT_SYNC_WAIT: Duration = Duration::from_secs(5);
-#[cfg(test)]
-const PROJECT_SYNC_WAIT: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,12 +84,11 @@ fn catalog() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "add_project",
-            description: "Add a folder inside the user's home on a device as a Zeron project, so chats can be created in it (create_chat with the returned id). The device checks the folder on its own disk: it must exist and resolve (after ~, .. and symlinks) inside that device's home, not to the home itself. Adding a folder that is already a project returns the existing one (created=false). ready=false means a remote project has not synced here yet: wait and retry create_chat. The user is notified that your chat added it. Side chats cannot add projects.",
+            description: "Add a folder inside the user's home on the device this chat runs on as a Zeron project, so chats can be created in it (create_chat with the returned id). The folder must exist and resolve (after ~, .. and symlinks) inside the home, not to the home itself. Adding a folder that is already a project returns the existing one (created=false). Only this chat's own device: to add a project on another device, create a chat there and have it call add_project. The user is notified that your chat added it. Side chats cannot add projects.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Absolute folder path on that device, or ~/relative to its home." },
-                    "device": device_schema(),
+                    "path": { "type": "string", "description": "Absolute folder path on this device, or ~/relative to its home." },
                     "name": { "type": "string", "description": "Display name. Defaults to the folder name." }
                 },
                 "required": ["path"]
@@ -290,6 +284,8 @@ struct DeviceArgs {
 #[derive(Deserialize)]
 struct AddProjectArgs {
     path: String,
+    /// Not in the schema: only this chat's own device is accepted, so a
+    /// stray `device` naming another one fails instead of adding here.
     device: Option<String>,
     name: Option<String>,
 }
@@ -600,19 +596,15 @@ impl Tools {
         .await?;
         let path = args.path.trim();
         anyhow::ensure!(!path.is_empty(), "path is empty");
-        let (device_id, local, devices) = tokio::try_join!(
-            self.zeron.resolve_device_id(args.device.as_deref()),
-            self.zeron.local_device_id(),
-            self.zeron.devices()
-        )?;
-        let remote = device_id != local;
-        if remote {
+        let (local, devices) =
+            tokio::try_join!(self.zeron.local_device_id(), self.zeron.devices())?;
+        // Projects are added where this chat runs: that is the disk its
+        // agent can see. Another device's chat adds its own.
+        if args.device.is_some() {
+            let device = self.zeron.resolve_device_id(args.device.as_deref()).await?;
             anyhow::ensure!(
-                devices
-                    .iter()
-                    .any(|d| d.id == device_id
-                        && d.supports(zeron_proto::capabilities::ADD_PROJECT_V1)),
-                "device {device_id} runs a Zeron version that cannot add projects for agents; update it or ask the user to add the project"
+                device == local,
+                "add_project only adds folders on the device this chat runs on ({local}). To add one on device {device}, create a chat there (create_chat with device and kind chat) and have it call add_project"
             );
         }
         let mut params = json!({ "path": path });
@@ -627,40 +619,14 @@ impl Tools {
         if let Some(chat) = &self.zeron.origin().chat_id {
             params["createdByChatId"] = json!(chat);
         }
-        if remote {
-            params["targetDeviceId"] = json!(device_id);
-        }
         let reply = self.zeron.call(methods::ADD_PROJECT, params).await?;
         let space: Space = serde_json::from_value(reply["space"].clone())
             .context("AddProject: unexpected reply")?;
         let created = reply["created"].as_bool().unwrap_or(false);
-        // The owning host wrote the row; let it sync here so create_chat can
-        // name the project right away — and say so when it has not yet.
-        let mut ready = !remote;
-        if remote {
-            let deadline = Instant::now() + PROJECT_SYNC_WAIT;
-            loop {
-                if self.zeron.spaces().await?.iter().any(|s| s.id == space.id) {
-                    ready = true;
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        }
-        let mut result = json!({
+        Ok(json!({
             "project": summarize_project(&space, &devices),
             "created": created,
-            "ready": ready,
-        });
-        if !ready {
-            result["note"] = json!(format!(
-                "The project exists on device {device_id} but has not synced to this engine yet, so create_chat cannot use it until it does. Retry in a few seconds; list_projects shows it once synced."
-            ));
-        }
-        Ok(result)
+        }))
     }
 
     async fn list_harnesses(&self, args: DeviceArgs) -> anyhow::Result<Value> {
@@ -1385,10 +1351,6 @@ mod tests {
         extra_chats: Vec<Value>,
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
-        /// dev-remote advertises `add-project-v1`.
-        remote_adds_projects: bool,
-        /// dev-remote answers AddProject with a row that never syncs here.
-        remote_add_unsynced: bool,
     }
 
     fn stream(item: Value) -> RpcReply {
@@ -1416,10 +1378,7 @@ mod tests {
                 methods::WATCH_DEVICES => stream(json!([{
                     "id": "dev-local", "name": "Laptop", "platform": "linux",
                     "lastSeenAt": null
-                }, {
-                    "id": "dev-remote", "name": "Worker", "platform": "linux", "lastSeenAt": null,
-                    "capabilities": if self.remote_adds_projects { vec!["add-project-v1"] } else { vec![] }
-                }])),
+                }, {"id": "dev-remote", "name": "Worker", "platform": "linux", "lastSeenAt": null}])),
                 methods::WATCH_SPACES => stream(json!([{
                     "id": "space-1", "deviceId": "dev-local", "path": "/repo/comet",
                     "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
@@ -1480,18 +1439,10 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push((method.to_owned(), params.clone()));
-                    // The remote host already has this folder; locally it is new.
-                    let (id, device, created) = if remote && self.remote_add_unsynced {
-                        ("space-pending", "dev-remote", true)
-                    } else if remote {
-                        ("space-unique", "dev-remote", false)
-                    } else {
-                        ("space-1", "dev-local", true)
-                    };
                     RpcReply::Value(json!({
-                        "created": created,
+                        "created": true,
                         "space": {
-                            "id": id, "deviceId": device, "path": "/repo/unique",
+                            "id": "space-new", "deviceId": "dev-local", "path": "/repo/unique",
                             "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
                         }
                     }))
@@ -1889,7 +1840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn add_project_asks_the_owning_host_and_attributes_the_chat() {
+    async fn add_project_stays_on_this_device_and_attributes_the_chat() {
         let world = Arc::new(World::default());
         let alpha = tools(
             world.clone(),
@@ -1914,13 +1865,11 @@ mod tests {
             assert_eq!(params["path"], "~/code/unique");
             assert_eq!(params["name"], "Unique");
             assert_eq!(params["createdByChatId"], "chat-alpha-1");
-            assert!(
-                params.get("targetDeviceId").is_none(),
-                "local host: no forward"
-            );
+            assert!(params.get("targetDeviceId").is_none(), "never forwarded");
         }
 
-        // A host that predates AddProject is refused before any call.
+        // Only this chat's own device: another one is refused before any call,
+        // naming the way to get there; the local one by name is fine.
         let error = alpha
             .call(
                 "add_project",
@@ -1928,62 +1877,16 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error.contains("cannot add projects"), "{error}");
+        assert!(error.contains("create a chat there"), "{error}");
         assert_eq!(world.writes.lock().unwrap().len(), 1);
-
-        let world = Arc::new(World {
-            remote_adds_projects: true,
-            ..Default::default()
-        });
-        let added = tools(world.clone(), Origin::default())
+        alpha
             .call(
                 "add_project",
-                json!({ "path": "/repo/unique", "device": "Worker" }),
+                json!({ "path": "/repo/x", "device": "Laptop" }),
             )
             .await
             .unwrap();
-        assert_eq!(added["created"], false);
-        assert_eq!(added["project"]["id"], "space-unique");
-        assert_eq!(added["ready"], true, "already synced here");
-        {
-            let writes = world.writes.lock().unwrap();
-            assert_eq!(writes[0].1["targetDeviceId"], "dev-remote");
-            assert!(
-                writes[0].1.get("createdByChatId").is_none(),
-                "no origin chat"
-            );
-        }
-
-        // A row that has not synced here yet is reported, not passed off as usable.
-        let pending = tools(
-            Arc::new(World {
-                remote_adds_projects: true,
-                remote_add_unsynced: true,
-                ..Default::default()
-            }),
-            Origin::default(),
-        );
-        let added = pending
-            .call(
-                "add_project",
-                json!({ "path": "/repo/new", "device": "Worker" }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(added["created"], true);
-        assert_eq!(added["ready"], false);
-        assert!(
-            added["note"].as_str().unwrap().contains("not synced"),
-            "{added}"
-        );
-        let error = pending
-            .call(
-                "create_chat",
-                json!({ "project": "space-pending", "device": "Worker" }),
-            )
-            .await
-            .unwrap_err();
-        assert!(error.contains("no project matches"), "{error}");
+        assert_eq!(world.writes.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

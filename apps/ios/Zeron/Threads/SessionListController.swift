@@ -21,8 +21,6 @@ class SessionListController: UIViewController, UICollectionViewDelegate {
     var reorderable = false
     /// The Archived list: rows offer Unarchive instead of Archive / Pin / Move.
     var archivedRows = false
-    /// Another session's side chats: they live under it, so no Pin / Move.
-    var sideRows = false
     /// The session open beside this list (iPad sidebar): drawn as current.
     var currentChatId: String? {
         didSet {
@@ -228,7 +226,7 @@ class SessionListController: UIViewController, UICollectionViewDelegate {
     }
 
     private func leadingSwipe(_ path: IndexPath) -> UISwipeActionsConfiguration? {
-        guard !archivedRows, !sideRows, let id = sessionId(path), let vm = sessions[id] else { return nil }
+        guard !archivedRows, let id = sessionId(path), let vm = sessions[id] else { return nil }
         let pin = UIContextualAction(style: .normal, title: vm.pinned ? "Unpin" : "Pin") { [weak self] _, _, done in
             self?.app.setPinned(id, !vm.pinned)
             done(true)
@@ -255,7 +253,6 @@ class SessionListController: UIViewController, UICollectionViewDelegate {
         }
         archive.image = UIImage(systemName: "archivebox.fill")
         archive.backgroundColor = Palette.secondary
-        if sideRows { return UISwipeActionsConfiguration(actions: [archive]) }
         let move = UIContextualAction(style: .normal, title: "Move") { [weak self] _, view, done in
             self?.presentMoveMenu(id, from: view)
             done(true)
@@ -276,12 +273,6 @@ class SessionListController: UIViewController, UICollectionViewDelegate {
                 return UIMenu(children: [
                     UIAction(title: "Unarchive", image: UIImage(systemName: "tray.and.arrow.up")) { _ in self.app.unarchive(id) },
                     UIAction(title: "Rename…", image: UIImage(systemName: "pencil")) { _ in self.rename(id) },
-                ])
-            }
-            if self.sideRows {
-                return UIMenu(children: [
-                    UIAction(title: "Rename…", image: UIImage(systemName: "pencil")) { _ in self.rename(id) },
-                    UIAction(title: "Archive", image: UIImage(systemName: "archivebox"), attributes: .destructive) { _ in self.app.archive(id) },
                 ])
             }
             return UIMenu(children: [

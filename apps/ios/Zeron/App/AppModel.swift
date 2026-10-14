@@ -499,6 +499,12 @@ final class AppModel {
         (client?.childSessions(parentId: chatId) ?? []).filter { !$0.archived }.map(Self.vm)
     }
 
+    /// Subagents `chatId`'s agent spawned, in spawn order (its open
+    /// transcript's spawn chips; empty while the session isn't open).
+    func subagents(of chatId: String) -> [SubagentInfo] {
+        client?.session(chatId: chatId)?.subagents() ?? []
+    }
+
     func sessions(inFolder id: String) -> [SessionRowVM] {
         id == "archived" ? archived : frontPage.sectionSessions[id] ?? []
     }

@@ -29,7 +29,7 @@ use zeron_proto::{
 pub use snapshot::{
     AppendHint, ComposerState, Entry, HostCapabilities, HostInfo, InputRequest, LiveStatus,
     LocalEcho, PendingKind, PendingSend, QueueGate, QueueItem, RoomState, SessionSnapshot,
-    SnapshotDelta,
+    SnapshotDelta, SubagentRow, SubagentState,
 };
 use transcript::{Dirty, Tracker};
 

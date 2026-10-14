@@ -65,7 +65,10 @@ fn front_page_mirrors_the_desktop_sidebar() {
         ["chat-cjk", "chat-home", "chat-deploy", "chat-blog"]
     );
     assert_eq!(ids(&ws.archived), ["chat-oklch", "chat-presence"]);
-    assert_eq!(ids(ws.children("chat-veil")), ["chat-side"]);
+    assert_eq!(
+        ids(ws.children("chat-veil")),
+        ["chat-side-2", "chat-side-3", "chat-side", "chat-side-4"]
+    );
 
     let veil = ws.session("chat-veil").unwrap();
     assert_eq!(veil.indicator, ChatIndicator::Working);
@@ -124,7 +127,7 @@ fn spawn_chips_open_their_subagent_transcript() {
     assert_eq!(zeron_client::subagent_parent("chat-tabs"), None);
     // The working chat badges its running subagents; idle ones don't.
     let ws = client.workspace();
-    assert_eq!(ws.session("chat-veil").unwrap().running_subagents, 2);
+    assert_eq!(ws.session("chat-veil").unwrap().running_subagents, 4);
     assert_eq!(ws.session("chat-tabs").unwrap().running_subagents, 0);
 
     let spawned = |chat_id: &str| {
@@ -142,8 +145,28 @@ fn spawn_chips_open_their_subagent_transcript() {
     };
     let doc_id = spawned("chat-tabs").expect("chat-tabs carries a linked spawn chip");
     // One chat shows both: a side chat and a subagent.
-    assert_eq!(ids(ws.children("chat-veil")), ["chat-side"]);
+    assert_eq!(
+        ids(ws.children("chat-veil")),
+        ["chat-side-2", "chat-side-3", "chat-side", "chat-side-4"]
+    );
     let veil_sub = spawned("chat-veil").expect("chat-veil carries a linked spawn chip");
+    // Its spawned subagents, in spawn order: four finished, four running.
+    let agents = client
+        .open_session("chat-veil")
+        .unwrap()
+        .snapshot()
+        .subagents();
+    let count = |state| agents.iter().filter(|a| a.state == state).count();
+    assert_eq!(count(zeron_client::SubagentState::Running), 4);
+    assert_eq!(count(zeron_client::SubagentState::Done), 3);
+    assert_eq!(count(zeron_client::SubagentState::Failed), 1);
+    assert_eq!(agents[0].title, "Map how the veil splits chunks");
+    assert_eq!(agents[0].model.as_deref(), Some("haiku"));
+    let running = agents
+        .iter()
+        .find(|a| a.state == zeron_client::SubagentState::Running)
+        .unwrap();
+    assert!(running.tail.is_some());
     let runtime = zeron_client::runtime::shared();
     let veil_entries = runtime
         .block_on(client.open_subagent(&veil_sub, true))

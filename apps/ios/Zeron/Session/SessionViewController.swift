@@ -46,19 +46,34 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         let voiceBar = VoiceBarItem(app: app, host: self)
         self.voiceBar = voiceBar
         let menu = navigationItem.rightBarButtonItem!
-        // Side chats and agent-spawned chats of this session, once it has any.
+        // This session's side chats and subagents, once it has any. While
+        // subagents run, the badge is the sidebar's "● N"; otherwise a quiet
+        // count (the default red reads as unread).
         let sideChats = UIBarButtonItem(image: UIImage(systemName: "bubble.left.and.bubble.right"), primaryAction: UIAction { [weak self] _ in
             self?.showSideChats()
         })
-        sideChats.accessibilityLabel = "Side chats"
+        sideChats.accessibilityLabel = "Side chats and agents"
         sideChats.accessibilityIdentifier = "side-chats"
         let syncBar = { [weak self, weak voiceBar] in
             guard let self, let voiceBar else { return }
-            let children = self.app.children(of: self.chatId).count
-            sideChats.badge = children > 0 ? .count(children) : nil
+            let agents = self.app.subagents(of: self.chatId)
+            let running = agents.filter { $0.state == .running }.count
+            let total = self.app.children(of: self.chatId).count + agents.count
+            var badge: UIBarButtonItem.Badge?
+            if running > 0 {
+                badge = .string("● \(running)")
+                badge?.backgroundColor = Palette.accent
+                badge?.foregroundColor = .white
+            } else if total > 0 {
+                badge = .count(total)
+                badge?.backgroundColor = Palette.secondary
+                badge?.foregroundColor = Palette.background
+            }
+            if sideChats.badge != badge { sideChats.badge = badge }
+            sideChats.accessibilityValue = running > 0 ? "\(running) running" : nil
             var items = [menu]
             if voiceBar.visible { items.append(voiceBar.item) }
-            if children > 0 { items.append(sideChats) }
+            if total > 0 { items.append(sideChats) }
             if self.navigationItem.rightBarButtonItems?.map(ObjectIdentifier.init) != items.map(ObjectIdentifier.init) {
                 self.navigationItem.setRightBarButtonItems(items, animated: self.view.window != nil)
             }
@@ -66,6 +81,8 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         voiceToken = app.voice.observe(syncBar)
         hostsToken = app.observe(syncBar)
         childrenToken = app.observeWorkspace(syncBar)
+        // Spawn chips land and settle with the transcript.
+        agentsToken = app.observeSession(chatId, syncBar)
         syncBar()
 
         list.frame = view.bounds
@@ -199,6 +216,7 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     private var voiceToken: AnyObject?
     private var hostsToken: AnyObject?
     private var childrenToken: AnyObject?
+    private var agentsToken: AnyObject?
 
     deinit {
         if let backgroundObserver { NotificationCenter.default.removeObserver(backgroundObserver) }
@@ -550,6 +568,11 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         }
         list.onNew = { [weak self] in self?.dismiss(animated: true) { self?.newSideChat() } }
         list.onFork = { [weak self] in self?.dismiss(animated: true) { self?.forkSideChat() } }
+        list.onOpenAgent = { [weak self] agent in
+            guard let self else { return }
+            self.dismiss(animated: true)
+            self.navigationController?.pushViewController(SubagentViewController(app: self.app, docId: agent.docId, title: agent.title, frozen: agent.state != .running), animated: true)
+        }
         let sheet = UINavigationController(rootViewController: list)
         if let s = sheet.sheetPresentationController {
             s.detents = [.medium(), .large()]

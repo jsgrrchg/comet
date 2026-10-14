@@ -207,11 +207,13 @@ pub(crate) fn chats() -> Vec<DemoChat> {
             )
         },
         // chat-veil's other side chats: it shows four of each (side chats,
-        // running and finished subagents).
+        // running and finished subagents). This one is still Working, so it
+        // adds to chat-veil's "● N" pill beside the four running subagents.
         DemoChat {
             parent: Some("chat-veil"),
             harness: Codex,
             model: "gpt-6-astra",
+            status: Some(SessionStatus::Working),
             last_ago_ms: 4 * MIN,
             ..chat(
                 "chat-side-2",

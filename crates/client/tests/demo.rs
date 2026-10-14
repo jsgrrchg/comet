@@ -129,6 +129,15 @@ fn spawn_chips_open_their_subagent_transcript() {
     let ws = client.workspace();
     assert_eq!(ws.session("chat-veil").unwrap().running_subagents, 4);
     assert_eq!(ws.session("chat-tabs").unwrap().running_subagents, 0);
+    // Its one Working side chat joins the pill ("● 5"); the finished ones
+    // and the other chats add nothing.
+    assert_eq!(
+        ws.session("chat-side-2").unwrap().host_indicator,
+        ChatIndicator::Working
+    );
+    assert_eq!(ws.session("chat-veil").unwrap().working_side_chats, 1);
+    assert_eq!(ws.session("chat-tabs").unwrap().working_side_chats, 0);
+    assert_eq!(ws.session("chat-picker").unwrap().working_side_chats, 0);
 
     let spawned = |chat_id: &str| {
         client
@@ -516,14 +525,11 @@ fn subagents_keep_their_pill_after_the_parent_turn_ends() {
             .host_indicator
             != ChatIndicator::Working
     });
-    assert_eq!(
-        client
-            .workspace()
-            .session("chat-veil")
-            .unwrap()
-            .running_subagents,
-        4
-    );
+    let ws = client.workspace();
+    let veil = ws.session("chat-veil").unwrap();
+    assert_eq!(veil.running_subagents, 4);
+    // So does its Working side chat's share of the pill.
+    assert_eq!(veil.working_side_chats, 1);
 }
 
 #[test]

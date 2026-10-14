@@ -481,7 +481,8 @@ final class AppModel {
             unseen: r.unseen,
             pinned: r.pinned,
             sendFailed: r.sendState == .failed,
-            runningSubagents: Int(r.runningSubagents)
+            runningSubagents: Int(r.runningSubagents),
+            workingSideChats: Int(r.workingSideChats)
         )
     }
 

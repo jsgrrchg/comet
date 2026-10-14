@@ -29,8 +29,11 @@ struct SessionRowVM: Hashable {
     var unseen: Bool
     var pinned: Bool
     var sendFailed: Bool
-    /// Subagents of this session streaming right now (a "● N" pill).
+    /// Subagents of this session streaming right now.
     var runningSubagents: Int
+    /// Side chats of this session that are Working right now. The "● N" pill
+    /// shows this plus `runningSubagents`, like the desktop sidebar.
+    var workingSideChats: Int
 }
 
 /// Folder row ("Pinned 2 ›", "P0 3 ›").
@@ -159,10 +162,16 @@ final class SessionCell: UICollectionViewListCell {
             status.kind = .none
             status.isHidden = true
         }
-        agents.isHidden = vm.runningSubagents == 0
+        let running = vm.runningSubagents + vm.workingSideChats
+        agents.isHidden = running == 0
         agents.font = Fonts.ui(.sansMedium, TypeScale.size(11.5))
-        agents.text = "● \(vm.runningSubagents)"
-        let agentsLabel = vm.runningSubagents == 0 ? nil : vm.runningSubagents == 1 ? "1 subagent running" : "\(vm.runningSubagents) subagents running"
+        agents.text = "● \(running)"
+        // One number on screen, but VoiceOver says what it is made of.
+        let runningParts = [
+            vm.runningSubagents == 0 ? nil : vm.runningSubagents == 1 ? "1 subagent" : "\(vm.runningSubagents) subagents",
+            vm.workingSideChats == 0 ? nil : vm.workingSideChats == 1 ? "1 side chat" : "\(vm.workingSideChats) side chats",
+        ].compactMap { $0 }
+        let agentsLabel = runningParts.isEmpty ? nil : runningParts.joined(separator: " and ") + " running"
         accessibilityLabel = [vm.title, vm.projectName, corner?.word, agentsLabel, prBadge.isHidden ? nil : prBadge.accessibilityLabel].compactMap { $0 }.joined(separator: ", ")
         accessibilityIdentifier = "session-\(vm.id)"
         setNeedsLayout()

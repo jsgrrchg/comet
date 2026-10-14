@@ -6,12 +6,15 @@
 #   scripts/dev-demo.sh --slow     # pace mock streams (~10s) to watch streaming
 #
 # Everything lives under /tmp/zeron-demo-*; re-runs reuse it. Ctrl-C cleans up.
+# A second demo beside a running one (another worktree's) picks its own
+# state and port: ZERON_DEMO_DIR=/tmp/zeron-demo-b ZERON_DEMO_PORT=27931.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-DAEMON_DIR=/tmp/zeron-demo-daemon
-UI_DIR=/tmp/zeron-demo-ui
-IPC=27921
+DEMO_DIR="${ZERON_DEMO_DIR:-/tmp/zeron-demo}"
+DAEMON_DIR="$DEMO_DIR-daemon"
+UI_DIR="$DEMO_DIR-ui"
+IPC="${ZERON_DEMO_PORT:-27921}"
 # Demo projects live in ~/github when it exists, else in throwaway folders
 # (a space must point at a real folder).
 PROJECTS_DIR="$HOME/github"

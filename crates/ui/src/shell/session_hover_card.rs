@@ -332,48 +332,44 @@ impl Shell {
             .children(branch.map(|branch| meta_row(glyph(icons::GIT_BRANCH), branch)))
             .children(worktree.map(|worktree| meta_row(glyph(icons::FOLDER), worktree)));
 
-        // ── The pull request, tinted in its state's color like the badge.
+        // ── The pull request on one line: its state lives in the tint and
+        // the glyph's color (the badge's), so only the title and number
+        // need words.
         let pull_request = change_request.map(|model| {
             let tone = model.tone.color(&theme);
             div()
                 .flex()
-                .flex_col()
-                .gap(px(3.0))
+                .flex_row()
+                .items_start()
+                .gap(px(7.0))
                 .px(px(9.0))
                 .py(px(7.0))
                 .rounded(px(8.0))
                 .bg(tone.opacity(0.08))
+                .text_size(crate::typography::ui_rems(12.0))
+                .line_height(px(16.0))
                 .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(5.0))
-                        .text_size(crate::typography::ui_rems(11.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(tone.opacity(0.9))
-                        .child(
-                            icon(icons::PULL_REQUEST)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(tone.opacity(0.9)),
-                        )
-                        .child(
-                            div()
-                                .font_family(theme.font_mono.clone())
-                                .child(SharedString::from(format!("#{}", model.number))),
-                        )
-                        .child(div().opacity(0.6).child("·"))
-                        .child(model.state_label),
+                    div().h(px(16.0)).flex_none().flex().items_center().child(
+                        icon(icons::PULL_REQUEST)
+                            .size(px(12.0))
+                            .text_color(tone.opacity(0.9)),
+                    ),
                 )
                 .child(
                     div()
-                        .w_full()
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .line_height(px(16.0))
+                        .flex_1()
+                        .min_w_0()
                         .text_color(theme.text)
                         .line_clamp(2)
                         .child(model.title),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(crate::typography::ui_rems(11.0))
+                        .text_color(tone.opacity(0.85))
+                        .child(SharedString::from(format!("#{}", model.number))),
                 )
         });
 

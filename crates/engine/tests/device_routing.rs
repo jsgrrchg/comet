@@ -2022,6 +2022,21 @@ async fn mcp_standalone_session_executes_on_the_selected_device() {
         .await
         .unwrap();
     let project = projects["projects"][0]["id"].as_str().unwrap();
+    // add_project is answered on B's disk: B either refuses a folder outside
+    // its home or, when the temp dir lives under home, finds the existing project.
+    match tools
+        .call(
+            "add_project",
+            json!({"device":"device-b", "path": format!("{}/", folder.display())}),
+        )
+        .await
+    {
+        Ok(added) => {
+            assert_eq!(added["created"], false, "{added}");
+            assert_eq!(added["project"]["id"], project);
+        }
+        Err(error) => assert!(error.contains("outside the home"), "{error}"),
+    }
     tools
         .call(
             "list_models",

@@ -13569,6 +13569,7 @@ dependencies = [
  "zeron-rpc",
  "zeron-ui",
  "zeron-update",
+ "zeron-visual",
 ]
 
 [[package]]

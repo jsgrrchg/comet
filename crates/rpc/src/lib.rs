@@ -212,6 +212,8 @@ pub mod methods {
     pub const GET_CHANGE_REQUEST: &str = "GetChangeRequest";
     pub const POST_CHANGE_REQUEST_COMMENT: &str = "PostChangeRequestComment";
     pub const GET_CHANGE_REQUEST_DIFF: &str = "GetChangeRequestDiff";
+    /// A pull request's commits from GitHub, newest first (`url`, `headRefOid`).
+    pub const LIST_CHANGE_REQUEST_COMMITS: &str = "ListChangeRequestCommits";
     pub const GET_CHECKOUT_DIFF: &str = "GetCheckoutDiff";
     /// Permanently restore one chat-owned checkout to its current HEAD and
     /// remove only its untracked, non-ignored paths.

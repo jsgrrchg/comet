@@ -1113,7 +1113,7 @@ mod pinned_session_tests {
         let (host, cx) = cx.add_window_view(|_, cx| {
             PinnedHost(cx.new(|cx| {
                 let state = cx.new(|_| AppState::new());
-                let mut shell = Shell::new(
+                let shell = Shell::new(
                     state,
                     EngineBootConfig {
                         data_dir: dir.path().into(),

@@ -304,7 +304,7 @@ mod tests {
             "row delivery and wake delivery are independent"
         );
         host.shutdown_workers().await;
-        workspace.flush();
+        workspace.flush().unwrap();
         let attempts_before = attempts.load(Ordering::SeqCst);
         status.store(200, Ordering::SeqCst);
         let reopened = Arc::new(DocsStore::open(dir.path()).unwrap());

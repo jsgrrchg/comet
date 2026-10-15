@@ -2282,6 +2282,8 @@ pub struct Shell {
     session_info_last_reserve: f32,
     /// The lanes card's folds and pages.
     session_lanes: session_lanes::LaneState,
+    /// The working-tree diffs behind the card's branch-row totals.
+    session_diffs: session_info::SessionDiffs,
     files_content_tween: Option<WidthTween>,
     /// The last tracked frame: its chat, the window fit, and for each of
     /// `[sidebar, surface host, Files]` the width painted and the width its
@@ -2739,6 +2741,7 @@ impl Shell {
             session_info_docked: false,
             session_info_last_reserve: 0.0,
             session_lanes: session_lanes::LaneState::default(),
+            session_diffs: session_info::SessionDiffs::default(),
             files_content_tween: None,
             painted_columns: None,
             fit_exits: [None; 3],

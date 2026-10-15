@@ -1560,6 +1560,7 @@ fn forwardable(method: &str) -> bool {
             | methods::GET_CHANGE_REQUEST
             | methods::GET_CHANGE_REQUEST_DIFF
             | methods::LIST_CHANGE_REQUEST_COMMITS
+            | methods::GET_CHANGE_REQUEST_COMMIT_DIFF
             | methods::POST_CHANGE_REQUEST_COMMENT
             | methods::GET_CHECKOUT_DIFF
             | methods::DISCARD_WORKING_TREE
@@ -2765,6 +2766,22 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(change_request_rpc_error)?;
                 RpcReply::value(&commits)
+            }
+            methods::GET_CHANGE_REQUEST_COMMIT_DIFF => {
+                #[derive(Deserialize)]
+                struct P {
+                    url: String,
+                    sha: String,
+                    #[serde(default)]
+                    refresh: bool,
+                }
+                let p: P = parse_params(params)?;
+                let patch = self
+                    .github
+                    .commit_diff(&p.url, &p.sha, p.refresh)
+                    .await
+                    .map_err(change_request_rpc_error)?;
+                RpcReply::value(&patch)
             }
             // One-shot scoped capture for the Changes pane: `branch` diffs the
             // working tree against merge-base(baseRef, HEAD); `turn` diffs the
@@ -4412,6 +4429,8 @@ mod tests {
         assert!(!is_stream_method(methods::GET_CHANGE_REQUEST_DIFF));
         assert!(forwardable(methods::LIST_CHANGE_REQUEST_COMMITS));
         assert!(!is_stream_method(methods::LIST_CHANGE_REQUEST_COMMITS));
+        assert!(forwardable(methods::GET_CHANGE_REQUEST_COMMIT_DIFF));
+        assert!(!is_stream_method(methods::GET_CHANGE_REQUEST_COMMIT_DIFF));
     }
 
     /// Every forwardable unary method gets a bounded reply deadline —

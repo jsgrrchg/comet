@@ -34,6 +34,8 @@ const GITHUB_OUTPUT_LIMIT: usize = 1024 * 1024;
 /// GitHub's REST API never lists more of a pull request's commits than this.
 const GITHUB_PR_COMMITS_LIMIT: usize = 250;
 const GITHUB_PR_COMMITS_PAGE: usize = 100;
+/// Cache key prefix of SHA-pinned commit patches.
+const COMMIT_DIFF_KEY: &str = "commit-diff:";
 const GITHUB_RESULT_LIMIT: &str = "20";
 const GITHUB_JSON_FIELDS: &str = "number,title,url,state,baseRefName,headRefName,updatedAt,isCrossRepository,headRepositoryOwner";
 const GITHUB_SEARCH_QUERY: &str = "query($search: String!, $owner: String!, $name: String!, $after: String) { repository(owner: $owner, name: $name) { nameWithOwner } search(query: $search, type: ISSUE, first: 50, after: $after) { issueCount pageInfo { hasNextPage endCursor } nodes { ... on PullRequest { author { login } headRefOid viewerDidAuthor viewerLatestReviewRequest { id } reviewRequests(first: 100) { nodes { id } pageInfo { hasNextPage } } statusCheckRollup { commit { oid } state contexts { totalCount checkRunCountsByState { state count } statusContextCountsByState { state count } } } number title url state isDraft mergeable reviewDecision createdAt updatedAt additions deletions repository { nameWithOwner } } } } }";
@@ -381,6 +383,8 @@ impl GitHubCli {
                 Err(_) if refresh => Duration::ZERO,
                 Err(_) => Duration::from_secs(60),
                 Ok(_) if refresh => Duration::from_secs(15),
+                // A commit's patch never changes.
+                Ok(_) if key.starts_with(COMMIT_DIFF_KEY) => Duration::from_secs(24 * 60 * 60),
                 Ok(_) => Duration::from_secs(5 * 60),
             };
             let fresh = entry.1.elapsed() < ttl;
@@ -623,15 +627,38 @@ impl GitHubCli {
         Ok(zeron_proto::ChangeRequestCommits { commits, truncated })
     }
 
-    async fn fetch_revision_diff(&self, url: &str, head: &str, base: &str) -> PrResult {
-        let parsed = reqwest::Url::parse(url).map_err(|_| ChangeRequestError::Decode)?;
+    /// One commit's patch against its first parent, as GitHub renders it.
+    pub async fn commit_diff(
+        &self,
+        url: &str,
+        sha: &str,
+        refresh: bool,
+    ) -> Result<String, ChangeRequestError> {
+        let url = validated_pull_request_url(url)?;
+        if !zeron_proto::change_request_assessment::valid_head_oid(sha) {
+            return Err(ChangeRequestError::Decode);
+        }
+        let parsed = reqwest::Url::parse(&url).map_err(|_| ChangeRequestError::Decode)?;
         let parts: Vec<_> = parsed.path().trim_matches('/').split('/').collect();
+        let endpoint = format!("repos/{}/{}/commits/{sha}", parts[0], parts[1]);
+        let github = self.clone();
+        let value = self
+            .cached_pr_request(
+                format!("{COMMIT_DIFF_KEY}{endpoint}"),
+                refresh,
+                async move { github.fetch_patch(endpoint).await },
+            )
+            .await?;
+        serde_json::from_value(value).map_err(|_| ChangeRequestError::Decode)
+    }
+
+    async fn fetch_patch(&self, endpoint: String) -> PrResult {
         let output = self
             .runner
             .run(ProcessRequest {
                 args: vec![
                     "api".into(),
-                    format!("repos/{}/{}/compare/{base}...{head}", parts[0], parts[1]),
+                    endpoint,
                     "-H".into(),
                     "Accept: application/vnd.github.diff".into(),
                 ],
@@ -648,6 +675,16 @@ impl GitHubCli {
         Ok(serde_json::Value::String(
             String::from_utf8_lossy(&output.stdout).into_owned(),
         ))
+    }
+
+    async fn fetch_revision_diff(&self, url: &str, head: &str, base: &str) -> PrResult {
+        let parsed = reqwest::Url::parse(url).map_err(|_| ChangeRequestError::Decode)?;
+        let parts: Vec<_> = parsed.path().trim_matches('/').split('/').collect();
+        self.fetch_patch(format!(
+            "repos/{}/{}/compare/{base}...{head}",
+            parts[0], parts[1]
+        ))
+        .await
     }
 
     /// Fetch one PR without requiring a local checkout or executing shell text.
@@ -3026,6 +3063,49 @@ mod tests {
         // Same head: cached. Invalid heads never reach GitHub.
         github.commits(url, false, Some(&head)).await.unwrap();
         assert!(github.commits(url, false, Some("--help")).await.is_err());
+        assert_eq!(runner.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn pr_commit_diff_is_pinned_by_sha_and_cached() {
+        let sha = "c".repeat(40);
+        let mut truncated = command_success("partial").unwrap();
+        truncated.stdout_truncated = true;
+        let runner = FakeProcessRunner::with_responses([
+            command_success("diff --git a/x b/x\n"),
+            Ok(truncated),
+        ]);
+        let github = GitHubCli::with_runner(runner.clone());
+        let url = "https://github.com/a/b/pull/7";
+        assert_eq!(
+            github.commit_diff(url, &sha, false).await.unwrap(),
+            "diff --git a/x b/x\n"
+        );
+        assert_eq!(
+            runner.requests()[0].args,
+            [
+                "api",
+                &format!("repos/a/b/commits/{sha}"),
+                "-H",
+                "Accept: application/vnd.github.diff"
+            ]
+        );
+        // Reopening the same commit reuses its patch; a refresh does not.
+        github.commit_diff(url, &sha, false).await.unwrap();
+        assert_eq!(runner.requests().len(), 1);
+        // Older than the five-minute detail TTL, still served.
+        for entry in &mut github.pr_cache.lock().await.entries {
+            entry.1 = Instant::now()
+                .checked_sub(Duration::from_secs(30 * 60))
+                .unwrap();
+        }
+        github.commit_diff(url, &sha, false).await.unwrap();
+        assert_eq!(runner.requests().len(), 1);
+        assert!(github.commit_diff(url, &sha, true).await.is_err());
+        assert_eq!(runner.requests().len(), 2);
+        for sha in ["--help", "abc", "../../x"] {
+            assert!(github.commit_diff(url, sha, false).await.is_err());
+        }
         assert_eq!(runner.requests().len(), 2);
     }
 

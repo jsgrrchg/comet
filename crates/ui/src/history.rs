@@ -1300,8 +1300,16 @@ fn decode_history_avatar(encoded: &str) -> Option<Arc<Image>> {
     Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
+/// Where the pane's commits come from.
+enum HistorySource {
+    /// Paged from the selected chat's checkout on that chat's device. The
+    /// pane follows the selection.
+    SelectedChat,
+}
+
 pub struct GitHistory {
     state: Entity<AppState>,
+    source: HistorySource,
     started: bool,
     target_key: Option<String>,
     commits: Vec<GitHistoryCommit>,
@@ -1949,8 +1957,13 @@ impl GitHistory {
                 this.ensure_loaded(cx);
             }
         });
+        Self::with_source(state, HistorySource::SelectedChat, observe)
+    }
+
+    fn with_source(state: Entity<AppState>, source: HistorySource, observe: Subscription) -> Self {
         Self {
             state,
+            source,
             started: false,
             target_key: None,
             commits: Vec::new(),
@@ -2006,14 +2019,19 @@ impl GitHistory {
         }
     }
 
+    /// The repository the engine reads from: `(key, cwd, target device)`.
     fn context(&self, cx: &App) -> Option<(String, String, Option<String>)> {
-        let state = self.state.read(cx);
-        let chat = state.selected_chat_row()?;
-        let cwd = chat.cwd.clone()?;
-        let target = (state.local_device_id.as_deref() != Some(chat.device_id.as_str()))
-            .then(|| chat.device_id.clone());
-        let key = format!("{}|{cwd}", target.as_deref().unwrap_or("local"));
-        Some((key, cwd, target))
+        match self.source {
+            HistorySource::SelectedChat => {
+                let state = self.state.read(cx);
+                let chat = state.selected_chat_row()?;
+                let cwd = chat.cwd.clone()?;
+                let target = (state.local_device_id.as_deref() != Some(chat.device_id.as_str()))
+                    .then(|| chat.device_id.clone());
+                let key = format!("{}|{cwd}", target.as_deref().unwrap_or("local"));
+                Some((key, cwd, target))
+            }
+        }
     }
 
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {

@@ -966,6 +966,7 @@ impl DemoHost {
             status: Some(MessageStatus::Complete),
             continuation_of: None,
             duration_ms: None,
+            native_fork_point: None,
         });
         lock(&self.forks).insert(chat_id.clone(), copied);
         let mut chat = source.clone();

@@ -273,6 +273,7 @@ fn host_answers(edge: &MockEdge, host_doc: &LoroDoc) -> Option<String> {
         status: Some(zeron_doc::MessageStatus::Complete),
         continuation_of: None,
         duration_ms: None,
+        native_fork_point: None,
     };
     session
         .push_message(&entry(&message_id, MessageRole::User, "ios-live", &prompt))
@@ -964,6 +965,7 @@ async fn a_resumed_subagent_leaves_its_frozen_copy_for_the_live_doc() {
         status: Some(zeron_doc::MessageStatus::Complete),
         continuation_of: None,
         duration_ms: None,
+        native_fork_point: None,
     };
 
     // Finished once: read from its frozen copy, no room.

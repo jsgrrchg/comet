@@ -125,17 +125,24 @@ pub fn open_on_device(url: &str, device: Option<String>, window: &mut Window, cx
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Summary,
+    Commits,
     Code,
     Activity,
 }
 
 /// Navigation segments in display order: (tab, label, element id, glyph).
-const TABS: [(Tab, &str, &str, &str); 3] = [
+const TABS: [(Tab, &str, &str, &str); 4] = [
     (
         Tab::Summary,
         "Summary",
         "pr-summary",
         crate::icons::DOCUMENT,
+    ),
+    (
+        Tab::Commits,
+        "Commits",
+        "pr-commits",
+        crate::icons::GIT_COMMIT,
     ),
     (Tab::Code, "Code", "pr-code", crate::icons::FILE_CODE),
     (
@@ -168,8 +175,8 @@ const NAV_HEIGHT: f32 = NAV_SEGMENT_HEIGHT + 2.0 * (NAV_SEGMENT_INSET + NAV_PADD
 /// tightens its gutters.
 const NARROW_PAGE: f32 = 480.0;
 /// Below this page width the section navigation shows glyphs and counts
-/// only; the labels no longer fit three equal segments.
-const COMPACT_NAV_PAGE: f32 = 440.0;
+/// only; the labels no longer fit four equal segments.
+const COMPACT_NAV_PAGE: f32 = 560.0;
 /// The content column's gutter on narrow pages.
 const NARROW_PAD_X: f32 = 16.0;
 
@@ -430,7 +437,7 @@ pub struct PullRequestDetailPage {
     tab: Tab,
     checks_expanded: bool,
     tab_slide: crate::motion::IndicatorSlide,
-    tab_focus: [gpui::FocusHandle; 3],
+    tab_focus: [gpui::FocusHandle; 4],
     /// The file tree is one Tab stop; arrow keys move between files.
     tree_focus: gpui::FocusHandle,
     /// The narrow layout's file picker trigger, refocused when it closes.
@@ -508,7 +515,7 @@ impl PullRequestDetailPage {
             tab: Tab::Summary,
             checks_expanded: false,
             tab_slide: crate::motion::IndicatorSlide::at(tab_slot(Tab::Summary), Instant::now()),
-            tab_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
+            tab_focus: std::array::from_fn(|_| cx.focus_handle()),
             tree_focus: cx.focus_handle().tab_stop(true),
             files_focus: cx.focus_handle().tab_stop(true),
             return_focus: None,
@@ -1041,6 +1048,7 @@ impl PullRequestDetailPage {
         let counts = self.detail.as_ref().map(|detail| {
             [
                 None,
+                None,
                 Some(detail.files.len()),
                 Some(detail.activity_comments().count()),
             ]
@@ -1209,7 +1217,7 @@ impl PullRequestDetailPage {
 
 #[cfg(feature = "pull-request-fixture")]
 impl PullRequestDetailPage {
-    /// 0 Summary, 1 Code, 2 Activity.
+    /// 0 Summary, 1 Commits, 2 Code, 3 Activity.
     pub fn fixture_select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.select_tab(TABS[index.min(TABS.len() - 1)].0, cx);
     }
@@ -1642,7 +1650,7 @@ impl Render for PullRequestDetailPage {
                     Tab::Activity => 32.0,
                     // The workspace reserves its own room for the navigation.
                     Tab::Code => 0.0,
-                    Tab::Summary => 76.0,
+                    Tab::Summary | Tab::Commits => 76.0,
                 }))
                 .text_size(crate::typography::ui_rems(13.0))
                 .text_color(theme.text);
@@ -1976,6 +1984,7 @@ impl Render for PullRequestDetailPage {
                                 .child(description),
                         );
                     }
+                    Tab::Commits => {}
                     Tab::Code => {
                         if let Some(error) = &self.diff_error {
                             column = column
@@ -3779,7 +3788,12 @@ mod tests {
                     "{segments:?}"
                 );
             }
-            for (tab, slot) in [(Tab::Code, 1), (Tab::Activity, 2), (Tab::Summary, 0)] {
+            for (tab, slot) in [
+                (Tab::Code, 2),
+                (Tab::Commits, 1),
+                (Tab::Activity, 3),
+                (Tab::Summary, 0),
+            ] {
                 page.update(cx, |page, cx| page.select_tab(tab, cx));
                 cx.run_until_parked();
                 let thumb = cx.debug_bounds("pr-detail-nav-thumb").unwrap();
@@ -3868,7 +3882,8 @@ mod tests {
         fixture::init(cx);
         let (host, cx) = cx.add_window_view(|window, cx| DetailHost::new(window, cx, true));
         let page = host.read_with(cx, |host, _| host.page.clone());
-        for (width, compact) in [(360.0, true), (460.0, false)] {
+        // Four labels need more room than a narrow side pane offers.
+        for (width, compact) in [(360.0, true), (460.0, true), (580.0, false)] {
             cx.simulate_resize(gpui::size(px(width), px(800.0)));
             // The page reads its width a frame late.
             for _ in 0..2 {
@@ -3878,7 +3893,7 @@ mod tests {
             let column = cx.debug_bounds("pr-content-column").unwrap();
             let card = cx.debug_bounds("pr-detail-title").unwrap();
             assert!(
-                card.left() - column.left() <= px(NARROW_PAD_X + 8.5),
+                width >= NARROW_PAGE || card.left() - column.left() <= px(NARROW_PAD_X + 8.5),
                 "the column keeps a narrow gutter at {width}: {column:?} {card:?}"
             );
             page.read_with(cx, |page, _| {
@@ -3889,7 +3904,7 @@ mod tests {
             });
             let nav = cx.debug_bounds("pr-detail-nav").unwrap();
             assert!(nav.left() >= px(0.0) && nav.right() <= px(width));
-            for selector in ["pr-summary", "pr-code", "pr-activity"] {
+            for selector in ["pr-summary", "pr-commits", "pr-code", "pr-activity"] {
                 let segment = cx.debug_bounds(selector).unwrap();
                 assert!(nav.left() <= segment.left() && segment.right() <= nav.right());
             }
@@ -3928,7 +3943,7 @@ mod tests {
             let nav = cx.debug_bounds("pr-detail-nav").unwrap();
             assert_eq!(nav.bottom(), px(784.0));
             assert_eq!(nav.size.height, px(NAV_HEIGHT));
-            for selector in ["pr-summary", "pr-code", "pr-activity"] {
+            for selector in ["pr-summary", "pr-commits", "pr-code", "pr-activity"] {
                 let bounds = cx.debug_bounds(selector).unwrap();
                 assert!(
                     bounds.left() >= px(0.0) && bounds.right() <= px(width),

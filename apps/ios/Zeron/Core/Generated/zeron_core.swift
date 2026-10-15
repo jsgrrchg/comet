@@ -9209,6 +9209,11 @@ public struct SessionRow: Equatable, Hashable {
      * Subagents of this chat streaming right now.
      */
     public var runningSubagents: UInt32
+    /**
+     * Side chats of this chat that are Working right now. The row's "● N"
+     * pill shows `running_subagents + working_side_chats`.
+     */
+    public var workingSideChats: UInt32
     public var lastActivityMs: Int64
     /**
      * `now` / `34m` / `4h` / `2d` at derive time.
@@ -9259,7 +9264,11 @@ public struct SessionRow: Equatable, Hashable {
          */workingSinceMs: Int64?, 
         /**
          * Subagents of this chat streaming right now.
-         */runningSubagents: UInt32, lastActivityMs: Int64, 
+         */runningSubagents: UInt32, 
+        /**
+         * Side chats of this chat that are Working right now. The row's "● N"
+         * pill shows `running_subagents + working_side_chats`.
+         */workingSideChats: UInt32, lastActivityMs: Int64, 
         /**
          * `now` / `34m` / `4h` / `2d` at derive time.
          */timeLabel: String, createdAtMs: Int64, unseen: Bool, archived: Bool, pinned: Bool, sectionId: String?, pullRequest: PullRequest?, 
@@ -9289,6 +9298,7 @@ public struct SessionRow: Equatable, Hashable {
         self.hostIndicator = hostIndicator
         self.workingSinceMs = workingSinceMs
         self.runningSubagents = runningSubagents
+        self.workingSideChats = workingSideChats
         self.lastActivityMs = lastActivityMs
         self.timeLabel = timeLabel
         self.createdAtMs = createdAtMs
@@ -9338,6 +9348,7 @@ public struct FfiConverterTypeSessionRow: FfiConverterRustBuffer {
                 hostIndicator: FfiConverterTypeChatIndicator.read(from: &buf), 
                 workingSinceMs: FfiConverterOptionInt64.read(from: &buf), 
                 runningSubagents: FfiConverterUInt32.read(from: &buf), 
+                workingSideChats: FfiConverterUInt32.read(from: &buf), 
                 lastActivityMs: FfiConverterInt64.read(from: &buf), 
                 timeLabel: FfiConverterString.read(from: &buf), 
                 createdAtMs: FfiConverterInt64.read(from: &buf), 
@@ -9373,6 +9384,7 @@ public struct FfiConverterTypeSessionRow: FfiConverterRustBuffer {
         FfiConverterTypeChatIndicator.write(value.hostIndicator, into: &buf)
         FfiConverterOptionInt64.write(value.workingSinceMs, into: &buf)
         FfiConverterUInt32.write(value.runningSubagents, into: &buf)
+        FfiConverterUInt32.write(value.workingSideChats, into: &buf)
         FfiConverterInt64.write(value.lastActivityMs, into: &buf)
         FfiConverterString.write(value.timeLabel, into: &buf)
         FfiConverterInt64.write(value.createdAtMs, into: &buf)

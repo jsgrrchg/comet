@@ -1643,10 +1643,10 @@ mod tests {
         assert_eq!(comment_block(&lines, 11), Some(3));
         assert_eq!(comment_block(&[], 1), None);
     }
-    /// `zeron visual check` finds fences with a line scanner; it must see the
-    /// same code as the preview's parser, or the seeds would differ.
+    /// `zeron visual check` and the preview share the Markdown parser. Their
+    /// extraction must also keep code and occurrences identical for seeding.
     #[test]
-    fn visual_check_scanner_matches_the_parser() {
+    fn visual_check_parser_matches_the_preview() {
         for source in [
             "# Doc\n\n```zeron-visual\nlocal a = 1\n\n  indented()\n```\n\nText\n\n~~~zeron-visual\ntilde()\n~~~\n",
             "- item\n\n  ```zeron-visual\n  listed()\n    deeper()\n  ```\n\n1. ```zeron-visual\n   numbered()\n   ```\n",
@@ -1654,6 +1654,12 @@ mod tests {
             "```zeron-visual\r\ncrlf()\r\n\r\nend\r\n```\r\n",
             "````markdown\n```zeron-visual\nhidden()\n```\n````\n```zeron-visual\nopen()\n",
             "```zeron-visual\n```\n\n```zeron-visual\n\n\n```\n",
+            "- item\n\n\t```zeron-visual\n\treturn ui.nope {}\n\t```\n",
+            "<!--\n```zeron-visual\nhidden()\n```\n-->\n\n```zeron-visual\nshown()\n```\n",
+            "<div>\n```zeron-visual\nhidden()\n```\n</div>\n",
+            "    ```zeron-visual\n    hidden()\n    ```\n",
+            "- ```zeron-visual\n  first()\n\n```zeron-visual\nsecond()\n```\n",
+            "[x](/tmp/Some Folder/x.md)\r\n\r\n> ```zeron-visual\r\n> quoted()\r\n> ```\r\n",
         ] {
             let tree = parser::parse_full(source);
             let parsed: Vec<String> = tree

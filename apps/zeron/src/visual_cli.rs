@@ -121,6 +121,40 @@ mod tests {
     }
 
     #[test]
+    fn markdown_checks_visuals_in_tab_indented_lists() {
+        let (lines, ok) = check_markdown(
+            "tabbed.md",
+            "- item\n\n\t```zeron-visual\n\treturn ui.nope {}\n\t```\n",
+        );
+        assert!(!ok);
+        assert!(lines[0].starts_with("tabbed.md:4: visual 1: "), "{lines:?}");
+    }
+
+    #[test]
+    fn markdown_ignores_visual_source_in_html_and_indented_code() {
+        for source in [
+            "<!--\n```zeron-visual\nreturn ui.nope {}\n```\n-->\n",
+            "<div>\n```zeron-visual\nreturn ui.nope {}\n```\n</div>\n",
+            "    ```zeron-visual\n    return ui.nope {}\n    ```\n",
+        ] {
+            let (lines, ok) = check_markdown("plain.md", source);
+            assert!(ok, "{lines:?}");
+            assert_eq!(lines, ["plain.md: no ```zeron-visual fences"]);
+        }
+    }
+
+    #[test]
+    fn markdown_checks_the_visual_after_an_unclosed_list_fence() {
+        let (lines, ok) = check_markdown(
+            "list.md",
+            "- ```zeron-visual\n  return ui.text \"first\"\n\n```zeron-visual\nreturn ui.nope {}\n```\n",
+        );
+        assert!(!ok);
+        assert!(lines[0].starts_with("list.md:1: visual 1 ok"), "{lines:?}");
+        assert!(lines[1].starts_with("list.md:5: visual 2: "), "{lines:?}");
+    }
+
+    #[test]
     fn scripts_report_their_own_lines() {
         let (lines, ok) = check_script(
             "v.luau",

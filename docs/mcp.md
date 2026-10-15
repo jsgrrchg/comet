@@ -268,9 +268,9 @@ visuals the way the preview will (`zeron_visual::check` with the same seed):
 every fence of a `.md`/`.markdown`, or a whole `.luau` script. It prints
 `file.md:LINE: visual K ok (N interactions)` plus the script's `print()`
 output, or `file.md:LINE: visual K: message` with the error's script line
-mapped to the document's, and exits 1 when any visual fails. It finds fences
-with a line scanner (`zeron_visual::document`) that understands backtick and
-tilde fences, list indentation, and quotes.
+mapped to the document's, and exits 1 when any visual fails. Fence extraction
+(`zeron_visual::document`) uses the preview's shared Markdown parser, including
+its handling of lists, tabs, quotes, HTML, and code indentation.
 
 ## Selecting a host and project
 

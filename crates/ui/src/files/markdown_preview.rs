@@ -2395,6 +2395,24 @@ mod async_tests {
     }
 
     #[gpui::test]
+    fn nested_visuals_keep_independent_frames(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let view = cx.new(|cx| MarkdownPreview::new("README.md".into(), Rc::new(|_, _| {}), cx));
+        view.update(cx, |view, cx| {
+            let source = "> > Intro\n> >\n> > ```zeron-visual\n> > return ui.text \"A\"\n> > ```\n>\n> ```zeron-visual\n> return ui.text \"B\"\n> ```\n";
+            show(view, source);
+            let slots = render_visuals(view, cx);
+            assert_eq!(slots.len(), 2);
+            let a = live(&slots[0]);
+            let b = live(&slots[1]);
+            assert_ne!(a, b);
+            assert_eq!(a.read(cx).test_status(), Ok(()));
+            assert_eq!(b.read(cx).test_status(), Ok(()));
+            assert_eq!(view.visuals.len(), 2);
+        });
+    }
+
+    #[gpui::test]
     fn documents_run_a_bounded_number_of_visuals(cx: &mut TestAppContext) {
         cx.update(|cx| cx.set_global(Theme::dark()));
         let view = cx.new(|cx| MarkdownPreview::new("README.md".into(), Rc::new(|_, _| {}), cx));

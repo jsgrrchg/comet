@@ -501,16 +501,17 @@ pub fn render_tree(
     window: &Window,
     highlight: &dyn Fn(usize) -> Option<std::sync::Arc<HighlightedDocument>>,
 ) -> AnyElement {
+    let mut next_ix = 0;
     div()
         .flex()
         .flex_col()
         .gap(px(MD_BLOCK_GAP))
         .children(tree.blocks.iter().enumerate().map(|(ix, top)| {
             let document = highlight(ix);
-            render_block(
+            render_block_next(
                 &top.block,
                 ix,
-                ix,
+                &mut next_ix,
                 opts,
                 theme,
                 window,
@@ -522,72 +523,51 @@ pub fn render_tree(
         .into_any_element()
 }
 
-fn quote_child_ix(ix: usize, child_ix: usize) -> usize {
-    ix * 100 + child_ix
-}
-
-fn list_child_ix(ix: usize, item_ix: usize, child_ix: usize) -> usize {
-    ix * 100 + item_ix * 10 + child_ix
+/// Visit blocks in preorder, assigning each block one distinct index. Shared
+/// with rendering so nested fences get the same identity in every caller.
+fn visit_blocks(block: &Block, next_ix: &mut usize, visit: &mut impl FnMut(usize, &Block)) {
+    let ix = *next_ix;
+    *next_ix += 1;
+    visit(ix, block);
+    match block {
+        Block::BlockQuote { children } => {
+            for child in children {
+                visit_blocks(child, next_ix, visit);
+            }
+        }
+        Block::List { items, .. } => {
+            for child in items.iter().flatten() {
+                visit_blocks(child, next_ix, visit);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Element discriminators for every code block below `block`. Transcript rows
 /// use this to provision one independent scroll handle per nested fence before
 /// the renderer recursively reaches it.
-pub(crate) fn code_block_indices(block: &Block, ix: usize) -> Vec<usize> {
-    fn collect(block: &Block, ix: usize, out: &mut Vec<usize>) {
-        match block {
-            Block::CodeBlock { .. } => out.push(ix),
-            Block::BlockQuote { children } => {
-                for (child_ix, child) in children.iter().enumerate() {
-                    collect(child, quote_child_ix(ix, child_ix), out);
-                }
-            }
-            Block::List { items, .. } => {
-                for (item_ix, item) in items.iter().enumerate() {
-                    for (child_ix, child) in item.iter().enumerate() {
-                        collect(child, list_child_ix(ix, item_ix, child_ix), out);
-                    }
-                }
-            }
-            Block::Paragraph { .. } | Block::Heading { .. } | Block::Table { .. } | Block::Rule => {
-            }
-        }
-    }
-
+pub(crate) fn code_block_indices(block: &Block, mut ix: usize) -> Vec<usize> {
     let mut indices = Vec::new();
-    collect(block, ix, &mut indices);
+    visit_blocks(block, &mut ix, &mut |ix, block| {
+        if matches!(block, Block::CodeBlock { .. }) {
+            indices.push(ix);
+        }
+    });
     indices
 }
 
 /// The ```` ```zeron-visual ```` fences below `block` with the element
 /// discriminator each one renders with (the same as [`code_block_indices`]).
-pub(crate) fn visual_fences(block: &Block, ix: usize) -> Vec<(usize, String)> {
-    fn collect(block: &Block, ix: usize, out: &mut Vec<(usize, String)>) {
-        match block {
-            Block::CodeBlock { language, code } => {
-                if language.as_deref().is_some_and(is_visual_language) {
-                    out.push((ix, code.clone()));
-                }
-            }
-            Block::BlockQuote { children } => {
-                for (child_ix, child) in children.iter().enumerate() {
-                    collect(child, quote_child_ix(ix, child_ix), out);
-                }
-            }
-            Block::List { items, .. } => {
-                for (item_ix, item) in items.iter().enumerate() {
-                    for (child_ix, child) in item.iter().enumerate() {
-                        collect(child, list_child_ix(ix, item_ix, child_ix), out);
-                    }
-                }
-            }
-            Block::Paragraph { .. } | Block::Heading { .. } | Block::Table { .. } | Block::Rule => {
-            }
-        }
-    }
-
+pub(crate) fn visual_fences(block: &Block, mut ix: usize) -> Vec<(usize, String)> {
     let mut fences = Vec::new();
-    collect(block, ix, &mut fences);
+    visit_blocks(block, &mut ix, &mut |ix, block| {
+        if let Block::CodeBlock { language, code } = block
+            && language.as_deref().is_some_and(is_visual_language)
+        {
+            fences.push((ix, code.clone()));
+        }
+    });
     fences
 }
 
@@ -597,12 +577,27 @@ pub(crate) fn visual_fences(block: &Block, ix: usize) -> Vec<(usize, String)> {
 pub fn render_block(
     block: &Block,
     top_ix: usize,
-    ix: usize,
+    mut ix: usize,
     opts: &RenderOptions,
     theme: &Theme,
     window: &Window,
     highlight: CodeHighlight,
 ) -> AnyElement {
+    render_block_next(block, top_ix, &mut ix, opts, theme, window, highlight)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_block_next(
+    block: &Block,
+    top_ix: usize,
+    next_ix: &mut usize,
+    opts: &RenderOptions,
+    theme: &Theme,
+    window: &Window,
+    highlight: CodeHighlight,
+) -> AnyElement {
+    let ix = *next_ix;
+    *next_ix += 1;
     match block {
         Block::Paragraph { runs } => text_element(
             runs,
@@ -627,33 +622,27 @@ pub fn render_block(
             theme,
             highlight,
         ),
-        Block::BlockQuote { children } => div()
-            // Accent-tinted quote: indigo rail + a whisper of the same hue
-            // behind it (the inline-code treatment, dialed down).
-            .border_l_2()
-            .border_color(theme.accent.opacity(0.6))
-            .bg(theme.accent.opacity(0.05))
-            .rounded_tr(px(6.0))
-            .rounded_br(px(6.0))
-            .pl(px(12.0))
-            .pr(px(10.0))
-            .py(px(6.0))
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .text_color(theme.text_muted)
-            .children(children.iter().enumerate().map(|(ci, child)| {
-                render_block(
-                    child,
-                    top_ix,
-                    quote_child_ix(ix, ci),
-                    opts,
-                    theme,
-                    window,
-                    None,
-                )
-            }))
-            .into_any_element(),
+        Block::BlockQuote { children } => {
+            div()
+                // Accent-tinted quote: indigo rail + a whisper of the same hue
+                // behind it (the inline-code treatment, dialed down).
+                .border_l_2()
+                .border_color(theme.accent.opacity(0.6))
+                .bg(theme.accent.opacity(0.05))
+                .rounded_tr(px(6.0))
+                .rounded_br(px(6.0))
+                .pl(px(12.0))
+                .pr(px(10.0))
+                .py(px(6.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .text_color(theme.text_muted)
+                .children(children.iter().map(|child| {
+                    render_block_next(child, top_ix, next_ix, opts, theme, window, None)
+                }))
+                .into_any_element()
+        }
         Block::List {
             ordered_start,
             items,
@@ -780,15 +769,7 @@ pub fn render_block(
                             } else {
                                 child
                             };
-                            render_block(
-                                child,
-                                top_ix,
-                                list_child_ix(ix, item_ix, ci),
-                                opts,
-                                theme,
-                                window,
-                                None,
-                            )
+                            render_block_next(child, top_ix, next_ix, opts, theme, window, None)
                         })),
                 )
             }))
@@ -3302,13 +3283,33 @@ mod tests {
     #[test]
     fn code_block_indices_include_nested_quotes_and_lists() {
         let quoted = parse_full("> ```rust\n> let x = 1;\n> ```\n");
-        assert_eq!(code_block_indices(&quoted.blocks[0].block, 0), vec![0]);
+        assert_eq!(code_block_indices(&quoted.blocks[0].block, 0), vec![1]);
 
         let listed = parse_full("- Result:\n\n  ```json\n  {\"ok\":true}\n  ```\n");
-        assert_eq!(code_block_indices(&listed.blocks[0].block, 0), vec![1]);
+        assert_eq!(code_block_indices(&listed.blocks[0].block, 0), vec![2]);
 
         let top_level = parse_full("paragraph\n\n```text\nvalue\n```\n");
         assert_eq!(code_block_indices(&top_level.blocks[1].block, 1), vec![1]);
+    }
+
+    const NESTED_VISUALS: &str = "> > Intro\n> >\n> > ```zeron-visual\n> > return ui.text \"A\"\n> > ```\n>\n> ```zeron-visual\n> return ui.text \"B\"\n> ```\n";
+
+    #[test]
+    fn nested_block_indices_are_unique() {
+        // The old base-100 arithmetic gave both of these fences index 1.
+        let quoted = parse_full(NESTED_VISUALS);
+        let indices = code_block_indices(&quoted.blocks[0].block, 0);
+        assert_eq!(indices.len(), 2);
+        assert_ne!(indices[0], indices[1]);
+
+        // List item 0's child 10 also used to collide with item 1's child 0.
+        let mut listed = String::from("- First\n\n");
+        listed.push_str(&"  Paragraph.\n\n".repeat(9));
+        listed.push_str("  ```zeron-visual\n  return ui.text \"A\"\n  ```\n\n- ```zeron-visual\n  return ui.text \"B\"\n  ```\n");
+        let tree = parse_full(&listed);
+        let indices = code_block_indices(&tree.blocks[0].block, 0);
+        assert_eq!(indices.len(), 2);
+        assert_ne!(indices[0], indices[1]);
     }
 
     #[test]
@@ -3327,8 +3328,8 @@ mod tests {
             found,
             [
                 (0, "top()".to_string()),
-                (100, "quoted()".to_string()),
-                (202, "listed()".to_string()),
+                (2, "quoted()".to_string()),
+                (5, "listed()".to_string()),
             ]
         );
         for (ix, top) in tree.blocks.iter().enumerate() {
@@ -3344,6 +3345,7 @@ mod tests {
     struct VisualFenceHarness {
         handler: bool,
         calls: Rc<RefCell<Vec<String>>>,
+        source: &'static str,
     }
 
     impl Render for VisualFenceHarness {
@@ -3369,7 +3371,7 @@ mod tests {
                 .size_full()
                 .child(selection_frame_reset())
                 .child(render_tree(
-                    &parse_full("```zeron-visual\nreturn nil\n```\n"),
+                    &parse_full(self.source),
                     &opts,
                     &theme,
                     window,
@@ -3390,6 +3392,7 @@ mod tests {
             let (_, cx) = cx.add_window_view(|_, _| VisualFenceHarness {
                 handler,
                 calls: calls.clone(),
+                source: "```zeron-visual\nreturn nil\n```\n",
             });
             cx.simulate_resize(size(px(640.0), px(240.0)));
             cx.update(|window, cx| {
@@ -3405,6 +3408,37 @@ mod tests {
                 "{calls:?}"
             );
         }
+    }
+
+    #[gpui::test]
+    fn nested_visuals_render_with_distinct_frame_ids(cx: &mut TestAppContext) {
+        let _selection = super::super::selection::test_state_lock();
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let (_, cx) = cx.add_window_view(|_, _| VisualFenceHarness {
+            handler: true,
+            calls: calls.clone(),
+            source: NESTED_VISUALS,
+        });
+        cx.simulate_resize(size(px(640.0), px(480.0)));
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let tree = parse_full(NESTED_VISUALS);
+        let expected: std::collections::HashSet<_> = visual_fences(&tree.blocks[0].block, 0)
+            .into_iter()
+            .map(|(ix, _)| format!("visual-test-visual-{ix}"))
+            .collect();
+        assert_eq!(expected.len(), 2);
+        assert_eq!(
+            calls
+                .borrow()
+                .iter()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>(),
+            expected
+        );
     }
 
     #[test]

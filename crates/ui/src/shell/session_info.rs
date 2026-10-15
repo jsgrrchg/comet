@@ -32,6 +32,26 @@ pub(super) fn session_card_reserve(main: f32, transcript: f32) -> Option<f32> {
     (main - reserve - 2.0 * TRANSCRIPT_GUTTER >= transcript - 0.5).then_some(reserve)
 }
 
+/// The checkouts' working-tree diffs, for the branch row's `+N −M`: the
+/// Changes pane's `WatchCheckoutDiffs` stream, kept without the pane.
+#[derive(Default)]
+pub(super) struct SessionDiffs {
+    diffs: Vec<zeron_proto::CheckoutDiff>,
+    /// Device the running watch targets: `None` the connected engine, else
+    /// a remote chat's host (diffs are produced where the checkout lives).
+    target: Option<Option<String>>,
+    _watch: Option<Task<()>>,
+}
+
+impl SessionDiffs {
+    /// The chat's uncommitted line totals; `None` while clean or unknown.
+    fn totals(&self, chat: &zeron_proto::Chat) -> Option<(u32, u32)> {
+        crate::changes::resolve_diff(&self.diffs, chat)
+            .map(|diff| (diff.additions, diff.deletions))
+            .filter(|&(adds, dels)| adds + dels > 0)
+    }
+}
+
 /// A non-interactive card row: icon slot, label, optional trailing detail.
 fn info_row(theme: &Theme, glyph: AnyElement, label: SharedString) -> gpui::Div {
     div()
@@ -55,6 +75,71 @@ fn row_glyph(path: &'static str, theme: &Theme) -> AnyElement {
 }
 
 impl Shell {
+    /// Watch the selected chat's host for checkout diffs (idempotent per
+    /// host); it retries every 2s while the stream fails or ends.
+    fn ensure_session_diffs(&mut self, cx: &mut Context<Self>) {
+        let (target, engine) = {
+            let state = self.state.read(cx);
+            let Some(chat) = state.selected_chat_row() else {
+                return;
+            };
+            let device = chat.device_id.clone();
+            let target = (state.local_device_id.as_deref() != Some(device.as_str()))
+                .then_some(device);
+            (target, state.engine().cloned())
+        };
+        if self.session_diffs.target.as_ref() == Some(&target) {
+            return;
+        }
+        // Engine still booting: the next render retries.
+        let Some(engine) = engine else {
+            return;
+        };
+        self.session_diffs.diffs.clear();
+        self.session_diffs.target = Some(target.clone());
+        self.session_diffs._watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let mut params = serde_json::Map::new();
+                if let Some(target) = &target {
+                    params.insert(
+                        "targetDeviceId".into(),
+                        serde_json::Value::String(target.clone()),
+                    );
+                }
+                if let Ok(mut rx) = engine
+                    .client()
+                    .subscribe(
+                        methods::WATCH_CHECKOUT_DIFFS,
+                        serde_json::Value::Object(params),
+                    )
+                    .await
+                {
+                    while let Some(value) = rx.recv().await {
+                        let alive = this.update(cx, |this, cx| {
+                            // Repaint only when the open chat's totals move.
+                            let chat = this.state.read(cx).selected_chat_row().cloned();
+                            let totals = |diffs: &SessionDiffs| {
+                                chat.as_ref().and_then(|chat| diffs.totals(chat))
+                            };
+                            let before = totals(&this.session_diffs);
+                            if crate::changes::apply_diff_frame(
+                                &mut this.session_diffs.diffs,
+                                value,
+                            ) && totals(&this.session_diffs) != before
+                            {
+                                cx.notify();
+                            }
+                        });
+                        if alive.is_err() {
+                            return;
+                        }
+                    }
+                }
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+            }
+        }));
+    }
+
     /// The card's reserve at the main column's LIVE width (see
     /// [`session_card_reserve`]): while the sidebar or a pane animates, the
     /// settled width would move or hide the card ahead of the column.
@@ -225,10 +310,43 @@ impl Shell {
             None => info_row(&theme, row_glyph(icons::HOME, &theme), "No project".into())
                 .into_any_element(),
         };
+        self.ensure_session_diffs(cx);
+        let totals = self.session_diffs.totals(&chat);
         let branch_row = branch.map(|branch| {
             info_row(&theme, row_glyph(icons::GIT_BRANCH, &theme), branch.clone())
                 .id("session-info-branch")
                 .tooltip(crate::settings::widgets::text_tooltip(branch))
+                // What the checkout holds uncommitted; it opens the diff.
+                .children(totals.map(|(adds, dels)| {
+                    let stat = |text: String, color: gpui::Hsla| {
+                        div()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(color)
+                            .child(SharedString::from(text))
+                    };
+                    div()
+                        .id("session-info-diff")
+                        .debug_selector(|| "session-info-diff".into())
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(5.0))
+                        .mr(px(-5.0))
+                        .py(px(2.0))
+                        .rounded(px(5.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::ink(0.08)))
+                        .tooltip(crate::settings::widgets::text_tooltip("Uncommitted changes"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_session_info_overlay(cx);
+                            this.add_diff_surface(window, cx);
+                        }))
+                        .child(stat(format!("+{adds}"), crate::changes::add_color(&theme)))
+                        .child(stat(format!("−{dels}"), crate::changes::del_color(&theme)))
+                }))
         });
 
         // ── The project's run actions.

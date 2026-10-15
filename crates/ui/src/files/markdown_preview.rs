@@ -218,7 +218,8 @@ pub(super) struct MarkdownPreview {
     diagram_style: u32,
     source_visible: HashSet<String>,
     /// Running ```` ```zeron-visual ```` fences, created when their row
-    /// first renders and kept while their code stays in the document.
+    /// first renders and kept while their code stays among the first
+    /// [`MAX_VISUALS`] fences in the document.
     visuals: HashMap<VisualKey, gpui::Entity<crate::visuals::VisualFrame>>,
     /// Each fence's key by its frame id (`{row}-visual-{ix}`), per parse.
     visual_slots: HashMap<String, VisualKey>,
@@ -790,7 +791,7 @@ impl MarkdownPreview {
     }
 
     /// Map the parsed tree's visual fences to their keys, and drop the
-    /// visuals whose fence left the document or changed its code.
+    /// visuals whose fence left the allowed set or changed its code.
     fn sync_visuals(&mut self) {
         self.visual_slots.clear();
         self.visual_allowed.clear();
@@ -810,8 +811,9 @@ impl MarkdownPreview {
         if self.truncated {
             self.visuals.clear();
         }
+        self.visuals
+            .retain(|key, _| self.visual_allowed.contains(key));
         let present: HashSet<&VisualKey> = self.visual_slots.values().collect();
-        self.visuals.retain(|key, _| present.contains(key));
         self.visual_runnable.retain(|key| present.contains(key));
     }
 
@@ -2441,6 +2443,57 @@ mod async_tests {
                     .all(|slot| matches!(slot, RowVisual::Blocked(_)))
             );
         });
+    }
+
+    #[gpui::test]
+    fn document_edits_release_visuals_that_leave_the_preview_limit(cx: &mut TestAppContext) {
+        cx.update(|cx| cx.set_global(Theme::dark()));
+        let view = cx.new(|cx| MarkdownPreview::new("README.md".into(), Rc::new(|_, _| {}), cx));
+        let mut source: String = (0..MAX_VISUALS)
+            .map(|i| fence(&format!("{SCRIPT}\n-- initial {i}")))
+            .collect();
+        let mut previous: Vec<_> = view.update(cx, |view, cx| {
+            show(view, &source);
+            render_visuals(view, cx)
+                .iter()
+                .map(|slot| live(slot).downgrade())
+                .collect()
+        });
+        cx.run_until_parked();
+
+        for edit in 0..3 {
+            source = format!("{}{source}", fence(&format!("{SCRIPT}\n-- added {edit}")));
+            view.update(cx, |view, _| {
+                show(view, &source);
+                assert_eq!(view.visuals.len(), MAX_VISUALS - 1);
+                assert!(
+                    previous[..MAX_VISUALS - 1]
+                        .iter()
+                        .all(|frame| frame.upgrade().is_some()),
+                    "allowed frames keep their state"
+                );
+            });
+            // GPUI defers entity releases until the update's effects finish.
+            cx.run_until_parked();
+            assert!(
+                previous.last().unwrap().upgrade().is_none(),
+                "the displaced frame is released"
+            );
+            previous = view.update(cx, |view, cx| {
+                let slots = render_visuals(view, cx);
+                assert!(
+                    slots[MAX_VISUALS..]
+                        .iter()
+                        .all(|slot| matches!(slot, RowVisual::Blocked(_)))
+                );
+                assert_eq!(view.visuals.len(), MAX_VISUALS);
+                slots[..MAX_VISUALS]
+                    .iter()
+                    .map(|slot| live(slot).downgrade())
+                    .collect()
+            });
+            cx.run_until_parked();
+        }
     }
 
     #[gpui::test]

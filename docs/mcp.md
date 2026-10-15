@@ -256,9 +256,9 @@ end
 - Lua runs on the desktop's main thread, so a document runs at most 8 visuals
   (its first 8 fences; the rest show as code with a notice), each starts only
   when its row first renders, and they are dropped when the preview suspends,
-  switches documents, or the fence leaves the document. A truncated preview
-  runs none. A document outside the workspace runs nothing on its own: each
-  fence shows its code with a "Run visual" button.
+  switches documents, or the fence leaves the document's first 8 fences. A
+  truncated preview runs none. A document outside the workspace runs nothing
+  on its own: each fence shows its code with a "Run visual" button.
 - The fence sits on the document without a code-block frame; a quiet row above
   it toggles "Show source" / "Show visual". Elsewhere (GitHub, other editors,
   chat replies, iOS) the fence is ordinary code.

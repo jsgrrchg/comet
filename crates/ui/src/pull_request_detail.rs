@@ -6,6 +6,7 @@ mod handoff;
 #[path = "pull_request_interactions.rs"]
 mod interactions;
 use crate::{
+    history::{GitHistory, GitHistoryCount, GitHistorySearchControl},
     settings::{self, PullRequestDestination, widgets},
     state::AppState,
     theme::Theme,
@@ -18,7 +19,7 @@ use gpui::{
 use std::time::Duration;
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 use zeron_proto::change_request_assessment::{CiState, Facts, check_failed, check_status};
-use zeron_proto::{ChangeRequestDetail, ChangeRequestListItem};
+use zeron_proto::{ChangeRequestCommits, ChangeRequestDetail, ChangeRequestListItem};
 use zeron_rpc::methods;
 
 #[derive(Clone, PartialEq, Action)]
@@ -318,6 +319,7 @@ struct DetailSnapshot {
     diff: Option<Arc<ParsedDiff>>,
     /// Keep the engine-cache invalidation alive across closing/reopening.
     diff_refresh_owed: bool,
+    commits: Option<ChangeRequestCommits>,
 }
 
 /// Window/profile scoped, bounded cache. Device remains part of the identity.
@@ -409,6 +411,14 @@ impl Default for CodeReview {
     }
 }
 
+/// The Commits tab: the shared history graph over the pull request's
+/// commits, with its count and search controls.
+struct CommitHistory {
+    graph: Entity<GitHistory>,
+    count: Entity<GitHistoryCount>,
+    search: Entity<GitHistorySearchControl>,
+}
+
 pub struct PullRequestDetailPage {
     state: Entity<AppState>,
     pub url: String,
@@ -434,6 +444,14 @@ pub struct PullRequestDetailPage {
     /// Refresh invalidated the patch. Keep bypassing the engine cache until
     /// a diff load succeeds, including across errors and reopening.
     diff_refresh_owed: bool,
+    /// The pull request's commits, newest first, once listed for its head.
+    commits: Option<ChangeRequestCommits>,
+    commits_task: Option<Task<()>>,
+    commits_error: Option<String>,
+    /// Refresh invalidated the listing; bypass the engine cache until it lands.
+    commits_refresh_owed: bool,
+    /// The Commits tab's history graph, created on first visit.
+    history: Option<CommitHistory>,
     tab: Tab,
     checks_expanded: bool,
     tab_slide: crate::motion::IndicatorSlide,
@@ -512,6 +530,11 @@ impl PullRequestDetailPage {
             },
             diff_error: None,
             diff_refresh_owed: false,
+            commits: None,
+            commits_task: None,
+            commits_error: None,
+            commits_refresh_owed: false,
+            history: None,
             tab: Tab::Summary,
             checks_expanded: false,
             tab_slide: crate::motion::IndicatorSlide::at(tab_slot(Tab::Summary), Instant::now()),
@@ -621,6 +644,7 @@ impl PullRequestDetailPage {
             if let Some(diff) = snapshot.diff {
                 page.install_diff(diff, cx);
             }
+            page.commits = snapshot.commits;
         }
         let draft = page
             .cache
@@ -824,10 +848,13 @@ impl PullRequestDetailPage {
         self.diff = None;
         crate::markdown::render::clear_selection_surface(&self.selection_prefix);
         self.diff_refresh_owed = true;
+        self.drop_commits();
+        self.commits_refresh_owed = true;
         let cached = self.cache.borrow_mut().get(&self.target, &self.url);
         if let Some(mut snapshot) = cached {
             snapshot.diff = None;
             snapshot.diff_refresh_owed = true;
+            snapshot.commits = None;
             snapshot.fetched = Instant::now();
             self.cache
                 .borrow_mut()
@@ -893,6 +920,7 @@ impl PullRequestDetailPage {
                     activity: detail.activity_comments()
                         .map(|comment| super::pull_request_media::parse_description(&comment.body)).collect(),
                     detail, fetched: Instant::now(), diff: None, diff_refresh_owed: false,
+                    commits: None,
                 })
             }).await;
             let _ = this.update(cx, |page, cx| {
@@ -915,9 +943,13 @@ impl PullRequestDetailPage {
                             page.diff = None;
                             page.diff_refresh_owed = true;
                         }
+                        if page.commits_head() != Some(snapshot.detail.head_ref_oid.as_str()) {
+                            page.drop_commits();
+                        }
                         page.fetched = Some(snapshot.fetched);
                         snapshot.diff = page.diff.clone();
                         snapshot.diff_refresh_owed = page.diff_refresh_owed;
+                        snapshot.commits = page.commits.clone();
                         page.body = Some(snapshot.body.clone());
                         page.activity_bodies = snapshot.activity.clone();
                         page.detail = Some(snapshot.detail.clone());
@@ -925,12 +957,13 @@ impl PullRequestDetailPage {
                     }
                     Err(error) => page.error = Some(error),
                 }
-                if !page.refresh_from_board(cx)
-                    && loaded
-                    && page.tab == Tab::Code
-                    && page.diff.is_none()
-                {
-                    page.load_diff(false, cx);
+                if !page.refresh_from_board(cx) && loaded {
+                    if page.tab == Tab::Code && page.diff.is_none() {
+                        page.load_diff(false, cx);
+                    }
+                    if page.tab == Tab::Commits && page.commits.is_none() {
+                        page.load_commits(false, cx);
+                    }
                 }
                 cx.notify();
             });
@@ -1019,6 +1052,110 @@ impl PullRequestDetailPage {
         self.rebuild_stream(cx);
     }
 
+    /// The head the shown commit listing belongs to: its newest commit.
+    fn commits_head(&self) -> Option<&str> {
+        self.commits
+            .as_ref()
+            .and_then(|commits| commits.commits.first())
+            .map(|commit| commit.sha.as_str())
+    }
+
+    /// Forget the listing; it belongs to an older head or a refresh.
+    fn drop_commits(&mut self) {
+        self.commits_task = None;
+        self.commits_error = None;
+        self.commits = None;
+    }
+
+    fn load_commits(&mut self, refresh: bool, cx: &mut Context<Self>) {
+        // Wait for the detail's head so the listing is keyed by it.
+        if self.loading || self.detail.is_none() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.commits_error = Some("Connect to your device to load the commits.".into());
+            return;
+        };
+        self.commits_error = None;
+        let mut params = self.params(refresh || self.commits_refresh_owed);
+        params.as_object_mut().unwrap().remove("baseRefOid");
+        let head = self.detail.as_ref().unwrap().head_ref_oid.clone();
+        self.commit_history(cx)
+            .graph
+            .update(cx, |history, cx| history.set_loading(cx));
+        self.commits_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_CHANGE_REQUEST_COMMITS, params)
+                .await
+                .map_err(|error| format!("Couldn’t load the commits. {}", failure_reason(&error)))
+                .and_then(|value| {
+                    serde_json::from_value::<ChangeRequestCommits>(value)
+                        .map_err(|_| "The device returned an invalid commit list.".to_owned())
+                });
+            let _ = this.update(cx, |page, cx| {
+                // The listing must belong to the head currently being shown.
+                if page.loading
+                    || !page
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| detail.head_ref_oid == head)
+                {
+                    return;
+                }
+                page.commits_task = None;
+                match result {
+                    Ok(commits) => {
+                        page.commits_refresh_owed = false;
+                        let cached = page.cache.borrow_mut().get(&page.target, &page.url);
+                        if let Some(mut snapshot) = cached
+                            && snapshot.detail.head_ref_oid == head
+                        {
+                            snapshot.commits = Some(commits.clone());
+                            page.cache.borrow_mut().put(
+                                page.target.clone(),
+                                page.url.clone(),
+                                snapshot,
+                            );
+                        }
+                        page.commits = Some(commits);
+                        page.show_commits(cx);
+                    }
+                    Err(error) => {
+                        page.commits_error = Some(error);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// The Commits tab's graph and its header controls, made on first use.
+    fn commit_history(&mut self, cx: &mut Context<Self>) -> &CommitHistory {
+        if self.history.is_none() {
+            let graph = cx.new(|_| GitHistory::provided(self.state.clone(), self.url.clone()));
+            let count = cx.new(|cx| GitHistoryCount::new(graph.clone(), cx));
+            let search = cx.new(|cx| GitHistorySearchControl::new(graph.clone(), cx));
+            self.history = Some(CommitHistory {
+                graph,
+                count,
+                search,
+            });
+            self.show_commits(cx);
+        }
+        self.history.as_ref().unwrap()
+    }
+
+    /// Hand the listing to the graph, if both exist.
+    fn show_commits(&mut self, cx: &mut Context<Self>) {
+        if let (Some(history), Some(commits)) = (&self.history, &self.commits) {
+            let commits = commits.clone();
+            history.graph.update(cx, |graph, cx| {
+                graph.set_commits(commits.commits, commits.truncated, cx)
+            });
+        }
+    }
+
     /// Floating pill nav. One raised thumb glides between equal-width segments
     /// (positioned as a fraction of the track, so it stays aligned at any label
     /// length or text scale) while each segment's icon and label fade with the
@@ -1048,7 +1185,7 @@ impl PullRequestDetailPage {
         let counts = self.detail.as_ref().map(|detail| {
             [
                 None,
-                None,
+                self.commits.as_ref().map(|commits| commits.commits.len()),
                 Some(detail.files.len()),
                 Some(detail.activity_comments().count()),
             ]
@@ -1211,6 +1348,12 @@ impl PullRequestDetailPage {
         if tab == Tab::Code && self.diff.is_none() && self.diff_task.is_none() {
             self.load_diff(false, cx);
         }
+        if tab == Tab::Commits {
+            self.commit_history(cx);
+            if self.commits.is_none() && self.commits_task.is_none() {
+                self.load_commits(false, cx);
+            }
+        }
         cx.notify();
     }
 }
@@ -1232,6 +1375,47 @@ impl PullRequestDetailPage {
         self.review.jumped = None;
         cx.notify();
     }
+}
+
+/// The Commits tab under the header: count and search above the graph,
+/// which fills the rest of the page.
+fn commits_section(history: &CommitHistory) -> AnyElement {
+    div()
+        .id("pr-commits-section")
+        .debug_selector(|| "pr-commits-section".into())
+        .mt(px(24.0))
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .h(px(crate::surface_chrome::CONTROL_SIZE))
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(crate::surface_chrome::CONTROL_GAP))
+                .px(px(8.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .flex()
+                        .child(history.count.clone()),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_shrink(1.0)
+                        .flex()
+                        .items_center()
+                        .child(history.search.clone()),
+                ),
+        )
+        .child(div().flex_1().min_h_0().child(history.graph.clone()))
+        .into_any_element()
 }
 
 fn rich_text(
@@ -1644,13 +1828,16 @@ impl Render for PullRequestDetailPage {
                 .when(self.tab == Tab::Code, |el| {
                     el.max_w_full().px(px(24.0)).h_full().min_h_0()
                 })
+                .when(self.tab == Tab::Commits, |el| el.h_full().min_h_0())
                 .pt(px(24.0))
                 .pb(px(match self.tab {
                     // The comment dock sits below the scroll, not over it.
                     Tab::Activity => 32.0,
                     // The workspace reserves its own room for the navigation.
                     Tab::Code => 0.0,
-                    Tab::Summary | Tab::Commits => 76.0,
+                    Tab::Summary => 76.0,
+                    // The graph scrolls itself and ends above the navigation.
+                    Tab::Commits => NAV_CLEARANCE,
                 }))
                 .text_size(crate::typography::ui_rems(13.0))
                 .text_color(theme.text);
@@ -1984,7 +2171,20 @@ impl Render for PullRequestDetailPage {
                                 .child(description),
                         );
                     }
-                    Tab::Commits => {}
+                    Tab::Commits => {
+                        if let Some(error) = &self.commits_error {
+                            column = column
+                                .child(div().mt(px(24.0)))
+                                .child(widgets::error_strip(&theme, error.clone()))
+                                .child(div().mt(px(8.0)).flex().child(
+                                    action("pr-retry-commits", "Retry commits", &theme).on_click(
+                                        cx.listener(|page, _, _, cx| page.load_commits(true, cx)),
+                                    ),
+                                ));
+                        } else if let Some(history) = &self.history {
+                            column = column.child(commits_section(history));
+                        }
+                    }
                     Tab::Code => {
                         if let Some(error) = &self.diff_error {
                             column = column
@@ -2299,6 +2499,8 @@ impl Render for PullRequestDetailPage {
                 ));
             }
             let scroll = self.scroll.scroll.clone();
+            // Code and Commits virtualize their own lists.
+            let scrolls = !matches!(self.tab, Tab::Code | Tab::Commits);
             let rail = crate::popover::rail(self, "pr-detail-scrollbar", &theme, cx);
             div()
                 .id("pr-detail-scroll-host")
@@ -2339,14 +2541,14 @@ impl Render for PullRequestDetailPage {
                             .id("pr-detail-scroll")
                             .debug_selector(|| "pr-detail-scroll".into())
                             .size_full()
-                            .when(self.tab != Tab::Code, |el| el.overflow_y_scroll())
-                            .when(self.tab == Tab::Code, |el| el.overflow_hidden())
+                            .when(scrolls, |el| el.overflow_y_scroll())
+                            .when(!scrolls, |el| el.overflow_hidden())
                             .track_scroll(&scroll)
                             .child(column),
                     )
                     .fade_overflow_y(&scroll),
                 )
-                .when(self.tab != Tab::Code, |el| el.children(rail))
+                .when(scrolls, |el| el.children(rail))
                 .into_any_element()
         };
         let navigation = self.navigation(&theme, cx);
@@ -2469,6 +2671,7 @@ mod tests {
             fetched: Instant::now(),
             diff: None,
             diff_refresh_owed: false,
+            commits: None,
         }
     }
 
@@ -2761,6 +2964,120 @@ mod tests {
             })
             .unwrap();
         assert_eq!(rpc.completed(), 2);
+    }
+
+    fn pr_commit(sha: String) -> zeron_proto::GitHistoryCommit {
+        zeron_proto::GitHistoryCommit {
+            subject: format!("Commit {}", &sha[..7]),
+            sha,
+            parent_shas: Vec::new(),
+            author_name: "Ada".into(),
+            author_email: "ada@example.com".into(),
+            authored_at: "2026-09-01T10:00:00Z".into(),
+            refs: Vec::new(),
+        }
+    }
+
+    fn init_history(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            crate::history::init(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                cx,
+            )
+        });
+    }
+
+    #[gpui::test]
+    fn pull_request_commits_load_once_per_head(cx: &mut gpui::TestAppContext) {
+        let runtime = fixture::runtime();
+        let _guard = runtime.enter();
+        fixture::init(cx);
+        init_history(cx);
+        let listed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rpc = ScriptedRpc::new({
+            let listed = listed.clone();
+            move |method, params| {
+                let listed = listed.clone();
+                async move {
+                    let head = params["headRefOid"]
+                        .as_str()
+                        .map_or_else(|| "a".repeat(40), str::to_owned);
+                    match method.as_str() {
+                        methods::GET_CHANGE_REQUEST => {
+                            zeron_rpc::RpcReply::value(&ChangeRequestDetail {
+                                head_ref_oid: head,
+                                base_ref_oid: "d".repeat(40),
+                                ..Default::default()
+                            })
+                        }
+                        methods::LIST_CHANGE_REQUEST_COMMITS => {
+                            // The listing is keyed by the head alone.
+                            assert!(params.get("baseRefOid").is_none());
+                            listed
+                                .lock()
+                                .unwrap()
+                                .push((head.clone(), params["refresh"] == true));
+                            zeron_rpc::RpcReply::value(&ChangeRequestCommits {
+                                commits: vec![pr_commit(head), pr_commit("c".repeat(40))],
+                                truncated: false,
+                            })
+                        }
+                        _ => panic!("unexpected RPC {method}"),
+                    }
+                }
+            }
+        });
+        let (page, cx) = cx.add_window_view(|window, cx| {
+            PullRequestDetailPage::new(
+                fixture::state(cx, Some(rpc.client())),
+                "https://github.com/a/b/pull/1".into(),
+                None,
+                Rc::new(RefCell::new(PullRequestCache::default())),
+                None,
+                window,
+                cx,
+            )
+        });
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| page.detail.is_some())
+        });
+        page.update(cx, |page, cx| page.select_tab(Tab::Commits, cx));
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| page.commits.is_some())
+        });
+        page.read_with(cx, |page, cx| {
+            let history = page.history.as_ref().unwrap();
+            assert_eq!(history.graph.read(cx).commit_count(), Some(2));
+            assert_eq!(page.commits_head(), Some("a".repeat(40).as_str()));
+        });
+        assert!(cx.debug_bounds("pr-commits-section").is_some());
+        // Coming back to the tab reuses the listing.
+        page.update(cx, |page, cx| {
+            page.select_tab(Tab::Summary, cx);
+            page.select_tab(Tab::Commits, cx);
+            assert!(page.commits_task.is_none());
+        });
+        // A push replaces it with the new head's, bypassing the engine cache.
+        page.update(cx, |page, cx| {
+            page.update_board_preview(board_preview(&"b".repeat(40)), cx);
+            assert!(page.commits.is_none());
+        });
+        rpc.settle(cx, &runtime, |cx| {
+            page.read_with(cx, |page, _| {
+                page.commits_head() == Some("b".repeat(40).as_str())
+            })
+        });
+        assert_eq!(
+            *listed.lock().unwrap(),
+            [("a".repeat(40), false), ("b".repeat(40), true)]
+        );
+        page.read_with(cx, |page, cx| {
+            let history = page.history.as_ref().unwrap();
+            assert_eq!(history.graph.read(cx).commit_count(), Some(2));
+        });
     }
 
     fn board_preview(head: &str) -> ChangeRequestListItem {

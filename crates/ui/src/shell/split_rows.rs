@@ -347,8 +347,8 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Carried out: onto the list it leaves the split, onto a
-            // conversation it opens beside it (or moves within the split).
+            // Carried onto a conversation it opens beside it (or moves
+            // within the split); the list ignores it.
             .on_drag(drag, |payload, _, _, cx| {
                 cx.stop_propagation();
                 cx.new(|_| chat_dropzone::SplitPillGhost {

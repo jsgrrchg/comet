@@ -9390,12 +9390,6 @@ impl Shell {
                             this.cancel_sidebar_session_transfer(cx);
                         },
                     ))
-                    // A pill dropped back on the list leaves its split.
-                    .on_drop::<chat_dropzone::SplitPillDrag>(cx.listener(
-                        |this, payload: &chat_dropzone::SplitPillDrag, _, cx| {
-                            this.close_split_pane(&payload.chat_id, cx);
-                        },
-                    ))
                     .px(px(Theme::SPACE_SM))
                     .flex()
                     .flex_col()

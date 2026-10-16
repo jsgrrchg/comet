@@ -4233,6 +4233,38 @@ impl Shell {
         self.register_diff_surface(changes, window, cx);
     }
 
+    /// A Commits row in a pull request tab of this pane: the commit's diff,
+    /// read from GitHub, opens as its own tab beside it. Opening the same
+    /// commit again returns to its tab.
+    pub(super) fn open_change_request_commit_surface(
+        &mut self,
+        url: String,
+        device: Option<String>,
+        commit: zeron_proto::GitHistoryCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self.panel_key(cx);
+        let existing = self.right_tabs.get(&key).and_then(|tabs| {
+            tabs.iter().copied().find(|surface| match surface {
+                RightSurface::Diff(id) => self.diffs.get(id).is_some_and(|changes| {
+                    changes.read(cx).change_request_commit()
+                        == Some((url.as_str(), commit.sha.as_str()))
+                }),
+                _ => false,
+            })
+        });
+        if let Some(surface) = existing {
+            self.set_right_active(surface, cx);
+            cx.notify();
+            return;
+        }
+        let changes = cx.new(|cx| {
+            Changes::for_change_request_commit(self.state.clone(), url, device, commit, cx)
+        });
+        self.register_diff_surface(changes, window, cx);
+    }
+
     fn register_diff_surface(
         &mut self,
         changes: Entity<Changes>,
@@ -12127,8 +12159,11 @@ impl Shell {
                     .diffs
                     .get(&id)
                     .map(|changes| {
-                        if changes.read(cx).is_history() {
+                        let changes = changes.read(cx);
+                        if changes.is_history() {
                             icons::GIT_BRANCH
+                        } else if changes.change_request_commit().is_some() {
+                            icons::GIT_COMMIT
                         } else {
                             icons::LIST
                         }

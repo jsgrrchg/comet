@@ -28,11 +28,7 @@ pub(super) struct PendingDraftChanges {
 }
 impl Shell {
     fn prompt_draft_row_height(&self) -> f32 {
-        if self.settings.sidebar_compact {
-            sidebar_row_height(true, false, false, false)
-        } else {
-            64.0
-        }
+        sidebar_row_height(self.settings.sidebar_compact, true, false, false)
     }
 
     fn finish_draft_drop(&mut self, payload: &DraftDrag, cx: &mut Context<Self>) {
@@ -231,17 +227,18 @@ impl Shell {
         let height = rows.len() as f32 * self.prompt_draft_row_height()
             + spaces::SIDEBAR_DISCLOSURE_BODY_INSET;
         let chevron = self.sidebar_disclosure_chevron("drafts", open, theme);
-        let header = spaces::sidebar_disclosure_header(theme, None, "Drafts".into(), count, None, chevron)
-            .id("drafts-toggle")
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.begin_sidebar_disclosure_motion(
-                    "drafts",
-                    if open { height } else { 0.0 },
-                    if open { 0.0 } else { height },
-                );
-                this.drafts_open = !open;
-                cx.notify();
-            }));
+        let header =
+            spaces::sidebar_disclosure_header(theme, None, "Drafts".into(), count, None, chevron)
+                .id("drafts-toggle")
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.begin_sidebar_disclosure_motion(
+                        "drafts",
+                        if open { height } else { 0.0 },
+                        if open { 0.0 } else { height },
+                    );
+                    this.drafts_open = !open;
+                    cx.notify();
+                }));
         let items: Vec<_> = rows
             .into_iter()
             .map(|row| self.render_prompt_draft_row(row, theme, cx))
@@ -270,11 +267,6 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let compact = self.settings.sidebar_compact;
-        let preview = if row.conflict {
-            format!("Recovered edit · {}", row.preview)
-        } else {
-            row.preview.clone()
-        };
         let state = self.state.read(cx);
         let space = state
             .spaces
@@ -289,53 +281,7 @@ impl Shell {
             .map(|space| space.display_name().to_string())
             .or_else(|| row.target.project_name.clone())
             .unwrap_or_else(|| "No project".into());
-        let leading_icon = if self.settings.sidebar_show_project_icon {
-            self.render_space_project_icon(
-                &format!("draft-{}", row.id),
-                space.as_ref(),
-                Some(&row.target.device_id),
-                SIDEBAR_ACTIVE_HARNESS_ICON_SIZE,
-                false,
-                cx,
-            )
-        } else {
-            icon(icons::PEN)
-                .size(px(12.0))
-                .text_color(theme.accent)
-                .into_any_element()
-        };
-        let harness = self
-            .settings
-            .sidebar_show_harness
-            .then(|| row.target.config.as_ref().map(|config| config.harness))
-            .flatten();
-        let title_gap = if compact {
-            4.0
-        } else {
-            SIDEBAR_ACTIVE_HARNESS_TITLE_GAP
-        };
-        let mut title_icons = Some(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(title_gap))
-                .when_some(
-                    harness.map(crate::pickers::harness_brand_icon),
-                    |el, (path, tint)| {
-                        el.child(
-                            icon(path)
-                                .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
-                                .flex_none()
-                                .text_color(tint.unwrap_or(theme.text_muted).opacity(0.8)),
-                        )
-                    },
-                )
-                .child(leading_icon),
-        );
-        let host = self
-            .state
-            .read(cx)
+        let host = state
             .devices
             .iter()
             .find(|d| d.id == row.target.device_id)
@@ -344,8 +290,27 @@ impl Shell {
         let target = if host.is_empty() {
             label
         } else {
-            format!("{label} · {host}")
+            format!("{label} @ {host}")
         };
+        let selected = self.composer.read(cx).active_prompt_draft() == Some(row.id.as_str());
+        let subline = theme.text_muted.opacity(0.5);
+        // Drafts read as sessions-in-waiting: same geometry and type scale as
+        // session rows, with a pen standing in for the status glyph.
+        let project_icon = self.settings.sidebar_show_project_icon.then(|| {
+            self.render_space_project_icon(
+                &format!("draft-{}", row.id),
+                space.as_ref(),
+                Some(&row.target.device_id),
+                SIDEBAR_ACTIVE_HARNESS_ICON_SIZE,
+                false,
+                cx,
+            )
+        });
+        let harness = self
+            .settings
+            .sidebar_show_harness
+            .then(|| row.target.config.as_ref().map(|config| config.harness))
+            .flatten();
         let id = row.id.clone();
         let discard = row.id.clone();
         let activate = row.clone();
@@ -361,20 +326,143 @@ impl Shell {
             cx.has_active_drag() && self.draft_drop_target.as_ref() == Some(&(id.clone(), false));
         let drop_below =
             cx.has_active_drag() && self.draft_drop_target.as_ref() == Some(&(id.clone(), true));
+
+        let (status_label, status_color) = if row.conflict {
+            ("Recovered", theme.warning)
+        } else {
+            ("Draft", theme.text_muted)
+        };
+        // The corner shows the draft badge at rest and swaps to Discard while
+        // the row is hovered, mirroring the session rows' Archive swap.
+        let rest = div()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .group_hover("sidebar-session-row", |s| s.opacity(0.0))
+            .when(compact, |el| el.justify_center())
+            .child(
+                icon(icons::PEN)
+                    .size(px(if compact { 11.0 } else { 10.0 }))
+                    .flex_none()
+                    .text_color(status_color),
+            )
+            .when(!compact, |el| {
+                el.child(
+                    div()
+                        .text_size(crate::typography::ui_rems(10.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(status_color)
+                        .child(status_label),
+                )
+            });
+        let discard_button = div()
+            .id(SharedString::from(format!("discard-draft-{id}")))
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right_0()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .opacity(0.0)
+            .group_hover("sidebar-session-row", |s| s.opacity(1.0))
+            .when(!compact, |el| {
+                el.h(px(18.0))
+                    .top(px(-2.0))
+                    .px(px(4.0))
+                    .mr(px(-4.0))
+                    .rounded(px(5.0))
+                    .bg(crate::theme::wash(0.10))
+                    .hover(|s| s.bg(crate::theme::wash(0.18)))
+            })
+            .when(compact, |el| el.left_0().justify_center())
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.change_prompt_draft(
+                    DraftChange::Discard {
+                        id: discard.clone(),
+                    },
+                    cx,
+                );
+                if this.composer.read(cx).active_prompt_draft() == Some(discard.as_str()) {
+                    this.composer
+                        .update(cx, |composer, cx| composer.abandon_prompt_draft(cx));
+                }
+            }))
+            .tooltip(crate::settings::widgets::text_tooltip_above(
+                "Discard draft",
+            ))
+            .child(
+                icon(icons::CLOSE)
+                    .size(px(if compact {
+                        SIDEBAR_ACTIVE_HARNESS_ICON_SIZE
+                    } else {
+                        11.0
+                    }))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            )
+            .when(!compact, |el| {
+                el.child(
+                    div()
+                        .text_size(crate::typography::ui_rems(10.0))
+                        .text_color(theme.text_muted)
+                        .child("Discard"),
+                )
+            });
+        let corner = div()
+            .relative()
+            .flex_none()
+            .h(px(14.0))
+            .flex()
+            .items_center()
+            .when(compact, |el| el.w(px(18.0)).justify_center())
+            .child(rest)
+            .child(discard_button);
+        let mut corner = Some(corner);
+
+        let preview = sidebar_faded_label(
+            format!("draft-title-{id}").into(),
+            true,
+            div()
+                .text_size(crate::typography::ui_rems(13.0))
+                .line_height(px(17.0))
+                .child(row.preview.clone()),
+        );
+        let fade_key = format!("draft-row-{id}-hover");
+        let rest_bg = if selected {
+            crate::theme::glass_selected_bg()
+        } else {
+            crate::theme::wash(0.0)
+        };
+        let hover_bg = if selected {
+            crate::theme::glass_selected_bg()
+        } else {
+            theme.glass_hover()
+        };
+        let rest_text = if selected {
+            theme.text
+        } else {
+            theme.text.opacity(0.8)
+        };
         div()
             .id(SharedString::from(format!("draft-row-{id}")))
             .group("sidebar-session-row")
             .h(px(self.prompt_draft_row_height()))
             .w_full()
-            .rounded(px(6.0))
-            .px(px(10.0))
-            .py(px(if compact { 0.0 } else { 8.0 }))
             .flex()
             .flex_col()
             .when(compact, |el| el.justify_center())
-            .gap(px(4.0))
+            .gap(px(2.0))
+            .rounded(px(8.0))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
+            .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
+            .on_hover(motion::hover_listener(fade_key.clone()))
             .cursor_pointer()
-            .hover(|style| style.bg(theme.glass_hover()))
             .when(drop_above, |el| el.border_t_2().border_color(theme.accent))
             .when(drop_below, |el| el.border_b_2().border_color(theme.accent))
             .when_some(drag, |el, drag| {
@@ -407,73 +495,54 @@ impl Shell {
                 });
                 cx.notify();
             }))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(title_gap))
-                    .when(compact, |el| el.children(title_icons.take()))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::typography::ui_rems(if compact {
-                                12.0
-                            } else {
-                                11.0
-                            }))
-                            .text_color(theme.accent)
-                            .child(if compact { preview.clone() } else { target }),
-                    )
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("discard-draft-{id}")))
-                            .size(px(18.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.change_prompt_draft(
-                                    DraftChange::Discard {
-                                        id: discard.clone(),
-                                    },
-                                    cx,
-                                );
-                                if this.composer.read(cx).active_prompt_draft()
-                                    == Some(discard.as_str())
-                                {
-                                    this.composer.update(cx, |composer, cx| {
-                                        composer.abandon_prompt_draft(cx)
-                                    });
-                                }
-                            }))
-                            .child(
-                                icon(icons::CLOSE)
-                                    .size(px(12.0))
-                                    .text_color(theme.text_muted),
-                            ),
-                    ),
-            )
+            // Line 1: "project @ device", draft badge / Discard right.
             .when(!compact, |el| {
                 el.child(
                     div()
+                        .w_full()
                         .flex()
+                        .flex_row()
                         .items_center()
-                        .gap(px(title_gap))
-                        .children(title_icons)
-                        .child(
+                        .gap(px(Theme::SPACE_SM))
+                        .child(sidebar_faded_label(
+                            format!("draft-target-{id}").into(),
+                            true,
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(crate::typography::ui_rems(12.0))
-                                .text_color(theme.accent)
-                                .child(preview),
-                        ),
+                                .text_size(crate::typography::ui_rems(11.0))
+                                .line_height(px(14.0))
+                                .text_color(subline)
+                                .child(target),
+                        ))
+                        .children(corner.take()),
                 )
             })
+            // Line 2: harness and project identity lead the prompt preview.
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(if compact {
+                        4.0
+                    } else {
+                        SIDEBAR_ACTIVE_HARNESS_TITLE_GAP
+                    }))
+                    .when_some(
+                        harness.map(crate::pickers::harness_brand_icon),
+                        |el, (path, tint)| {
+                            el.child(
+                                icon(path)
+                                    .size(px(SIDEBAR_ACTIVE_HARNESS_ICON_SIZE))
+                                    .flex_none()
+                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                            )
+                        },
+                    )
+                    .children(project_icon)
+                    .child(preview)
+                    .children(corner),
+            )
             .into_any_element()
     }
 }

@@ -23,8 +23,10 @@ pub mod composer;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
+pub mod generative_art;
 pub mod home_visual;
 pub mod notifications;
+pub mod script_card;
 pub mod shortcuts;
 pub mod thread_naming;
 pub mod wallpaper;
@@ -115,6 +117,28 @@ impl Default for NewThreadBackgroundAdjustment {
             focal_x: 0.5,
             focal_y: 0.5,
             zoom: 1.0,
+        }
+    }
+}
+
+/// What fills the new-thread background.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NewThreadBackgroundSource {
+    /// The chosen image, with its framing and effect.
+    #[default]
+    Image,
+    /// The user's generative art (`new_thread_generative_art`).
+    Generative,
+}
+
+impl NewThreadBackgroundSource {
+    pub const ALL: [Self; 2] = [Self::Image, Self::Generative];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Image => "Image",
+            Self::Generative => "Generative",
         }
     }
 }
@@ -485,6 +509,8 @@ fn commit_background(
     wallpaper::remember(&mut next.wallpaper_history, source);
     next.wallpaper_source = Some(source.to_path_buf());
     next.wallpaper_color = color;
+    // A newly chosen image is what the user wants to see.
+    next.new_thread_background_source = NewThreadBackgroundSource::Image;
     let previous = next
         .new_thread_composer_background
         .replace(replacement.clone());
@@ -549,6 +575,41 @@ pub fn set_new_thread_visual(script: Option<String>, cx: &mut App) {
     if update(SavePolicy::Immediate, cx, |settings| {
         settings.new_thread_visual = script;
     }) {
+        cx.refresh_windows();
+    }
+}
+
+pub fn set_new_thread_background_source(source: NewThreadBackgroundSource, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.new_thread_background_source = source;
+    }) {
+        if current(cx).wallpaper_theme_colors {
+            crate::appearance::apply(cx);
+        }
+        cx.refresh_windows();
+    }
+}
+
+/// Save the generative background with the color sampled from one of its
+/// frames, and show it; `None` clears it and returns to the image. Callers
+/// check the script first; see `settings::generative_art`.
+pub fn set_new_thread_generative_art(
+    art: Option<(String, Option<zeron_theme::Color>)>,
+    cx: &mut App,
+) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        let (script, color) = art.map_or((None, None), |(script, color)| (Some(script), color));
+        settings.new_thread_background_source = if script.is_some() {
+            NewThreadBackgroundSource::Generative
+        } else {
+            NewThreadBackgroundSource::Image
+        };
+        settings.new_thread_generative_art = script;
+        settings.new_thread_generative_color = color;
+    }) {
+        if current(cx).wallpaper_theme_colors {
+            crate::appearance::apply(cx);
+        }
         cx.refresh_windows();
     }
 }
@@ -1013,6 +1074,17 @@ pub struct UiSettings {
     pub wallpaper_color: Option<zeron_theme::Color>,
     /// Non-destructive treatment composited inside the artwork's fade mask.
     pub new_thread_background_effect: NewThreadBackgroundEffect,
+    /// Which background shows behind the new-thread composer. The image and
+    /// the generative art are both kept, so switching loses neither.
+    pub new_thread_background_source: NewThreadBackgroundSource,
+    /// The user's generative background: a Luau script whose `ui.shader`
+    /// renders at the background's size. Checked before it is saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_thread_generative_art: Option<String>,
+    /// The generative art's dominant color, sampled from a frame when it
+    /// was saved, for "Match wallpaper colors".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_thread_generative_color: Option<zeron_theme::Color>,
     /// The user's own Luau visual (the `show_visual` script format), drawn
     /// below the blank new-thread composer. Checked before it is saved.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1120,6 +1192,9 @@ impl Default for UiSettings {
             wallpaper_theme_colors: false,
             wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
+            new_thread_background_source: NewThreadBackgroundSource::Image,
+            new_thread_generative_art: None,
+            new_thread_generative_color: None,
             new_thread_visual: None,
             reduce_motion: crate::motion::ReduceMotion::System,
             pause_animations_in_background: false,
@@ -1766,6 +1841,9 @@ impl UiSettings {
             wallpaper_theme_colors,
             wallpaper_color,
             new_thread_background_effect,
+            new_thread_background_source,
+            new_thread_generative_art,
+            new_thread_generative_color,
             new_thread_visual,
             reduce_motion,
             pause_animations_in_background,
@@ -2871,6 +2949,9 @@ mod tests {
             wallpaper_theme_colors: false,
             wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
+            new_thread_background_source: NewThreadBackgroundSource::Generative,
+            new_thread_generative_art: Some("return function() return ui.shader { height = 80, code = [[void mainImage(out vec4 c, in vec2 p) { c = vec4(1.0); }]] } end".into()),
+            new_thread_generative_color: Some(zeron_theme::Color::rgb(12, 34, 56)),
             new_thread_visual: Some("return function() return ui.text \"Hi\" end".into()),
             reduce_motion: crate::motion::ReduceMotion::On,
             pause_animations_in_background: true,

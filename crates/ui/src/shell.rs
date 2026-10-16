@@ -1373,6 +1373,19 @@ fn bottom_stack_measurement_matches(
     measured_has_composer == expected_has_composer
 }
 
+/// What the new-thread background shows this frame.
+pub(crate) struct NewThreadArtwork {
+    pub image: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// Identifies the source across frames: the image's path, or the
+    /// generative art's key.
+    pub key: Option<std::path::PathBuf>,
+    pub adjustment: settings::NewThreadBackgroundAdjustment,
+    /// A background is chosen (`image` None then means still loading).
+    pub enabled: bool,
+    /// Frames of one source replace each other (the generative art).
+    pub live: bool,
+}
+
 /// Space between the new-thread composer and the home visual, and below the
 /// visual when no Home notice sits at the window bottom.
 const HOME_VISUAL_GAP: f32 = 24.0;
@@ -1980,6 +1993,8 @@ pub struct Shell {
     /// The user's Luau visual below the blank new-thread composer, and the
     /// script it runs (rebuilt when Settings saves another).
     home_visual: Option<(String, Entity<crate::visuals::VisualFrame>)>,
+    /// The generative new-thread background while it is chosen.
+    generative_background: Option<crate::new_thread_generative::GenerativeBackground>,
     /// The persistent composer, and the column the home visual is placed
     /// in, as last painted (window coordinates).
     home_composer_bounds: crate::new_thread_background_mask::SurfaceBounds,
@@ -2542,6 +2557,7 @@ impl Shell {
             composer_dock: Default::default(),
             new_thread_artwork_ready: Default::default(),
             home_visual: None,
+            generative_background: None,
             home_composer_bounds: Default::default(),
             home_visual_origin: Default::default(),
             archived_open: true,
@@ -11030,39 +11046,38 @@ impl Shell {
             (has_spaces || no_project || has_appshots) && has_selection,
         );
         let ui_settings = settings::current(cx);
-        let new_thread_background_setting = ui_settings.new_thread_composer_background;
-        let new_thread_background_effect = ui_settings.new_thread_background_effect;
-        let new_thread_background_adjustment = new_thread_background_setting
-            .as_ref()
-            .map(|background| background.adjustment)
-            .unwrap_or_default();
         let frame_time = self.render_time.unwrap_or_else(std::time::Instant::now);
-        // Prewarm even in an established thread. Decode/effect work is not
-        // contingent on a hero measurement or a navigation gesture.
-        let artwork = new_thread_background_setting
-            .as_ref()
-            .and_then(|background| {
-                crate::new_thread_background_effects::prepare(
-                    new_thread_background_effect,
-                    theme,
-                    std::path::Path::new(&background.path),
-                    cx,
-                )
-            });
-        let artwork_frame = self.new_thread_artwork_ready.frame(
-            artwork,
-            new_thread_background_setting
-                .as_ref()
-                .map(|background| std::path::Path::new(&background.path)),
-            new_thread_background_adjustment,
-            new_thread_background_setting.is_some(),
-            self.reduced_motion,
-            frame_time,
-        );
         let dock_frame =
             self.composer_dock
                 .borrow_mut()
                 .tick(has_selection, self.reduced_motion, frame_time);
+        // Prewarm even in an established thread. Decode/effect work is not
+        // contingent on a hero measurement or a navigation gesture; only the
+        // generative art renders just while the hero shows.
+        let hero_size = (
+            (self.viewport_width - self.sidebar_now()).max(0.0),
+            new_thread_background_height(self.viewport_height),
+        );
+        let artwork = self.new_thread_artwork(
+            &ui_settings,
+            theme,
+            hero_size,
+            !has_selection || dock_frame.active,
+            window,
+            cx,
+        );
+        if let (true, Some(key)) = (artwork.live, artwork.key.as_deref()) {
+            self.new_thread_artwork_ready
+                .adopt_live_frame(artwork.image.as_ref(), key);
+        }
+        let artwork_frame = self.new_thread_artwork_ready.frame(
+            artwork.image,
+            artwork.key.as_deref(),
+            artwork.adjustment,
+            artwork.enabled,
+            self.reduced_motion,
+            frame_time,
+        );
         if dock_frame.active {
             self.motion_active.set(true);
         }
@@ -11441,6 +11456,83 @@ impl Shell {
             .child(Self::attachment_drop_overlay(theme))
             .child(Self::mention_drop_overlay(theme))
             .into_any_element()
+    }
+
+    /// The new-thread background's source image this frame: the generative
+    /// art's newest frame while it is chosen and can run here, otherwise the
+    /// image with its effect. `painted` says the caller paints it this frame;
+    /// generative art renders only then, so a hidden background stops.
+    pub(crate) fn new_thread_artwork(
+        &mut self,
+        ui_settings: &settings::UiSettings,
+        theme: &Theme,
+        size: (f32, f32),
+        painted: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> NewThreadArtwork {
+        let generative = matches!(
+            ui_settings.new_thread_background_source,
+            settings::NewThreadBackgroundSource::Generative
+        );
+        let script = ui_settings
+            .new_thread_generative_art
+            .as_deref()
+            .filter(|_| generative);
+        if self.generative_background.as_ref().map(|art| art.script()) != script {
+            let images = self
+                .generative_background
+                .take()
+                .and_then(|mut art| art.take_image());
+            crate::visuals::free_images(images.into_iter().collect(), cx);
+            self.generative_background =
+                script.map(crate::new_thread_generative::GenerativeBackground::new);
+        }
+        match self.generative_background.as_mut() {
+            // Without a GPU the image shows instead.
+            Some(art) if !art.failed() => {
+                let image = if painted {
+                    art.frame(size, window.scale_factor(), self.reduced_motion, cx)
+                } else {
+                    None
+                };
+                return NewThreadArtwork {
+                    image,
+                    key: Some(art.key().to_path_buf()),
+                    adjustment: Default::default(),
+                    enabled: true,
+                    live: true,
+                };
+            }
+            // Generative chosen with no art yet: nothing shows.
+            None if generative => {
+                return NewThreadArtwork {
+                    image: None,
+                    key: None,
+                    adjustment: Default::default(),
+                    enabled: false,
+                    live: false,
+                };
+            }
+            _ => {}
+        }
+        let background = ui_settings.new_thread_composer_background.as_ref();
+        NewThreadArtwork {
+            image: background.and_then(|background| {
+                crate::new_thread_background_effects::prepare(
+                    ui_settings.new_thread_background_effect,
+                    theme,
+                    std::path::Path::new(&background.path),
+                    cx,
+                )
+            }),
+            key: background.map(|background| std::path::PathBuf::from(&background.path)),
+            adjustment: background
+                .map(|background| background.adjustment)
+                .unwrap_or_default(),
+            enabled: background.is_some(),
+            live: false,
+        }
     }
 
     /// The user's Luau visual (Settings → Appearance → Home visual) in the

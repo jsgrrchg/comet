@@ -7,19 +7,22 @@ use zeron_proto::{DraftChange, PromptDraft};
 pub(super) struct DraftDrag {
     id: String,
     profile: String,
-    label: String,
 }
-impl Render for DraftDrag {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.global::<Theme>();
-        div()
-            .px(px(12.0))
-            .py(px(8.0))
-            .rounded(px(6.0))
-            .bg(theme.accent_wash)
-            .text_color(theme.accent)
-            .child(self.label.clone())
-    }
+
+/// A draft lifted out of the list. Like a dragged session row it keeps its
+/// column and follows the pointer as frosted glass while its siblings slide
+/// between slots; released anywhere but the Drafts section it slides home.
+pub(super) struct DraftLift {
+    id: String,
+    ids: Vec<String>,
+    from: usize,
+    over: usize,
+    prev_over: usize,
+    epoch: u64,
+    origin: std::rc::Rc<std::cell::Cell<gpui::Bounds<Pixels>>>,
+    cursor_offset: Point<Pixels>,
+    pointer: Point<Pixels>,
+    returning: bool,
 }
 
 pub(super) struct PendingDraftChanges {
@@ -31,37 +34,188 @@ impl Shell {
         sidebar_row_height(self.settings.sidebar_compact, true, false, false)
     }
 
-    fn finish_draft_drop(&mut self, payload: &DraftDrag, cx: &mut Context<Self>) {
-        if self.active_sidebar_pin_profile_key(cx).as_ref() != Some(&payload.profile) {
-            return;
-        }
-        let Some((anchor, after)) = self.draft_drop_target.take() else {
-            return;
-        };
-        if anchor == payload.id {
-            return;
-        }
-        let rows: Vec<_> = self
+    fn begin_draft_lift(
+        &mut self,
+        payload: &DraftDrag,
+        cursor_offset: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ids: Vec<String> = self
             .visible_prompt_drafts(cx)
             .into_iter()
-            .filter(|r| r.id != payload.id)
+            .map(|row| row.id)
             .collect();
-        let Some(index) = rows
-            .iter()
-            .position(|r| r.id == anchor)
-            .map(|i| i + usize::from(after))
+        let Some(from) = ids.iter().position(|id| id == &payload.id) else {
+            return;
+        };
+        self.pinned_session_drag_generation = self.pinned_session_drag_generation.wrapping_add(1);
+        let pointer = window.mouse_position();
+        let width = f32::from(self.sidebar_scroll.bounds().size.width) - 2.0 * Theme::SPACE_SM;
+        self.draft_lift = Some(DraftLift {
+            id: payload.id.clone(),
+            ids,
+            from,
+            over: from,
+            prev_over: from,
+            epoch: self.pinned_session_drag_generation << 32,
+            origin: std::rc::Rc::new(std::cell::Cell::new(gpui::Bounds::new(
+                pointer - cursor_offset,
+                gpui::size(px(width.max(0.0)), px(self.prompt_draft_row_height())),
+            ))),
+            cursor_offset,
+            pointer,
+            returning: false,
+        });
+        self.scroll_draft_drag(f32::from(pointer.y), cx);
+        cx.notify();
+    }
+
+    fn move_draft_lift(&mut self, event: &gpui::DragMoveEvent<DraftDrag>, cx: &mut Context<Self>) {
+        let id = event.drag(cx).id.clone();
+        let row_height = self.prompt_draft_row_height();
+        let Some(lift) = self
+            .draft_lift
+            .as_mut()
+            .filter(|lift| lift.id == id && !lift.returning)
         else {
             return;
         };
+        lift.pointer = event.event.position;
+        let rel_y = f32::from(event.event.position.y - event.bounds.top());
+        let heights = vec![row_height; lift.ids.len()];
+        if let Some(over) = spaces::row_drop_index(rel_y, &heights, true)
+            && over != lift.over
+        {
+            lift.prev_over = lift.over;
+            lift.over = over;
+            lift.epoch = lift.epoch.wrapping_add(1);
+        }
+        self.scroll_draft_drag(f32::from(event.event.position.y), cx);
+        cx.notify();
+    }
+
+    /// Ends a lift without a move: the row and its siblings ease back.
+    fn return_draft_lift(&mut self, cx: &mut Context<Self>) {
+        let Some(lift) = self.draft_lift.as_mut().filter(|lift| !lift.returning) else {
+            return;
+        };
+        if self.reduced_motion {
+            self.draft_lift = None;
+            cx.notify();
+            return;
+        }
+        lift.returning = true;
+        lift.prev_over = lift.over;
+        lift.over = lift.from;
+        lift.epoch = lift.epoch.wrapping_add(1);
+        let epoch = lift.epoch;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(TAB_SLIDE.total()).await;
+            this.update(cx, |shell, cx| {
+                if shell
+                    .draft_lift
+                    .as_ref()
+                    .is_some_and(|lift| lift.epoch == epoch)
+                {
+                    shell.draft_lift = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn finish_draft_drop(&mut self, payload: &DraftDrag, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .visible_prompt_drafts(cx)
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        let valid = self.active_sidebar_pin_profile_key(cx).as_ref() == Some(&payload.profile)
+            && self
+                .draft_lift
+                .as_ref()
+                .is_some_and(|lift| lift.id == payload.id && !lift.returning && lift.ids == ids);
+        let Some((from, over)) = self
+            .draft_lift
+            .as_ref()
+            .filter(|lift| valid && lift.over != lift.from)
+            .map(|lift| (lift.from, lift.over))
+        else {
+            self.return_draft_lift(cx);
+            return;
+        };
+        let mut rest = ids;
+        rest.remove(from);
+        self.draft_lift = None;
         self.change_prompt_draft(
             DraftChange::Move {
                 id: payload.id.clone(),
-                before: rows.get(index).map(|r| r.id.clone()),
-                after: index.checked_sub(1).map(|i| rows[i].id.clone()),
+                before: rest.get(over).cloned(),
+                after: over.checked_sub(1).map(|i| rest[i].clone()),
             },
             cx,
         );
     }
+
+    fn render_lifted_draft(&self, row: AnyElement, theme: &Theme) -> Option<AnyElement> {
+        let lift = self.draft_lift.as_ref()?;
+        let origin = lift.origin.get();
+        let height = self.prompt_draft_row_height();
+        let lifted = lift.pointer - lift.cursor_offset;
+        let frame = div()
+            .relative()
+            .w(origin.size.width)
+            .h(px(height))
+            .rounded(px(8.0));
+        // Window coordinates, drawn above the sidebar's clip: the same lifted
+        // glass as a dragged session row, settling back unlifted.
+        let (position, frame) = if lift.returning {
+            let dy = f32::from(lifted.y - origin.origin.y);
+            (
+                origin.origin,
+                frame
+                    .child(row)
+                    .with_animation(
+                        ("sidebar-draft-return", lift.epoch),
+                        TAB_SLIDE.animation(),
+                        move |el, t| el.top(px(motion::lerp(dy, 0.0, t))),
+                    )
+                    .into_any_element(),
+            )
+        } else {
+            (
+                gpui::point(origin.origin.x, lifted.y),
+                frame
+                    .child(crate::frost::frosted(
+                        8.0,
+                        crate::frost::MENU_BLUR,
+                        div()
+                            .size_full()
+                            .rounded(px(8.0))
+                            .bg(crate::popover::surface_bg(theme))
+                            .shadow_md()
+                            .child(
+                                div()
+                                    .size_full()
+                                    .rounded(px(8.0))
+                                    .bg(crate::theme::wash(0.06))
+                                    .child(row),
+                            ),
+                    ))
+                    .into_any_element(),
+            )
+        };
+        Some(
+            gpui::deferred(gpui::anchored().position(position).child(frame))
+                .with_priority(1)
+                .into_any_element(),
+        )
+    }
+
     fn scroll_draft_drag(&mut self, y: f32, cx: &mut Context<Self>) {
         self.draft_drag_y = y;
         if self.draft_drag_scroll.is_some() {
@@ -76,7 +230,7 @@ impl Shell {
                     .update(cx, |shell, cx| {
                         if !cx.has_active_drag() {
                             shell.draft_drag_scroll = None;
-                            shell.draft_drop_target = None;
+                            shell.return_draft_lift(cx);
                             cx.notify();
                             return false;
                         }
@@ -222,9 +376,17 @@ impl Shell {
         if rows.is_empty() {
             return None;
         }
+        if self.draft_lift.as_ref().is_some_and(|lift| {
+            lift.ids.len() != rows.len()
+                || lift.ids.iter().zip(&rows).any(|(id, row)| id != &row.id)
+        }) {
+            self.draft_lift = None;
+        }
         let open = self.drafts_open;
         let count = (!open).then_some(rows.len());
-        let height = rows.len() as f32 * self.prompt_draft_row_height()
+        let row_height = self.prompt_draft_row_height();
+        let height = rows.len() as f32 * row_height
+            + rows.len().saturating_sub(1) as f32 * SIDEBAR_LIST_GAP
             + spaces::SIDEBAR_DISCLOSURE_BODY_INSET;
         let chevron = self.sidebar_disclosure_chevron("drafts", open, theme);
         let header =
@@ -239,15 +401,77 @@ impl Shell {
                     this.drafts_open = !open;
                     cx.notify();
                 }));
-        let items: Vec<_> = rows
-            .into_iter()
-            .map(|row| self.render_prompt_draft_row(row, theme, cx))
-            .collect();
+        let slide = self.draft_lift.as_ref().map(|lift| {
+            (
+                lift.id.clone(),
+                lift.from,
+                lift.over,
+                lift.prev_over,
+                lift.epoch,
+            )
+        });
+        let step = row_height + SIDEBAR_LIST_GAP;
+        let mut lifted = None;
+        let mut items = Vec::with_capacity(rows.len());
+        for (ix, row) in rows.into_iter().enumerate() {
+            let is_lifted = slide.as_ref().is_some_and(|(id, ..)| id == &row.id);
+            let element = self.render_prompt_draft_row(row, is_lifted, theme, cx);
+            let Some((_, from, over, prev_over, epoch)) = &slide else {
+                items.push(element);
+                continue;
+            };
+            if is_lifted {
+                // The row itself rides the movement layer; its slot stays put
+                // and reports where the row settles back to.
+                lifted = Some(element);
+                let origin = self.draft_lift.as_ref().unwrap().origin.clone();
+                items.push(
+                    div()
+                        .child(div().h(px(row_height)))
+                        .on_children_prepainted(move |bounds, _, _| {
+                            if let Some(bounds) = bounds.first() {
+                                origin.set(*bounds);
+                            }
+                        })
+                        .into_any_element(),
+                );
+                continue;
+            }
+            let start = crate::terminal::panel::slide_offset(ix, *from, *prev_over) * step;
+            let target = crate::terminal::panel::slide_offset(ix, *from, *over) * step;
+            items.push(if self.reduced_motion {
+                div()
+                    .relative()
+                    .top(px(target))
+                    .child(element)
+                    .into_any_element()
+            } else {
+                div()
+                    .child(element)
+                    .with_animation(
+                        ("sidebar-draft-slide", (ix as u64) | (epoch << 32)),
+                        TAB_SLIDE.animation(),
+                        move |el, t| el.relative().top(px(motion::lerp(start, target, t))),
+                    )
+                    .into_any_element()
+            });
+        }
+        let lifted = lifted.and_then(|row| self.render_lifted_draft(row, theme));
         let body = div()
-            .flex()
-            .flex_col()
             .pt(px(spaces::SIDEBAR_DISCLOSURE_BODY_INSET))
-            .children(items)
+            .child(
+                div()
+                    .id("sidebar-drafts-list")
+                    .flex()
+                    .flex_col()
+                    .gap(px(SIDEBAR_LIST_GAP))
+                    .on_drag_move::<DraftDrag>(cx.listener(
+                        |this, event: &gpui::DragMoveEvent<DraftDrag>, _, cx| {
+                            this.move_draft_lift(event, cx)
+                        },
+                    ))
+                    .children(items),
+            )
             .into_any_element();
         Some(
             div()
@@ -255,14 +479,19 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .pb(px(8.0))
+                .on_drop::<DraftDrag>(
+                    cx.listener(|this, payload, _, cx| this.finish_draft_drop(payload, cx)),
+                )
                 .child(header)
                 .child(self.render_sidebar_disclosure_body("drafts", open, height, body))
+                .children(lifted)
                 .into_any_element(),
         )
     }
     fn render_prompt_draft_row(
         &mut self,
         row: PromptDraft,
+        lifted: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -316,16 +545,11 @@ impl Shell {
         let activate = row.clone();
         let drag = self
             .active_sidebar_pin_profile_key(cx)
+            .filter(|_| !lifted)
             .map(|profile| DraftDrag {
                 id: id.clone(),
                 profile,
-                label: row.preview.clone(),
             });
-        let over_id = id.clone();
-        let drop_above =
-            cx.has_active_drag() && self.draft_drop_target.as_ref() == Some(&(id.clone(), false));
-        let drop_below =
-            cx.has_active_drag() && self.draft_drop_target.as_ref() == Some(&(id.clone(), true));
 
         let (status_label, status_color) = if row.conflict {
             ("Recovered", theme.warning)
@@ -463,31 +687,16 @@ impl Shell {
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
             .on_hover(motion::hover_listener(fade_key.clone()))
             .cursor_pointer()
-            .when(drop_above, |el| el.border_t_2().border_color(theme.accent))
-            .when(drop_below, |el| el.border_b_2().border_color(theme.accent))
             .when_some(drag, |el, drag| {
-                el.on_drag(drag, |payload, _, _, cx| cx.new(|_| payload.clone()))
+                let shell = cx.entity();
+                el.on_drag(drag, move |payload, offset, window, cx| {
+                    shell.update(cx, |shell, cx| {
+                        shell.begin_draft_lift(payload, offset, window, cx)
+                    });
+                    cx.stop_propagation();
+                    cx.new(|_| DragGhost)
+                })
             })
-            .on_drag_move::<DraftDrag>(cx.listener(
-                move |this, event: &gpui::DragMoveEvent<DraftDrag>, _, cx| {
-                    if !event.bounds.contains(&event.event.position) {
-                        return;
-                    }
-                    let payload = event.drag(cx);
-                    if this.active_sidebar_pin_profile_key(cx).as_ref() != Some(&payload.profile) {
-                        return;
-                    }
-                    this.draft_drop_target = Some((
-                        over_id.clone(),
-                        event.event.position.y >= event.bounds.center().y,
-                    ));
-                    this.scroll_draft_drag(f32::from(event.event.position.y), cx);
-                    cx.notify();
-                },
-            ))
-            .on_drop::<DraftDrag>(
-                cx.listener(|this, payload, _, cx| this.finish_draft_drop(payload, cx)),
-            )
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.route = Route::Chat;
                 this.composer.update(cx, |composer, cx| {

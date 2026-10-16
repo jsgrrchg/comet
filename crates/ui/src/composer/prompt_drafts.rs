@@ -139,7 +139,7 @@ async fn load_bundle(engine: &EngineHandle, revision: &str) -> Result<DraftBundl
 }
 
 fn restore_images(bundle: &DraftBundle) -> Result<Vec<attachments::StagedAttachment>, String> {
-    bundle
+    let mut restored = bundle
         .content
         .attachments
         .iter()
@@ -150,21 +150,34 @@ fn restore_images(bundle: &DraftBundle) -> Result<Vec<attachments::StagedAttachm
                 .find(|b| b.blob == asset.blob)
                 .ok_or_else(|| format!("Missing draft attachment: {}", asset.name))?;
             let bytes = STANDARD.decode(&bytes.data).map_err(|e| e.to_string())?;
-            let format = attachments::format_by_extension(std::path::Path::new(&asset.name))
-                .ok_or_else(|| format!("Unsupported draft image: {}", asset.name))?;
+            let format = attachments::format_by_extension(std::path::Path::new(&asset.name));
             if let Some(meta) = &asset.appshot {
+                if format.is_none() {
+                    return Err(format!("Unsupported Appshot image: {}", asset.name));
+                }
                 serde_json::from_value::<appshots::AccessibilitySnapshot>(
                     meta["accessibility"].clone(),
                 )
                 .map_err(|e| format!("Invalid Appshot context: {e}"))?;
             }
+            // Images come back as pictures; any other file as its bytes.
+            let content = match format {
+                Some(format) => attachments::AttachmentContent::Image(Arc::new(
+                    gpui::Image::from_bytes(format, bytes),
+                )),
+                None => attachments::AttachmentContent::File(Arc::new(bytes)),
+            };
             Ok(attachments::StagedAttachment {
                 id: asset.id.clone(),
                 name: asset.name.clone(),
-                image: Arc::new(gpui::Image::from_bytes(format, bytes)),
+                content,
+                mention: None,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    // Chips in the restored prompt keep naming their attachments.
+    attachments::pair_with_chips(&bundle.content.prompt, &mut restored);
+    Ok(restored)
 }
 
 fn recovery_directory(state: &AppState) -> Option<std::path::PathBuf> {
@@ -882,7 +895,7 @@ mod tests {
             }],
         };
         let images = restore_images(&bundle).unwrap();
-        assert_eq!(images[0].image.format, gpui::ImageFormat::Jpeg);
+        assert_eq!(images[0].image().unwrap().format, gpui::ImageFormat::Jpeg);
         assert_eq!(images[0].id, "jpeg");
         bundle.assets.clear();
         assert!(restore_images(&bundle).is_err());
@@ -915,6 +928,7 @@ mod tests {
                         git_detected: true,
                         git_checked_at: None,
                         checkout_id: None,
+                        repository_id: None,
                         created_at: chrono::Utc::now(),
                     }];
                     state.selected_space = Some("project".into());

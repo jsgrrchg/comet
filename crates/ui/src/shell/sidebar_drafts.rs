@@ -227,15 +227,11 @@ impl Shell {
             return None;
         }
         let open = self.drafts_open;
-        let label = if open {
-            "Drafts".into()
-        } else {
-            format!("Drafts ({})", rows.len()).into()
-        };
+        let count = (!open).then_some(rows.len());
         let height = rows.len() as f32 * self.prompt_draft_row_height()
             + spaces::SIDEBAR_DISCLOSURE_BODY_INSET;
         let chevron = self.sidebar_disclosure_chevron("drafts", open, theme);
-        let header = spaces::sidebar_disclosure_header(theme, label, chevron)
+        let header = spaces::sidebar_disclosure_header(theme, None, "Drafts".into(), count, None, chevron)
             .id("drafts-toggle")
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.begin_sidebar_disclosure_motion(

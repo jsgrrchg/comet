@@ -420,7 +420,7 @@ mod tests {
                 }
                 doc.ack_batch(&batch.batch, 1);
             }
-            doc.apply_rows(1, server.values().cloned().collect());
+            let _ = doc.apply_rows(1, server.values().cloned().collect());
         }
         exchange(&mut a, &mut server);
         exchange(&mut b, &mut server);

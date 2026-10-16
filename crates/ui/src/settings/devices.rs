@@ -262,6 +262,7 @@ pub fn short_id(id: &str) -> String {
 
 impl Render for DevicesPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = Utc::now();
         let (devices, local_id, workspace_scope) = {
@@ -289,7 +290,9 @@ impl Render for DevicesPage {
             let rename_name = device.name.clone();
             let mut meta: Vec<AnyElement> = vec![
                 div()
-                    .child(SharedString::from(platform_label(&device.platform).to_string()))
+                    .child(SharedString::from(
+                        platform_label(&device.platform).to_string(),
+                    ))
                     .into_any_element(),
             ];
             if let Some(version) = device.version.as_deref().filter(|v| !v.is_empty()) {
@@ -340,9 +343,11 @@ impl Render for DevicesPage {
                             .role(gpui::Role::Button)
                             .aria_label(format!("Copy device ID {}", device.id))
                             .focus_visible(|s| s.border_2().border_color(theme.accent))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.copy_id(copy_id.clone(), cx);
-                            })),
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.copy_id(copy_id.clone(), cx);
+                                },
+                            )),
                         )
                         .child(
                             widgets::text_action(&theme, widgets::ActionTone::Filled, "Rename")
@@ -419,22 +424,6 @@ impl Render for DevicesPage {
                                     &theme,
                                     devices_subtitle(workspace_scope),
                                 ))
-                                .when_some(self.error.clone(), |el, message| {
-                                    el.child(
-                                        widgets::error_strip(&theme, message)
-                                            .id("devices-error")
-                                            .cursor_pointer()
-                                            .tab_index(0)
-                                            .role(gpui::Role::Button)
-                                            .focus_visible(|s| {
-                                                s.border_2().border_color(theme.accent).opacity(1.0)
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.error = None;
-                                                cx.notify();
-                                            })),
-                                    )
-                                })
                                 .child(card),
                         ),
                 )

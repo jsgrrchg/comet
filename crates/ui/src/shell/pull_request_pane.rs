@@ -2,7 +2,8 @@
 //! the board, so the list stays in view while one is inspected.
 
 use super::*;
-use crate::pull_request_detail::PullRequestDetailPage;
+use crate::changes::Changes;
+use crate::pull_request_detail::{PullRequestDetailEvent, PullRequestDetailPage};
 use crate::settings::PULL_REQUEST_PANE_DEFAULT;
 
 /// Drag marker for the pull request pane's resize handle.
@@ -18,6 +19,8 @@ pub(super) const PULL_REQUEST_TABS_MAX: usize = 8;
 #[derive(Clone)]
 pub(super) enum PaneTabContent {
     PullRequest(Entity<PullRequestDetailPage>),
+    /// One of the pull request's commits, read from GitHub.
+    CommitDiff(Entity<Changes>),
 }
 
 pub(super) struct PullRequestTab {
@@ -30,7 +33,7 @@ pub(super) struct PullRequestTab {
     pub(super) content: PaneTabContent,
     /// Activation stamp; the smallest is the least recently viewed.
     viewed: u64,
-    _subscription: Subscription,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl PullRequestTab {
@@ -38,6 +41,17 @@ impl PullRequestTab {
     pub(super) fn page(&self) -> Option<&Entity<PullRequestDetailPage>> {
         match &self.content {
             PaneTabContent::PullRequest(page) => Some(page),
+            PaneTabContent::CommitDiff(_) => None,
+        }
+    }
+
+    /// Whether the tab shows this pull request commit.
+    fn shows_commit(&self, url: &str, sha: &str, cx: &App) -> bool {
+        match &self.content {
+            PaneTabContent::CommitDiff(changes) => {
+                changes.read(cx).change_request_commit() == Some((url, sha))
+            }
+            PaneTabContent::PullRequest(_) => false,
         }
     }
 }
@@ -116,7 +130,7 @@ impl PullRequestPane {
         url: String,
         device: Option<String>,
         content: PaneTabContent,
-        subscription: Subscription,
+        subscriptions: Vec<Subscription>,
     ) -> usize {
         self.next_id += 1;
         let ix = ix.min(self.tabs.len());
@@ -128,7 +142,7 @@ impl PullRequestPane {
                 device,
                 content,
                 viewed: 0,
-                _subscription: subscription,
+                _subscriptions: subscriptions,
             },
         );
         ix
@@ -149,21 +163,34 @@ impl PullRequestPane {
         }
     }
 
-    /// Remove a tab. Closing the active one activates the tab that takes
-    /// its place, else the one before it.
+    /// Remove a tab. Closing the active one returns to the pull request a
+    /// commit tab came from, else activates the tab that takes its place,
+    /// else the one before it.
     fn remove(&mut self, ix: usize) {
         if ix >= self.tabs.len() {
             return;
         }
         let was_active = self.active_index() == Some(ix);
-        self.tabs.remove(ix);
+        let removed = self.tabs.remove(ix);
         if !was_active {
             return;
         }
         self.active = None;
-        if !self.tabs.is_empty() {
+        let origin = matches!(removed.content, PaneTabContent::CommitDiff(_))
+            .then(|| self.pull_request_index(&removed.url))
+            .flatten();
+        if let Some(origin) = origin {
+            self.activate(origin);
+        } else if !self.tabs.is_empty() {
             self.activate(ix.min(self.tabs.len() - 1));
         }
+    }
+
+    /// The tab showing the pull request at `url` itself.
+    fn pull_request_index(&self, url: &str) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|tab| tab.page().is_some() && tab.url == url)
     }
 }
 
@@ -310,11 +337,7 @@ impl Shell {
             self.pull_requests_page =
                 Some(cx.new(|cx| PullRequestsPage::new(self.state.clone(), cx)));
         }
-        let existing = self
-            .pull_request_pane
-            .tabs
-            .iter()
-            .position(|tab| tab.page().is_some() && tab.url == url);
+        let existing = self.pull_request_pane.pull_request_index(&url);
         let ix = match existing {
             Some(ix) => ix,
             None => {
@@ -333,18 +356,97 @@ impl Shell {
                         cx,
                     )
                 });
-                let subscription = cx.observe(&page, |_, _, cx| cx.notify());
+                let observe = cx.observe(&page, |_, _, cx| cx.notify());
+                // The page's requests are answered in this pane, beside it.
+                let events =
+                    cx.subscribe_in(&page, window, |this: &mut Self, _, event, window, cx| {
+                        match event {
+                            PullRequestDetailEvent::OpenCommit {
+                                url,
+                                device,
+                                commit,
+                            } => this.open_pull_request_commit_tab(
+                                url.clone(),
+                                device.clone(),
+                                commit.clone(),
+                                window,
+                                cx,
+                            ),
+                        }
+                    });
                 let pane = &mut self.pull_request_pane;
                 pane.insert(
                     pane.tabs.len(),
                     url.clone(),
                     target,
                     PaneTabContent::PullRequest(page),
-                    subscription,
+                    vec![observe, events],
                 )
             }
         };
         self.pull_request_pane.closing = None;
+        self.pull_request_pane.activate(ix);
+        self.pull_request_pane.trim();
+        self.set_pull_request_pane_open(true, cx);
+        self.sync_pull_request_selection(cx);
+        cx.notify();
+    }
+
+    /// A Commits row in one of the pane's pull requests: the commit's diff,
+    /// read from GitHub, opens as a tab just right of that pull request.
+    /// Opening the same commit again returns to its tab.
+    fn open_pull_request_commit_tab(
+        &mut self,
+        url: String,
+        device: Option<String>,
+        commit: zeron_proto::GitHistoryCommit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let existing = self
+            .pull_request_pane
+            .tabs
+            .iter()
+            .position(|tab| tab.shows_commit(&url, &commit.sha, cx));
+        if let Some(ix) = existing {
+            self.activate_pull_request_tab(ix, window, cx);
+            return;
+        }
+        // After the pull request and the commits already opened from it.
+        let tabs = &self.pull_request_pane.tabs;
+        let beside = match self.pull_request_pane.pull_request_index(&url) {
+            Some(origin) => {
+                let mut beside = origin + 1;
+                while tabs.get(beside).is_some_and(|tab| {
+                    tab.url == url && matches!(tab.content, PaneTabContent::CommitDiff(_))
+                }) {
+                    beside += 1;
+                }
+                beside
+            }
+            None => tabs.len(),
+        };
+        let changes = cx.new(|cx| {
+            Changes::for_change_request_commit(
+                self.state.clone(),
+                url.clone(),
+                device.clone(),
+                commit,
+                cx,
+            )
+        });
+        changes.update(cx, |changes, cx| changes.ensure_content(cx));
+        let observe = cx.observe(&changes, |_, _, cx| cx.notify());
+        let ix = self.pull_request_pane.insert(
+            beside,
+            url,
+            device,
+            PaneTabContent::CommitDiff(changes),
+            vec![observe],
+        );
+        self.pull_request_pane.closing = None;
+        self.navigation_focus.right_was_focused = true;
+        window.focus(&self.navigation_focus.right, cx);
         self.pull_request_pane.activate(ix);
         self.pull_request_pane.trim();
         self.set_pull_request_pane_open(true, cx);
@@ -363,12 +465,15 @@ impl Shell {
         let Some(tab) = self.pull_request_pane.tabs.get(ix) else {
             return;
         };
-        let entry = NavEntry::PullRequest {
-            url: tab.url.clone(),
-            device: tab.device.clone(),
-        };
-        if self.nav.current() != &entry {
-            self.nav.push(entry);
+        // Commit tabs stay out of history; Back returns past them.
+        if tab.page().is_some() {
+            let entry = NavEntry::PullRequest {
+                url: tab.url.clone(),
+                device: tab.device.clone(),
+            };
+            if self.nav.current() != &entry {
+                self.nav.push(entry);
+            }
         }
         // The old page's focused content is about to unmount. Keep keyboard
         // navigation in the pane, as activating a chat surface does.
@@ -666,6 +771,17 @@ impl Shell {
                     .child(div().flex_1().min_h_0().child(page))
                     .into_any_element()
             }
+            Some(PaneTabContent::CommitDiff(changes)) => {
+                changes.update(cx, |changes, cx| changes.ensure_content(cx));
+                let controls = changes.update(cx, |changes, cx| changes.render_header_controls(cx));
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(crate::surface_chrome::toolbar(&theme).child(controls))
+                    .child(div().flex_1().min_h_0().child(changes))
+                    .into_any_element()
+            }
             None => Empty.into_any_element(),
         };
         let panel = div()
@@ -741,7 +857,20 @@ impl Shell {
                 PaneTabContent::PullRequest(page) => {
                     let page = page.read(cx);
                     let (number, title) = page.identity();
-                    (number, title, page.is_loading())
+                    let label = match number {
+                        Some(number) => format!("#{number} {title}"),
+                        None => title.clone(),
+                    };
+                    (label, title, page.is_loading(), icons::PULL_REQUEST)
+                }
+                PaneTabContent::CommitDiff(changes) => {
+                    let changes = changes.read(cx);
+                    let title = changes.tab_title().to_string();
+                    let label = match changes.change_request_commit() {
+                        Some((_, sha)) => format!("{} {title}", &sha[..sha.len().min(7)]),
+                        None => title.clone(),
+                    };
+                    (label, title, changes.is_loading(), icons::GIT_COMMIT)
                 }
             })
             .collect();
@@ -777,13 +906,9 @@ impl Shell {
             .on_drop::<PullRequestTabDrag>(
                 cx.listener(|this, payload, _, cx| this.drop_pull_request_tab(payload, cx)),
             );
-        for (ix, (number, title, loading)) in rows.into_iter().enumerate() {
+        for (ix, (label, title, loading, icon)) in rows.into_iter().enumerate() {
             let is_active = active == Some(ix);
-            let label: SharedString = match number {
-                Some(number) => format!("#{number} {title}"),
-                None => title.clone(),
-            }
-            .into();
+            let label: SharedString = label.into();
             let leading = if loading {
                 loaders::mini_glyph_spinner(
                     format!("pull-request-tab-{ix}"),
@@ -794,7 +919,7 @@ impl Shell {
                 )
                 .into_any_element()
             } else {
-                crate::surface_chrome::tab_chip_icon(icons::PULL_REQUEST, is_active, &theme)
+                crate::surface_chrome::tab_chip_icon(icon, is_active, &theme)
             };
             let tooltip = label.clone();
             let ghost_title: SharedString = title.clone().into();

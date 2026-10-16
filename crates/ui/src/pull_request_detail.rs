@@ -6,7 +6,6 @@ mod handoff;
 #[path = "pull_request_interactions.rs"]
 mod interactions;
 use crate::{
-    history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistorySearchControl},
     settings::{self, PullRequestDestination, widgets},
     state::AppState,
     theme::Theme,
@@ -138,24 +137,17 @@ pub fn open_on_device(url: &str, device: Option<String>, window: &mut Window, cx
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Summary,
-    Commits,
     Code,
     Activity,
 }
 
 /// Navigation segments in display order: (tab, label, element id, glyph).
-const TABS: [(Tab, &str, &str, &str); 4] = [
+const TABS: [(Tab, &str, &str, &str); 3] = [
     (
         Tab::Summary,
         "Summary",
         "pr-summary",
         crate::icons::DOCUMENT,
-    ),
-    (
-        Tab::Commits,
-        "Commits",
-        "pr-commits",
-        crate::icons::GIT_COMMIT,
     ),
     (Tab::Code, "Code", "pr-code", crate::icons::FILE_CODE),
     (
@@ -188,8 +180,8 @@ const NAV_HEIGHT: f32 = NAV_SEGMENT_HEIGHT + 2.0 * (NAV_SEGMENT_INSET + NAV_PADD
 /// tightens its gutters.
 const NARROW_PAGE: f32 = 480.0;
 /// Below this page width the section navigation shows glyphs and counts
-/// only; the labels no longer fit four equal segments.
-const COMPACT_NAV_PAGE: f32 = 560.0;
+/// only; the labels no longer fit three equal segments.
+const COMPACT_NAV_PAGE: f32 = 440.0;
 /// The content column's gutter on narrow pages.
 const NARROW_PAD_X: f32 = 16.0;
 
@@ -423,15 +415,6 @@ impl Default for CodeReview {
     }
 }
 
-/// The Commits tab: the shared history graph over the pull request's
-/// commits, with its count and search controls.
-struct CommitHistory {
-    graph: Entity<GitHistory>,
-    count: Entity<GitHistoryCount>,
-    search: Entity<GitHistorySearchControl>,
-    _events: Subscription,
-}
-
 pub struct PullRequestDetailPage {
     state: Entity<AppState>,
     pub url: String,
@@ -463,12 +446,10 @@ pub struct PullRequestDetailPage {
     commits_error: Option<String>,
     /// Refresh invalidated the listing; bypass the engine cache until it lands.
     commits_refresh_owed: bool,
-    /// The Commits tab's history graph, created on first visit.
-    history: Option<CommitHistory>,
     tab: Tab,
     checks_expanded: bool,
     tab_slide: crate::motion::IndicatorSlide,
-    tab_focus: [gpui::FocusHandle; 4],
+    tab_focus: [gpui::FocusHandle; 3],
     /// The file tree is one Tab stop; arrow keys move between files.
     tree_focus: gpui::FocusHandle,
     /// The narrow layout's file picker trigger, refocused when it closes.
@@ -549,11 +530,10 @@ impl PullRequestDetailPage {
             commits_task: None,
             commits_error: None,
             commits_refresh_owed: false,
-            history: None,
             tab: Tab::Summary,
             checks_expanded: false,
             tab_slide: crate::motion::IndicatorSlide::at(tab_slot(Tab::Summary), Instant::now()),
-            tab_focus: std::array::from_fn(|_| cx.focus_handle()),
+            tab_focus: [cx.focus_handle(), cx.focus_handle(), cx.focus_handle()],
             tree_focus: cx.focus_handle().tab_stop(true),
             files_focus: cx.focus_handle().tab_stop(true),
             return_focus: None,
@@ -976,7 +956,7 @@ impl PullRequestDetailPage {
                     if page.tab == Tab::Code && page.diff.is_none() {
                         page.load_diff(false, cx);
                     }
-                    if page.tab == Tab::Commits && page.commits.is_none() {
+                    if page.tab == Tab::Activity && page.commits.is_none() {
                         page.load_commits(false, cx);
                     }
                 }
@@ -1087,17 +1067,15 @@ impl PullRequestDetailPage {
         if self.loading || self.detail.is_none() {
             return;
         }
+        // Without a connection the detail itself says so; the thread stays
+        // the conversation alone.
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.commits_error = Some("Connect to your device to load the commits.".into());
             return;
         };
         self.commits_error = None;
         let mut params = self.params(refresh || self.commits_refresh_owed);
         params.as_object_mut().unwrap().remove("baseRefOid");
         let head = self.detail.as_ref().unwrap().head_ref_oid.clone();
-        self.commit_history(cx)
-            .graph
-            .update(cx, |history, cx| history.set_loading(cx));
         self.commits_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -1134,7 +1112,6 @@ impl PullRequestDetailPage {
                             );
                         }
                         page.commits = Some(commits);
-                        page.show_commits(cx);
                     }
                     Err(error) => {
                         page.commits_error = Some(error);
@@ -1143,42 +1120,6 @@ impl PullRequestDetailPage {
                 cx.notify();
             });
         }));
-    }
-
-    /// The Commits tab's graph and its header controls, made on first use.
-    fn commit_history(&mut self, cx: &mut Context<Self>) -> &CommitHistory {
-        if self.history.is_none() {
-            let graph = cx.new(|_| GitHistory::provided(self.state.clone(), self.url.clone()));
-            let count = cx.new(|cx| GitHistoryCount::new(graph.clone(), cx));
-            let search = cx.new(|cx| GitHistorySearchControl::new(graph.clone(), cx));
-            let events = cx.subscribe(&graph, |page: &mut Self, _, event, cx| {
-                if let GitHistoryEvent::OpenCommit(commit) = event {
-                    cx.emit(PullRequestDetailEvent::OpenCommit {
-                        url: page.url.clone(),
-                        device: page.target.clone(),
-                        commit: commit.clone(),
-                    });
-                }
-            });
-            self.history = Some(CommitHistory {
-                graph,
-                count,
-                search,
-                _events: events,
-            });
-            self.show_commits(cx);
-        }
-        self.history.as_ref().unwrap()
-    }
-
-    /// Hand the listing to the graph, if both exist.
-    fn show_commits(&mut self, cx: &mut Context<Self>) {
-        if let (Some(history), Some(commits)) = (&self.history, &self.commits) {
-            let commits = commits.clone();
-            history.graph.update(cx, |graph, cx| {
-                graph.set_commits(commits.commits, commits.truncated, cx)
-            });
-        }
     }
 
     /// Floating pill nav. One raised thumb glides between equal-width segments
@@ -1210,7 +1151,6 @@ impl PullRequestDetailPage {
         let counts = self.detail.as_ref().map(|detail| {
             [
                 None,
-                self.commits.as_ref().map(|commits| commits.commits.len()),
                 Some(detail.files.len()),
                 Some(detail.activity_comments().count()),
             ]
@@ -1373,11 +1313,9 @@ impl PullRequestDetailPage {
         if tab == Tab::Code && self.diff.is_none() && self.diff_task.is_none() {
             self.load_diff(false, cx);
         }
-        if tab == Tab::Commits {
-            self.commit_history(cx);
-            if self.commits.is_none() && self.commits_task.is_none() {
-                self.load_commits(false, cx);
-            }
+        // The commits share the Activity thread with the conversation.
+        if tab == Tab::Activity && self.commits.is_none() && self.commits_task.is_none() {
+            self.load_commits(false, cx);
         }
         cx.notify();
     }
@@ -1385,7 +1323,7 @@ impl PullRequestDetailPage {
 
 #[cfg(feature = "pull-request-fixture")]
 impl PullRequestDetailPage {
-    /// 0 Summary, 1 Commits, 2 Code, 3 Activity.
+    /// 0 Summary, 1 Code, 2 Activity.
     pub fn fixture_select_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         self.select_tab(TABS[index.min(TABS.len() - 1)].0, cx);
     }
@@ -1416,47 +1354,6 @@ impl PullRequestDetailPage {
         self.review.jumped = None;
         cx.notify();
     }
-}
-
-/// The Commits tab under the header: count and search above the graph,
-/// which fills the rest of the page.
-fn commits_section(history: &CommitHistory) -> AnyElement {
-    div()
-        .id("pr-commits-section")
-        .debug_selector(|| "pr-commits-section".into())
-        .mt(px(24.0))
-        .flex_1()
-        .min_h_0()
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .child(
-            div()
-                .h(px(crate::surface_chrome::CONTROL_SIZE))
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap(px(crate::surface_chrome::CONTROL_GAP))
-                .px(px(8.0))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .flex()
-                        .child(history.count.clone()),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_shrink(1.0)
-                        .flex()
-                        .items_center()
-                        .child(history.search.clone()),
-                ),
-        )
-        .child(div().flex_1().min_h_0().child(history.graph.clone()))
-        .into_any_element()
 }
 
 fn rich_text(
@@ -1509,6 +1406,182 @@ fn inline_thread(
         index -= thread.comments.len();
     }
     None
+}
+
+/// When a comment or review happened, as GitHub reports it.
+fn comment_time(comment: &zeron_proto::ChangeRequestComment) -> &str {
+    if comment.created_at.is_empty() {
+        &comment.submitted_at
+    } else {
+        &comment.created_at
+    }
+}
+
+/// One entry of the Activity thread: a comment or review, or the commits
+/// that landed between two of them.
+enum TimelineItem<'a> {
+    Comment(usize, &'a zeron_proto::ChangeRequestComment),
+    Commits(Vec<&'a zeron_proto::GitHistoryCommit>),
+}
+
+/// Comments (in time order) and commits (oldest first) merged by time.
+/// Consecutive commits fold into one run, as a push reads on GitHub.
+fn activity_timeline<'a>(
+    comments: Vec<(usize, &'a zeron_proto::ChangeRequestComment)>,
+    commits: impl IntoIterator<Item = &'a zeron_proto::GitHistoryCommit>,
+) -> Vec<TimelineItem<'a>> {
+    let instant = |raw: &str| chrono::DateTime::parse_from_rfc3339(raw).ok();
+    let mut commits = commits.into_iter().peekable();
+    let mut items = Vec::new();
+    let push = |items: &mut Vec<TimelineItem<'a>>, commit| match items.last_mut() {
+        Some(TimelineItem::Commits(run)) => run.push(commit),
+        _ => items.push(TimelineItem::Commits(vec![commit])),
+    };
+    for (index, comment) in comments {
+        let at = instant(comment_time(comment));
+        while let Some(commit) = commits.next_if(|commit| {
+            at.is_some_and(|at| instant(&commit.authored_at).is_some_and(|time| time <= at))
+        }) {
+            push(&mut items, commit);
+        }
+        items.push(TimelineItem::Comment(index, comment));
+    }
+    for commit in commits {
+        push(&mut items, commit);
+    }
+    items
+}
+
+/// A run of commits in the Activity thread: who added them and when, then
+/// one row per commit that opens its diff beside the pull request.
+fn commit_run(
+    run: &[&zeron_proto::GitHistoryCommit],
+    theme: &Theme,
+    cx: &mut Context<PullRequestDetailPage>,
+) -> AnyElement {
+    let Some(last) = run.last() else {
+        return gpui::Empty.into_any_element();
+    };
+    let author = run
+        .iter()
+        .all(|commit| commit.author_name == last.author_name)
+        .then_some(last.author_name.as_str())
+        .filter(|name| !name.is_empty());
+    let count = format!(
+        "{} {}",
+        run.len(),
+        if run.len() == 1 { "commit" } else { "commits" }
+    );
+    let header = div()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .gap(px(8.0))
+        .child(
+            div()
+                .size(px(24.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme.glass_hover())
+                .child(
+                    crate::icons::icon(crate::icons::GIT_COMMIT)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted),
+                ),
+        )
+        .child(match author {
+            Some(author) => div()
+                .flex()
+                .items_baseline()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .child(author.to_owned()),
+                )
+                .child(
+                    div()
+                        .text_color(theme.text_muted)
+                        .child(format!("added {count}")),
+                ),
+            None => div()
+                .text_color(theme.text_muted)
+                .child(format!("Added {count}")),
+        })
+        .child(
+            div()
+                .text_size(crate::typography::ui_rems(11.0))
+                .text_color(theme.text_muted)
+                .child(activity_time(&last.authored_at)),
+        );
+    let rows = run.iter().map(|commit| {
+        let short: String = commit.sha.chars().take(7).collect();
+        let subject = commit.subject.clone();
+        let open = (*commit).clone();
+        div()
+            .id(SharedString::from(format!("pr-commit-{}", commit.sha)))
+            .debug_selector({
+                let short = short.clone();
+                move || format!("pr-commit-{short}")
+            })
+            .role(gpui::Role::Button)
+            .aria_label(format!("Open commit {short}: {subject}"))
+            .tab_index(0)
+            .h(px(28.0))
+            .px(px(8.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .rounded(px(7.0))
+            .cursor_pointer()
+            .hover(|style| style.bg(theme.ink(0.05)))
+            .tooltip(widgets::text_tooltip(subject.clone()))
+            .child(
+                div()
+                    .size(px(6.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(theme.text_muted.opacity(0.6)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(12.5))
+                    .child(subject),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child(short),
+            )
+            .on_click(cx.listener(move |page, _, _, cx| {
+                cx.emit(PullRequestDetailEvent::OpenCommit {
+                    url: page.url.clone(),
+                    device: page.target.clone(),
+                    commit: open.clone(),
+                });
+            }))
+    });
+    div()
+        .id(SharedString::from(format!("pr-commit-run-{}", last.sha)))
+        .w(gpui::relative(0.9))
+        .min_w_0()
+        .mb(px(24.0))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(header)
+        // Rows line up with the header's text, past the glyph.
+        .child(div().pl(px(24.0)).flex().flex_col().children(rows))
+        .into_any_element()
 }
 
 fn activity_time(raw: &str) -> String {
@@ -1869,7 +1942,6 @@ impl Render for PullRequestDetailPage {
                 .when(self.tab == Tab::Code, |el| {
                     el.max_w_full().px(px(24.0)).h_full().min_h_0()
                 })
-                .when(self.tab == Tab::Commits, |el| el.h_full().min_h_0())
                 .pt(px(24.0))
                 .pb(px(match self.tab {
                     // The comment dock sits below the scroll, not over it.
@@ -1877,8 +1949,6 @@ impl Render for PullRequestDetailPage {
                     // The workspace reserves its own room for the navigation.
                     Tab::Code => 0.0,
                     Tab::Summary => 76.0,
-                    // The graph scrolls itself and ends above the navigation.
-                    Tab::Commits => NAV_CLEARANCE,
                 }))
                 .text_size(crate::typography::ui_rems(13.0))
                 .text_color(theme.text);
@@ -2212,20 +2282,6 @@ impl Render for PullRequestDetailPage {
                                 .child(description),
                         );
                     }
-                    Tab::Commits => {
-                        if let Some(error) = &self.commits_error {
-                            column = column
-                                .child(div().mt(px(24.0)))
-                                .child(widgets::error_strip(&theme, error.clone()))
-                                .child(div().mt(px(8.0)).flex().child(
-                                    action("pr-retry-commits", "Retry commits", &theme).on_click(
-                                        cx.listener(|page, _, _, cx| page.load_commits(true, cx)),
-                                    ),
-                                ));
-                        } else if let Some(history) = &self.history {
-                            column = column.child(commits_section(history));
-                        }
-                    }
                     Tab::Code => {
                         if let Some(error) = &self.diff_error {
                             column = column
@@ -2240,13 +2296,20 @@ impl Render for PullRequestDetailPage {
                     }
                     Tab::Activity => {
                         let mut activity: Vec<_> = detail.activity_comments().enumerate().collect();
-                        activity.sort_by_key(|(_, comment)| {
-                            if comment.created_at.is_empty() {
-                                &comment.submitted_at
-                            } else {
-                                &comment.created_at
-                            }
-                        });
+                        activity.sort_by_key(|(_, comment)| comment_time(comment));
+                        let commits_pending = self.commits.is_none() && self.commits_task.is_some();
+                        let truncated = self
+                            .commits
+                            .as_ref()
+                            .is_some_and(|commits| commits.truncated);
+                        // GitHub lists commits newest first; the thread reads
+                        // oldest first.
+                        let timeline = activity_timeline(
+                            activity,
+                            self.commits
+                                .iter()
+                                .flat_map(|commits| commits.commits.iter().rev()),
+                        );
                         // The thread keeps the same 24px under the header as the
                         // Summary's first card.
                         let mut thread = div()
@@ -2258,10 +2321,17 @@ impl Render for PullRequestDetailPage {
                             .pl(px(8.0))
                             .flex()
                             .flex_col()
-                            .when(detail.review_threads.is_none() && !activity.is_empty(), |thread| thread.child(
+                            .when(detail.review_threads.is_none() && !timeline.is_empty(), |thread| thread.child(
                                 div().mb(px(16.0)).text_color(theme.text_muted)
                                     .child("Inline review threads are unavailable. Refresh or open this pull request on GitHub to read them.")));
-                        if activity.is_empty() {
+                        if truncated {
+                            thread = thread.child(
+                                div().mb(px(16.0)).text_color(theme.text_muted).child(
+                                    "GitHub lists only this pull request’s first 250 commits.",
+                                ),
+                            );
+                        }
+                        if timeline.is_empty() && !commits_pending {
                             thread = thread
                                 .pl_0()
                                 .flex_1()
@@ -2311,7 +2381,14 @@ impl Render for PullRequestDetailPage {
                                 })
                                 .map(|comment| comment.author.login.as_str())
                         });
-                        for (index, comment) in activity {
+                        for item in timeline {
+                            let (index, comment) = match item {
+                                TimelineItem::Comment(index, comment) => (index, comment),
+                                TimelineItem::Commits(run) => {
+                                    thread = thread.child(commit_run(&run, &theme, cx));
+                                    continue;
+                                }
+                            };
                             let own = comment.viewer_did_author
                                 || viewer_login.is_some_and(|login| {
                                     login.eq_ignore_ascii_case(&comment.author.login)
@@ -2491,6 +2568,33 @@ impl Render for PullRequestDetailPage {
                                     ),
                             );
                         }
+                        if commits_pending {
+                            thread = thread.child(
+                                div()
+                                    .id("pr-commits-loading")
+                                    .debug_selector(|| "pr-commits-loading".into())
+                                    .mb(px(24.0))
+                                    .text_color(theme.text_muted)
+                                    .child("Loading commits…"),
+                            );
+                        }
+                        if let Some(error) = &self.commits_error {
+                            thread = thread.child(
+                                div()
+                                    .mb(px(24.0))
+                                    .flex()
+                                    .flex_col()
+                                    .items_start()
+                                    .gap(px(8.0))
+                                    .child(widgets::error_strip(&theme, error.clone()))
+                                    .child(
+                                        action("pr-retry-commits", "Retry commits", &theme)
+                                            .on_click(cx.listener(|page, _, _, cx| {
+                                                page.load_commits(true, cx)
+                                            })),
+                                    ),
+                            );
+                        }
                         column = column.child(thread);
                     }
                 }
@@ -2540,8 +2644,8 @@ impl Render for PullRequestDetailPage {
                 ));
             }
             let scroll = self.scroll.scroll.clone();
-            // Code and Commits virtualize their own lists.
-            let scrolls = !matches!(self.tab, Tab::Code | Tab::Commits);
+            // Code virtualizes its own list.
+            let scrolls = self.tab != Tab::Code;
             let rail = crate::popover::rail(self, "pr-detail-scrollbar", &theme, cx);
             div()
                 .id("pr-detail-scroll-host")
@@ -3019,24 +3123,11 @@ mod tests {
         }
     }
 
-    fn init_history(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            crate::history::init(
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                Default::default(),
-                cx,
-            )
-        });
-    }
-
     #[gpui::test]
     fn pull_request_commits_load_once_per_head(cx: &mut gpui::TestAppContext) {
         let runtime = fixture::runtime();
         let _guard = runtime.enter();
         fixture::init(cx);
-        init_history(cx);
         let listed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let rpc = ScriptedRpc::new({
             let listed = listed.clone();
@@ -3085,20 +3176,22 @@ mod tests {
         rpc.settle(cx, &runtime, |cx| {
             page.read_with(cx, |page, _| page.detail.is_some())
         });
-        page.update(cx, |page, cx| page.select_tab(Tab::Commits, cx));
+        page.update(cx, |page, cx| page.select_tab(Tab::Activity, cx));
         rpc.settle(cx, &runtime, |cx| {
             page.read_with(cx, |page, _| page.commits.is_some())
         });
-        page.read_with(cx, |page, cx| {
-            let history = page.history.as_ref().unwrap();
-            assert_eq!(history.graph.read(cx).commit_count(), Some(2));
+        page.read_with(cx, |page, _| {
             assert_eq!(page.commits_head(), Some("a".repeat(40).as_str()));
         });
-        assert!(cx.debug_bounds("pr-commits-section").is_some());
+        // The commits join the conversation, one row each.
+        cx.update(|window, cx| window.draw(cx).clear());
+        assert!(cx.debug_bounds("pr-commit-aaaaaaa").is_some());
+        assert!(cx.debug_bounds("pr-commit-ccccccc").is_some());
+        assert!(cx.debug_bounds("pr-activity-empty").is_none());
         // Coming back to the tab reuses the listing.
         page.update(cx, |page, cx| {
             page.select_tab(Tab::Summary, cx);
-            page.select_tab(Tab::Commits, cx);
+            page.select_tab(Tab::Activity, cx);
             assert!(page.commits_task.is_none());
         });
         // A push replaces it with the new head's, bypassing the engine cache.
@@ -3115,18 +3208,47 @@ mod tests {
             *listed.lock().unwrap(),
             [("a".repeat(40), false), ("b".repeat(40), true)]
         );
-        page.read_with(cx, |page, cx| {
-            let history = page.history.as_ref().unwrap();
-            assert_eq!(history.graph.read(cx).commit_count(), Some(2));
-        });
+    }
+
+    #[test]
+    fn activity_timeline_folds_commits_between_comments() {
+        let comment = |at: &str| zeron_proto::ChangeRequestComment {
+            created_at: at.into(),
+            ..Default::default()
+        };
+        let commit = |sha: &str, at: &str| zeron_proto::GitHistoryCommit {
+            authored_at: at.into(),
+            ..pr_commit(sha.repeat(40))
+        };
+        let comments = [
+            comment("2026-09-02T10:00:00Z"),
+            comment("2026-09-04T10:00:00Z"),
+        ];
+        let commits = [
+            commit("a", "2026-09-01T10:00:00Z"),
+            commit("b", "2026-09-01T12:00:00+02:00"),
+            commit("c", "2026-09-03T10:00:00Z"),
+            commit("d", "2026-09-05T10:00:00Z"),
+        ];
+        let shape: Vec<_> = activity_timeline(comments.iter().enumerate().collect(), &commits)
+            .into_iter()
+            .map(|item| match item {
+                TimelineItem::Comment(index, _) => format!("comment {index}"),
+                TimelineItem::Commits(run) => run
+                    .iter()
+                    .map(|commit| &commit.sha[..1])
+                    .collect::<Vec<_>>()
+                    .join(""),
+            })
+            .collect();
+        assert_eq!(shape, ["ab", "comment 0", "c", "comment 1", "d"]);
     }
 
     #[gpui::test]
     fn pull_request_commit_rows_ask_the_host_to_open_them(cx: &mut gpui::TestAppContext) {
         fixture::init(cx);
-        init_history(cx);
         let (page, cx) = cx.add_window_view(|window, cx| {
-            PullRequestDetailPage::new(
+            let mut page = PullRequestDetailPage::new(
                 fixture::state(cx, None),
                 "https://github.com/a/b/pull/1".into(),
                 Some("remote-device".into()),
@@ -3134,7 +3256,15 @@ mod tests {
                 None,
                 window,
                 cx,
-            )
+            );
+            page.error = None;
+            page.detail = Some(ChangeRequestDetail::default());
+            page.commits = Some(ChangeRequestCommits {
+                commits: vec![pr_commit("c".repeat(40))],
+                truncated: false,
+            });
+            page.tab = Tab::Activity;
+            page
         });
         let opened = Rc::new(RefCell::new(Vec::new()));
         let _subscription = cx.update(|_, cx| {
@@ -3150,10 +3280,9 @@ mod tests {
                     .push((url.clone(), device.clone(), commit.sha.clone()));
             })
         });
-        let graph = page.update(cx, |page, cx| page.commit_history(cx).graph.clone());
-        graph.update(cx, |_, cx| {
-            cx.emit(GitHistoryEvent::OpenCommit(pr_commit("c".repeat(40))))
-        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let row = cx.debug_bounds("pr-commit-ccccccc").unwrap();
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
         cx.run_until_parked();
         assert_eq!(
             *opened.borrow(),
@@ -4190,12 +4319,7 @@ mod tests {
                     "{segments:?}"
                 );
             }
-            for (tab, slot) in [
-                (Tab::Code, 2),
-                (Tab::Commits, 1),
-                (Tab::Activity, 3),
-                (Tab::Summary, 0),
-            ] {
+            for (tab, slot) in [(Tab::Code, 1), (Tab::Activity, 2), (Tab::Summary, 0)] {
                 page.update(cx, |page, cx| page.select_tab(tab, cx));
                 cx.run_until_parked();
                 let thumb = cx.debug_bounds("pr-detail-nav-thumb").unwrap();
@@ -4284,8 +4408,7 @@ mod tests {
         fixture::init(cx);
         let (host, cx) = cx.add_window_view(|window, cx| DetailHost::new(window, cx, true));
         let page = host.read_with(cx, |host, _| host.page.clone());
-        // Four labels need more room than a narrow side pane offers.
-        for (width, compact) in [(360.0, true), (460.0, true), (580.0, false)] {
+        for (width, compact) in [(360.0, true), (460.0, false)] {
             cx.simulate_resize(gpui::size(px(width), px(800.0)));
             // The page reads its width a frame late.
             for _ in 0..2 {
@@ -4295,7 +4418,7 @@ mod tests {
             let column = cx.debug_bounds("pr-content-column").unwrap();
             let card = cx.debug_bounds("pr-detail-title").unwrap();
             assert!(
-                width >= NARROW_PAGE || card.left() - column.left() <= px(NARROW_PAD_X + 8.5),
+                card.left() - column.left() <= px(NARROW_PAD_X + 8.5),
                 "the column keeps a narrow gutter at {width}: {column:?} {card:?}"
             );
             page.read_with(cx, |page, _| {
@@ -4306,7 +4429,7 @@ mod tests {
             });
             let nav = cx.debug_bounds("pr-detail-nav").unwrap();
             assert!(nav.left() >= px(0.0) && nav.right() <= px(width));
-            for selector in ["pr-summary", "pr-commits", "pr-code", "pr-activity"] {
+            for selector in ["pr-summary", "pr-code", "pr-activity"] {
                 let segment = cx.debug_bounds(selector).unwrap();
                 assert!(nav.left() <= segment.left() && segment.right() <= nav.right());
             }
@@ -4345,7 +4468,7 @@ mod tests {
             let nav = cx.debug_bounds("pr-detail-nav").unwrap();
             assert_eq!(nav.bottom(), px(784.0));
             assert_eq!(nav.size.height, px(NAV_HEIGHT));
-            for selector in ["pr-summary", "pr-commits", "pr-code", "pr-activity"] {
+            for selector in ["pr-summary", "pr-code", "pr-activity"] {
                 let bounds = cx.debug_bounds(selector).unwrap();
                 assert!(
                     bounds.left() >= px(0.0) && bounds.right() <= px(width),

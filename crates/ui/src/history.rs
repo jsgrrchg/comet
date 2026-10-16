@@ -1300,20 +1300,8 @@ fn decode_history_avatar(encoded: &str) -> Option<Arc<Image>> {
     Some(Arc::new(Image::from_bytes(format, bytes)))
 }
 
-/// Where the pane's commits come from.
-enum HistorySource {
-    /// Paged from the selected chat's checkout on that chat's device. The
-    /// pane follows the selection.
-    SelectedChat,
-    /// Handed in whole by the host (e.g. a pull request's commits from
-    /// GitHub). Nothing is read from a checkout: search filters the loaded
-    /// rows and there are no refs, avatars or older pages.
-    Provided,
-}
-
 pub struct GitHistory {
     state: Entity<AppState>,
-    source: HistorySource,
     started: bool,
     target_key: Option<String>,
     commits: Vec<GitHistoryCommit>,
@@ -1369,9 +1357,7 @@ pub struct GitHistory {
     fetch_for: Option<String>,
     fetch_error: Option<SharedString>,
     fetch_task: Option<Task<()>>,
-    /// A provided list stops short of the full history.
-    truncated: bool,
-    _observe: Option<Subscription>,
+    _observe: Subscription,
 }
 
 pub enum GitHistoryEvent {
@@ -1963,26 +1949,8 @@ impl GitHistory {
                 this.ensure_loaded(cx);
             }
         });
-        Self::with_source(state, HistorySource::SelectedChat, Some(observe))
-    }
-
-    /// A pane over commits the host supplies through [`Self::set_commits`].
-    /// `key` identifies the list, e.g. the pull request's URL.
-    pub fn provided(state: Entity<AppState>, key: impl Into<String>) -> Self {
-        let mut history = Self::with_source(state, HistorySource::Provided, None);
-        history.started = true;
-        history.target_key = Some(key.into());
-        history
-    }
-
-    fn with_source(
-        state: Entity<AppState>,
-        source: HistorySource,
-        observe: Option<Subscription>,
-    ) -> Self {
         Self {
             state,
-            source,
             started: false,
             target_key: None,
             commits: Vec::new(),
@@ -2034,64 +2002,22 @@ impl GitHistory {
             fetch_for: None,
             fetch_error: None,
             fetch_task: None,
-            truncated: false,
             _observe: observe,
         }
     }
 
-    /// The repository the engine reads from: `(key, cwd, target device)`.
     fn context(&self, cx: &App) -> Option<(String, String, Option<String>)> {
-        match self.source {
-            HistorySource::SelectedChat => {
-                let state = self.state.read(cx);
-                let chat = state.selected_chat_row()?;
-                let cwd = chat.cwd.clone()?;
-                let target = (state.local_device_id.as_deref() != Some(chat.device_id.as_str()))
-                    .then(|| chat.device_id.clone());
-                let key = format!("{}|{cwd}", target.as_deref().unwrap_or("local"));
-                Some((key, cwd, target))
-            }
-            HistorySource::Provided => None,
-        }
-    }
-
-    /// A provided list is on its way; keeps the rows already shown.
-    pub fn set_loading(&mut self, cx: &mut Context<Self>) {
-        self.loading = true;
-        self.error = None;
-        cx.notify();
-    }
-
-    pub fn set_error(&mut self, error: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.loading = false;
-        self.error = Some(error.into());
-        cx.notify();
-    }
-
-    /// Replace a provided list. Commits arrive newest first, in topological
-    /// order; the newest one is drawn as the head.
-    pub fn set_commits(
-        &mut self,
-        commits: Vec<GitHistoryCommit>,
-        truncated: bool,
-        cx: &mut Context<Self>,
-    ) {
-        self.loading = false;
-        self.error = None;
-        self.truncated = truncated;
-        self.head_sha = commits.first().map(|commit| commit.sha.clone());
-        self.head_commit_count = Some(commits.len());
-        self.total_count = Some(commits.len());
-        self.commits = commits;
-        self.graph_lane_capacity = 0;
-        self.rebuild_view(cx);
+        let state = self.state.read(cx);
+        let chat = state.selected_chat_row()?;
+        let cwd = chat.cwd.clone()?;
+        let target = (state.local_device_id.as_deref() != Some(chat.device_id.as_str()))
+            .then(|| chat.device_id.clone());
+        let key = format!("{}|{cwd}", target.as_deref().unwrap_or("local"));
+        Some((key, cwd, target))
     }
 
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
         self.started = true;
-        if matches!(self.source, HistorySource::Provided) {
-            return;
-        }
         let Some((key, cwd, target)) = self.context(cx) else {
             self.fetch_task = None;
             self.fetching_all = false;
@@ -4365,10 +4291,7 @@ impl Render for GitHistory {
                     div()
                         .text_size(px(12.0))
                         .text_color(theme.text_faint)
-                        .child(match self.source {
-                            HistorySource::SelectedChat => "Loading history…",
-                            HistorySource::Provided => "Loading commits…",
-                        }),
+                        .child("Loading history…"),
                 )
                 .into_any_element()
         } else if self.visible_commits.is_empty() {
@@ -4461,27 +4384,6 @@ impl Render for GitHistory {
                     )
                 },
             )
-            .when(self.truncated && !self.search_active(), |element| {
-                element.child(
-                    div()
-                        .id("history-truncated")
-                        .debug_selector(|| "history-truncated".into())
-                        .h(px(28.0))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px(px(8.0))
-                        .border_b_1()
-                        .border_color(crate::theme::hairline(0.06))
-                        .truncate()
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(format!(
-                            "Showing the first {} commits",
-                            self.commits.len()
-                        ))),
-                )
-            })
             .child(
                 container_query(move |size, window, cx| {
                     let responsive_target = responsive_graph_geometry(
@@ -4653,52 +4555,6 @@ mod tests {
                 .child(div().h(px(40.0)).child(self.composer.clone()))
                 .child(self.search.clone())
         }
-    }
-
-    #[gpui::test]
-    fn provided_history_shows_injected_commits_and_searches_them_locally(
-        cx: &mut gpui::TestAppContext,
-    ) {
-        let state = cx.new(|_| AppState::new());
-        let history = cx.new(|_| GitHistory::provided(state.clone(), "pr"));
-        let shas = |history: &GitHistory| {
-            history
-                .visible_commits
-                .iter()
-                .map(|commit| commit.sha.clone())
-                .collect::<Vec<_>>()
-        };
-        history.update(cx, |history, cx| {
-            history.set_loading(cx);
-            assert!(history.loading && history.target_key.as_deref() == Some("pr"));
-            history.set_commits(
-                vec![
-                    commit("ccc", &["bbb"]),
-                    commit("bbb", &["aaa"]),
-                    commit("aaa", &[]),
-                ],
-                true,
-                cx,
-            );
-            assert!(!history.loading && history.truncated);
-            assert_eq!(shas(history), ["ccc", "bbb", "aaa"]);
-            assert_eq!(history.commit_count(), Some(3));
-            assert_eq!(history.head_sha.as_deref(), Some("ccc"));
-            history.set_search_query("bbb".into(), cx);
-            // No checkout to search: the loaded rows filter in place.
-            assert!(!history.search_loading && history.search_task.is_none());
-            assert_eq!(shas(history), ["bbb"]);
-            history.set_search_query(String::new(), cx);
-            assert_eq!(shas(history), ["ccc", "bbb", "aaa"]);
-        });
-        // The selection changing never resets a provided list.
-        state.update(cx, |_, cx| cx.notify());
-        history.update(cx, |history, cx| {
-            history.ensure_loaded(cx);
-            assert_eq!(shas(history), ["ccc", "bbb", "aaa"]);
-            history.set_error("GitHub is unavailable", cx);
-            assert_eq!(history.commits.len(), 3);
-        });
     }
 
     fn commit(sha: &str, parents: &[&str]) -> GitHistoryCommit {

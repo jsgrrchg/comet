@@ -251,12 +251,12 @@ fn main() -> anyhow::Result<()> {
                     window.update(cx, |s, _, cx| s.fixture_pull_request_pane_width(360.0, cx))?;
                     pause(cx, 500).await;
                     shot(cx, "05b-summary-pane-360")?;
-                    detail.update(cx, |d, cx| d.fixture_select_tab(3, cx));
+                    detail.update(cx, |d, cx| d.fixture_select_tab(2, cx));
                     pause(cx, 500).await;
                     shot(cx, "05c-activity-pane-360")?;
                     detail.update(cx, |d, cx| d.fixture_select_tab(0, cx));
                     window.update(cx, |s, _, cx| s.fixture_pull_request_pane_width(640.0, cx))?;
-                    detail.update(cx, |d, cx| d.fixture_select_tab(2, cx));
+                    detail.update(cx, |d, cx| d.fixture_select_tab(1, cx));
                     pause(cx, 700).await;
                     shot(cx, "06-code-loading")?;
                     pause(cx, 8000).await;
@@ -274,14 +274,14 @@ fn main() -> anyhow::Result<()> {
                     pause(cx, 600).await;
                     shot(cx, "09-code-760")?;
                     window.update(cx, |_, w, _| w.resize(size(px(1320.), px(848.))))?;
-                    detail.update(cx, |d, cx| d.fixture_select_tab(3, cx));
+                    detail.update(cx, |d, cx| d.fixture_select_tab(2, cx));
                     pause(cx, 800).await;
                     shot(cx, "10-activity")?;
                     cx.update(|cx| appearance::set_mode(appearance::AppearanceMode::Light, cx));
                     detail.update(cx, |d, cx| d.fixture_select_tab(0, cx));
                     pause(cx, 800).await;
                     shot(cx, "11-summary-light")?;
-                    detail.update(cx, |d, cx| d.fixture_select_tab(2, cx));
+                    detail.update(cx, |d, cx| d.fixture_select_tab(1, cx));
                     pause(cx, 800).await;
                     shot(cx, "12-code-light")?;
                     detail.update(cx, |d, cx| {
@@ -300,9 +300,9 @@ fn main() -> anyhow::Result<()> {
                     shot(cx, "13-summary-600-light")?;
                     cx.update(|cx| appearance::set_mode(appearance::AppearanceMode::Dark, cx));
                     window.update(cx, |_, w, _| w.resize(size(px(1320.), px(848.))))?;
-                    detail.update(cx, |d, cx| d.fixture_select_tab(1, cx));
+                    detail.update(cx, |d, cx| d.fixture_select_tab(2, cx));
                     pause(cx, 6000).await;
-                    shot(cx, "14-commits")?;
+                    shot(cx, "14-activity-commits")?;
                     detail.update(cx, |d, cx| d.fixture_open_commit(cx));
                     pause(cx, 6000).await;
                     shot(cx, "15-commit-diff")?;

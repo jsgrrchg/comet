@@ -14,14 +14,32 @@ pub(super) const PULL_REQUEST_BOARD_MIN: f32 = 360.0;
 /// Opening more closes the least recently viewed tab.
 pub(super) const PULL_REQUEST_TABS_MAX: usize = 8;
 
+/// What a pane tab shows.
+#[derive(Clone)]
+pub(super) enum PaneTabContent {
+    PullRequest(Entity<PullRequestDetailPage>),
+}
+
 pub(super) struct PullRequestTab {
+    /// The tab's identity in the pane; the active tab is tracked by it.
+    id: u64,
+    /// The pull request the tab belongs to.
     pub(super) url: String,
     /// The device whose engine reads it; `None` for this device.
     pub(super) device: Option<String>,
-    pub(super) page: Entity<PullRequestDetailPage>,
+    pub(super) content: PaneTabContent,
     /// Activation stamp; the smallest is the least recently viewed.
     viewed: u64,
     _subscription: Subscription,
+}
+
+impl PullRequestTab {
+    /// The pull request's detail view, when the tab shows one.
+    pub(super) fn page(&self) -> Option<&Entity<PullRequestDetailPage>> {
+        match &self.content {
+            PaneTabContent::PullRequest(page) => Some(page),
+        }
+    }
 }
 
 /// Drag payload for reordering the pane's tabs.
@@ -52,7 +70,10 @@ fn tabs_to_close(len: usize, index: usize, action: TabCloseAction) -> Vec<usize>
 #[derive(Default)]
 pub(super) struct PullRequestPane {
     pub(super) tabs: Vec<PullRequestTab>,
-    pub(super) active: Option<String>,
+    /// The active tab's [`PullRequestTab::id`].
+    pub(super) active: Option<u64>,
+    /// The next tab's id.
+    next_id: u64,
     pub(super) open: bool,
     /// Takeover: the pane covers the board, as the detail did before tabs.
     pub(super) expanded: bool,
@@ -66,24 +87,51 @@ pub(super) struct PullRequestPane {
     pub(super) menu: popover::Popup<PullRequestTabMenu>,
     /// The last closed tab's view, kept on screen while the pane animates
     /// shut.
-    closing: Option<Entity<PullRequestDetailPage>>,
+    closing: Option<PaneTabContent>,
     views: u64,
 }
 
 impl PullRequestPane {
     pub(super) fn active_index(&self) -> Option<usize> {
-        let active = self.active.as_deref()?;
-        self.tabs.iter().position(|tab| tab.url == active)
+        let active = self.active?;
+        self.tabs.iter().position(|tab| tab.id == active)
     }
 
+    #[cfg(feature = "pull-request-fixture")]
     pub(super) fn active_page(&self) -> Option<Entity<PullRequestDetailPage>> {
-        self.active_index().map(|ix| self.tabs[ix].page.clone())
+        self.active_index()
+            .and_then(|ix| self.tabs[ix].page().cloned())
     }
 
     fn activate(&mut self, ix: usize) {
         self.views += 1;
         self.tabs[ix].viewed = self.views;
-        self.active = Some(self.tabs[ix].url.clone());
+        self.active = Some(self.tabs[ix].id);
+    }
+
+    /// Add a tab at `ix` and return where it landed.
+    fn insert(
+        &mut self,
+        ix: usize,
+        url: String,
+        device: Option<String>,
+        content: PaneTabContent,
+        subscription: Subscription,
+    ) -> usize {
+        self.next_id += 1;
+        let ix = ix.min(self.tabs.len());
+        self.tabs.insert(
+            ix,
+            PullRequestTab {
+                id: self.next_id,
+                url,
+                device,
+                content,
+                viewed: 0,
+                _subscription: subscription,
+            },
+        );
+        ix
     }
 
     /// Drop tabs past the cap, least recently viewed first, never the
@@ -210,17 +258,17 @@ impl Shell {
             // Only compare revisions observed by the same device. This is a
             // local lookup, not another board fetch on every tab activation.
             if board.target_device() == tab.device
+                && let Some(page) = tab.page()
                 && let Some(preview) = board.preview(&tab.url)
             {
-                tab.page
-                    .update(cx, |page, cx| page.update_board_preview(preview, cx));
+                page.update(cx, |page, cx| page.update_board_preview(preview, cx));
             }
         }
         let selected = self
             .pull_request_pane
-            .open
-            .then(|| self.pull_request_pane.active.clone())
-            .flatten();
+            .active_index()
+            .filter(|_| self.pull_request_pane.open)
+            .map(|ix| self.pull_request_pane.tabs[ix].url.clone());
         if let Some(page) = &self.pull_requests_page {
             page.update(cx, |page, cx| page.select_url(selected, cx));
         }
@@ -242,6 +290,7 @@ impl Shell {
     }
 
     /// The active tab's detail view, if the pane has one.
+    #[cfg(feature = "pull-request-fixture")]
     pub(super) fn active_pull_request_page(&self) -> Option<Entity<PullRequestDetailPage>> {
         self.pull_request_pane.active_page()
     }
@@ -265,7 +314,7 @@ impl Shell {
             .pull_request_pane
             .tabs
             .iter()
-            .position(|tab| tab.url == url);
+            .position(|tab| tab.page().is_some() && tab.url == url);
         let ix = match existing {
             Some(ix) => ix,
             None => {
@@ -286,14 +335,13 @@ impl Shell {
                 });
                 let subscription = cx.observe(&page, |_, _, cx| cx.notify());
                 let pane = &mut self.pull_request_pane;
-                pane.tabs.push(PullRequestTab {
-                    url: url.clone(),
-                    device: target,
-                    page,
-                    viewed: 0,
-                    _subscription: subscription,
-                });
-                pane.tabs.len() - 1
+                pane.insert(
+                    pane.tabs.len(),
+                    url.clone(),
+                    target,
+                    PaneTabContent::PullRequest(page),
+                    subscription,
+                )
             }
         };
         self.pull_request_pane.closing = None;
@@ -367,7 +415,7 @@ impl Shell {
     }
 
     /// Move a dragged tab to the slot it was dropped on. The active tab is
-    /// tracked by URL, so it stays active wherever it lands.
+    /// tracked by id, so it stays active wherever it lands.
     fn reorder_pull_request_tabs(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
         let tabs = &mut self.pull_request_pane.tabs;
         if from < tabs.len() && to < tabs.len() && from != to {
@@ -500,7 +548,7 @@ impl Shell {
             return;
         }
         if self.pull_request_pane.tabs.len() == 1 {
-            self.pull_request_pane.closing = Some(self.pull_request_pane.tabs[ix].page.clone());
+            self.pull_request_pane.closing = Some(self.pull_request_pane.tabs[ix].content.clone());
             self.set_pull_request_pane_open(false, cx);
         }
         self.pull_request_pane.remove(ix);
@@ -601,12 +649,14 @@ impl Shell {
         let covers_board = target >= self.pull_request_pane_available() - 0.5;
         let corner = Self::window_corner_radius(window);
         let content = match self
-            .active_pull_request_page()
+            .pull_request_pane
+            .active_index()
+            .map(|ix| self.pull_request_pane.tabs[ix].content.clone())
             .or_else(|| self.pull_request_pane.closing.clone())
         {
             // The pull request's title and actions sit in the pane's own
             // toolbar row; its tabs live in the titlebar band above.
-            Some(page) => {
+            Some(PaneTabContent::PullRequest(page)) => {
                 let toolbar = page.update(cx, |page, cx| page.toolbar(cx));
                 div()
                     .size_full()
@@ -687,10 +737,12 @@ impl Shell {
             .pull_request_pane
             .tabs
             .iter()
-            .map(|tab| {
-                let page = tab.page.read(cx);
-                let (number, title) = page.identity();
-                (number, title, page.is_loading())
+            .map(|tab| match &tab.content {
+                PaneTabContent::PullRequest(page) => {
+                    let page = page.read(cx);
+                    let (number, title) = page.identity();
+                    (number, title, page.is_loading())
+                }
             })
             .collect();
         let mut strip = div()

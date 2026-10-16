@@ -608,3 +608,94 @@ fn pane_titles_and_pills_reorder_the_split(cx: &mut TestAppContext) {
     release(cx, left);
     assert_eq!(chats(cx), ["parent", "other"]);
 }
+
+/// A rest on a pane's title grows its session card out of it; leaving, a press on
+/// the title or Escape closes it, and its rows act on that pane's chat.
+#[gpui::test]
+fn resting_on_a_pane_title_peeks_at_its_session(cx: &mut TestAppContext) {
+    let (shell, cx) = setup_with_shell(cx, true);
+    shell.update(cx, |shell, cx| {
+        assert!(shell.split_chat_beside(
+            "parent",
+            "other",
+            crate::split_view::SplitSide::Right,
+            cx
+        ));
+        // Focus stays on "parent": the peek is of the other pane.
+        shell.focus_split_pane("parent", cx);
+        // Focus follows the selection through the state observer, which
+        // the fixture stubs out.
+        shell._state_observation = cx.observe(&shell.state, |shell, state, cx| {
+            shell.on_state_changed(&state, cx);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear());
+    // The titlebar's hover is fed directly: the test window's hit testing
+    // drops it on the next pointer event.
+    let wait = |cx: &mut VisualTestContext, ms: u64| {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(ms));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+    };
+    let title = |cx: &mut VisualTestContext, hovered: bool| {
+        shell.update(cx, |shell, cx| {
+            shell.hover_session_peek_title("other", hovered, cx)
+        });
+    };
+    let open = |cx: &mut VisualTestContext| {
+        shell.read_with(cx, |shell, _| shell.session_peek_chat().map(str::to_string))
+    };
+
+    // A brief pass doesn't open it; a rest does, below the title.
+    title(cx, true);
+    wait(cx, 100);
+    title(cx, false);
+    wait(cx, 400);
+    assert_eq!(open(cx), None);
+    title(cx, true);
+    wait(cx, 400);
+    assert_eq!(open(cx).as_deref(), Some("other"));
+    // It grows out of the title: a head over it, the card hanging from the
+    // head's left edge (sliding out from under it while it opens).
+    let peek = cx.debug_bounds("session-peek-other").expect("the peek shows");
+    let title_bounds = cx.debug_bounds("split-title-other").unwrap();
+    let head = cx.debug_bounds("session-peek-head").unwrap();
+    assert!((head.left() - title_bounds.left()).abs() <= px(1.));
+    assert!((head.top() - title_bounds.top()).abs() <= px(1.));
+    assert_eq!(head.size, title_bounds.size);
+    assert_eq!(peek.left(), head.left());
+    assert!(peek.top() <= head.bottom() && peek.top() >= head.bottom() - px(8.));
+
+    // Leaving the title for the peek within the grace keeps it; leaving
+    // both closes it.
+    title(cx, false);
+    cx.simulate_mouse_move(peek.center(), None, gpui::Modifiers::default());
+    wait(cx, 300);
+    assert_eq!(open(cx).as_deref(), Some("other"));
+    cx.simulate_mouse_move(gpui::point(px(600.), px(600.)), None, gpui::Modifiers::default());
+    wait(cx, 300);
+    assert_eq!(open(cx), None);
+    assert!(cx.debug_bounds("session-peek-other").is_none());
+
+    // Escape closes it.
+    title(cx, true);
+    wait(cx, 400);
+    cx.simulate_keystrokes("escape");
+    assert_eq!(open(cx), None);
+
+    // Its side chat row focuses the pane, then opens the side chat there.
+    title(cx, true);
+    wait(cx, 400);
+    let before = shell.read_with(cx, |shell, _| shell.side_chat_seq);
+    let row = cx.debug_bounds("session-peek-side-chat").unwrap().center();
+    cx.simulate_click(row, gpui::Modifiers::default());
+    cx.run_until_parked();
+    shell.read_with(cx, |shell, _| {
+        assert_eq!(shell.active_chat, "other");
+        assert_eq!(shell.side_chat_seq, before + 1);
+        assert!(shell.session_peek_chat().is_none());
+    });
+}

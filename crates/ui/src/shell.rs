@@ -84,6 +84,7 @@ mod panel_interaction_tests;
 pub(crate) mod project_icon;
 mod pull_request_pane;
 mod session_info;
+mod session_peek;
 mod side_chats;
 mod sidebar_pins;
 mod sidebar_sections;
@@ -2074,6 +2075,8 @@ pub struct Shell {
     chat_drop_zone: Option<chat_dropzone::ChatDropZone>,
     /// The pane title or sidebar pill a carried pill would land beside.
     split_reorder: Option<chat_dropzone::SplitReorder>,
+    /// The session card for one pane of a split, on hover over its title.
+    session_peek: session_peek::SessionPeekState,
     /// Each conversation's composer bounds as last painted, by chat id.
     chat_drop_composers: std::collections::HashMap<
         String,
@@ -2607,6 +2610,7 @@ impl Shell {
             split_layout: None,
             chat_drop_zone: None,
             split_reorder: None,
+            session_peek: Default::default(),
             chat_drop_composers: std::collections::HashMap::new(),
             side_chat_creating: false,
             browsers: std::collections::HashMap::new(),
@@ -10611,6 +10615,11 @@ impl Shell {
             cx.stop_propagation();
             return;
         }
+        if event.keystroke.key == "escape" && self.session_peek_chat().is_some() {
+            self.close_session_peek(cx);
+            cx.stop_propagation();
+            return;
+        }
         if event.keystroke.key == "escape" && self.command_palette.is_some() {
             self.close_command_palette(window, cx);
             cx.stop_propagation();
@@ -10849,6 +10858,9 @@ impl Shell {
         }
         if let Some(menu) = self.render_pull_request_tab_menu(cx) {
             overlays.push(menu);
+        }
+        if let Some(peek) = self.render_session_peek(cx) {
+            overlays.push(peek);
         }
 
         overlays.extend(self.render_space_overlays(viewport, window, cx));

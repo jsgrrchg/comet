@@ -22,15 +22,25 @@ pub const MENU_BLUR: f32 = 16.0;
 /// Frost `child` (a popover card): backdrop-blurred on glass, pass-through on
 /// opaque platforms. `corner_radius` must match the card's rounding.
 pub fn frosted(corner_radius: f32, blur_radius: f32, child: impl IntoElement) -> Frosted {
+    frosted_corners(Corners::all(px(corner_radius)), blur_radius, child)
+}
+
+/// [`frosted`] for a card rounded unevenly, such as one joined to another
+/// along an edge.
+pub fn frosted_corners(
+    corner_radii: Corners<Pixels>,
+    blur_radius: f32,
+    child: impl IntoElement,
+) -> Frosted {
     Frosted {
-        corner_radius,
+        corner_radii,
         blur_radius,
         child: child.into_any_element(),
     }
 }
 
 pub struct Frosted {
-    corner_radius: f32,
+    corner_radii: Corners<Pixels>,
     blur_radius: f32,
     child: AnyElement,
 }
@@ -81,11 +91,7 @@ impl Element for Frosted {
     ) {
         if Theme::of(cx).is_frost() {
             window.paint_layer(bounds, |window| {
-                window.paint_backdrop_blur(
-                    bounds,
-                    Corners::all(px(self.corner_radius)),
-                    px(self.blur_radius),
-                );
+                window.paint_backdrop_blur(bounds, self.corner_radii, px(self.blur_radius));
                 self.child.paint(window, cx);
             });
         } else {

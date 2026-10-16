@@ -29,8 +29,55 @@ pub(super) fn session_card_reserve(main: f32, transcript: f32) -> Option<f32> {
     (main - reserve - 2.0 * TRANSCRIPT_GUTTER >= transcript - 0.5).then_some(reserve)
 }
 
+/// Where a chat runs, as a session card tells it.
+pub(super) struct SessionFacts {
+    pub(super) chat: zeron_proto::Chat,
+    pub(super) device: SharedString,
+    /// The chat runs on this device.
+    pub(super) local: bool,
+    pub(super) online: bool,
+    /// The project's name and path.
+    pub(super) project: Option<(SharedString, SharedString)>,
+    pub(super) branch: Option<SharedString>,
+}
+
+impl SessionFacts {
+    pub(super) fn for_chat(state: &AppState, chat_id: &str) -> Option<Self> {
+        let chat = state.chats.iter().find(|chat| chat.id == chat_id)?.clone();
+        let device: SharedString = state
+            .device_name(&chat.device_id)
+            .unwrap_or("Unknown device")
+            .to_owned()
+            .into();
+        let local = state.local_device_id.as_deref() == Some(chat.device_id.as_str());
+        let online = state.device_online(&chat.device_id, Utc::now());
+        let project = chat
+            .space_id
+            .as_deref()
+            .and_then(|id| state.space_row(id))
+            .map(|space| {
+                (
+                    SharedString::from(space.display_name().to_owned()),
+                    SharedString::from(space.path.clone()),
+                )
+            });
+        let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(|branch| SharedString::from(branch.to_owned()));
+        Some(Self {
+            chat,
+            device,
+            local,
+            online,
+            project,
+            branch,
+        })
+    }
+}
+
 /// A non-interactive card row: icon slot, label, optional trailing detail.
-fn info_row(theme: &Theme, glyph: AnyElement, label: SharedString) -> gpui::Div {
+pub(super) fn info_row(theme: &Theme, glyph: AnyElement, label: SharedString) -> gpui::Div {
     div()
         .flex()
         .flex_row()
@@ -44,7 +91,7 @@ fn info_row(theme: &Theme, glyph: AnyElement, label: SharedString) -> gpui::Div 
         .child(div().flex_1().min_w_0().truncate().child(label))
 }
 
-fn row_glyph(path: &'static str, theme: &Theme) -> AnyElement {
+pub(super) fn row_glyph(path: &'static str, theme: &Theme) -> AnyElement {
     icon(path)
         .size(px(15.0))
         .text_color(theme.text_muted)
@@ -157,32 +204,17 @@ impl Shell {
             return None;
         }
         let theme = Theme::of(cx).for_popup();
-        let now = Utc::now();
-        let (chat, device, local, online, project, branch) = {
+        let SessionFacts {
+            chat,
+            device,
+            local,
+            online,
+            project,
+            branch,
+        } = {
             let state = self.state.read(cx);
-            let chat = state.selected_chat_row()?.clone();
-            let device: SharedString = state
-                .device_name(&chat.device_id)
-                .unwrap_or("Unknown device")
-                .to_owned()
-                .into();
-            let local = state.local_device_id.as_deref() == Some(chat.device_id.as_str());
-            let online = state.device_online(&chat.device_id, now);
-            let project = chat
-                .space_id
-                .as_deref()
-                .and_then(|id| state.space_row(id))
-                .map(|space| {
-                    (
-                        SharedString::from(space.display_name().to_owned()),
-                        SharedString::from(space.path.clone()),
-                    )
-                });
-            let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
-                .map(str::trim)
-                .filter(|branch| !branch.is_empty())
-                .map(|branch| SharedString::from(branch.to_owned()));
-            (chat, device, local, online, project, branch)
+            let selected = state.selected_chat_row()?.id.clone();
+            SessionFacts::for_chat(state, &selected)?
         };
 
         // ── Where it runs.
@@ -307,7 +339,7 @@ impl Shell {
 
     /// The Actions section: a row per project action (click runs it; the
     /// gear edits it), imports from zeron.json, and Add action.
-    fn render_session_info_actions(
+    pub(super) fn render_session_info_actions(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,

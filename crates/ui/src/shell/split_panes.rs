@@ -713,8 +713,8 @@ impl Shell {
 
     /// The titlebar over a split: each pane's title above it, the focused
     /// one raised. A title focuses its pane; its ✕ takes the chat out of the
-    /// split; dragged, it moves the pane. `row_left` is where the titlebar
-    /// row starts.
+    /// split; dragged, it moves the pane; a rest on it peeks at the
+    /// session's card. `row_left` is where the titlebar row starts.
     pub(super) fn render_split_titles(
         &mut self,
         view: &SplitView,
@@ -761,6 +761,7 @@ impl Shell {
             let group = SharedString::from(format!("split-title-{ix}"));
             let focus_id = chat_id.clone();
             let close_id = chat_id.clone();
+            let hover_id = chat_id.clone();
             let drag = chat_dropzone::SplitPillDrag {
                 chat_id: chat_id.clone(),
                 title: title.clone(),
@@ -791,10 +792,19 @@ impl Shell {
                 .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                     window.prevent_default()
                 })
+                // A press means a click or a drag: either ends the peek.
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, cx| this.close_session_peek(cx)),
+                )
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    this.hover_session_peek_title(&hover_id, *hovered, cx);
+                }))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.focus_split_pane(&focus_id, cx);
                 }))
+                .child(self.session_peek_anchor_probe(chat_id))
                 .when_some(
                     harness.map(crate::pickers::harness_brand_icon),
                     |el, (path, tint)| {

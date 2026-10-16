@@ -1,6 +1,7 @@
 //! Isolated native sidebar review fixture. ZERON_SIDEBAR_COMPACT / ZERON_SIDEBAR_HIDE_LABEL select layout;
 //! ZERON_SIDEBAR_BY_PROJECT groups by project, with a remote clone of the local repository.
-//! ZERON_SIDEBAR_SPLIT opens the selected session in a split view beside another.
+//! ZERON_SIDEBAR_SPLIT opens the selected session in a split view beside another;
+//! ZERON_SIDEBAR_PEEK=<chat id> then opens that pane's session peek.
 use gpui::{AppContext, Bounds, WindowBounds, WindowOptions, px, size};
 use zeron_ui::*;
 
@@ -107,6 +108,17 @@ fn main() -> anyhow::Result<()> {
             window_background: theme::Theme::of(cx).window_background_appearance(),
             ..Default::default()
         }, |_, cx| cx.new(|cx| shell::Shell::new(state.clone(), boot, cx))).unwrap();
+        if let Some(chat) = std::env::var_os("ZERON_SIDEBAR_PEEK") {
+            let chat = chat.to_string_lossy().into_owned();
+            let window = _window;
+            cx.spawn(async move |cx| {
+                // Again once the titles have painted: the peek hangs from one.
+                for _ in 0..2 {
+                    cx.background_executor().timer(std::time::Duration::from_millis(800)).await;
+                    window.update(cx, |shell, _, cx| shell.fixture_open_session_peek(&chat, cx)).ok();
+                }
+            }).detach();
+        }
         appearance::reapply_window_background(cx);
         state.update(cx, |_, cx| cx.notify());
         cx.activate(true);

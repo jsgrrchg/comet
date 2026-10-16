@@ -92,7 +92,9 @@ impl Shell {
         if self.navigation_overlay_open(cx) {
             return;
         }
-        if matches!(self.route, Route::Chat)
+        if self.pull_request_pane_open() && self.navigation_focus.in_right(window, cx) {
+            self.cycle_pull_request_tabs(forward, window, cx);
+        } else if matches!(self.route, Route::Chat)
             && self.right_pane_open(cx)
             && self.navigation_focus.in_right(window, cx)
         {
@@ -123,6 +125,7 @@ impl Shell {
             || self.rename_space_dialog.is_some()
             || self.discard_working_tree.is_some()
             || self.chat_menu.get().is_some()
+            || self.pull_request_pane.menu.get().is_some()
             || self.space_menu.get().is_some()
             || self.user_menu.get().is_some()
             || self.spaces_menu.get().is_some()
@@ -580,7 +583,8 @@ impl Shell {
         // transcript's stretch of the titlebar, left of the side pane's tabs
         // when one is open, else just left of the explorer toggle.
         let session_info_toggle = (!takeover && !on_canvas).then(|| {
-            let label = if self.session_info_open() {
+            let open = self.session_info_visible(cx);
+            let label = if open {
                 "Hide session details"
             } else {
                 "Show session details"
@@ -594,9 +598,11 @@ impl Shell {
             .role(gpui::Role::Button)
             .aria_label(label)
             .flex_none()
-            .when(self.session_info_open(), |button| {
-                button.bg(crate::theme::wash(0.09))
-            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.note_session_info_press()),
+            )
+            .when(open, |button| button.bg(crate::theme::wash(0.09)))
         });
         let inner = div()
             .size_full()

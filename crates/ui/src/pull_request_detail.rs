@@ -6,7 +6,7 @@ mod handoff;
 #[path = "pull_request_interactions.rs"]
 mod interactions;
 use crate::{
-    history::{GitHistory, GitHistoryCount, GitHistorySearchControl},
+    history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistorySearchControl},
     settings::{self, PullRequestDestination, widgets},
     state::AppState,
     theme::Theme,
@@ -47,6 +47,18 @@ pub struct StartPullRequestSession {
 #[derive(Clone, PartialEq, Action)]
 #[action(namespace = shell, no_json)]
 pub struct AddPullRequestProject(pub String);
+
+/// What the page asks of the pane hosting it. Each host subscribes, so the
+/// request is answered beside the page that made it.
+pub enum PullRequestDetailEvent {
+    /// A commit row was clicked: open its diff as its own tab. The pull
+    /// request and device locate the commit on GitHub, without a checkout.
+    OpenCommit {
+        url: String,
+        device: Option<String>,
+        commit: zeron_proto::GitHistoryCommit,
+    },
+}
 
 /// What went wrong and what to do, in words. Error codes and transport
 /// details never reach the reader.
@@ -417,6 +429,7 @@ struct CommitHistory {
     graph: Entity<GitHistory>,
     count: Entity<GitHistoryCount>,
     search: Entity<GitHistorySearchControl>,
+    _events: Subscription,
 }
 
 pub struct PullRequestDetailPage {
@@ -493,6 +506,8 @@ pub struct PullRequestDetailPage {
     /// The image that failed to load, offered in the browser instead.
     image_failed: Option<String>,
 }
+
+impl gpui::EventEmitter<PullRequestDetailEvent> for PullRequestDetailPage {}
 
 impl PullRequestDetailPage {
     pub(crate) fn new(
@@ -1136,10 +1151,20 @@ impl PullRequestDetailPage {
             let graph = cx.new(|_| GitHistory::provided(self.state.clone(), self.url.clone()));
             let count = cx.new(|cx| GitHistoryCount::new(graph.clone(), cx));
             let search = cx.new(|cx| GitHistorySearchControl::new(graph.clone(), cx));
+            let events = cx.subscribe(&graph, |page: &mut Self, _, event, cx| {
+                if let GitHistoryEvent::OpenCommit(commit) = event {
+                    cx.emit(PullRequestDetailEvent::OpenCommit {
+                        url: page.url.clone(),
+                        device: page.target.clone(),
+                        commit: commit.clone(),
+                    });
+                }
+            });
             self.history = Some(CommitHistory {
                 graph,
                 count,
                 search,
+                _events: events,
             });
             self.show_commits(cx);
         }
@@ -3078,6 +3103,50 @@ mod tests {
             let history = page.history.as_ref().unwrap();
             assert_eq!(history.graph.read(cx).commit_count(), Some(2));
         });
+    }
+
+    #[gpui::test]
+    fn pull_request_commit_rows_ask_the_host_to_open_them(cx: &mut gpui::TestAppContext) {
+        fixture::init(cx);
+        init_history(cx);
+        let (page, cx) = cx.add_window_view(|window, cx| {
+            PullRequestDetailPage::new(
+                fixture::state(cx, None),
+                "https://github.com/a/b/pull/1".into(),
+                Some("remote-device".into()),
+                Rc::new(RefCell::new(PullRequestCache::default())),
+                None,
+                window,
+                cx,
+            )
+        });
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        let _subscription = cx.update(|_, cx| {
+            let opened = opened.clone();
+            cx.subscribe(&page, move |_, event: &PullRequestDetailEvent, _| {
+                let PullRequestDetailEvent::OpenCommit {
+                    url,
+                    device,
+                    commit,
+                } = event;
+                opened
+                    .borrow_mut()
+                    .push((url.clone(), device.clone(), commit.sha.clone()));
+            })
+        });
+        let graph = page.update(cx, |page, cx| page.commit_history(cx).graph.clone());
+        graph.update(cx, |_, cx| {
+            cx.emit(GitHistoryEvent::OpenCommit(pr_commit("c".repeat(40))))
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            *opened.borrow(),
+            [(
+                "https://github.com/a/b/pull/1".to_owned(),
+                Some("remote-device".to_owned()),
+                "c".repeat(40)
+            )]
+        );
     }
 
     fn board_preview(head: &str) -> ChangeRequestListItem {

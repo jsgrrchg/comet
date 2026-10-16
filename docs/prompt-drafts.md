@@ -16,8 +16,10 @@ continue using their existing per-chat draft behavior.
   creation time. Every surviving revision head is recoverable. Concurrent edits
   appear as separate entries; consuming one head preserves the other heads.
 - Full content and image bytes live outside registry rows. Desktop uses SQLite
-  snapshots plus a durable publication outbox; iOS uses profile-scoped files and
-  an atomic outbox. Content is limited to 2 MiB; individual assets to 32 MiB.
+  snapshots plus a durable publication outbox; iOS (the Rust core,
+  `crates/client/src/drafts.rs`) uses profile-scoped object files and an atomic
+  outbox under the client's data directory. Content is limited to 2 MiB;
+  individual assets to 32 MiB.
 - Publication uploads immutable content to `/draft-content/{org}/{object}` before
   publishing its registry references. Asset IDs are SHA-256 hashes and successful
   uploads are cached. Offline edits are visible locally while publication retries.
@@ -33,6 +35,21 @@ continue using their existing per-chat draft behavior.
   and then its assets, avoiding oversized WebSocket frames even for large images.
 - Desktop saves after 300 ms of inactivity and flushes on navigation and normal
   application quit. iOS also flushes when entering the background.
+
+## iOS
+
+The new-session page is the canvas. Every edit (text, images, project, host,
+branch/worktree, model, effort) autosaves after 300 ms; closing the page unsent,
+or replacing it in the iPad column, lists the draft and the next page starts
+empty (keeping the options picked). A page the app dies on lists at the next
+launch. The Sessions page shows a foldable **Drafts** section above Pinned, in
+the desktop's accent: tap to reopen, swipe to discard, long-press to move to the
+top/bottom; the section's menu opens a Drafts page that reorders by drag. Drafts
+saved offline read "Not synced" until they publish. A canvas only this device
+has seen sends at once (offline too); a listed draft is reserved first. The
+demo workspace (`-demo`) seeds drafts in every shape the list shows: with an
+image, projectless, in a new worktree on another host, and a concurrent edit
+(`-route draft:<id>` opens one).
 
 The ordering allocator is shared with sidebar pins. Draft ordering is independent
 of pin ordering. The sidebar applies pending moves optimistically and accepts
@@ -56,7 +73,7 @@ retained; this version does not garbage-collect draft history or shared assets.
 ## Rollout and validation
 
 Deploy the Edge routes and registry claim support before using cross-device draft
-publication. Update the desktop engine/UI and native iOS client. Desktop capability
+publication. Update the desktop engine/UI and the iOS app (its Rust core included). Desktop capability
 negotiation uses `prompt-drafts-v1` and prevents sending to unsupported hosts.
 This change does not deploy Edge automatically.
 
@@ -65,5 +82,7 @@ heads after send, durable discard, content/asset restart recovery, immutable
 retries, cross-user/org isolation in real R2, serialized claims in real SQLite,
 preserving independent composer canvases, failure recovery across navigation,
 large attachments over real WebSocket RPC, late command duplicates, and
-out-of-order revision publication. Native Swift tests cover registry
-projection and restored Appshot context; they require Xcode to run.
+out-of-order revision publication. iOS coverage lives in the core
+(`crates/client`: outbox restart, immutable revisions, pending overlay, and the
+demo list/open/reorder/send/discard flow) plus UI flows in
+`ZeronUITests/SessionFlowTests` (Xcode).

@@ -1492,30 +1492,34 @@ fn commit_run(
                         .text_color(theme.text_muted),
                 ),
         )
-        .child(match author {
-            Some(author) => div()
-                .flex()
-                .items_baseline()
-                .gap(px(4.0))
-                .child(
-                    div()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(author.to_owned()),
-                )
-                .child(
-                    div()
-                        .text_color(theme.text_muted)
-                        .child(format!("added {count}")),
-                ),
-            None => div()
-                .text_color(theme.text_muted)
-                .child(format!("Added {count}")),
-        })
+        // One line of text at one size: a smaller time never sits on the
+        // same line as the name in every UI font.
         .child(
             div()
-                .text_size(crate::typography::ui_rems(11.0))
-                .text_color(theme.text_muted)
-                .child(activity_time(&last.authored_at)),
+                .min_w_0()
+                .flex()
+                .flex_wrap()
+                .items_baseline()
+                .gap(px(4.0))
+                .text_size(crate::typography::ui_rems(12.5))
+                .line_height(crate::typography::ui_rems(16.0))
+                .when_some(author, |el, author| {
+                    el.child(
+                        div()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(author.to_owned()),
+                    )
+                })
+                .child(div().text_color(theme.text_muted).child(match author {
+                    Some(_) => format!("added {count}"),
+                    None => format!("Added {count}"),
+                }))
+                .child(
+                    div()
+                        .ml(px(4.0))
+                        .text_color(theme.text_muted)
+                        .child(activity_time(&last.authored_at)),
+                ),
         );
     let rows = run.iter().map(|commit| {
         let short: String = commit.sha.chars().take(7).collect();

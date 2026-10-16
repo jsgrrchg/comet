@@ -547,3 +547,64 @@ fn carried_sessions_mention_from_the_composer_and_split_from_the_transcript(
         assert_eq!(shell.split_views(cx)[0].chats, ["parent", "other"]);
     });
 }
+
+/// A pane title carried onto another title moves its pane to that side, a
+/// marker showing where; a sidebar pill does the same onto another pill.
+#[gpui::test]
+fn pane_titles_and_pills_reorder_the_split(cx: &mut TestAppContext) {
+    let (shell, cx) = setup_with_shell(cx, true);
+    // The split's sidebar row will stand where its first member's row
+    // stands, its pills halving it. The sidebar is a cached view: a
+    // refresh repaints it so its debug bounds show.
+    cx.update(|window, cx| {
+        window.refresh();
+        window.draw(cx).clear()
+    });
+    let row = cx.debug_bounds("chat-other").unwrap();
+    shell.update(cx, |shell, cx| {
+        assert!(shell.split_chat_beside(
+            "parent",
+            "other",
+            crate::split_view::SplitSide::Right,
+            cx
+        ));
+    });
+    cx.update(|window, cx| window.draw(cx).clear());
+    let chats = |cx: &mut VisualTestContext| {
+        shell.read_with(cx, |shell, cx| shell.split_views(cx)[0].chats.clone())
+    };
+    assert_eq!(chats(cx), ["parent", "other"]);
+
+    let parent = cx.debug_bounds("split-title-parent").unwrap();
+    let left = gpui::point(parent.left() + px(4.), parent.center().y);
+    carry(cx, "split-title-other", left);
+    assert!(cx.debug_bounds("split-reorder-title-left-parent").is_some());
+    release(cx, left);
+    assert_eq!(chats(cx), ["other", "parent"]);
+    assert!(cx.debug_bounds("split-reorder-title-left-parent").is_none());
+
+    // Now "other" is the left pill and "parent" the right one.
+    let paint = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear()
+        })
+    };
+    paint(cx);
+    let other = cx.debug_bounds("split-pill-other").unwrap();
+    let parent = cx.debug_bounds("split-pill-parent").unwrap();
+    assert!(other.right() <= parent.left());
+    let left = gpui::point(other.left() + px(6.), other.center().y);
+    cx.simulate_mouse_down(
+        parent.center(),
+        MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    for _ in 0..2 {
+        cx.simulate_mouse_move(left, Some(MouseButton::Left), gpui::Modifiers::default());
+        paint(cx);
+    }
+    assert!(cx.debug_bounds("split-reorder-pill-left-other").is_some());
+    release(cx, left);
+    assert_eq!(chats(cx), ["parent", "other"]);
+}

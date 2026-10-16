@@ -48,9 +48,130 @@ pub(super) struct ChatDropZone {
     pub(super) target: String,
     pub(super) kind: ChatDropKind,
     bounds: gpui::Bounds<Pixels>,
+    /// The carried chat is already in the target's split: opening beside
+    /// it moves its pane.
+    moves: bool,
+}
+
+/// The pane title or sidebar pill a carried pill would land beside, and on
+/// which side of it.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct SplitReorder {
+    target: String,
+    /// Which of the target's handles: its pane title or its sidebar pill.
+    handle: SplitHandle,
+    side: SplitSide,
+}
+
+/// The two handles a split pane has outside its body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SplitHandle {
+    Title,
+    Pill,
 }
 
 impl Shell {
+    /// Let `el`, the `handle` of `chat_id`'s pane, take carried
+    /// pills: one lands on the side of it the pointer is over, moving its
+    /// pane there. A marker on that edge shows where.
+    pub(super) fn split_reorder_target(
+        &self,
+        el: gpui::Stateful<gpui::Div>,
+        chat_id: &str,
+        handle: SplitHandle,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (track_id, drop_id) = (chat_id.to_string(), chat_id.to_string());
+        let marker = self
+            .split_reorder
+            .as_ref()
+            .filter(|reorder| {
+                reorder.target == chat_id && reorder.handle == handle && cx.has_active_drag()
+            })
+            .map(|reorder| {
+                div()
+                    .debug_selector({
+                        let id = chat_id.to_string();
+                        let side = reorder.side;
+                        let handle = match handle {
+                            SplitHandle::Title => "title",
+                            SplitHandle::Pill => "pill",
+                        };
+                        move || format!("split-reorder-{handle}-{}-{id}", side_name(side))
+                    })
+                    .absolute()
+                    .top(px(2.0))
+                    .bottom(px(2.0))
+                    .w(px(2.0))
+                    .rounded_full()
+                    .bg(theme.accent)
+                    .when(reorder.side == SplitSide::Left, |el| el.left(px(-1.0)))
+                    .when(reorder.side == SplitSide::Right, |el| el.right(px(-1.0)))
+            });
+        el.relative()
+            .on_drag_move::<SplitPillDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<SplitPillDrag>, _, cx| {
+                    let dragged = event.drag(cx).chat_id.clone();
+                    this.track_split_reorder(
+                        &track_id,
+                        handle,
+                        &dragged,
+                        event.bounds,
+                        event.event.position,
+                        cx,
+                    );
+                },
+            ))
+            .on_drop::<SplitPillDrag>(cx.listener(move |this, payload: &SplitPillDrag, _, cx| {
+                let reorder = this.split_reorder.take();
+                this.chat_drop_zone = None;
+                cx.stop_propagation();
+                if let Some(reorder) =
+                    reorder.filter(|reorder| reorder.target == drop_id && reorder.handle == handle)
+                {
+                    this.split_chat_beside(&drop_id, &payload.chat_id, reorder.side, cx);
+                }
+                cx.notify();
+            }))
+            .children(marker)
+    }
+
+    /// Follow a carried pill over the `handle` of `target`'s pane.
+    fn track_split_reorder(
+        &mut self,
+        target: &str,
+        handle: SplitHandle,
+        dragged: &str,
+        bounds: gpui::Bounds<Pixels>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let over = bounds.contains(&position)
+            && dragged != target
+            && self.chat_can_split(target, dragged, cx);
+        let reorder = over.then(|| SplitReorder {
+            target: target.to_string(),
+            handle,
+            side: if position.x < bounds.center().x {
+                SplitSide::Left
+            } else {
+                SplitSide::Right
+            },
+        });
+        let current = self
+            .split_reorder
+            .as_ref()
+            .filter(|reorder| reorder.target == target && reorder.handle == handle);
+        if reorder.is_none() && current.is_none() {
+            return;
+        }
+        if reorder.as_ref() != current {
+            self.split_reorder = reorder;
+            cx.notify();
+        }
+    }
+
     /// The entire conversation receives attachments in its own composer,
     /// regardless of which pane had keyboard focus when the drag started.
     /// `split_anchor` is the chat the conversation shows when a session
@@ -187,6 +308,9 @@ impl Shell {
                 target: anchor.to_string(),
                 kind,
                 bounds,
+                moves: self
+                    .split_of_chat(anchor, cx)
+                    .is_some_and(|view| view.contains(dragged)),
             }
         });
         let current = self
@@ -271,16 +395,7 @@ impl Shell {
         };
         let overlay = match zone.kind {
             ChatDropKind::Beside(side) => div()
-                .debug_selector(move || {
-                    format!(
-                        "chat-drop-{}",
-                        if side == SplitSide::Left {
-                            "left"
-                        } else {
-                            "right"
-                        }
-                    )
-                })
+                .debug_selector(move || format!("chat-drop-{}", side_name(side)))
                 .absolute()
                 .top(px(Theme::TITLEBAR_HEIGHT))
                 .bottom(px(8.0))
@@ -294,7 +409,11 @@ impl Shell {
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(label("Open beside")),
+                .child(label(if zone.moves {
+                    "Move here"
+                } else {
+                    "Open beside"
+                })),
             ChatDropKind::Mention => {
                 let composer = self
                     .chat_drop_composers
@@ -362,5 +481,12 @@ impl Shell {
             .drag_over::<SidebarSessionDrag>(|style, _, _, _| style.opacity(1.0))
             .drag_over::<SplitPillDrag>(|style, _, _, _| style.opacity(1.0))
             .child("Drop to mention")
+    }
+}
+
+fn side_name(side: SplitSide) -> &'static str {
+    match side {
+        SplitSide::Left => "left",
+        SplitSide::Right => "right",
     }
 }

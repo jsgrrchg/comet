@@ -2,7 +2,7 @@
 //! side as the panes are. The row sits where its first member's row would
 //! (so a pinned member pins the split), and the members don't also list on
 //! their own. A pill opens its chat's pane; the row opens the pane focused
-//! last.
+//! last. Pills drag onto one another to reorder the panes.
 use super::*;
 use crate::split_view::{self, SplitView};
 use std::collections::HashSet;
@@ -298,7 +298,8 @@ impl Shell {
             chat_id: chat_id.clone(),
             title: title.clone(),
         };
-        crate::surface_chrome::tab(SharedString::from(pill_id.clone()), focused, theme)
+        let tab = crate::surface_chrome::tab(SharedString::from(pill_id.clone()), focused, theme);
+        self.split_reorder_target(tab, &chat_id, chat_dropzone::SplitHandle::Pill, theme, cx)
             .debug_selector({
                 let id = chat_id.clone();
                 move || format!("split-pill-{id}")
@@ -347,8 +348,9 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Carried onto a conversation it opens beside it (or moves
-            // within the split); the list ignores it.
+            // Carried onto a conversation, a pane title or another pill it
+            // opens beside it (or moves within the split); the list ignores
+            // it.
             .on_drag(drag, |payload, _, _, cx| {
                 cx.stop_propagation();
                 cx.new(|_| chat_dropzone::SplitPillGhost {

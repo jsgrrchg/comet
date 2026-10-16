@@ -713,7 +713,8 @@ impl Shell {
 
     /// The titlebar over a split: each pane's title above it, the focused
     /// one raised. A title focuses its pane; its ✕ takes the chat out of the
-    /// split. `row_left` is where the titlebar row starts.
+    /// split; dragged, it moves the pane. `row_left` is where the titlebar
+    /// row starts.
     pub(super) fn render_split_titles(
         &mut self,
         view: &SplitView,
@@ -760,6 +761,10 @@ impl Shell {
             let group = SharedString::from(format!("split-title-{ix}"));
             let focus_id = chat_id.clone();
             let close_id = chat_id.clone();
+            let drag = chat_dropzone::SplitPillDrag {
+                chat_id: chat_id.clone(),
+                title: title.clone(),
+            };
             let title_el = div()
                 .id(("split-title", ix))
                 .debug_selector({
@@ -846,7 +851,21 @@ impl Shell {
                                 .size(px(12.0))
                                 .text_color(theme.text_muted),
                         ),
-                );
+                )
+                // Carried onto another title or pane it moves there.
+                .on_drag(drag, |payload, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| chat_dropzone::SplitPillGhost {
+                        title: payload.title.clone(),
+                    })
+                });
+            let title_el = self.split_reorder_target(
+                title_el,
+                chat_id,
+                chat_dropzone::SplitHandle::Title,
+                &theme,
+                cx,
+            );
             let slot = div()
                 .h_full()
                 .min_w_0()

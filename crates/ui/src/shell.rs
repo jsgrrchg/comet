@@ -2072,6 +2072,8 @@ pub struct Shell {
     split_layout: Option<(String, usize)>,
     /// Where a chat carried over a conversation would land.
     chat_drop_zone: Option<chat_dropzone::ChatDropZone>,
+    /// The pane title or sidebar pill a carried pill would land beside.
+    split_reorder: Option<chat_dropzone::SplitReorder>,
     /// Each conversation's composer bounds as last painted, by chat id.
     chat_drop_composers: std::collections::HashMap<
         String,
@@ -2604,6 +2606,7 @@ impl Shell {
             split_panes: std::collections::HashMap::new(),
             split_layout: None,
             chat_drop_zone: None,
+            split_reorder: None,
             chat_drop_composers: std::collections::HashMap::new(),
             side_chat_creating: false,
             browsers: std::collections::HashMap::new(),
@@ -13575,6 +13578,7 @@ impl Render for Shell {
             }))
             .on_drop::<chat_dropzone::SplitPillDrag>(cx.listener(|this, _, _, cx| {
                 this.chat_drop_zone = None;
+                this.split_reorder = None;
                 cx.notify();
             }))
             .on_mouse_up(

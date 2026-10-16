@@ -1390,6 +1390,22 @@ impl PullRequestDetailPage {
         self.select_tab(TABS[index.min(TABS.len() - 1)].0, cx);
     }
 
+    /// Open the newest listed commit, as a click on its row does.
+    pub fn fixture_open_commit(&mut self, cx: &mut Context<Self>) {
+        let newest = self
+            .commits
+            .as_ref()
+            .and_then(|commits| commits.commits.first())
+            .cloned();
+        if let Some(commit) = newest {
+            cx.emit(PullRequestDetailEvent::OpenCommit {
+                url: self.url.clone(),
+                device: self.target.clone(),
+                commit,
+            });
+        }
+    }
+
     pub fn fixture_select_file(&mut self, index: usize, cx: &mut Context<Self>) {
         self.select_code_file(index, cx);
     }

@@ -317,6 +317,7 @@ pub struct AppearancePage {
     review_entry: Option<String>,
     library_error: Option<SharedString>,
     background_error: Option<SharedString>,
+    home_visual: Entity<crate::settings::home_visual::HomeVisualCard>,
 }
 
 impl AppearancePage {
@@ -581,6 +582,7 @@ impl AppearancePage {
             review_entry: None,
             library_error: None,
             background_error: None,
+            home_visual: cx.new(crate::settings::home_visual::HomeVisualCard::new),
         }
     }
 
@@ -4036,6 +4038,11 @@ impl Render for AppearancePage {
                                     &theme,
                                     "Material and background",
                                     widgets::section_card(&theme).mt_0().children(settings_rows),
+                                ))
+                                .child(widgets::section(
+                                    &theme,
+                                    "Home visual",
+                                    self.home_visual.clone(),
                                 ))
                                 .child(widgets::section(
                                     &theme,

@@ -180,12 +180,7 @@ impl VisualFrame {
         target_device_id: Option<String>,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Its drawings leave every window's sprite atlas with it.
-        cx.on_release(|this, cx| {
-            let images = this.local.borrow_mut().prune(None);
-            free_images(images, cx);
-        })
-        .detach();
+        let mut frame = Self::unloaded(id, title, cx);
         let mut tasks = Vec::new();
         let load = match engine {
             Some(engine) => {
@@ -240,10 +235,36 @@ impl VisualFrame {
             }
             None => Load::Failed("Visual unavailable".into()),
         };
+        frame.load = load;
+        frame._tasks = tasks;
+        frame
+    }
+
+    /// A visual from a script already in hand rather than an agent's reply
+    /// (the user's own visual below the new-thread composer). It has no
+    /// assets; its seed comes from `id`, as [`zeron_visual::seed_for`].
+    pub fn from_script(
+        id: SharedString,
+        title: String,
+        script: &str,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut frame = Self::unloaded(id, title, cx);
+        frame.start(script, zeron_visual::Assets::default(), cx);
+        frame
+    }
+
+    fn unloaded(id: SharedString, title: String, cx: &mut Context<Self>) -> Self {
+        // Its drawings leave every window's sprite atlas with it.
+        cx.on_release(|this, cx| {
+            let images = this.local.borrow_mut().prune(None);
+            free_images(images, cx);
+        })
+        .detach();
         Self {
             id,
             title: title.into(),
-            load,
+            load: Load::Loading,
             runtime: None,
             tree: None,
             generation: 0,
@@ -251,7 +272,7 @@ impl VisualFrame {
             link_ui: None,
             local: Rc::default(),
             started: Instant::now(),
-            _tasks: tasks,
+            _tasks: Vec::new(),
         }
     }
 

@@ -23,6 +23,7 @@ pub mod composer;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
+pub mod home_visual;
 pub mod notifications;
 pub mod shortcuts;
 pub mod thread_naming;
@@ -542,6 +543,16 @@ pub fn set_new_thread_background_effect(effect: NewThreadBackgroundEffect, cx: &
     }
 }
 
+/// Save (or clear, with `None`) the visual below the new-thread composer.
+/// Callers check the script first; see `settings::home_visual`.
+pub fn set_new_thread_visual(script: Option<String>, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.new_thread_visual = script;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
 pub fn set_new_thread_background_adjustment(
     adjustment: NewThreadBackgroundAdjustment,
     cx: &mut App,
@@ -1002,6 +1013,10 @@ pub struct UiSettings {
     pub wallpaper_color: Option<zeron_theme::Color>,
     /// Non-destructive treatment composited inside the artwork's fade mask.
     pub new_thread_background_effect: NewThreadBackgroundEffect,
+    /// The user's own Luau visual (the `show_visual` script format), drawn
+    /// below the blank new-thread composer. Checked before it is saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_thread_visual: Option<String>,
     /// Snap animations to rest. Defaults to following the OS.
     pub reduce_motion: crate::motion::ReduceMotion,
     /// Also snap animations while the main window is not focused.
@@ -1105,6 +1120,7 @@ impl Default for UiSettings {
             wallpaper_theme_colors: false,
             wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::None,
+            new_thread_visual: None,
             reduce_motion: crate::motion::ReduceMotion::System,
             pause_animations_in_background: false,
             codex_voice: None,
@@ -1750,6 +1766,7 @@ impl UiSettings {
             wallpaper_theme_colors,
             wallpaper_color,
             new_thread_background_effect,
+            new_thread_visual,
             reduce_motion,
             pause_animations_in_background,
             codex_voice,
@@ -2059,6 +2076,19 @@ mod tests {
     }
 
     #[test]
+    fn new_thread_visual_round_trips_and_is_omitted_when_unset() {
+        let settings = UiSettings {
+            new_thread_visual: Some("return function() return ui.text \"Hi\" end".into()),
+            ..Default::default()
+        };
+        let loaded: UiSettings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(loaded.new_thread_visual, settings.new_thread_visual);
+        let unset = serde_json::to_string(&UiSettings::default()).unwrap();
+        assert!(!unset.contains("newThreadVisual"));
+    }
+
+    #[test]
     fn composer_send_behavior_is_opt_in_for_old_and_partial_settings() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2075,6 +2105,7 @@ mod tests {
             loaded.new_thread_background_effect,
             NewThreadBackgroundEffect::None
         );
+        assert!(loaded.new_thread_visual.is_none());
         assert_eq!(loaded.reduce_motion, crate::motion::ReduceMotion::System);
         assert!(!loaded.pause_animations_in_background);
         assert_eq!(loaded.sidebar_width, 300.0);
@@ -2840,6 +2871,7 @@ mod tests {
             wallpaper_theme_colors: false,
             wallpaper_color: None,
             new_thread_background_effect: NewThreadBackgroundEffect::Ascii,
+            new_thread_visual: Some("return function() return ui.text \"Hi\" end".into()),
             reduce_motion: crate::motion::ReduceMotion::On,
             pause_animations_in_background: true,
             legacy_accent_color: None,

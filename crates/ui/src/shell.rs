@@ -1373,6 +1373,15 @@ fn bottom_stack_measurement_matches(
     measured_has_composer == expected_has_composer
 }
 
+/// Space between the new-thread composer and the home visual, and below the
+/// visual when no Home notice sits at the window bottom.
+const HOME_VISUAL_GAP: f32 = 24.0;
+/// Room left below the home visual for the bottom Home notices chip.
+const HOME_VISUAL_NOTICE_CLEARANCE: f32 = 72.0;
+/// Less room than this and the home visual stays hidden.
+const HOME_VISUAL_MIN_HEIGHT: f32 = 48.0;
+const HOME_VISUAL_FADE_BAND: f32 = 48.0;
+
 fn new_thread_background_opacity(is_frost: bool) -> f32 {
     if is_frost {
         NEW_THREAD_BACKGROUND_FROSTED_OPACITY
@@ -1968,6 +1977,13 @@ pub struct Shell {
     /// Shared route clock and measured prepaint geometry for the persistent composer.
     composer_dock: crate::composer_dock::SharedDock,
     new_thread_artwork_ready: crate::new_thread_background_effects::Readiness,
+    /// The user's Luau visual below the blank new-thread composer, and the
+    /// script it runs (rebuilt when Settings saves another).
+    home_visual: Option<(String, Entity<crate::visuals::VisualFrame>)>,
+    /// The persistent composer, and the column the home visual is placed
+    /// in, as last painted (window coordinates).
+    home_composer_bounds: crate::new_thread_background_mask::SurfaceBounds,
+    home_visual_origin: crate::new_thread_background_mask::SurfaceBounds,
     /// Session-transient disclosure state, matching the Archived shelf.
     pub(super) pinned_open: bool,
     pub(super) sessions_open: bool,
@@ -2525,6 +2541,9 @@ impl Shell {
             bottom_stack_has_composer: std::rc::Rc::new(std::cell::Cell::new(false)),
             composer_dock: Default::default(),
             new_thread_artwork_ready: Default::default(),
+            home_visual: None,
+            home_composer_bounds: Default::default(),
+            home_visual_origin: Default::default(),
             archived_open: true,
             pinned_open: true,
             sessions_open: true,
@@ -11212,6 +11231,22 @@ impl Shell {
         } else {
             None
         };
+        let home_shown = !has_selection || dock_frame.active;
+        let home_visual_layer = self.render_home_visual(
+            ui_settings.new_thread_visual.as_deref(),
+            if home_shown && (has_spaces || no_project || has_appshots) {
+                chip_opacity
+            } else {
+                0.0
+            },
+            if harness_update_card.is_some() {
+                HOME_VISUAL_NOTICE_CLEARANCE
+            } else {
+                HOME_VISUAL_GAP
+            },
+            terminal_geometry.clone(),
+            cx,
+        );
         let status = div()
             .relative()
             .left(px(-session_reserve / 2.0))
@@ -11242,6 +11277,7 @@ impl Shell {
             // it must paint under the overlaid titlebar instead of becoming
             // fully transparent across the titlebar's inset band.
             .children(new_thread_background_layer)
+            .children(home_visual_layer)
             .child(
                 // Full-height underlay: the transcript viewport spans the
                 // whole column, scrolling UNDER the titlebar above and the
@@ -11368,6 +11404,22 @@ impl Shell {
                                     .opacity(composer_opacity)
                                     .mx_auto()
                                     .child(self.composer.clone())
+                                    .when(home_shown, |composer| {
+                                        let measured = self.home_composer_bounds.clone();
+                                        composer.child(
+                                            gpui::canvas(
+                                                move |bounds, window, _| {
+                                                    if measured.get() != Some(bounds) {
+                                                        measured.set(Some(bounds));
+                                                        window.request_animation_frame();
+                                                    }
+                                                },
+                                                |_, _, _, _| {},
+                                            )
+                                            .absolute()
+                                            .inset_0(),
+                                        )
+                                    })
                                     .children(if has_selection {
                                         self.render_jump_to_bottom(cx)
                                     } else {
@@ -11389,6 +11441,103 @@ impl Shell {
             .child(Self::attachment_drop_overlay(theme))
             .child(Self::mention_drop_overlay(theme))
             .into_any_element()
+    }
+
+    /// The user's Luau visual (Settings → Appearance → Home visual) in the
+    /// room between the blank new-thread composer and the window bottom.
+    /// It is placed from last frame's composer and column bounds, like the
+    /// bottom-stack clearance, and fades with the Home selectors.
+    fn render_home_visual(
+        &mut self,
+        script: Option<&str>,
+        opacity: f32,
+        bottom_clearance: f32,
+        terminal_geometry: crate::terminal::dock::SharedGeometry,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let Some(script) = script else {
+            self.home_visual = None;
+            return None;
+        };
+        if self
+            .home_visual
+            .as_ref()
+            .is_none_or(|(current, _)| current != script)
+        {
+            let frame = cx.new(|cx| {
+                crate::visuals::VisualFrame::from_script(
+                    settings::home_visual::HOME_VISUAL_ID.into(),
+                    "Home visual".into(),
+                    script,
+                    cx,
+                )
+            });
+            self.home_visual = Some((script.to_owned(), frame));
+        }
+        if opacity <= 0.001 {
+            return None;
+        }
+        let frame = self.home_visual.as_ref()?.1.clone();
+        let origin = self.home_visual_origin.clone();
+        let placement = |column: gpui::Bounds<Pixels>, composer: gpui::Bounds<Pixels>| {
+            let top = f32::from(composer.bottom() - column.top()) + HOME_VISUAL_GAP;
+            let height = f32::from(column.size.height) - top - bottom_clearance;
+            (height >= HOME_VISUAL_MIN_HEIGHT).then(|| {
+                (
+                    f32::from(composer.left() - column.left()) + Theme::SPACE_LG,
+                    top,
+                    (f32::from(composer.size.width) - 2.0 * Theme::SPACE_LG).max(0.0),
+                    height,
+                )
+            })
+        };
+        let placement = origin
+            .get()
+            .zip(self.home_composer_bounds.get())
+            .and_then(|(column, composer)| placement(column, composer));
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .child(
+                    gpui::canvas(
+                        move |bounds, window, _| {
+                            if origin.get() != Some(bounds) {
+                                origin.set(Some(bounds));
+                                window.request_animation_frame();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                )
+                .when_some(placement, |layer, (left, top, width, height)| {
+                    // Clipped at the terminal's top edge, like the Home notices.
+                    layer.child(crate::terminal::dock::above_terminal(
+                        div().size_full().overflow_hidden().child(
+                            div()
+                                .absolute()
+                                .left(px(left))
+                                .top(px(top))
+                                .w(px(width))
+                                .h(px(height))
+                                .overflow_hidden()
+                                .opacity(opacity)
+                                // A visual taller than the room fades out at
+                                // its bottom instead of being cut off.
+                                .child(crate::edge_fade::edge_faded(
+                                    HOME_VISUAL_FADE_BAND,
+                                    false,
+                                    true,
+                                    div().size_full().child(frame),
+                                )),
+                        ),
+                        terminal_geometry,
+                    ))
+                })
+                .into_any_element(),
+        )
     }
 
     /// The "↓ Scroll to bottom" pill (round-9 §3): a LABELED rounded-full

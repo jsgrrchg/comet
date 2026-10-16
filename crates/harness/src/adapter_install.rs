@@ -906,36 +906,61 @@ mod native_fork_install_tests {
         for cancel in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let npm = dir.path().join("fake npm");
-            std::fs::write(&npm, "#!/bin/sh\nprintf '%s' $$ > pid\nexec sleep 30\n").unwrap();
+            std::fs::write(&npm, "#!/bin/sh\nprintf '%s' $$ > pid\nexec sleep 3600\n").unwrap();
             std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
             let token = crate::CancellationToken::new();
-            if cancel {
-                let token = token.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    token.cancel();
-                });
-            }
             let root = dir.path().join("project with spaces");
-            let deadline = tokio::time::Instant::now()
-                + Duration::from_millis(if cancel { 5000 } else { 500 });
-            let result = install_into(
+            let cache = dir.path().join("cache");
+            let pin = NpmPin {
+                name: "fixture",
+                version: "1",
+            };
+            // Keep the deadline out of startup's way. Advance the test clock only
+            // after the real subprocess has published its PID.
+            let lifetime = Duration::from_secs(24 * 60 * 60);
+            let deadline = tokio::time::Instant::now() + lifetime;
+            let install = install_into(
                 &npm,
-                &NpmPin {
-                    name: "fixture",
-                    version: "1",
-                },
+                &pin,
                 &root,
-                &dir.path().join("cache"),
+                &cache,
                 "fork fixture",
                 Some((deadline, &token)),
-            )
-            .await;
-            assert!(result.is_err());
-            let pid: i32 = std::fs::read_to_string(root.join("pid"))
-                .unwrap_or_else(|e| panic!("installer did not start: {result:?}; {e}"))
-                .parse()
-                .unwrap();
+            );
+            tokio::pin!(install);
+            let pid: i32 = tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    tokio::select! {
+                        result = &mut install => panic!("installer exited before readiness: {result:?}"),
+                        _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                            if let Ok(contents) = std::fs::read_to_string(root.join("pid")) {
+                                if let Ok(pid) = contents.parse::<i32>() {
+                                    break pid;
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("installer must publish its PID within the startup safety limit");
+            let reason = if cancel {
+                token.cancel();
+                "was cancelled"
+            } else {
+                tokio::time::pause();
+                tokio::time::advance(lifetime).await;
+                // Reaping waits on real OS events, so its safety limit uses real time.
+                tokio::time::resume();
+                "timed out"
+            };
+            let result = tokio::time::timeout(Duration::from_secs(5), &mut install)
+                .await
+                .expect("installer must finish cleanup after cancellation or timeout");
+            assert!(
+                matches!(&result, Err(HarnessError::Install(message)) if message.ends_with(reason)),
+                "expected {reason}, got {result:?}"
+            );
             assert_eq!(
                 unsafe { libc::kill(pid, 0) },
                 -1,

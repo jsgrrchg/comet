@@ -18,11 +18,13 @@ use crate::shader_player::{ShaderPlayer, ShaderProgram, SharedShaderPlayer};
 pub(crate) const GENERATIVE_ID: &str = "new-thread-generative";
 /// Frames per second while the art moves.
 const FPS: f64 = 30.0;
-/// Frames render below the display's resolution: the art is soft and fades
-/// out anyway, and every frame is read back from the GPU.
-const RENDER_SCALE: f32 = 0.5;
-/// The longest side of a frame, in pixels.
-const MAX_SIDE: f32 = 1600.0;
+/// Frames render at one pixel per logical pixel: sharp on a 1x display, half
+/// the device's on a 2x one, where the art's soft fades hide it, and every
+/// frame is read back from the GPU.
+const MAX_DENSITY: f32 = 1.0;
+/// The most pixels in a frame (about 2560 by 1600); bigger backgrounds scale
+/// down to it.
+const MAX_PIXELS: f32 = 4_096_000.0;
 /// When the art's color is sampled for "Match wallpaper colors".
 const SAMPLE_TIME: f32 = 2.0;
 
@@ -189,11 +191,12 @@ impl GenerativeBackground {
         let (Some(shader), Some(program)) = (self.shader.clone(), self.program.clone()) else {
             return None;
         };
-        let density = scale_factor.min(2.0) * RENDER_SCALE;
+        let density = scale_factor.min(MAX_DENSITY);
         let mut pixels = (size.0 * density, size.1 * density);
-        let longest = pixels.0.max(pixels.1);
-        if longest > MAX_SIDE {
-            pixels = (pixels.0 * MAX_SIDE / longest, pixels.1 * MAX_SIDE / longest);
+        let area = pixels.0 * pixels.1;
+        if area > MAX_PIXELS {
+            let shrink = (MAX_PIXELS / area).sqrt();
+            pixels = (pixels.0 * shrink, pixels.1 * shrink);
         }
         let pixels = (
             pixels.0.round().max(1.0) as u32,

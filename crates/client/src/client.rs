@@ -18,6 +18,7 @@ use crate::connectivity::{
     Connectivity, ConnectivityState, ConnectivityTracker, RawConnectivity, SendState,
 };
 use crate::demo::DemoHost;
+use crate::drafts::DraftStore;
 use crate::error::{ClientError, Result};
 use crate::events::{ClientEvent, ClientListener, EventPump};
 use crate::live::LiveBackend;
@@ -86,6 +87,7 @@ pub(crate) struct ClientInner {
     pub(crate) workspace: WorkspaceStore,
     pub(crate) tokens: TokenProvider,
     pub(crate) attachment_cache: AttachmentCache,
+    pub(crate) drafts: DraftStore,
     backend: OnceLock<Backend>,
     sessions: Mutex<HashMap<String, Arc<SessionCore>>>,
     pub(crate) cancel: CancellationToken,
@@ -195,6 +197,8 @@ impl ClientInner {
         let posture = live.registry_posture();
         if posture.synced {
             self.synced.store(true, Ordering::Release);
+            // Reconnected: retry drafts a dropped upload left queued.
+            self.publish_drafts();
             // Initialize prefs / prune pins of deleted chats (authoritative
             // only once a server state applied — never on a cold replica).
             match self
@@ -553,7 +557,7 @@ impl ClientInner {
 /// One signed-in account (or Demo mode). Cheap to clone.
 #[derive(Clone)]
 pub struct Client {
-    inner: Arc<ClientInner>,
+    pub(crate) inner: Arc<ClientInner>,
 }
 
 impl std::fmt::Debug for Client {
@@ -611,6 +615,10 @@ impl Client {
             events: events.clone(),
             tokens,
             attachment_cache: AttachmentCache::new(ATTACHMENT_CACHE_BYTES),
+            // Demo drafts live in memory: one run never seeds the next.
+            drafts: DraftStore::open(
+                (!credentials.is_demo()).then(|| config.data_dir.join("drafts")),
+            ),
             backend: OnceLock::new(),
             sessions: Mutex::new(HashMap::new()),
             cancel: CancellationToken::new(),
@@ -647,7 +655,9 @@ impl Client {
         };
         let _ = inner.backend.set(backend);
         events.start(inner.cancel.clone());
+        inner.workspace.set_pending_drafts(inner.drafts.pending());
         inner.recompute_workspace();
+        inner.publish_drafts();
         match inner.backend() {
             Backend::Demo(demo) => demo.start(&inner, inner.cancel.clone()),
             Backend::Live(live) => {
@@ -744,8 +754,11 @@ impl Client {
         if let Some(parent_id) = &new.parent_chat_id {
             return self.create_side_chat(parent_id, new.config, new.title);
         }
+        self.create_session_as(crate::new_id(), new)
+    }
+
+    pub(crate) fn create_session_as(&self, id: String, new: NewSession) -> Result<String> {
         let (state, _) = self.inner.workspace.state();
-        let id = crate::new_id();
         let now = Utc::now();
         let (device_id, space_id, cwd) = match &new.target {
             SessionTarget::Project { space_id } => {
@@ -1676,6 +1689,7 @@ impl Client {
             live.relay.clear_unsupported();
             self.inner.reconcile_change_request_watches();
         }
+        self.inner.publish_drafts();
         self.inner.tick();
     }
 

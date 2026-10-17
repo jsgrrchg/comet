@@ -718,6 +718,7 @@ pub enum RightSurface {
     File(u64),
     Browser(u64),
     Diff(u64),
+    /// Keys [`Shell::right_terminals`].
     Terminal(u64),
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
@@ -1148,6 +1149,13 @@ fn sidebar_drag_sample(
         latched_edge,
         reduced_motion,
     )
+}
+
+/// One right-pane Terminal surface: its own embedded panel and the key of
+/// the panel's single tab.
+struct RightTerminal {
+    panel: Entity<TerminalPanel>,
+    key: u64,
 }
 
 /// The dragged surface-tab payload (strip reorder).
@@ -2011,10 +2019,12 @@ pub struct Shell {
     terminal: Option<Entity<TerminalPanel>>,
     /// Last resolved layout, for drag anchors and matching transcript clearance.
     terminal_geometry: crate::terminal::dock::SharedGeometry,
-    /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
-    /// entity from the bottom drawer's (own PTYs, own grid geometry; one
-    /// panel can only size one visible grid at a time).
-    right_terminal: Option<Entity<TerminalPanel>>,
+    /// Right-pane Terminal surfaces, one embedded panel each — SEPARATE
+    /// entities from the bottom drawer's (own PTYs, own grid geometry). A
+    /// panel sizes one visible grid at a time, so split panes can show
+    /// several terminals side by side only with a panel per tab.
+    right_terminals: std::collections::HashMap<u64, RightTerminal>,
+    right_terminal_seq: u64,
     /// The surface-tab strip's `+` menu (Browser / Terminal / Diffs / History rows).
     right_plus: popover::Popup<()>,
     /// Host-owned project Actions cached per (device, space).
@@ -2551,7 +2561,8 @@ impl Shell {
             sidebar_disclosure_motion: std::collections::HashMap::new(),
             jump_hints: false,
             terminal: None,
-            right_terminal: None,
+            right_terminals: Default::default(),
+            right_terminal_seq: 0,
             right_plus: popover::Popup::default(),
             project_actions: crate::project_actions::ProjectActionsController::default(),
             diffs: std::collections::HashMap::new(),
@@ -3411,13 +3422,10 @@ impl Shell {
         cx.notify();
     }
 
-    fn right_terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
-        if let Some(terminal) = &self.right_terminal {
-            return terminal.clone();
-        }
-        let terminal = cx.new(|cx| TerminalPanel::new_embedded(self.state.clone(), cx));
-        self.right_terminal = Some(terminal.clone());
-        terminal
+    fn right_terminal_panel(&self, id: u64) -> Option<Entity<TerminalPanel>> {
+        self.right_terminals
+            .get(&id)
+            .map(|terminal| terminal.panel.clone())
     }
 
     /// The right pane's surface tabs in the STORED (drag-reorderable) order —
@@ -3449,11 +3457,6 @@ impl Shell {
     /// Rows for `stored` surfaces; entries whose backing tab/entity is gone
     /// are skipped.
     fn right_rows_for(&self, stored: &[RightSurface], cx: &App) -> Vec<RightRow> {
-        let terminals: Vec<(u64, SharedString, bool)> = self
-            .right_terminal
-            .as_ref()
-            .map(|t| t.read(cx).tab_summaries(cx))
-            .unwrap_or_default();
         stored
             .iter()
             .filter_map(|surface| match surface {
@@ -3475,10 +3478,14 @@ impl Shell {
                     // Contextual title (user request): the pane's scope
                     // label, or the pinned commit's subject.
                     .map(|changes| (*surface, changes.read(cx).tab_title(), false, None)),
-                RightSurface::Terminal(tab) => terminals
-                    .iter()
-                    .find(|(k, _, _)| k == tab)
-                    .map(|(_, title, _)| (*surface, title.clone(), false, None)),
+                RightSurface::Terminal(id) => self.right_terminals.get(id).and_then(|terminal| {
+                    let panel = terminal.panel.read(cx);
+                    panel
+                        .tab_summaries(cx)
+                        .into_iter()
+                        .find(|(key, _, _)| *key == terminal.key)
+                        .map(|(_, title, _)| (*surface, title, false, None))
+                }),
                 RightSurface::SideChat(id) => self.side_chats.get(id).map(|tab| {
                     let title = tab
                         .state
@@ -3676,14 +3683,12 @@ impl Shell {
                     }
                 }
             }
-            RightSurface::Terminal(tab) => {
-                let panel = self.right_terminal_panel(cx);
-                self.composer
-                    .update(cx, |composer, _| composer.focus_pending = false);
-                panel.update(cx, |panel, cx| {
-                    panel.select_tab_by_key(tab, cx);
-                    panel.request_focus(cx);
-                });
+            RightSurface::Terminal(id) => {
+                if let Some(panel) = self.right_terminal_panel(id) {
+                    self.composer
+                        .update(cx, |composer, _| composer.focus_pending = false);
+                    panel.update(cx, |panel, cx| panel.request_focus(cx));
+                }
             }
             RightSurface::Diff(id) => {
                 if let Some(changes) = self.diffs.get(&id).cloned() {
@@ -4309,19 +4314,32 @@ impl Shell {
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
     /// opens a fresh embedded terminal tab.
     fn add_terminal_surface(&mut self, cx: &mut Context<Self>) {
-        let panel = self.right_terminal_panel(cx);
+        let panel = cx.new(|cx| TerminalPanel::new_embedded(self.state.clone(), cx));
         let opened = panel.update(cx, |panel, cx| {
             panel.set_open(true, cx);
             panel.open_tab_for_selected(cx)
         });
-        if let Some(tab) = opened {
-            let key = self.panel_key(cx);
-            self.right_tabs
-                .entry(key)
-                .or_default()
-                .push(RightSurface::Terminal(tab));
-            self.set_right_active(RightSurface::Terminal(tab), cx);
+        if let Some(key) = opened {
+            self.insert_terminal_surface(panel, key, cx);
         }
+    }
+
+    /// File an embedded panel's tab `key` as a new Terminal surface tab.
+    fn insert_terminal_surface(
+        &mut self,
+        panel: Entity<TerminalPanel>,
+        key: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.right_terminal_seq += 1;
+        let id = self.right_terminal_seq;
+        self.right_terminals
+            .insert(id, RightTerminal { panel, key });
+        self.right_tabs
+            .entry(self.panel_key(cx))
+            .or_default()
+            .push(RightSurface::Terminal(id));
+        self.set_right_active(RightSurface::Terminal(id), cx);
     }
 
     /// Spawn-chip events from the primary transcript AND from subagent-tab
@@ -4577,9 +4595,13 @@ impl Shell {
                 // `PullRequestCache::submissions`.
                 self.chat_pull_requests.remove(&id);
             }
-            RightSurface::Terminal(tab) => {
-                let panel = self.right_terminal_panel(cx);
-                panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
+            RightSurface::Terminal(id) => {
+                if let Some(terminal) = self.right_terminals.remove(&id) {
+                    let key = terminal.key;
+                    terminal
+                        .panel
+                        .update(cx, |panel, cx| panel.close_tab_by_key(key, window, cx));
+                }
             }
             RightSurface::SideChat(id) => {
                 // An unsent draft outlives the tab: the side chat stays
@@ -11786,16 +11808,15 @@ impl Shell {
                     .cloned()
                     .map(|browser| browser.into_any_element())
                     .unwrap_or_else(|| self.render_surface_picker(cx)),
-                RightSurface::Terminal(tab) => {
-                    let panel = self.right_terminal_panel(cx);
-                    // Keep the embedded panel's own active tab aligned with
-                    // the resolved surface (fallbacks can move it).
+                RightSurface::Terminal(id) if self.right_terminals.contains_key(&id) => {
+                    let terminal = self.right_terminals.get(&id).expect("checked");
+                    let (panel, key) = (terminal.panel.clone(), terminal.key);
                     let resize_suspended = self.tween_active(self.right_tween)
                         || self.tween_active(self.files_tween)
                         || self.tween_active(self.sidebar_tween);
                     panel.update(cx, |panel, cx| {
                         panel.set_resize_suspended(resize_suspended);
-                        panel.select_tab_by_key(tab, cx);
+                        panel.select_tab_by_key(key, cx);
                     });
                     panel.into_any_element()
                 }
@@ -16979,8 +17000,11 @@ mod exit_regressions {
                     shell.open_chat("terminal-session".into(), cx);
                     shell.active_chat = "terminal-session".into();
                     let panel = if embedded {
-                        shell.add_terminal_surface(cx);
-                        shell.right_terminal.clone().unwrap()
+                        let panel =
+                            cx.new(|cx| TerminalPanel::new_embedded(shell.state.clone(), cx));
+                        panel.update(cx, |panel, cx| panel.set_open(true, cx));
+                        shell.insert_terminal_surface(panel.clone(), 1, cx);
+                        panel
                     } else {
                         shell.toggle_terminal(window, cx);
                         shell.terminal.clone().unwrap()

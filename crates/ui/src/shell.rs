@@ -4029,9 +4029,17 @@ impl Shell {
                 crate::browser::BrowserEvent::Changed => cx.notify(),
                 crate::browser::BrowserEvent::NewTab(url) => {
                     // A background page cannot open a tab in the wrong session.
+                    // A page on screen opens it beside itself, in its pane.
+                    let surface = RightSurface::Browser(id);
                     if this.panel_key(cx) == owner
-                        && this.resolved_right_active(cx) == RightSurface::Browser(id)
+                        && this
+                            .right_shown_surfaces(cx)
+                            .iter()
+                            .any(|(shown, _)| *shown == surface)
                     {
+                        if this.right_split(cx).is_some() {
+                            this.set_right_active(surface, cx);
+                        }
                         this.add_browser_surface(url.clone(), window, cx);
                     }
                 }
@@ -13532,15 +13540,26 @@ impl Render for Shell {
         } else {
             0.0
         });
-        let selected_surface = self.resolved_right_active(cx);
+        // Every pane of a split host shows its own page.
+        let shown = self.right_shown_surfaces(cx);
         for (id, browser) in &self.browsers {
+            let placement = shown
+                .iter()
+                .find(|(surface, _)| *surface == RightSurface::Browser(*id));
             let presentation = crate::browser::model::presentation(
-                browser_active && selected_surface == RightSurface::Browser(*id),
+                browser_active && placement.is_some(),
                 browser_dragging,
             );
+            // Only a page on the host's left seam meets the outer resize
+            // target; one past a split divider clears that divider's grab.
+            #[cfg(target_os = "macos")]
+            let inset = match placement {
+                Some((_, false)) => px(right_panes::DIVIDER_HITBOX / 2.0 - 1.0),
+                _ => browser_resize_inset,
+            };
             browser.update(cx, |browser, cx| {
                 #[cfg(target_os = "macos")]
-                browser.set_resize_inset(browser_resize_inset, cx);
+                browser.set_resize_inset(inset, cx);
                 #[cfg(any(target_os = "macos", windows))]
                 browser.set_right_occlusion(browser_overlay_width, cx);
                 browser.set_shortcuts(&self.settings.keymap);

@@ -317,6 +317,7 @@ impl<T: Copy + PartialEq> SplitLayout<T> {
         self.focused
     }
 
+    #[cfg(test)]
     pub fn pane_count(&self) -> usize {
         self.panes.len()
     }

@@ -19,7 +19,7 @@ const STRIP_GUTTER: f32 = 8.0;
 const STRIP_TRAILING_GAP: f32 = 4.0;
 /// The hit width of a divider between split panes; the line itself is the
 /// 1px border every pane after the first draws.
-const DIVIDER_HITBOX: f32 = 8.0;
+pub(super) const DIVIDER_HITBOX: f32 = 8.0;
 
 /// Where a dragged tab would land: a zone of a split pane, or of the
 /// unsplit host (`pane: None`).
@@ -68,6 +68,24 @@ impl Shell {
             _ => self
                 .panels
                 .right_surface_fallback(&key, rows.iter().map(|(surface, ..)| *surface)),
+        }
+    }
+
+    /// The surfaces on screen in the host: each pane's shown tab, and
+    /// whether that pane meets the host's left edge.
+    pub(super) fn right_shown_surfaces(&self, cx: &App) -> Vec<(RightSurface, bool)> {
+        match self.right_split(cx) {
+            Some(layout) => layout
+                .rects()
+                .into_iter()
+                .map(|(pane, rect)| {
+                    (
+                        self.resolved_pane_active(pane, cx),
+                        right_layout::touches_left(&rect),
+                    )
+                })
+                .collect(),
+            None => vec![(self.resolved_right_active(cx), true)],
         }
     }
 

@@ -85,6 +85,8 @@ pub(crate) mod project_icon;
 mod pull_request_pane;
 mod right_layout;
 mod right_panes;
+#[cfg(test)]
+mod right_panes_tests;
 mod session_info;
 mod side_chats;
 mod sidebar_pins;

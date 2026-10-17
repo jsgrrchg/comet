@@ -602,7 +602,7 @@ impl Shell {
         )
     }
 
-    fn commit_right_pane_drop(&mut self, drop: RightPaneDrop, cx: &mut Context<Self>) {
+    pub(super) fn commit_right_pane_drop(&mut self, drop: RightPaneDrop, cx: &mut Context<Self>) {
         match (drop.zone, drop.pane) {
             (DropZone::Edge(edge), pane) => {
                 self.split_right_tab(drop.surface, pane, edge, cx);

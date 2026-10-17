@@ -9,9 +9,9 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Panes per split. Three already crowd a 242px sidebar row and need
-/// 3 × [`crate::settings::CHAT_PANEL_MIN`] of conversation column.
-pub const SPLIT_MAX_PANES: usize = 3;
+/// Panes per split. Four crowd a 242px sidebar row and need
+/// 4 × [`crate::settings::CHAT_PANEL_MIN`] of conversation column.
+pub const SPLIT_MAX_PANES: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -272,8 +272,11 @@ mod tests {
         place(&mut views, "a", "c", SplitSide::Left, || unreachable!());
         assert_eq!(ids(&views[0]), ["c", "a", "b"]);
         assert!(close(&views[0].normalized_ratios(), &[1.0 / 3.0; 3]));
+        place(&mut views, "b", "d", SplitSide::Right, || unreachable!());
+        assert_eq!(ids(&views[0]), ["c", "a", "b", "d"]);
+        assert!(close(&views[0].normalized_ratios(), &[0.25; 4]));
         assert_eq!(
-            place(&mut views, "a", "d", SplitSide::Right, || unreachable!()),
+            place(&mut views, "a", "e", SplitSide::Right, || unreachable!()),
             PlaceOutcome::Full
         );
         assert_eq!(

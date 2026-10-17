@@ -186,17 +186,34 @@ fn closing_panes_dissolves_the_split_and_full_splits_refuse(cx: &mut TestAppCont
     let window = shell_window(dir.path(), cx);
     window
         .update(cx, |shell, _, cx| {
+            // A fifth chat, for the split to refuse.
+            let mut chats = shell.state.read(cx).chats.clone();
+            let mut fifth = chats[0].clone();
+            fifth.id = "e".into();
+            chats.push(fifth);
+            shell.state.update(cx, |state, cx| {
+                state.apply_chats(chats);
+                cx.notify();
+            });
             shell.open_chat_in_split("b".into(), cx);
             shell.open_chat_in_split("c".into(), cx);
+            shell.open_chat_in_split("d".into(), cx);
         })
         .unwrap();
     cx.run_until_parked();
     window
         .update(cx, |shell, _, cx| {
-            assert_eq!(shell.shown_split(cx).unwrap().chats, ["a", "b", "c"]);
-            assert!(!shell.split_chat_beside("c", "d", crate::split_view::SplitSide::Right, cx));
-            assert_eq!(shell.shown_split(cx).unwrap().chats.len(), 3);
+            assert_eq!(shell.shown_split(cx).unwrap().chats, ["a", "b", "c", "d"]);
+            assert!(!shell.split_chat_beside("d", "e", crate::split_view::SplitSide::Right, cx));
+            assert_eq!(shell.shown_split(cx).unwrap().chats.len(), 4);
             // Closing the focused pane focuses its neighbour.
+            shell.close_split_pane("d", cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    window
+        .update(cx, |shell, _, cx| {
+            assert_eq!(shell.active_chat, "c");
             shell.close_split_pane("c", cx);
         })
         .unwrap();

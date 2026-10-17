@@ -35,6 +35,7 @@ const JUMP_KEYS: [(&str, &str); split_view::SPLIT_MAX_PANES] = [
     ("split-jump-0", "split-jump-pill-0"),
     ("split-jump-1", "split-jump-pill-1"),
     ("split-jump-2", "split-jump-pill-2"),
+    ("split-jump-3", "split-jump-pill-3"),
 ];
 
 /// Panel visibility for a split is shared by its panes.

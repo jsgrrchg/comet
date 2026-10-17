@@ -1,16 +1,49 @@
 // This module uses only official session storage APIs. It never invokes query().
 import { pathToFileURL } from 'node:url';
 
+async function historicalPrefix(sourceSessionId, dir, upToMessageId, sdk) {
+  const entries = [];
+  // The current conversation view has already applied later compactions. Read
+  // the original entries through the official API into an in-memory snapshot.
+  await sdk.importSessionToStore(sourceSessionId, {
+    async append(key, batch) {
+      if (key.sessionId !== sourceSessionId || key.subpath) throw new Error('Unexpected Claude transcript identity');
+      for (const entry of batch) entries.push(entry);
+    },
+  }, { dir, includeSubagents: false });
+  if (!entries.length) throw new Error('Native Claude session no longer exists');
+  const boundary = entries.findIndex(m => m.uuid === upToMessageId && m.type === 'assistant' && !m.isSidechain && !m.teamName);
+  if (boundary < 0) throw new Error('Native assistant UUID is unavailable');
+  const prefix = entries.slice(0, boundary + 1);
+  // Let the SDK resolve parent chains, tool blocks and earlier compactions from
+  // this frozen prefix. No later compact boundary can rewrite its meaning.
+  const expected = await sdk.getSessionMessages(sourceSessionId, {
+    dir, includeSystemMessages: true,
+    sessionStore: {
+      async load(key) {
+        if (key.sessionId !== sourceSessionId || key.subpath) throw new Error('Unexpected Claude transcript identity');
+        return prefix;
+      },
+      async append() { throw new Error('Historical Claude snapshot is read-only'); },
+    },
+  });
+  const last = expected.at(-1);
+  if (last?.uuid !== upToMessageId || last.type !== 'assistant' || last.parent_tool_use_id || last.parent_agent_id) {
+    throw new Error('Native assistant UUID is unavailable');
+  }
+  return expected;
+}
+
 export async function execute(request, sdk) {
   const { sourceSessionId, dir, upToMessageId, mode = 'fork' } = request;
   if (!sourceSessionId || !dir) throw new Error('Session ID and project directory are required');
-  const messages = await sdk.getSessionMessages(sourceSessionId, { dir, includeSystemMessages: true });
-  if (!messages.length) throw new Error('Native Claude session no longer exists');
-  if (mode === 'check') return { sessionId: sourceSessionId };
+  if (mode === 'check') {
+    const messages = await sdk.getSessionMessages(sourceSessionId, { dir, includeSystemMessages: true });
+    if (!messages.length) throw new Error('Native Claude session no longer exists');
+    return { sessionId: sourceSessionId };
+  }
   if (mode !== 'fork' || !upToMessageId) throw new Error('An exact assistant UUID is required');
-  const boundary = messages.findIndex(m => m.uuid === upToMessageId && m.type === 'assistant' && !m.parent_tool_use_id && !m.parent_agent_id);
-  if (boundary < 0) throw new Error('Native assistant UUID is unavailable');
-  const expected = messages.slice(0, boundary + 1);
+  const expected = await historicalPrefix(sourceSessionId, dir, upToMessageId, sdk);
   let created = false;
   try {
     created = true;

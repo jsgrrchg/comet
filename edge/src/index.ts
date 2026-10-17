@@ -1,4 +1,3 @@
-import { draftContentRoute } from "./draft-content";
 /**
  * Zeron-native edge Worker (design §2, ARCHITECTURE §6): JWT auth at the
  * edge, then forwarding into per-session, per-workspace, and per-device
@@ -292,9 +291,6 @@ export default {
           `?${deviceParam(url).replace(/^&/, "")}`
         );
       }
-      if (parts[2] === "draft-claim" && request.method === "POST") {
-        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/draft-claim", "");
-      }
       if (parts[2] === "stats" && request.method === "GET") {
         return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/stats", "");
       }
@@ -355,9 +351,6 @@ export default {
         return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/nudge", "");
       }
     }
-
-    const draftContent = draftContentRoute(request, env, auth);
-    if (draftContent) return draftContent;
 
     // ── R2 tool-output sidecar (docs/chat2-sync.md A2): full tool outputs
     //    and diffs live here, keyed `{chatId}/{partId}[.diff]`; the doc keeps

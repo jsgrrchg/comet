@@ -27,7 +27,6 @@ pub mod capabilities {
     pub const CHAT_UNREAD_V1: &str = "chat-unread-v1";
 
     pub const CURRENT: &[&str] = &[
-        crate::DRAFTS_CAPABILITY,
         COMPOSER_REFERENCES_V1,
         MESSAGE_QUEUE_V1,
         MESSAGE_QUEUE_ACTIONS_V1,
@@ -114,7 +113,6 @@ mod tests {
                 "workspaceScope": "local",
                 "cursorSdkVersion": "1.0.31",
                 "capabilities": [
-                    "prompt-drafts-v1",
                     "composer-references-v1",
                     "message-queue-v1",
                     "message-queue-actions-v1",

@@ -31,7 +31,6 @@ mod client;
 pub mod config;
 pub mod connectivity;
 mod demo;
-pub mod drafts;
 pub mod error;
 pub mod events;
 mod live;
@@ -47,7 +46,6 @@ pub use config::{
     AuthTokens, ClientConfig, Credentials, DemoFixture, DemoOptions, StreamSpeed, TranscriptScale,
 };
 pub use connectivity::{Connectivity, ConnectivityState, SendState};
-pub use drafts::{DraftEdit, DraftFile, LoadedDraft};
 pub use error::ClientError;
 pub use events::{ClientEvent, ClientListener};
 pub use session::{
@@ -58,16 +56,15 @@ pub use session::{
     SubagentState,
 };
 pub use workspace::{
-    DeviceView, DraftRow, FrontPage, ProjectRef, ProjectView, PullRequestGroups, SearchField,
-    SearchHit, SectionView, SessionRow, WorkspaceSnapshot, project_color_index,
-    relative_time_label,
+    DeviceView, FrontPage, ProjectRef, ProjectView, PullRequestGroups, SearchField, SearchHit,
+    SectionView, SessionRow, WorkspaceSnapshot, project_color_index, relative_time_label,
 };
 
 /// Re-exported so consumers (the layout engine) name the exact doc types the
 /// transcript carries without a direct `zeron-doc` dependency.
 pub use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 pub use zeron_proto::{
-    ChangeRequestState, ChangeRequestSummary, ChatConfig, ChatIndicator, ContextUsage, DraftTarget,
+    ChangeRequestState, ChangeRequestSummary, ChatConfig, ChatIndicator, ContextUsage,
     UserInputAnswer, UserInputQuestion, WorktreeSpec,
 };
 

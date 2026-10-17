@@ -63,8 +63,6 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
     var onChipTap: ((String, UIView) -> Void)?
     var onHeightChange: (() -> Void)?
     var onFocusChange: ((Bool) -> Void)?
-    /// The user changed the text or the staged images (autosave).
-    var onEdit: (() -> Void)?
     /// `@` file search (nil disables mentions).
     var mentionSearch: ((String) async -> [FileMatch])?
 
@@ -78,7 +76,7 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
     var chipMenus: [String: () -> UIMenu?] = [:] { didSet { applyChipMenus() } }
     /// Stay in the card state even when idle (new-session canvas).
     var chipsAlwaysVisible = false { didSet { updateMode(animated: false) } }
-    var images: [StagedImage] = [] { didSet { rebuildThumbs(); refreshAction(animated: true); updateMode(animated: true); onEdit?() } }
+    var images: [StagedImage] = [] { didSet { rebuildThumbs(); refreshAction(animated: true); updateMode(animated: true) } }
 
     var text: String {
         get { textView.text }
@@ -524,7 +522,6 @@ final class ComposerBar: UIView, UITextViewDelegate, UIGestureRecognizerDelegate
         textChanged()
         styleMentions()
         updateMentionQuery()
-        onEdit?()
     }
 
     func textViewDidChangeSelection(_ textView: UITextView) {

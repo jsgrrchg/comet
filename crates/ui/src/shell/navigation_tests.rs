@@ -32,7 +32,7 @@ impl Render for NavigationHost {
                 .on_action(cx.listener(|shell, _: &PrevSession, window, cx| {
                     shell.cycle_navigation(false, window, cx);
                 }))
-                .child(div().h(px(40.)).child(shell.render_right_tab_strip(cx)))
+                .child(div().h(px(40.)).child(shell.render_right_tab_strip(None, cx)))
                 .child(
                     div()
                         .flex()
@@ -358,20 +358,16 @@ fn embedded_terminal_and_browser_focus_route_to_right_tabs(cx: &mut TestAppConte
     shell.update(cx, |shell, cx| {
         // No engine in this harness: reserve a real emulator tab without
         // starting a PTY, then use the normal surface activation path.
-        let key = shell.right_terminal_panel(cx).update(cx, |panel, cx| {
+        let panel = shell.new_right_terminal_panel(cx);
+        let key = panel.update(cx, |panel, cx| {
             panel.set_open(true, cx);
             panel.reserve_tab_for_chat("parent".into(), "Test terminal", cx)
         });
-        shell
-            .right_tabs
-            .entry("parent".into())
-            .or_default()
-            .push(RightSurface::Terminal(key));
-        shell.set_right_active(RightSurface::Terminal(key), cx);
+        shell.insert_terminal_surface(panel, key, cx);
     });
     cx.update(|window, cx| window.draw(cx).clear());
     cx.update(|window, cx| {
-        let terminal = shell.read(cx).right_terminal.as_ref().unwrap().read(cx);
+        let terminal = shell.read(cx).right_terminals[&1].panel.read(cx);
         assert!(terminal.focus_handle().is_focused(window));
     });
     press(cx, true);

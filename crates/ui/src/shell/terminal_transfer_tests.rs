@@ -11,7 +11,7 @@ struct TransferHost {
 impl Render for TransferHost {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.shell.update(cx, |shell, cx| {
-            let tabs = shell.render_right_tab_strip(cx);
+            let tabs = shell.render_right_titlebar_strips(0.0, cx);
             let titlebar = shell.titlebar_drag_region(
                 "terminal-transfer-titlebar",
                 div().w_full().h(px(40.)).child(tabs),
@@ -107,20 +107,16 @@ fn setup(
                 }
                 panel.set_open(true, cx);
             });
-            if right_tabs > 0 {
-                let right = shell.right_terminal_panel(cx);
-                for ix in 0..right_tabs {
-                    let key = right.update(cx, |panel, cx| {
-                        panel.reserve_tab_for_chat("parent".into(), format!("Right {ix}"), cx)
-                    });
-                    shell
-                        .right_tabs
-                        .entry("parent".into())
-                        .or_default()
-                        .push(RightSurface::Terminal(key));
-                    shell.set_right_active(RightSurface::Terminal(key), cx);
-                }
-                right.update(cx, |panel, cx| panel.set_open(true, cx));
+            // One embedded panel per right-pane terminal surface.
+            for ix in 0..right_tabs {
+                let right = shell.new_right_terminal_panel(cx);
+                let key = right.update(cx, |panel, cx| {
+                    let key =
+                        panel.reserve_tab_for_chat("parent".into(), format!("Right {ix}"), cx);
+                    panel.set_open(true, cx);
+                    key
+                });
+                shell.insert_terminal_surface(right, key, cx);
             }
             shell
         });
@@ -158,6 +154,21 @@ fn drop_at(cx: &mut VisualTestContext, to: Point<gpui::Pixels>) {
     cx.update(|window, cx| window.draw(cx).clear());
 }
 
+/// The right-pane Terminal surface holding session `key`.
+fn right_surface(shell: &Shell, key: u64) -> RightSurface {
+    shell
+        .right_terminal_surface(key)
+        .expect("session has no right-pane surface")
+}
+
+/// The embedded panel of the surface holding session `key`.
+fn right_panel(shell: &Shell, key: u64) -> Entity<TerminalPanel> {
+    let RightSurface::Terminal(id) = right_surface(shell, key) else {
+        unreachable!("terminal surfaces are Terminal")
+    };
+    shell.right_terminal_panel(id).expect("registered panel")
+}
+
 #[gpui::test]
 fn last_terminal_moves_to_empty_strip_and_keeps_session_state(cx: &mut TestAppContext) {
     let (shell, sessions, cx) = setup(cx, 1, 0);
@@ -192,9 +203,10 @@ fn last_terminal_moves_to_empty_strip_and_keeps_session_state(cx: &mut TestAppCo
         assert!(drawer.tab_summaries(cx).is_empty());
         assert!(!drawer.is_open());
         assert!(!shell.terminal_open(cx));
-        assert_eq!(shell.right_tabs["parent"], [RightSurface::Terminal(key)]);
-        assert_eq!(shell.resolved_right_active(cx), RightSurface::Terminal(key));
-        let right = shell.right_terminal.as_ref().unwrap().read(cx);
+        let surface = right_surface(shell, key);
+        assert_eq!(shell.right_tabs["parent"], [surface]);
+        assert_eq!(shell.resolved_right_active(cx), surface);
+        let right = right_panel(shell, key).read(cx);
         assert_eq!(right.session_for_tab("parent", key).unwrap(), *session);
         assert_eq!(right.tab_summaries(cx)[0].1.as_ref(), "running command");
         let model = session.read(cx);
@@ -213,11 +225,7 @@ fn last_terminal_moves_to_empty_strip_and_keeps_session_state(cx: &mut TestAppCo
     });
     cx.update(|window, cx| {
         assert!(
-            shell
-                .read(cx)
-                .right_terminal
-                .as_ref()
-                .unwrap()
+            right_panel(shell.read(cx), key)
                 .read(cx)
                 .focus_handle()
                 .is_focused(window)
@@ -254,7 +262,7 @@ fn terminal_inserts_on_chips_at_both_edges_and_in_scrolled_strip(cx: &mut TestAp
     shell.read_with(cx, |shell, _| {
         assert_eq!(
             shell.right_tabs["parent"][0],
-            RightSurface::Terminal(source_keys[0])
+            right_surface(shell, source_keys[0])
         )
     });
     shell.update(cx, |shell, _| {
@@ -268,7 +276,7 @@ fn terminal_inserts_on_chips_at_both_edges_and_in_scrolled_strip(cx: &mut TestAp
     shell.read_with(cx, |shell, _| {
         assert_eq!(
             shell.right_tabs["parent"][3],
-            RightSurface::Terminal(source_keys[1])
+            right_surface(shell, source_keys[1])
         )
     });
     shell.update(cx, |shell, _| {
@@ -280,21 +288,19 @@ fn terminal_inserts_on_chips_at_both_edges_and_in_scrolled_strip(cx: &mut TestAp
     drop_at(cx, to);
     shell.read_with(cx, |shell, cx| {
         let tabs = &shell.right_tabs["parent"];
-        assert_eq!(tabs.last(), Some(&RightSurface::Terminal(source_keys[2])));
+        assert_eq!(tabs.last(), Some(&right_surface(shell, source_keys[2])));
         assert!(
             original.iter().all(|surface| tabs.contains(surface)),
             "key collision lost a destination tab"
         );
         assert_eq!(tabs.len(), 8);
-        assert_eq!(
+        assert_eq!(shell.right_terminals.len(), 8);
+        assert!(
             shell
-                .right_terminal
-                .as_ref()
-                .unwrap()
-                .read(cx)
-                .tab_summaries(cx)
-                .len(),
-            8
+                .right_terminals
+                .values()
+                .all(|terminal| terminal.panel.read(cx).tab_summaries(cx).len() == 1),
+            "each right-pane terminal has its own single-tab panel"
         );
     });
 }
@@ -310,8 +316,48 @@ fn terminal_drop_in_unused_strip_space_appends(cx: &mut TestAppContext) {
     shell.read_with(cx, |shell, _| {
         assert_eq!(
             shell.right_tabs["parent"].last(),
-            Some(&RightSurface::Terminal(key))
+            Some(&right_surface(shell, key))
         )
+    });
+}
+
+#[gpui::test]
+fn terminal_dropped_on_a_split_pane_strip_joins_that_pane(cx: &mut TestAppContext) {
+    let (shell, sessions, cx) = setup(cx, 2, 2);
+    let key = sessions[0].read_with(cx, |m, _| m.key);
+    let (left_tab, right_tab, right_pane) = shell.update(cx, |shell, cx| {
+        let tabs = shell.right_tabs["parent"].clone();
+        assert!(shell.split_right_tab(tabs[1], None, right_layout::Edge::Right, cx));
+        let pane = shell.right_pane_of(tabs[1], cx).unwrap();
+        (tabs[0], tabs[1], pane)
+    });
+    cx.update(|window, cx| window.draw(cx).clear());
+    let selector = Box::leak(format!("right-surface-strip-{right_pane}").into_boxed_str());
+    let to = cx.debug_bounds(selector).unwrap().center();
+    begin_drag(cx, key, to);
+    drop_at(cx, to);
+    shell.read_with(cx, |shell, cx| {
+        let surface = right_surface(shell, key);
+        let layout = shell.right_split(cx).expect("split survives the drop");
+        assert_eq!(layout.pane_of(surface), Some(right_pane));
+        assert_eq!(layout.pane_of(left_tab), shell.right_pane_of(left_tab, cx));
+        assert_ne!(layout.pane_of(left_tab), Some(right_pane));
+        assert_eq!(layout.pane(right_pane).unwrap().tabs.len(), 2);
+        assert!(layout.pane(right_pane).unwrap().tabs.contains(&right_tab));
+        assert_eq!(layout.focused(), right_pane);
+        assert_eq!(shell.resolved_right_active(cx), surface);
+        assert!(shell.right_tabs["parent"].contains(&surface));
+        assert_eq!(
+            right_panel(shell, key)
+                .read(cx)
+                .session_for_tab("parent", key)
+                .unwrap(),
+            sessions[0]
+        );
+        assert!(
+            shell.terminal_open(cx),
+            "moving a non-last tab closed the drawer"
+        );
     });
 }
 
@@ -368,12 +414,7 @@ fn cancel_outside_drop_and_session_switch_keep_terminal_in_origin(cx: &mut TestA
                 .session_for_tab("parent", key)
                 .is_some()
         );
-        assert!(
-            shell
-                .right_tabs
-                .values()
-                .all(|tabs| !tabs.contains(&RightSurface::Terminal(key)))
-        );
+        assert!(shell.right_terminal_surface(key).is_none());
     });
 }
 
@@ -506,7 +547,7 @@ fn live_stream_input_and_remote_target_follow_transfer_without_reopening(cx: &mu
                 && frame.params["targetDeviceId"] == "remote-host")
     );
     shell.read_with(cx, |shell, cx| {
-        let right = shell.right_terminal.as_ref().unwrap().read(cx);
+        let right = right_panel(shell, key).read(cx);
         assert_eq!(right.tab_summaries(cx)[0].1.as_ref(), "after move");
         assert_eq!(session.read(cx).last_seq, 2);
         let text: String = session
@@ -572,7 +613,8 @@ fn pending_action_handle_attaches_after_move_and_rejects_after_close(cx: &mut Te
         && frame.params["terminalId"] == "action-pty"));
     cx.update(|window, cx| {
         shell.update(cx, |shell, cx| {
-            shell.close_right_surface(RightSurface::Terminal(key), window, cx)
+            let surface = right_surface(shell, key);
+            shell.close_right_surface(surface, window, cx)
         });
     });
     // The test retains a strong model handle, so also check the closed gate,
@@ -673,10 +715,7 @@ fn open_terminal_reply_lands_in_destination_and_resizes_to_its_grid(cx: &mut Tes
             "moving a non-last tab closed the drawer"
         );
         assert_eq!(
-            shell
-                .right_terminal
-                .as_ref()
-                .unwrap()
+            right_panel(shell, key)
                 .read(cx)
                 .session_for_tab("parent", key)
                 .unwrap(),

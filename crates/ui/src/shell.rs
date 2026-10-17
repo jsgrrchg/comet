@@ -10859,6 +10859,22 @@ impl Shell {
                         cx,
                     ));
                 }
+                // Split hosts only: close every tab of this pane, and the
+                // pane with them.
+                if self.right_pane_of(surface, cx).is_some() {
+                    let row = popover::menu_row(&theme, false, "Close pane")
+                        .id("chat-menu-close-pane")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_chat_menu(cx);
+                            if this.panel_key(cx) == key {
+                                this.close_right_pane(surface, window, cx);
+                            }
+                        }))
+                        .child("Close pane");
+                    menu = menu.child(popover::menu_separator()).child(
+                        self.chat_menu_hover_row(CHAT_MENU_ROW_TAB + 4, row, cx),
+                    );
+                }
             }
             let menu = menu.into_any_element();
             overlays.push(popover::menu_at(

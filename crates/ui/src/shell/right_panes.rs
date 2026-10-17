@@ -215,6 +215,27 @@ impl Shell {
         split
     }
 
+    /// Close every tab of the pane holding `surface`; the emptied pane
+    /// closes with them. Unsaved files ask first, as from their own ✕.
+    pub(super) fn close_right_pane(
+        &mut self,
+        surface: RightSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.right_pane_of(surface, cx) else {
+            return;
+        };
+        let tabs: Vec<RightSurface> = self
+            .right_pane_rows(Some(pane), cx)
+            .into_iter()
+            .map(|(tab, ..)| tab)
+            .collect();
+        for tab in tabs {
+            self.close_right_surface(tab, window, cx);
+        }
+    }
+
     /// Move `surface` into pane `target` at `index` (its end when `None`).
     pub(super) fn move_right_tab(
         &mut self,

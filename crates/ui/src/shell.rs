@@ -11928,7 +11928,8 @@ impl Shell {
             // The titlebar is a glass overlay over the full-height content
             // row; the panel's own chrome starts below it.
             .when(clears_titlebar, |el| el.pt(px(Theme::TITLEBAR_HEIGHT)))
-            .child(content);
+            .child(content)
+            .children(self.right_pane_drop_listener(cx));
         let target = self.right_target(cx);
         let edge_offset = self.eval_resize_edge_bounce(
             self.right_edge_bounce,

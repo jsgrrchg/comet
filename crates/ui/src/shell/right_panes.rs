@@ -27,6 +27,8 @@ pub(super) const DIVIDER_HITBOX: f32 = 8.0;
 pub(super) struct RightPaneDrop {
     pub pane: Option<PaneId>,
     pub zone: DropZone,
+    /// The dragged tab.
+    pub surface: RightSurface,
 }
 
 /// Drag marker for a divider: the boundary before child `index` of split
@@ -515,7 +517,11 @@ impl Shell {
                             f32::from(event.bounds.size.height),
                             cx,
                         );
-                        zone.map(|zone| RightPaneDrop { pane, zone })
+                        zone.map(|zone| RightPaneDrop {
+                            pane,
+                            zone,
+                            surface: payload.surface,
+                        })
                     } else if this.right_pane_drop.is_some_and(|drop| drop.pane == pane) {
                         None
                     } else {
@@ -527,26 +533,6 @@ impl Shell {
                     }
                 },
             ))
-            .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
-                let Some(drop) = this.right_pane_drop.take().filter(|drop| drop.pane == pane)
-                else {
-                    return;
-                };
-                this.right_tab_drag = None;
-                cx.notify();
-                if payload.panel_key != this.panel_key(cx) {
-                    return;
-                }
-                match (drop.zone, pane) {
-                    (DropZone::Edge(edge), _) => {
-                        this.split_right_tab(payload.surface, pane, edge, cx);
-                    }
-                    (DropZone::Center, Some(target)) => {
-                        this.move_right_tab(payload.surface, target, None, cx);
-                    }
-                    (DropZone::Center, None) => {}
-                }
-            }))
             .child(content)
             .when_some(shown, |el, drop| {
                 // A quiet accent wash over the half the new pane would take
@@ -583,6 +569,50 @@ impl Shell {
                 el.child(preview)
             })
             .into_any_element()
+    }
+
+    /// Land a dragged tab on the pane zone under it. Pane content (a live
+    /// page, a terminal grid) claims its own mouse-ups, so the drop is taken
+    /// in the capture phase, ahead of everything, while a zone is armed.
+    pub(super) fn right_pane_drop_listener(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        self.right_pane_drop?;
+        let shell = cx.entity().downgrade();
+        Some(
+            gpui::canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    let shell = shell.clone();
+                    window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                        if phase != gpui::DispatchPhase::Capture || !cx.has_active_drag() {
+                            return;
+                        }
+                        let _ = shell.update(cx, |this, cx| {
+                            if let Some(drop) = this.right_pane_drop.take() {
+                                this.right_tab_drag = None;
+                                this.commit_right_pane_drop(drop, cx);
+                                cx.stop_propagation();
+                            }
+                        });
+                    });
+                },
+            )
+            .absolute()
+            .size_0()
+            .into_any_element(),
+        )
+    }
+
+    fn commit_right_pane_drop(&mut self, drop: RightPaneDrop, cx: &mut Context<Self>) {
+        match (drop.zone, drop.pane) {
+            (DropZone::Edge(edge), pane) => {
+                self.split_right_tab(drop.surface, pane, edge, cx);
+            }
+            (DropZone::Center, Some(target)) => {
+                self.move_right_tab(drop.surface, target, None, cx);
+            }
+            (DropZone::Center, None) => {}
+        }
+        cx.notify();
     }
 
     /// The zone a drag at (`x`, `y`) in a `w`×`h` pane targets, if landing

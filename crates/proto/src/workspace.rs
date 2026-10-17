@@ -20,6 +20,9 @@ pub mod capabilities {
     pub const PROJECTLESS_SCRATCH_V1: &str = "projectless-scratch-v1";
     /// The attached engine accepts the registry-scoped `markChatUnread` mutate.
     pub const CHAT_UNREAD_V1: &str = "chat-unread-v1";
+    /// The host accepts `SidebarSectionChange::Move` and orders sections by
+    /// their placed key; older hosts reject the action outright.
+    pub const SIDEBAR_SECTION_ORDER_V1: &str = "sidebar-section-order-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -30,6 +33,7 @@ pub mod capabilities {
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         HARNESS_UPDATES_V1,
         PROJECTLESS_SCRATCH_V1,
+        SIDEBAR_SECTION_ORDER_V1,
         crate::voice::remote::CAPABILITY,
         CHAT_UNREAD_V1,
     ];
@@ -113,6 +117,7 @@ mod tests {
                     "message-queue-edit-lease-v1",
                     "harness-updates-v1",
                     "projectless-scratch-v1",
+                    "sidebar-section-order-v1",
                     "voice-client-media-v1",
                     "chat-unread-v1"
                 ],

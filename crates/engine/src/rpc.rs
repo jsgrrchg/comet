@@ -26,7 +26,8 @@
 //!   reads, hash-guarded writes, and a checkout-scoped filesystem change stream.
 //! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows, cwd?}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
-//!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
+//!   (replay then live tail), `WriteTerminal {terminalId, data, writerId?, seq?}`
+//!   (a writer's frames apply in `seq` order), `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
 //!   real multi-account auth in M6.
 //! - Agent accounts (§3.7): `ListAgentAccounts {forceUsage?}` →
@@ -424,6 +425,12 @@ struct WriteTerminalParams {
     terminal_id: String,
     /// Base64 input bytes (plain UTF-8 accepted leniently).
     data: String,
+    /// Ordering stamp: frames of one writer apply in `seq` order. Older
+    /// clients omit both and write immediately.
+    #[serde(default)]
+    writer_id: Option<String>,
+    #[serde(default)]
+    seq: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3630,9 +3637,14 @@ impl RpcService for EngineRpc {
             }
             methods::WRITE_TERMINAL => {
                 let p: WriteTerminalParams = parse_params(params)?;
-                self.terminals
-                    .write(&p.terminal_id, &p.data)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                match (p.writer_id.as_deref(), p.seq) {
+                    (Some(writer), Some(seq)) => {
+                        self.terminals
+                            .write_sequenced(&p.terminal_id, &p.data, writer, seq)
+                    }
+                    _ => self.terminals.write(&p.terminal_id, &p.data),
+                }
+                .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::RESIZE_TERMINAL => {

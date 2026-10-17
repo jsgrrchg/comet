@@ -256,6 +256,31 @@ fn selection_scroll_lines(geometry: GridGeometry, position: gpui::Point<Pixels>)
     }
 }
 
+impl TerminalTab {
+    /// `WriteTerminal` params for `bytes`, stamped with this tab's next seq.
+    fn write_params(&mut self, terminal_id: String, bytes: &[u8]) -> serde_json::Value {
+        let seq = self.next_write_seq;
+        self.next_write_seq += 1;
+        with_target(
+            serde_json::json!({
+                "terminalId": terminal_id,
+                "data": encode_base64(bytes),
+                "writerId": self.writer_id,
+                "seq": seq,
+            }),
+            &self.target_device_id,
+        )
+    }
+}
+
+fn send_write(engine: &EngineHandle, params: serde_json::Value, cx: &mut Context<TerminalPanel>) {
+    let engine = engine.clone();
+    cx.spawn(async move |_, _| {
+        let _ = engine.client().call(methods::WRITE_TERMINAL, params).await;
+    })
+    .detach();
+}
+
 struct TerminalTab {
     key: u64,
     title: SharedString,
@@ -266,6 +291,10 @@ struct TerminalTab {
     scroll_remainder: f32,
     exited: Option<i32>,
     last_seq: u64,
+    /// `WriteTerminal` ordering stamp: the host applies this tab's frames in
+    /// `seq` order even when concurrent RPC handling swaps them.
+    writer_id: String,
+    next_write_seq: u64,
     coalescer: InputCoalescer,
     flush_task: Option<Task<()>>,
     resize_task: Option<Task<()>>,
@@ -495,6 +524,8 @@ impl TerminalPanel {
             scroll_remainder: 0.0,
             exited: None,
             last_seq: 0,
+            writer_id: uuid::Uuid::new_v4().to_string(),
+            next_write_seq: 0,
             coalescer: InputCoalescer::default(),
             flush_task: None,
             resize_task: None,
@@ -837,7 +868,6 @@ impl TerminalPanel {
         let Some(tab) = self.tab_mut(chat, key) else {
             return StreamDisposition::Stop;
         };
-        let target = tab.target_device_id.clone();
         match event {
             TerminalEvent::Data { seq, data } => {
                 tab.last_seq = seq;
@@ -845,22 +875,10 @@ impl TerminalPanel {
                 if !responses.is_empty()
                     && let Some(id) = tab.terminal_id.clone()
                 {
-                    // Query responses (DSR etc.) go straight back, no coalescing.
-                    let engine = engine.clone();
-                    let data = encode_base64(&responses);
-                    cx.spawn(async move |_, _| {
-                        let _ = engine
-                            .client()
-                            .call(
-                                methods::WRITE_TERMINAL,
-                                with_target(
-                                    serde_json::json!({ "terminalId": id, "data": data }),
-                                    &target,
-                                ),
-                            )
-                            .await;
-                    })
-                    .detach();
+                    // Query responses (DSR etc.) go straight back, no coalescing,
+                    // but share the keyboard's sequence so neither overtakes.
+                    let params = tab.write_params(id, &responses);
+                    send_write(engine, params, cx);
                 }
                 cx.notify();
                 StreamDisposition::Continue
@@ -916,7 +934,6 @@ impl TerminalPanel {
         let Some(tab) = self.tab_mut(&chat, key) else {
             return;
         };
-        let target = tab.target_device_id.clone();
         if tab.coalescer.is_empty() {
             return;
         }
@@ -927,20 +944,9 @@ impl TerminalPanel {
             }
             return;
         };
-        let data = encode_base64(&tab.coalescer.take());
-        cx.spawn(async move |_, _| {
-            let _ = engine
-                .client()
-                .call(
-                    methods::WRITE_TERMINAL,
-                    with_target(
-                        serde_json::json!({ "terminalId": id, "data": data }),
-                        &target,
-                    ),
-                )
-                .await;
-        })
-        .detach();
+        let bytes = tab.coalescer.take();
+        let params = tab.write_params(id, &bytes);
+        send_write(&engine, params, cx);
     }
 
     fn paste_clipboard(&mut self, cx: &mut Context<Self>) {

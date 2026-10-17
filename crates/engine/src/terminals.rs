@@ -22,9 +22,12 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use portable_pty::PtySize;
 #[cfg(not(windows))]
 use portable_pty::{CommandBuilder, native_pty_system};
+mod input_order;
 #[cfg(windows)]
 mod windows;
 use tokio::sync::mpsc;
+
+use input_order::InputOrder;
 
 use zeron_doc::TERMINAL_OUTPUT_BATCH_MS;
 use zeron_proto::{TerminalEvent, TerminalSession};
@@ -44,6 +47,8 @@ struct LiveTerminal {
     process_id: u32,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Option<Box<dyn Write + Send>>,
+    /// `{writerId, seq}` reordering for concurrent `WriteTerminal` frames.
+    input_order: InputOrder,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     #[cfg(windows)]
     reader_thread: Option<std::thread::JoinHandle<()>>,
@@ -308,6 +313,7 @@ impl Terminals {
             process_id: child.process_id().expect("ConPTY child has a process id"),
             master: Some(master),
             writer: Some(writer),
+            input_order: InputOrder::default(),
             killer,
             #[cfg(windows)]
             reader_thread: None,
@@ -419,6 +425,44 @@ impl Terminals {
         self.write_bytes(terminal_id, &bytes)
     }
 
+    /// [`Self::write`] for frame `seq` of `writer`: bytes reach the PTY in `seq`
+    /// order even when concurrent RPC handling swaps frames (see the
+    /// `input_order` module). Must run inside a Tokio runtime (gap timer).
+    pub fn write_sequenced(
+        &self,
+        terminal_id: &str,
+        data: &str,
+        writer: &str,
+        seq: u64,
+    ) -> Result<(), EngineError> {
+        let bytes = BASE64
+            .decode(data)
+            .unwrap_or_else(|_| data.as_bytes().to_vec());
+        if bytes.len() > MAX_INPUT_BYTES {
+            return Err(EngineError::Other("Terminal input is too large".into()));
+        }
+        let shared = self.session(terminal_id)?;
+        let mut session = lock(&shared);
+        if session.exited {
+            return Err(EngineError::Other("Terminal has exited".into()));
+        }
+        let now = std::time::Instant::now();
+        session.last_active_at = now;
+        let accepted = session
+            .input_order
+            .accept(writer, seq, bytes, MAX_INPUT_BYTES, now);
+        if accepted.arm_gap_timer {
+            tokio::spawn(release_input_gap(
+                Arc::downgrade(&shared),
+                writer.to_string(),
+            ));
+        }
+        if accepted.ready.is_empty() {
+            return Ok(());
+        }
+        write_pty(&mut session, &accepted.ready)
+    }
+
     /// Write trusted host-side bytes without applying the RPC base64 decoder.
     pub fn write_bytes(&self, terminal_id: &str, bytes: &[u8]) -> Result<(), EngineError> {
         if bytes.len() > MAX_INPUT_BYTES {
@@ -430,14 +474,7 @@ impl Terminals {
             return Err(EngineError::Other("Terminal has exited".into()));
         }
         session.last_active_at = std::time::Instant::now();
-        let writer = session
-            .writer
-            .as_mut()
-            .ok_or_else(|| EngineError::Other("Terminal has exited".into()))?;
-        writer
-            .write_all(&bytes)
-            .and_then(|_| writer.flush())
-            .map_err(|e| EngineError::Other(format!("Terminal write failed: {e}")))
+        write_pty(&mut session, bytes)
     }
 
     pub fn resize(&self, terminal_id: &str, cols: u16, rows: u16) -> Result<(), EngineError> {
@@ -480,6 +517,47 @@ impl Terminals {
         let sessions: Vec<_> = lock(&self.inner.sessions).drain().map(|(_, s)| s).collect();
         for session in sessions {
             dispose(&session, true);
+        }
+    }
+}
+
+fn write_pty(session: &mut LiveTerminal, bytes: &[u8]) -> Result<(), EngineError> {
+    let writer = session
+        .writer
+        .as_mut()
+        .ok_or_else(|| EngineError::Other("Terminal has exited".into()))?;
+    writer
+        .write_all(bytes)
+        .and_then(|_| writer.flush())
+        .map_err(|e| EngineError::Other(format!("Terminal write failed: {e}")))
+}
+
+/// Gap timer for one writer: once its gap has been open for
+/// [`input_order::INPUT_GAP_TIMEOUT`], write what is held rather than stall.
+async fn release_input_gap(session: Weak<Mutex<LiveTerminal>>, writer: String) {
+    let mut deadline = std::time::Instant::now() + input_order::INPUT_GAP_TIMEOUT;
+    loop {
+        tokio::time::sleep_until(deadline.into()).await;
+        let Some(session) = session.upgrade() else {
+            return;
+        };
+        let mut session = lock(&session);
+        if session.exited {
+            return;
+        }
+        match session
+            .input_order
+            .expire_gap(&writer, std::time::Instant::now())
+        {
+            Ok(ready) => {
+                tracing::debug!(bytes = ready.len(), "terminal: input gap expired");
+                if let Err(err) = write_pty(&mut session, &ready) {
+                    tracing::debug!(error = %err, "terminal: held input write failed");
+                }
+                return;
+            }
+            Err(Some(later)) => deadline = later,
+            Err(None) => return,
         }
     }
 }
@@ -1145,6 +1223,44 @@ mod initial_command_tests {
             std::fs::remove_file(output).unwrap();
         }
         assert!(!terminals.any_open());
+    }
+
+    #[tokio::test]
+    async fn sequenced_writes_reach_the_pty_in_seq_order() {
+        let root = tempfile::tempdir().unwrap();
+        let terminals = Terminals::new();
+        let session = terminals
+            .open_session(
+                root.path().to_str().unwrap(),
+                80,
+                24,
+                Some("/bin/sh"),
+                &HashMap::new(),
+                None,
+            )
+            .unwrap();
+        let mut rx = terminals.subscribe(&session.id, None).unwrap();
+        // Delivered swapped: only the in-order line prints `ordered`.
+        terminals
+            .write_sequenced(&session.id, &BASE64.encode("''ered\r"), "tab", 1)
+            .unwrap();
+        terminals
+            .write_sequenced(&session.id, &BASE64.encode("echo ord"), "tab", 0)
+            .unwrap();
+        let mut output = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = rx.recv().await {
+                if let TerminalEvent::Data { data, .. } = event {
+                    output.extend(BASE64.decode(data).unwrap());
+                    if String::from_utf8_lossy(&output).contains("ordered\r\n") {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("output: {:?}", String::from_utf8_lossy(&output)));
+        terminals.close(&session.id).unwrap();
     }
 
     #[tokio::test]

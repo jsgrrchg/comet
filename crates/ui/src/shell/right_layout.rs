@@ -412,13 +412,15 @@ impl<T: Copy + PartialEq> SplitLayout<T> {
     }
 
     /// File a tab no pane holds into the focused pane without showing it.
-    pub fn adopt(&mut self, tab: T) {
-        if self.pane_of(tab).is_none() {
-            let focused = self.focused;
-            if let Some(pane) = self.pane_mut(focused) {
-                pane.tabs.push(tab);
-            }
+    /// Returns whether it was new.
+    pub fn adopt(&mut self, tab: T) -> bool {
+        if self.pane_of(tab).is_some() {
+            return false;
         }
+        let focused = self.focused;
+        self.pane_mut(focused)
+            .map(|pane| pane.tabs.push(tab))
+            .is_some()
     }
 
     /// Move `tab` into a new pane on `edge` of `target`, focused. Refused

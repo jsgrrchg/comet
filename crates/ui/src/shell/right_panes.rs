@@ -7,8 +7,27 @@
 //! those tabs into panes. `ChatPanels::right_active` is the focused pane's
 //! tab, so everything that reads "the active surface" acts on that pane.
 
-use super::right_layout::{Edge, PaneId, SplitLayout};
+use super::right_layout::{
+    Axis, Edge, MIN_PANE_HEIGHT, MIN_PANE_WIDTH, Node, PaneId, Rect, SplitLayout,
+};
 use super::*;
+
+/// A split pane's tabs start this far past its left edge, like the unsplit
+/// host's strip.
+const STRIP_GUTTER: f32 = 8.0;
+/// Room a titlebar strip leaves before the next column's divider.
+const STRIP_TRAILING_GAP: f32 = 4.0;
+/// The hit width of a divider between split panes; the line itself is the
+/// 1px border every pane after the first draws.
+const DIVIDER_HITBOX: f32 = 8.0;
+
+/// Drag marker for a divider: the boundary before child `index` of split
+/// `split`.
+pub(super) struct RightSplitResize {
+    panel_key: String,
+    split: u64,
+    index: usize,
+}
 
 impl Shell {
     /// The current chat's split, while its host holds several panes.
@@ -73,9 +92,9 @@ impl Shell {
         let Some(layout) = self.panels.right_layouts.get_mut(key) else {
             return;
         };
-        layout.retain(&keep);
+        let mut changed = layout.retain(&keep);
         for tab in members.iter().filter(|tab| keep(tab)) {
-            layout.adopt(*tab);
+            changed |= layout.adopt(*tab);
         }
         if let Some(sole) = layout.sole_pane() {
             // Back to one pane: its strip order becomes the chat's tab order.
@@ -105,8 +124,11 @@ impl Shell {
         };
         if current != target {
             self.panels.update(key, |panel| panel.right_active = target);
+            changed = true;
         }
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Focus a pane of the current chat's split (a press anywhere in it).
@@ -206,5 +228,291 @@ impl Shell {
             cx.notify();
         }
         moved
+    }
+}
+
+impl Shell {
+    /// The split host: the layout tree, each pane with its surface.
+    pub(super) fn render_right_split(
+        &mut self,
+        layout: &SplitLayout<RightSurface>,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rects = layout.rects();
+        self.render_right_node(layout.root(), &rects, width, cx)
+    }
+
+    fn render_right_node(
+        &mut self,
+        node: &Node,
+        rects: &[(PaneId, Rect)],
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (split, axis, children, sizes) = match node {
+            Node::Pane(id) => {
+                let rect = rects
+                    .iter()
+                    .find(|(pane, _)| pane == id)
+                    .map(|(_, rect)| *rect)
+                    .unwrap_or(Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 1.0,
+                        h: 1.0,
+                    });
+                return self.render_right_split_pane(*id, rect, width, cx);
+            }
+            Node::Split {
+                id,
+                axis,
+                children,
+                sizes,
+            } => (*id, *axis, children, sizes),
+        };
+        let theme = Theme::of(cx).clone();
+        let row = axis == Axis::Row;
+        let key = self.panel_key(cx);
+        let mut container = div()
+            .id(("right-split", split as usize))
+            .size_full()
+            .relative()
+            .flex()
+            .when(row, |el| el.flex_row())
+            .when(!row, |el| el.flex_col())
+            .on_drag_move::<RightSplitResize>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<RightSplitResize>, _, cx| {
+                    let drag = event.drag(cx);
+                    if drag.split != split || drag.panel_key != this.panel_key(cx) {
+                        return;
+                    }
+                    let (pointer, start, extent, min) = if row {
+                        (
+                            event.event.position.x,
+                            event.bounds.left(),
+                            event.bounds.size.width,
+                            MIN_PANE_WIDTH,
+                        )
+                    } else {
+                        (
+                            event.event.position.y,
+                            event.bounds.top(),
+                            event.bounds.size.height,
+                            MIN_PANE_HEIGHT,
+                        )
+                    };
+                    let extent = f32::from(extent).max(1.0);
+                    let fraction = f32::from(pointer - start) / extent;
+                    let index = drag.index;
+                    let key = this.panel_key(cx);
+                    if let Some(layout) = this.panels.right_layouts.get_mut(&key)
+                        && layout.resize(split, index, fraction, min / extent)
+                    {
+                        cx.notify();
+                    }
+                },
+            ));
+        for (ix, (child, size)) in children.iter().zip(sizes).enumerate() {
+            let inner = self.render_right_node(child, rects, width, cx);
+            container = container.child(
+                div()
+                    .relative()
+                    .overflow_hidden()
+                    .flex_grow_0()
+                    .flex_shrink_0()
+                    .flex_basis(gpui::relative(*size))
+                    .min_w_0()
+                    .min_h_0()
+                    .when(row, |cell| cell.h_full())
+                    .when(!row, |cell| cell.w_full())
+                    // The divider: the same 1px hairline as the host's seam.
+                    .when(ix > 0 && row, |cell| {
+                        cell.border_l_1().border_color(theme.border)
+                    })
+                    .when(ix > 0 && !row, |cell| {
+                        cell.border_t_1().border_color(theme.border)
+                    })
+                    .child(inner),
+            );
+        }
+        let mut offset = 0.0;
+        for ix in 1..children.len() {
+            offset += sizes[ix - 1];
+            container = container.child(self.right_split_divider(
+                key.clone(),
+                split,
+                ix,
+                row,
+                offset,
+                &theme,
+                cx,
+            ));
+        }
+        container.into_any_element()
+    }
+
+    /// The invisible grab area over a divider; hovering strengthens the
+    /// hairline, a double click evens the split out.
+    #[allow(clippy::too_many_arguments)]
+    fn right_split_divider(
+        &self,
+        panel_key: String,
+        split: u64,
+        index: usize,
+        row: bool,
+        offset: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let group: SharedString = format!("right-split-divider-{split}-{index}").into();
+        let line = theme.border_strong;
+        div()
+            .id(("right-split-divider", (split as usize) << 8 | index))
+            .group(group.clone())
+            .absolute()
+            .when(row, |el| {
+                el.top_0()
+                    .bottom_0()
+                    .w(px(DIVIDER_HITBOX))
+                    .left(gpui::relative(offset))
+                    .ml(px(-DIVIDER_HITBOX / 2.0))
+                    .cursor_col_resize()
+            })
+            .when(!row, |el| {
+                el.left_0()
+                    .right_0()
+                    .h(px(DIVIDER_HITBOX))
+                    .top(gpui::relative(offset))
+                    .mt(px(-DIVIDER_HITBOX / 2.0))
+                    .cursor_row_resize()
+            })
+            .occlude()
+            .child(
+                div()
+                    .absolute()
+                    .when(row, |el| {
+                        el.top_0()
+                            .bottom_0()
+                            .left(px(DIVIDER_HITBOX / 2.0))
+                            .w(px(1.0))
+                    })
+                    .when(!row, |el| {
+                        el.left_0()
+                            .right_0()
+                            .top(px(DIVIDER_HITBOX / 2.0))
+                            .h(px(1.0))
+                    })
+                    .group_hover(group, move |style| style.bg(line)),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseUpEvent, _, cx| {
+                    if event.click_count == 2 {
+                        let key = this.panel_key(cx);
+                        if let Some(layout) = this.panels.right_layouts.get_mut(&key)
+                            && layout.balance(split)
+                        {
+                            cx.notify();
+                        }
+                    }
+                }),
+            )
+            .on_drag(
+                RightSplitResize {
+                    panel_key,
+                    split,
+                    index,
+                },
+                |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| DragGhost)
+                },
+            )
+    }
+
+    /// One split pane. Panes along the host's top edge clear the titlebar
+    /// band, where their strips live; the rest carry their own strip.
+    fn render_right_split_pane(
+        &mut self,
+        id: PaneId,
+        rect: Rect,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let surface = self.resolved_pane_active(id, cx);
+        let top = rect.y < 1e-4;
+        let content = self.render_right_surface(surface, rect.w * width, cx);
+        let header = (!top).then(|| {
+            div()
+                .h(px(crate::surface_chrome::HEADER_HEIGHT))
+                .w_full()
+                .flex_none()
+                .flex()
+                .items_center()
+                .pl(px(STRIP_GUTTER))
+                .pr(px(STRIP_TRAILING_GAP))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .overflow_hidden()
+                        .child(self.render_right_tab_strip(Some(id), cx)),
+                )
+        });
+        div()
+            .id(("right-split-pane", id as usize))
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
+                this.focus_right_pane(id, cx);
+            }))
+            // A side chat's transcript runs under the band, as unsplit.
+            .when(top && !matches!(surface, RightSurface::SideChat(_)), |el| {
+                el.pt(px(Theme::TITLEBAR_HEIGHT))
+            })
+            .children(header)
+            .child(div().flex_1().min_h_0().relative().child(content))
+            .into_any_element()
+    }
+
+    /// The titlebar's tab area over the right pane. Unsplit, the host's one
+    /// strip; split, one strip per top-edge pane over its column. `origin`
+    /// is the host's left edge relative to this area's.
+    pub(super) fn render_right_titlebar_strips(
+        &mut self,
+        origin: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(layout) = self.right_split(cx).cloned() else {
+            return self.render_right_tab_strip(None, cx);
+        };
+        let width = self.right_content_width(self.right_target(cx));
+        let top = right_layout::top_row(&layout.rects());
+        let last = top.len().saturating_sub(1);
+        let mut area = div().relative().size_full();
+        for (ix, (id, rect)) in top.into_iter().enumerate() {
+            let left = (origin + rect.x * width + STRIP_GUTTER).max(0.0);
+            let cell = div()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(left))
+                .overflow_hidden()
+                .flex()
+                .items_center();
+            let cell = if ix == last {
+                cell.right_0()
+            } else {
+                let right = origin + (rect.x + rect.w) * width - STRIP_TRAILING_GAP;
+                cell.w(px((right - left).max(0.0)))
+            };
+            area = area.child(cell.child(self.render_right_tab_strip(Some(id), cx)));
+        }
+        area.into_any_element()
     }
 }

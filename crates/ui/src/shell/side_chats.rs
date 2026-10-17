@@ -306,7 +306,14 @@ impl Shell {
         }
     }
 
-    pub(super) fn render_side_chat(&mut self, id: u64, cx: &mut Context<Self>) -> AnyElement {
+    /// `width` is the pane's laid-out width (a split pane's share of the
+    /// host).
+    pub(super) fn render_side_chat(
+        &mut self,
+        id: u64,
+        width: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(tab) = self
             .side_chats
             .get(&id)
@@ -319,11 +326,7 @@ impl Shell {
         // Share the main chat's docked width cap and responsive padding. Size
         // from the width the pane lays out at, not its mask, which an open or
         // close animates.
-        let width = composer_target_width(
-            self.right_content_width(self.right_target(cx)),
-            settings::transcript_width(cx),
-            true,
-        );
+        let width = composer_target_width(width, settings::transcript_width(cx), true);
         composer.update(cx, |composer, cx| {
             composer.set_dock_frame(crate::composer_dock::DockFrame::settled(true), cx);
             composer.set_available_width(width, cx);

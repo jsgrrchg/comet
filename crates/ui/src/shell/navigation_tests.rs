@@ -32,7 +32,7 @@ impl Render for NavigationHost {
                 .on_action(cx.listener(|shell, _: &PrevSession, window, cx| {
                     shell.cycle_navigation(false, window, cx);
                 }))
-                .child(div().h(px(40.)).child(shell.render_right_tab_strip(cx)))
+                .child(div().h(px(40.)).child(shell.render_right_tab_strip(None, cx)))
                 .child(
                     div()
                         .flex()

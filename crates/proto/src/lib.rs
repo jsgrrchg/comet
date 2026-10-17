@@ -16,6 +16,7 @@ pub mod native_forks;
 pub use native_forks::*;
 pub mod preview;
 pub mod projectless;
+pub mod pull_request_mentions;
 pub mod sidebar_pins;
 pub mod view;
 pub mod voice;

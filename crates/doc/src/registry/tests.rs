@@ -1368,6 +1368,7 @@ fn sidebar_sections_reorder_and_converge_across_devices() {
     assert_eq!(order(&a), ["four", "three", "two", "one"]);
     // Concurrent moves of the same section: the later one wins everywhere.
     moved(&mut a, "two", None, Some("four"));
+    std::thread::sleep(std::time::Duration::from_millis(5));
     moved(&mut b, "two", Some("one"), None);
     server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
     assert_eq!(order(&a), order(&b));
@@ -1377,6 +1378,17 @@ fn sidebar_sections_reorder_and_converge_across_devices() {
     moved(&mut a, "three", None, Some("four"));
     moved(&mut a, "one", Some("three"), None);
     assert_eq!(order(&a), ["four", "two", "one"]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    // Keying a new section leaves the keyed ones alone, so a concurrent
+    // move on another device survives a later move that keys it.
+    moved(&mut a, "one", None, Some("four"));
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    create(&mut b, "five");
+    moved(&mut b, "two", Some("five"), None);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    server_round(&mut server, &mut seq, &mut [&mut a, &mut b]);
+    assert_eq!(order(&a), order(&b));
+    assert_eq!(order(&a), ["one", "four", "five", "two"]);
 }
 
 #[test]

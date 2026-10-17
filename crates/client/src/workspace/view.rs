@@ -588,6 +588,7 @@ pub(crate) fn derive(
                 .iter()
                 .filter(|id| active_ids.contains(id.as_str()) && !rc.pinned.contains(id.as_str()))
                 .filter(|id| rc.section_of.get(id.as_str()) == Some(&section.id.as_str()))
+                .filter(|id| seen.insert(id.as_str()))
                 .map(|id| rows[id].clone())
                 .collect(),
         })

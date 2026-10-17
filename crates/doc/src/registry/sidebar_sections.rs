@@ -184,8 +184,19 @@ impl RegistryDoc {
     ) -> Result<(String, String), DocError> {
         members.retain(|(id, _)| id != moving);
         if members.iter().any(|(_, key)| key.is_none()) {
-            let mut lower: Option<String> = None;
+            // Keyless rows already sort after the keyed ones, so key just them
+            // past the last key: rewriting keyed rows would clobber a move
+            // another device made meanwhile. Only when no key fits past the
+            // last one (a key at its length cap) does everything restart.
+            let last = members.iter().rev().find_map(|(_, key)| key.clone());
+            // The nonce is fixed-width, so any one tells whether a key fits.
+            let fits = pin_order_key_between(last.as_deref(), None, "probe").is_ok();
+            let mut lower = if fits { last } else { None };
             for (id, key) in &mut members {
+                if fits && key.is_some() {
+                    continue;
+                }
+                self.observe_sidebar_row(kind, id);
                 let hlc = self.next_hlc();
                 let next = pin_order_key_between(lower.as_deref(), None, &hlc)
                     .map_err(|e| DocError::Schema(e.into()))?;

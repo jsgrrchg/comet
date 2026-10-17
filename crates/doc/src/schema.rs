@@ -144,6 +144,14 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             mime_type: Some(mime_type.clone()),
             ..Default::default()
         },
+        // The script path and title ride `path` and `name`.
+        MessagePart::Visual { id, path, title } => DocPartJson {
+            id: id.clone(),
+            kind: "visual".into(),
+            path: Some(path.clone()),
+            name: Some(title.clone()),
+            ..Default::default()
+        },
         MessagePart::Text { id, text } => DocPartJson {
             id: id.clone(),
             kind: "text".into(),
@@ -231,6 +239,17 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
 fn from_doc_part(p: DocPartJson) -> MessagePart {
     match p.kind.as_str() {
         "image" => image_part(p.id, p.path, p.name, p.mime_type),
+        "visual" => match p.path.filter(|path| !path.is_empty()) {
+            Some(path) => MessagePart::Visual {
+                id: p.id,
+                path,
+                title: p.name.unwrap_or_default(),
+            },
+            None => MessagePart::Error {
+                id: p.id,
+                message: "Visual unavailable".into(),
+            },
+        },
         "tool" => match p.call.and_then(|c| serde_json::from_value(c).ok()) {
             Some(call) => MessagePart::Tool {
                 id: p.id,
@@ -903,6 +922,14 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     Ok(())
 }
 
+/// Decode ONE `messages` entry map's deep JSON value (same strict-then-salvage
+/// policy as [`SessionDoc::read_entries`]). The per-entry seam for viewers
+/// that keep an incremental transcript mirror: they re-decode only the entry
+/// maps a commit touched instead of materializing the whole list.
+pub fn decode_entry_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError> {
+    entry_from_json(v)
+}
+
 fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
@@ -1511,6 +1538,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn visual_round_trips_and_degrades_without_a_path() {
+        let doc = SessionDoc::init("visuals").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a", "owner", 1).unwrap();
+        let mut parts = vec![];
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::Visual {
+                id: "v:1".into(),
+                path: "/uploads/v-1-visual.luau".into(),
+                title: "Latency by region".into(),
+            },
+        );
+        writer.sync(&parts).unwrap();
+        let imported = LoroDoc::new();
+        imported.import(&doc.export_snapshot().unwrap()).unwrap();
+        let loaded = SessionDoc::from_doc(imported);
+        assert_eq!(loaded.read_entries().unwrap()[0].parts, parts);
+        assert!(matches!(
+            from_doc_part(
+                serde_json::from_value(serde_json::json!({"kind":"visual", "id":"v", "name":"t"}))
+                    .unwrap()
+            ),
+            MessagePart::Error { .. }
+        ));
+        assert!(matches!(
+            from_doc_part(
+                serde_json::from_value(serde_json::json!({"kind":"visual", "id":"v", "path":"/p"}))
+                    .unwrap()
+            ),
+            MessagePart::Visual { .. }
+        ));
+    }
+
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
             id: id.into(),
@@ -1542,6 +1603,64 @@ mod tests {
             }]
         );
         assert_eq!(doc.chat_id().as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn todo_status_survives_the_doc_and_refreshes_in_place() {
+        use zeron_proto::{TodoItem, TodoStatus};
+        let todo = |items: Vec<TodoItem>| MessagePart::Tool {
+            // The ACP/Codex plan reuses one id for every update.
+            id: zeron_proto::LIVE_PLAN_TOOL_ID.into(),
+            call: ToolCall::Todo { items },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
+        };
+        let doc = SessionDoc::init("c1").unwrap();
+        let mut w = SegmentWriter::begin(&doc, "e1", "dev", 1).unwrap();
+        let first = todo(vec![
+            TodoItem::new("read", TodoStatus::InProgress),
+            TodoItem::new("fix", TodoStatus::Pending),
+        ]);
+        w.sync(std::slice::from_ref(&first)).unwrap();
+        assert_eq!(doc.read_entries().unwrap()[0].parts, vec![first]);
+        // The next plan update rewrites the same part, in-progress moved on.
+        let second = todo(vec![
+            TodoItem::new("read", TodoStatus::Completed),
+            TodoItem::new("fix", TodoStatus::InProgress),
+        ]);
+        w.sync(std::slice::from_ref(&second)).unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries[0].parts, vec![second]);
+    }
+
+    #[test]
+    fn legacy_todo_part_without_status_still_reads() {
+        // Written by a build that only knew `done`.
+        let part: DocPartJson = serde_json::from_value(serde_json::json!({
+            "id": "t", "kind": "tool", "isError": false,
+            "call": { "kind": "todo", "items": [
+                { "text": "a", "done": true }, { "text": "b", "done": false }
+            ]}
+        }))
+        .unwrap();
+        let MessagePart::Tool {
+            call: ToolCall::Todo { items },
+            ..
+        } = from_doc_part(part)
+        else {
+            panic!("a legacy todo part must still decode");
+        };
+        assert_eq!(items[0].status(), zeron_proto::TodoStatus::Completed);
+        assert_eq!(items[1].status(), zeron_proto::TodoStatus::Pending);
     }
 
     #[test]

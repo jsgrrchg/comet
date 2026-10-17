@@ -14,6 +14,10 @@ pub mod capabilities {
     pub const MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1: &str =
         "message-queue-clean-attachment-text-v1";
     pub const MESSAGE_QUEUE_EDIT_LEASE_V1: &str = "message-queue-edit-lease-v1";
+    pub const HARNESS_UPDATES_V1: &str = "harness-updates-v1";
+    /// The host creates a projectless chat's scratch folder
+    /// (`crate::projectless`) when it runs; older hosts only know `~`.
+    pub const PROJECTLESS_SCRATCH_V1: &str = "projectless-scratch-v1";
     /// The attached engine accepts the registry-scoped `markChatUnread` mutate.
     pub const CHAT_UNREAD_V1: &str = "chat-unread-v1";
 
@@ -24,6 +28,9 @@ pub mod capabilities {
         MESSAGE_QUEUE_ATTACHMENTS_V1,
         MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
         MESSAGE_QUEUE_EDIT_LEASE_V1,
+        HARNESS_UPDATES_V1,
+        PROJECTLESS_SCRATCH_V1,
+        crate::voice::remote::CAPABILITY,
         CHAT_UNREAD_V1,
     ];
 
@@ -104,6 +111,9 @@ mod tests {
                     "message-queue-attachments-v1",
                     "message-queue-clean-attachment-text-v1",
                     "message-queue-edit-lease-v1",
+                    "harness-updates-v1",
+                    "projectless-scratch-v1",
+                    "voice-client-media-v1",
                     "chat-unread-v1"
                 ],
             })

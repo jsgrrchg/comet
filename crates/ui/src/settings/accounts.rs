@@ -121,7 +121,9 @@ pub fn is_openable_login_url(url: &str) -> bool {
         "https" => true,
         "http" => {
             let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-            let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+            let authority = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
             let host = match authority.strip_prefix('[') {
                 Some(v6) => v6.split(']').next().unwrap_or(""),
                 None => authority.split(':').next().unwrap_or(""),
@@ -156,6 +158,21 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     } else {
         format!("resets {}", local.format("%b %-d"))
     })
+}
+
+/// "Session: resets 3:45 PM · Week: resets Thu" — the usage meters' tooltip.
+pub(crate) fn usage_resets(
+    windows: &[zeron_proto::AgentUsageWindow],
+    now: DateTime<Utc>,
+) -> String {
+    windows
+        .iter()
+        .map(|window| match format_reset(window.resets_at, now) {
+            Some(reset) => format!("{}: {reset}", window.label),
+            None => window.label.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// The providers zeron can sign into, in display order: (harness, name, CLI
@@ -1185,17 +1202,12 @@ impl AccountsPage {
         // line, so a failed probe never changes the row's height.
         let usage: AnyElement = if account.usage_windows.is_empty() {
             meta.extend(self.render_usage_missing(account, theme));
-            div().w(px(USAGE_COLUMN_WIDTH)).flex_none().into_any_element()
+            div()
+                .w(px(USAGE_COLUMN_WIDTH))
+                .flex_none()
+                .into_any_element()
         } else {
-            let resets = account
-                .usage_windows
-                .iter()
-                .map(|window| match format_reset(window.resets_at, now) {
-                    Some(reset) => format!("{}: {reset}", window.label),
-                    None => window.label.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(" · ");
+            let resets = usage_resets(&account.usage_windows, now);
             div()
                 .id(("account-usage", ix))
                 .w(px(USAGE_COLUMN_WIDTH))
@@ -1265,6 +1277,7 @@ impl AccountsPage {
             .tab_index(0)
             .role(gpui::Role::Button)
             .aria_label(format!("Actions for {email}"))
+            .tooltip(widgets::text_tooltip("Account actions"))
             .aria_expanded(menu_open)
             .focus_visible(|s| s.border_2().border_color(theme.accent))
             .on_mouse_down(
@@ -1370,7 +1383,9 @@ impl AccountsPage {
                     .flex_1()
                     .min_w_0()
                     .child(widgets::row_title(theme, email.clone()).truncate())
-                    .when(!meta.is_empty(), |el| el.child(widgets::meta_line(theme, meta))),
+                    .when(!meta.is_empty(), |el| {
+                        el.child(widgets::meta_line(theme, meta))
+                    }),
             )
             .child(usage)
             .child(
@@ -1829,21 +1844,6 @@ impl AccountsPage {
                             ),
                     ),
             )
-            .when_some(self.error.clone(), |el, message| {
-                el.child(
-                    widgets::error_strip(theme, message)
-                        .mt(px(4.0))
-                        .id("accounts-action-error")
-                        .role(gpui::Role::Button)
-                        .aria_label("Dismiss account error")
-                        .tab_index(0)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|page, _, _, cx| {
-                            page.error = None;
-                            cx.notify();
-                        })),
-                )
-            })
             .children(match &self.snapshot {
                 Loadable::Ready(snapshot) => snapshot
                     .warnings
@@ -1872,6 +1872,7 @@ impl AccountsPage {
 
 impl Render for AccountsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::toast::take_error(&mut self.error, cx);
         let theme = Theme::of(cx).for_settings_surface();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
@@ -2178,20 +2179,6 @@ impl Render for AccountsPage {
                                     )
                                     .child(self.render_device_switcher(&theme, cx)),
                             )
-                            .when_some(self.error.clone(), |el, message| {
-                                el.child(
-                                    widgets::error_strip(&theme, message)
-                                        .id("accounts-action-error")
-                                        .cursor_pointer()
-                                        .tab_index(0)
-.role(gpui::Role::Button)
-.focus_visible(|s| s.border_2().border_color(theme.accent).opacity(1.0))
-.on_click(cx.listener(|this, _, _, cx| {
-                                            this.error = None;
-                                            cx.notify();
-                                        })),
-                                )
-                            })
                             .children(sections)
                             // Footer note (zeron: `mt-6 text-[12px] leading-relaxed
                             // text-muted-foreground/60`).
@@ -2217,7 +2204,9 @@ impl Render for AccountsPage {
 mod tests {
     #[test]
     fn only_web_and_loopback_login_urls_open() {
-        assert!(is_openable_login_url("https://claude.com/cai/oauth/authorize?x=1"));
+        assert!(is_openable_login_url(
+            "https://claude.com/cai/oauth/authorize?x=1"
+        ));
         assert!(is_openable_login_url("http://localhost:1455/auth/callback"));
         assert!(is_openable_login_url("http://127.0.0.1:8080/"));
         assert!(is_openable_login_url("http://[::1]:9000/cb"));
@@ -2298,6 +2287,29 @@ mod tests {
                 monthly.with_timezone(&Local).format("%b %-d")
             ))
         );
+    }
+
+    #[test]
+    fn usage_resets_lists_every_window() {
+        let now = Utc::now();
+        let soon = now + TimeDelta::minutes(125);
+        let windows = [
+            zeron_proto::AgentUsageWindow {
+                label: "Session".into(),
+                used_fraction: 0.07,
+                resets_at: Some(soon),
+            },
+            zeron_proto::AgentUsageWindow {
+                label: "Week".into(),
+                used_fraction: 0.44,
+                resets_at: None,
+            },
+        ];
+        assert_eq!(
+            usage_resets(&windows, now),
+            format!("Session: {} · Week", format_reset(Some(soon), now).unwrap())
+        );
+        assert_eq!(usage_resets(&[], now), "");
     }
 
     #[test]

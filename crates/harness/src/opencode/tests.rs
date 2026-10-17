@@ -200,7 +200,7 @@ impl TurnWire {
                             "/api/session" => ("200 OK", r#"{"data":{"id":"fixture"}}"#),
                             "/api/command" => ("200 OK", r#"{"data":[]}"#),
                             // Non-empty: the catalog-sync retry loop must not stall tests.
-                            "/api/model" => ("200 OK", r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":[{"id":"low"}],"enabled":true}]}"#),
+                            "/api/model" => ("200 OK", r#"{"data":[{"providerID":"opencode","id":"muse","name":"Muse","limit":{"context":1000},"variants":[{"id":"low"}],"enabled":true},{"providerID":"opencode","id":"long-context","name":"Long Context","limit":{"context":2000},"enabled":true}]}"#),
                             _ => ("200 OK", "{}"),
                         }
                     } else {
@@ -237,6 +237,8 @@ impl TurnWire {
                 .send(crate::SteerMessage {
                     prompt: "second".into(),
                     message_id: None,
+                    attachments: Vec::new(),
+                    config: None,
                 })
                 .await
                 .unwrap();
@@ -255,6 +257,8 @@ impl TurnWire {
             server: Server::attached(base),
             event_tx,
             controls: RunControls {
+                realtime: None,
+                execution_lease: None,
                 request_input: Box::new(move |questions| {
                     let answer = answer.expect("fixture must not ask for input");
                     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -271,6 +275,7 @@ impl TurnWire {
                 }),
                 steering,
                 interrupt: interrupt.clone(),
+                turn: Default::default(),
             },
             request: serde_json::from_value(request).unwrap(),
             interrupt_grace: Duration::from_secs(2),
@@ -410,6 +415,8 @@ async fn completed_turn_keeps_mailbox_alive_for_the_next_queued_request() {
         .send(crate::SteerMessage {
             prompt: "after completion".into(),
             message_id: Some("second".into()),
+            attachments: Vec::new(),
+            config: None,
         })
         .await
         .unwrap();
@@ -559,6 +566,38 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
             "text": "PONG"
         }),
     );
+    // Each step reports its own tokens; `session.usage.updated` follows with
+    // the cumulative session totals, which must not read as occupancy.
+    let step = |wire: &TurnWire, message: &str, model: &str, tokens: Value, cumulative: Value| {
+        wire.v2(
+            "session.step.started",
+            json!({
+                "sessionID": "fixture",
+                "assistantMessageID": message,
+                "model": {"id": model, "providerID": "opencode"},
+            }),
+        );
+        wire.v2(
+            "session.step.ended",
+            json!({
+                "sessionID": "fixture", "assistantMessageID": message,
+                "finish": "stop", "cost": 0, "tokens": tokens,
+            }),
+        );
+        wire.v2(
+            "session.usage.updated",
+            json!({"sessionID": "fixture", "cost": 0, "tokens": cumulative}),
+        );
+    };
+    wire.v2(
+        "session.step.ended",
+        json!({
+            "sessionID": "fixture", "assistantMessageID": "msg_a",
+            "finish": "stop", "cost": 0,
+            "tokens": {"input": 10, "output": 2, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}}
+        }),
+    );
     wire.v2(
         "session.usage.updated",
         json!({
@@ -567,33 +606,72 @@ async fn v2_wire_streams_text_and_settles_on_execution_success() {
                        "cache": {"read": 0, "write": 0}}
         }),
     );
+    // A model switch resolves the new model's advertised window.
+    step(
+        &wire,
+        "msg_b",
+        "long-context",
+        json!({"input": 20, "output": 3, "reasoning": 0, "cache": {"read": 5, "write": 0}}),
+        json!({"input": 30, "output": 5, "reasoning": 0, "cache": {"read": 5, "write": 0}}),
+    );
+    // A step without reported usage is not an empty context.
+    step(
+        &wire,
+        "msg_c",
+        "long-context",
+        json!({"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}),
+        json!({"input": 30, "output": 5, "reasoning": 0, "cache": {"read": 5, "write": 0}}),
+    );
+    // After compaction the next prompt is smaller; the totals keep climbing.
+    step(
+        &wire,
+        "msg_d",
+        "long-context",
+        json!({"input": 4, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}}),
+        json!({"input": 34, "output": 6, "reasoning": 0, "cache": {"read": 5, "write": 0}}),
+    );
     wire.v2(
         "session.execution.succeeded",
         json!({"sessionID": "fixture"}),
     );
 
-    let (status, text, usage) = tokio::time::timeout(Duration::from_secs(5), async {
-        let mut text = String::new();
-        let mut usage = None;
-        loop {
-            match wire.events.recv().await.unwrap().unwrap() {
-                AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
-                AgentEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                } => {
-                    usage = Some((input_tokens, output_tokens));
+    let (status, text, usage, context_usage) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut text = String::new();
+            let mut usage = None;
+            let mut context_usage = Vec::new();
+            loop {
+                match wire.events.recv().await.unwrap().unwrap() {
+                    AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
+                    AgentEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                    } => {
+                        usage = Some((input_tokens, output_tokens));
+                    }
+                    AgentEvent::ContextUsage { tokens, window } => {
+                        context_usage.push((tokens, window));
+                    }
+                    AgentEvent::Done { status, .. } => {
+                        return (status, text, usage, context_usage);
+                    }
+                    _ => {}
                 }
-                AgentEvent::Done { status, .. } => return (status, text, usage),
-                _ => {}
             }
-        }
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
     assert_eq!(status, DoneStatus::Completed);
     assert_eq!(text, "PONG");
-    assert_eq!(usage, Some((10, 2)));
+    assert_eq!(usage, Some((4, 1)));
+    assert_eq!(
+        context_usage,
+        vec![
+            (Some(12), Some(1000)),
+            (Some(28), Some(2000)),
+            (Some(5), Some(2000)),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1224,13 +1302,91 @@ fn questions_map_to_input_panel_shape() {
             "multiple": true,
         }],
     });
-    let questions = map_questions(&props);
-    assert_eq!(questions.len(), 1);
-    assert_eq!(questions[0].id, "q0");
-    assert_eq!(questions[0].header, "Color");
-    assert_eq!(questions[0].question, "Which color?");
-    assert_eq!(questions[0].options, vec!["Red", "Blue"]);
-    assert!(questions[0].multi_select);
+    let pairs = map_questions(&props);
+    assert_eq!(pairs.len(), 1);
+    let (key, question) = &pairs[0];
+    // A key-less 1.x question falls back to the positional form key.
+    assert_eq!(key, "q0");
+    // Panel ids are minted per question, never taken from the wire.
+    assert_ne!(question.id, "q0");
+    assert_ne!(question.id, map_questions(&props)[0].1.id);
+    assert_eq!(question.header, "Color");
+    assert_eq!(question.question, "Which color?");
+    assert_eq!(question.options, vec!["Red", "Blue"]);
+    assert!(question.multi_select);
+}
+
+/// A live 2.0.24 `form.created` frame (the `question` tool's transport)
+/// folds into the same bus payload the 1.x question path consumes.
+#[test]
+fn v2_question_forms_fold_into_the_input_panel_shape() {
+    let mut tools = HashMap::new();
+    let out = normalize_v2_frame(
+        json!({"id":"evt_form","type":"form.created","data":{"form":{
+        "id":"frm_116e46801001",
+        "sessionID":"ses_1",
+        "title":"Questions",
+        "metadata":{"kind":"question","tool":{"messageID":"msg_1","id":"call_1"}},
+        "fields":[
+            {"key":"q0","title":"Color","description":"Which color?","type":"string",
+             "options":[{"value":"Red","label":"Red","description":"warm"},
+                        {"value":"Blue","label":"Blue","description":"cool"}],
+             "custom":true},
+            {"key":"q1","title":"Toppings","description":"Pick some","type":"multiselect",
+             "options":[{"value":"A","label":"A"},{"value":"B","label":"B"}],"custom":true}
+        ]}}}),
+        &mut tools,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"question.asked","properties":{
+        "id":"frm_116e46801001","sessionID":"ses_1","form":true,
+        "questions":[
+            {"key":"q0","header":"Color","question":"Which color?","multiple":false,
+             "options":[{"label":"Red"},{"label":"Blue"}]},
+            {"key":"q1","header":"Toppings","question":"Pick some","multiple":true,
+             "options":[{"label":"A"},{"label":"B"}]}
+        ]}})]
+    );
+    // Forms from other features (no question metadata) never reach the panel.
+    assert!(
+        normalize_v2_frame(
+            json!({"id":"evt_other","type":"form.created","data":{"form":{
+                "id":"frm_2","sessionID":"ses_1","title":"MCP",
+                "fields":[{"key":"url","title":"URL","type":"string"}]}}}),
+            &mut tools,
+        )
+        .is_empty()
+    );
+}
+
+/// Form answers key by field: one label for a single-select field, the label
+/// array for a multiselect.
+#[test]
+fn form_answers_key_by_field_with_multiselect_arrays() {
+    let pairs = map_questions(&json!({"questions":[
+        {"key":"q0","question":"Which color?","header":"Color","options":[],"multiple":false},
+        {"key":"q1","question":"Pick some","header":"Toppings","options":[],"multiple":true}
+    ]}));
+    let answers = vec![
+        UserInputAnswer {
+            question_id: pairs[0].1.id.clone(),
+            labels: vec!["Red".into()],
+        },
+        UserInputAnswer {
+            question_id: pairs[1].1.id.clone(),
+            labels: vec!["A".into(), "B".into()],
+        },
+    ];
+    assert_eq!(
+        form_answer_body(&pairs, &answers),
+        json!({"answer":{"q0":"Red","q1":["A","B"]}})
+    );
+    // An unanswered single-select degrades to an empty string, never an array.
+    assert_eq!(
+        form_answer_body(&pairs, &[]),
+        json!({"answer":{"q0":"","q1":[]}})
+    );
 }
 
 #[test]
@@ -1261,13 +1417,22 @@ fn tool_names_type_the_common_calls() {
         "todowrite",
         &json!({"todos": [
             {"content": "step one", "status": "completed"},
-            {"content": "step two", "status": "pending"},
+            {"content": "step two", "status": "in_progress"},
+            {"content": "step three", "status": "pending"},
+            {"content": "step four", "status": "cancelled"},
         ]}),
     );
-    assert!(matches!(
-        &call,
-        ToolCall::Todo { items } if items.len() == 2 && items[0].done && !items[1].done
-    ));
+    assert_eq!(
+        call,
+        ToolCall::Todo {
+            items: vec![
+                TodoItem::new("step one", TodoStatus::Completed),
+                TodoItem::new("step two", TodoStatus::InProgress),
+                TodoItem::new("step three", TodoStatus::Pending),
+                TodoItem::new("step four", TodoStatus::Pending),
+            ]
+        }
+    );
     let call = oc_tool_call("mystery", &json!({"x": 1}));
     assert!(matches!(&call, ToolCall::Unknown { name, input: Some(_) } if name == "mystery"));
     assert!(!call.is_subagent_spawn());
@@ -1429,10 +1594,10 @@ fn v2_frames_normalize_to_v1_payloads() {
             "type":"tool","tool":"read",
             "state":{"status":"running","input":{"path":"/tmp/x"}}}}})]
     );
-    // Usage totals reach the engine as an assistant message.updated.
+    // A step's own usage reaches the engine as an assistant message.updated.
     let out = normalize_v2_frame(
-        json!({"id":"evt_9","type":"session.usage.updated","data":{
-            "sessionID":"ses_1","cost":0,
+        json!({"id":"evt_9","type":"session.step.ended","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","finish":"stop","cost":0,
             "tokens":{"input":10,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}}),
         &mut tools,
     );
@@ -1442,6 +1607,60 @@ fn v2_frames_normalize_to_v1_payloads() {
             "info":{"sessionID":"ses_1","id":"usage","role":"assistant",
                     "tokens":{"input":10,"output":2,"reasoning":0,
                               "cache":{"read":0,"write":0}}}}})]
+    );
+    // Cumulative session totals are spend, not occupancy; malformed step
+    // usage is dropped.
+    for data in [
+        json!({"id":"evt_10","type":"session.usage.updated","data":{
+            "sessionID":"ses_1","cost":0,"tokens":{"input":10,"output":2}}}),
+        json!({"id":"evt_11","type":"session.step.ended","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a","tokens":"12"}}),
+        json!({"id":"evt_11","type":"session.step.ended","data":{
+            "sessionID":"ses_1","assistantMessageID":"msg_a"}}),
+    ] {
+        assert_eq!(normalize_v2_frame(data, &mut tools), Vec::<Value>::new());
+    }
+    // step.ended omits model identity; the session's latest step supplies
+    // it so the context window resolves downstream.
+    let mut session_models = HashMap::new();
+    let step = normalize_v2_frame_with_session_models(
+        json!({"id":"evt_12","type":"session.step.started","data":{
+            "sessionID":"ses_2","assistantMessageID":"msg_b",
+            "model":{"id":"long-context","providerID":"opencode"}}}),
+        &mut tools,
+        &mut session_models,
+    );
+    assert_eq!(step.len(), 1);
+    let out = normalize_v2_frame_with_session_models(
+        json!({"id":"evt_13","type":"session.step.ended","data":{
+            "sessionID":"ses_2","assistantMessageID":"msg_b","finish":"stop","cost":0,
+            "tokens":{"input":1,"output":2}}}),
+        &mut tools,
+        &mut session_models,
+    );
+    assert_eq!(
+        out,
+        vec![json!({"type":"message.updated","properties":{
+            "info":{"sessionID":"ses_2","id":"usage","role":"assistant",
+                    "tokens":{"input":1,"output":2},
+                    "providerID":"opencode","modelID":"long-context"}}})]
+    );
+    // A malformed model leaves the cached one in place.
+    for model in [
+        json!(null),
+        json!("opencode/muse"),
+        json!({"id":"", "providerID":"opencode"}),
+    ] {
+        normalize_v2_frame_with_session_models(
+            json!({"id":"evt_14","type":"session.step.started","data":{
+                "sessionID":"ses_2","assistantMessageID":"msg_c","model":model}}),
+            &mut tools,
+            &mut session_models,
+        );
+    }
+    assert_eq!(
+        session_models.get("ses_2").map(|m| m.model_id.as_str()),
+        Some("long-context")
     );
     // The permission ask keeps its 1.x name on 2.x (observed live when a
     // tool reaches outside the workspace); the auto-approver replies.
@@ -1624,6 +1843,47 @@ async fn permissions_do_not_auto_answer_agent_questions() {
     assert_eq!(body, json!({"answers": [["No"]]}));
 }
 
+/// 2.x (2.0.24+) answers question forms, keyed by field, on the session's
+/// form route — and the harness emits NO `InputRequested`/`InputResolved` of
+/// its own (the engine's input bridge owns that lifecycle; a twin under
+/// opencode's id folded an unanswerable duplicate chip into the doc).
+#[tokio::test]
+async fn v2_question_forms_answer_through_the_form_route() {
+    let mut wire = TurnWire::start_policy(false, true, false, Some(true)).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2(
+        "form.created",
+        json!({"form":{
+        "id":"frm_1","sessionID":"fixture","title":"Questions",
+        "metadata":{"kind":"question","tool":{"messageID":"msg_1","id":"call_1"}},
+        "fields":[
+            {"key":"q0","title":"Color","description":"Which color?","type":"string",
+             "options":[{"value":"Red","label":"Red","description":"warm"}],"custom":true},
+            {"key":"q1","title":"Toppings","description":"Pick some","type":"multiselect",
+             "options":[{"value":"A","label":"A"}],"custom":true}
+        ]}}),
+    );
+    let body = wire.posted("/api/session/fixture/form/frm_1/reply").await;
+    assert_eq!(body, json!({"answer":{"q0":"Yes","q1":["Yes"]}}));
+    // Let the pre-fix twin (if any) land, then prove the stream carries none.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut twins = Vec::new();
+    while let Ok(event) = wire.events.try_recv() {
+        let event = event.unwrap();
+        if matches!(
+            event,
+            AgentEvent::InputRequested { .. } | AgentEvent::InputResolved { .. }
+        ) {
+            twins.push(event);
+        }
+    }
+    assert!(
+        twins.is_empty(),
+        "harness must not emit input lifecycle events itself: {twins:?}"
+    );
+}
+
 #[test]
 fn v2_tools_are_scoped_and_retired_and_real_failures_are_visible() {
     let mut tools = HashMap::new();
@@ -1769,6 +2029,29 @@ async fn v2_pending_tool_overflow_fails_the_run_instead_of_growing_forever() {
         wire.v2("session.tool.input.started",json!({"sessionID":"other","assistantMessageID":"m","id":format!("c{i}"),"name":"read"}));
     }
     assert_eq!(wire.done().await.0, DoneStatus::Errored);
+}
+
+#[tokio::test]
+async fn v2_session_model_overflow_drops_the_cache_instead_of_failing_the_run() {
+    let mut wire = TurnWire::start_proto(false, true).await;
+    wire.request("/api/model").await;
+    wire.request("/prompt").await;
+    wire.v2("session.execution.started", json!({"sessionID": "fixture"}));
+    for i in 0..=MAX_V2_SESSION_MODELS {
+        wire.v2(
+            "session.step.started",
+            json!({
+                "sessionID": format!("other-{i}"),
+                "assistantMessageID": "m",
+                "model": {"id": "muse", "providerID": "opencode"},
+            }),
+        );
+    }
+    wire.v2(
+        "session.execution.succeeded",
+        json!({"sessionID": "fixture"}),
+    );
+    assert_eq!(wire.done().await.0, DoneStatus::Completed);
 }
 
 #[tokio::test]

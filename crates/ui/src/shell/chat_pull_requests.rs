@@ -3,12 +3,12 @@
 //! one conversation.
 
 use super::*;
-use crate::pull_request_detail::PullRequestDetailPage;
+use crate::pull_request_detail::{PullRequestDetailEvent, PullRequestDetailPage};
 
 pub(super) struct ChatPullRequest {
     pub(super) url: String,
     pub(super) page: Entity<PullRequestDetailPage>,
-    _subscription: Subscription,
+    _subscriptions: [Subscription; 2],
 }
 
 /// What a dragged pull request tab mentions when it lands in a composer.
@@ -63,13 +63,30 @@ impl Shell {
                         cx,
                     )
                 });
-                let subscription = cx.observe(&page, |_, _, cx| cx.notify());
+                let observe = cx.observe(&page, |_, _, cx| cx.notify());
+                // The page's requests are answered in this pane, beside it.
+                let events =
+                    cx.subscribe_in(&page, window, |this: &mut Self, _, event, window, cx| {
+                        match event {
+                            PullRequestDetailEvent::OpenCommit {
+                                url,
+                                device,
+                                commit,
+                            } => this.open_change_request_commit_surface(
+                                url.clone(),
+                                device.clone(),
+                                commit.clone(),
+                                window,
+                                cx,
+                            ),
+                        }
+                    });
                 self.chat_pull_requests.insert(
                     id,
                     ChatPullRequest {
                         url,
                         page,
-                        _subscription: subscription,
+                        _subscriptions: [observe, events],
                     },
                 );
                 let surface = RightSurface::PullRequest(id);

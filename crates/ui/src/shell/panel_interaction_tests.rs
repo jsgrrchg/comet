@@ -435,6 +435,35 @@ fn side_chat_menu_rename_keeps_the_editor_visible_without_opening_files(cx: &mut
     assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
 }
 
+#[gpui::test]
+fn side_chat_rename_leaves_takeover_to_show_its_editor(cx: &mut TestAppContext) {
+    let (_dir, shell, cx) = setup(cx);
+    change(&shell, cx, |shell, _, cx| {
+        shell.state.update(cx, |state, cx| {
+            state.chats.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "side", "title": "Side chat", "parentChatId": "a",
+                    "deviceId": "local", "archived": false, "createdAt": Utc::now(),
+                }))
+                .unwrap(),
+            );
+            cx.notify();
+        });
+        shell.toggle_right_pane(cx);
+    });
+    settled(&shell, cx);
+    change(&shell, cx, |s, _, cx| s.toggle_right_pane_expand(cx));
+    near(settled(&shell, cx).widths[3], 0.0);
+
+    change(&shell, cx, |s, _, cx| s.open_rename_chat("side".into(), cx));
+    let frame = settled(&shell, cx);
+    assert!(!shell.read_with(cx, |s, _| s.right_pane_expanded));
+    assert!(frame.widths[3] > 0.0, "the transcript column must return");
+    let field = cx.debug_bounds("session-lanes-chat-side-title-editor").unwrap();
+    let card = cx.debug_bounds("session-lanes").unwrap();
+    assert!(field.top() >= card.top() && field.bottom() <= card.bottom());
+}
+
 fn check_side_chat_rename_scroll(cx: &mut TestAppContext, width: f32, reduced_motion: bool) {
     let (_dir, shell, cx) = setup(cx);
     cx.simulate_resize(gpui::size(px(width), px(900.0)));

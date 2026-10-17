@@ -9342,7 +9342,7 @@ impl Shell {
     }
 
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        self.reconcile_session_hover_card(true, cx);
+        self.reconcile_session_hover_card(cx);
         if self.sidebar_session_transfer.as_ref().is_some_and(|drag| {
             !cx.has_active_drag() || !self.sidebar_session_transfer_is_valid(&drag.payload, cx)
         }) {
@@ -13941,13 +13941,14 @@ impl Render for Shell {
         self.reduced_motion = motion::reduced_motion(cx);
         self.motion_active.set(false);
         self.track_horizontal_fit(cx);
-        self.reconcile_session_hover_card(
-            matches!(gate, GatePhase::Ready)
-                && !restart_required
-                && !matches!(self.route, Route::Settings(_))
-                && self.sidebar_target() > 0.0,
-            cx,
-        );
+        // The sidebar's render reconciles the card against its rows.
+        if !matches!(gate, GatePhase::Ready)
+            || restart_required
+            || matches!(self.route, Route::Settings(_))
+            || self.sidebar_target() <= 0.0
+        {
+            self.dismiss_session_card(cx);
+        }
         self.suspend_hidden_right_images(cx);
         // After the fit tracking, which starts a fit exit this frame.
         let browser_active = matches!(gate, GatePhase::Ready)

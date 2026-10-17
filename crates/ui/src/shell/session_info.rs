@@ -253,6 +253,8 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if reveal <= 0.001 {
+            // Nothing shows the totals: stop streaming every checkout's patch.
+            self.session_diffs = SessionDiffs::default();
             return None;
         }
         let theme = Theme::of(cx).for_popup();

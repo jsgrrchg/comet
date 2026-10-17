@@ -294,6 +294,11 @@ impl Shell {
             return false;
         };
         self.session_lanes.reveal_chat(&parent, index);
+        // Takeover hides the transcript column the card lives in; a rename
+        // field there would take keystrokes unseen.
+        if self.right_pane_expanded {
+            self.toggle_right_pane_expand(cx);
+        }
         self.show_session_info(cx);
         true
     }

@@ -8,7 +8,7 @@
 //! tab, so everything that reads "the active surface" acts on that pane.
 
 use super::right_layout::{
-    Axis, Edge, MIN_PANE_HEIGHT, MIN_PANE_WIDTH, Node, PaneId, Rect, SplitLayout,
+    Axis, DropZone, Edge, MIN_PANE_HEIGHT, MIN_PANE_WIDTH, Node, PaneId, Rect, SplitLayout,
 };
 use super::*;
 
@@ -20,6 +20,14 @@ const STRIP_TRAILING_GAP: f32 = 4.0;
 /// The hit width of a divider between split panes; the line itself is the
 /// 1px border every pane after the first draws.
 const DIVIDER_HITBOX: f32 = 8.0;
+
+/// Where a dragged tab would land: a zone of a split pane, or of the
+/// unsplit host (`pane: None`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RightPaneDrop {
+    pub pane: Option<PaneId>,
+    pub zone: DropZone,
+}
 
 /// Drag marker for a divider: the boundary before child `index` of split
 /// `split`.
@@ -431,6 +439,146 @@ impl Shell {
             )
     }
 
+    /// Wrap a pane's content so tabs dragged over it can land: its edges
+    /// split it, its middle takes the tab. Nothing shows until a drag
+    /// reaches a zone that would change something.
+    pub(super) fn right_pane_drop_target(
+        &mut self,
+        pane: Option<PaneId>,
+        content: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let shown = self.right_pane_drop.filter(|drop| drop.pane == pane);
+        let id: gpui::ElementId = match pane {
+            Some(pane) => ("right-pane-drop", pane as usize).into(),
+            None => "right-pane-drop".into(),
+        };
+        div()
+            .id(id)
+            .relative()
+            .size_full()
+            .on_drag_move::<RightTabDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<RightTabDrag>, _, cx| {
+                    let payload = event.drag(cx);
+                    if payload.panel_key != this.panel_key(cx) {
+                        return;
+                    }
+                    let position = event.event.position;
+                    let next = if event.bounds.contains(&position) {
+                        let local = position - event.bounds.origin;
+                        let zone = this.right_drop_zone(
+                            payload,
+                            pane,
+                            f32::from(local.x),
+                            f32::from(local.y),
+                            f32::from(event.bounds.size.width),
+                            f32::from(event.bounds.size.height),
+                            cx,
+                        );
+                        zone.map(|zone| RightPaneDrop { pane, zone })
+                    } else if this.right_pane_drop.is_some_and(|drop| drop.pane == pane) {
+                        None
+                    } else {
+                        return;
+                    };
+                    if this.right_pane_drop != next {
+                        this.right_pane_drop = next;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop::<RightTabDrag>(cx.listener(move |this, payload: &RightTabDrag, _, cx| {
+                let Some(drop) = this.right_pane_drop.take().filter(|drop| drop.pane == pane)
+                else {
+                    return;
+                };
+                this.right_tab_drag = None;
+                cx.notify();
+                if payload.panel_key != this.panel_key(cx) {
+                    return;
+                }
+                match (drop.zone, pane) {
+                    (DropZone::Edge(edge), _) => {
+                        this.split_right_tab(payload.surface, pane, edge, cx);
+                    }
+                    (DropZone::Center, Some(target)) => {
+                        this.move_right_tab(payload.surface, target, None, cx);
+                    }
+                    (DropZone::Center, None) => {}
+                }
+            }))
+            .child(content)
+            .when_some(shown, |el, drop| {
+                // A quiet accent wash over the half the new pane would take
+                // (all of it for a move).
+                let preview = div()
+                    .absolute()
+                    .rounded(px(6.0))
+                    .border_1()
+                    .border_color(theme.accent.opacity(0.35))
+                    .bg(theme.accent.opacity(0.08));
+                let preview = match drop.zone {
+                    DropZone::Center => preview.inset(px(4.0)),
+                    DropZone::Edge(Edge::Left) => preview
+                        .top(px(4.0))
+                        .bottom(px(4.0))
+                        .left(px(4.0))
+                        .w(gpui::relative(0.5)),
+                    DropZone::Edge(Edge::Right) => preview
+                        .top(px(4.0))
+                        .bottom(px(4.0))
+                        .right(px(4.0))
+                        .w(gpui::relative(0.5)),
+                    DropZone::Edge(Edge::Top) => preview
+                        .left(px(4.0))
+                        .right(px(4.0))
+                        .top(px(4.0))
+                        .h(gpui::relative(0.5)),
+                    DropZone::Edge(Edge::Bottom) => preview
+                        .left(px(4.0))
+                        .right(px(4.0))
+                        .bottom(px(4.0))
+                        .h(gpui::relative(0.5)),
+                };
+                el.child(preview)
+            })
+            .into_any_element()
+    }
+
+    /// The zone a drag at (`x`, `y`) in a `w`×`h` pane targets, if landing
+    /// there changes anything: a pane's lone tab cannot split off itself,
+    /// and dropping a tab into its own pane is no move. A side chat takes a
+    /// dragged file tab anywhere as an attachment, so it offers no zones to
+    /// one.
+    #[allow(clippy::too_many_arguments)]
+    fn right_drop_zone(
+        &self,
+        payload: &RightTabDrag,
+        pane: Option<PaneId>,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        cx: &App,
+    ) -> Option<DropZone> {
+        let shown = match pane {
+            Some(pane) => self.resolved_pane_active(pane, cx),
+            None => self.resolved_right_active(cx),
+        };
+        if payload.workspace_path.is_some() && matches!(shown, RightSurface::SideChat(_)) {
+            return None;
+        }
+        let own = payload.pane == pane;
+        match right_layout::drop_zone(x, y, w, h) {
+            DropZone::Center => (!own).then_some(DropZone::Center),
+            DropZone::Edge(edge) => {
+                let lone = own && self.right_pane_rows(pane, cx).len() <= 1;
+                (!lone).then_some(DropZone::Edge(edge))
+            }
+        }
+    }
+
     /// One split pane. Panes along the host's top edge clear the titlebar
     /// band, where their strips live; the rest carry their own strip.
     fn render_right_split_pane(
@@ -443,6 +591,7 @@ impl Shell {
         let surface = self.resolved_pane_active(id, cx);
         let top = rect.y < 1e-4;
         let content = self.render_right_surface(surface, rect.w * width, cx);
+        let content = self.right_pane_drop_target(Some(id), content, cx);
         let header = (!top).then(|| {
             div()
                 .h(px(crate::surface_chrome::HEADER_HEIGHT))

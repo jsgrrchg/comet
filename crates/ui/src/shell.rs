@@ -2084,6 +2084,8 @@ pub struct Shell {
     right_pane_scrolls: std::collections::HashMap<right_layout::PaneId, gpui::ScrollHandle>,
     /// The split pane whose `+` opened [`Self::right_plus`].
     right_plus_pane: Option<right_layout::PaneId>,
+    /// The pane zone a dragged surface tab would land in.
+    right_pane_drop: Option<right_panes::RightPaneDrop>,
     /// Chat outlet, pull request dashboard, or settings pages.
     route: Route,
     settings_focus: FocusHandle,
@@ -2605,6 +2607,7 @@ impl Shell {
             right_tab_scroll: gpui::ScrollHandle::new(),
             right_pane_scrolls: Default::default(),
             right_plus_pane: None,
+            right_pane_drop: None,
             route,
             settings_focus: cx.focus_handle(),
             settings_end_focus: cx.focus_handle(),
@@ -11843,6 +11846,10 @@ impl Shell {
             // Prune tabs that died since the last frame (an exited shell).
             self.sync_right_layout(&key, cx);
         }
+        // A tab drag that ended anywhere else leaves no drop preview.
+        if self.right_pane_drop.is_some() && !cx.has_active_drag() {
+            self.right_pane_drop = None;
+        }
         let split = self.right_split(cx).cloned();
         let host_width = self.right_content_width(self.right_target(cx));
         let content: AnyElement = if !showing {
@@ -11851,7 +11858,8 @@ impl Shell {
             self.render_right_split(&layout, host_width, cx)
         } else {
             let surface = self.resolved_right_active(cx);
-            self.render_right_surface(surface, host_width, cx)
+            let content = self.render_right_surface(surface, host_width, cx);
+            self.right_pane_drop_target(None, content, cx)
         };
         // Flush panel (user request — the inset card is gone): full window
         // height with a left hairline, glass-friendly like the terminal dock
@@ -18216,6 +18224,7 @@ impl Shell {
     }
     pub fn fixture_browser_menu(&mut self, open: bool, cx: &mut Context<Self>) {
         if open {
+            self.right_plus_pane = None;
             self.right_plus.open(());
             cx.notify();
         } else {

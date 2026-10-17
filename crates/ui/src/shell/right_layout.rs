@@ -58,16 +58,6 @@ pub(super) struct Rect {
     pub h: f32,
 }
 
-impl Rect {
-    fn right(&self) -> f32 {
-        self.x + self.w
-    }
-
-    fn bottom(&self) -> f32 {
-        self.y + self.h
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum Node {
     Pane(PaneId),
@@ -383,15 +373,6 @@ impl<T: Copy + PartialEq> SplitLayout<T> {
         out
     }
 
-    pub fn focus(&mut self, id: PaneId) -> bool {
-        if self.focused != id && self.pane(id).is_some() {
-            self.focused = id;
-            true
-        } else {
-            false
-        }
-    }
-
     /// Show `tab` and focus its pane. A tab no pane holds yet (just opened)
     /// joins the focused pane.
     pub fn activate(&mut self, tab: T) {
@@ -613,32 +594,6 @@ pub(super) fn drop_zone(x: f32, y: f32, w: f32, h: f32) -> DropZone {
     best.map_or(DropZone::Center, |(_, edge)| DropZone::Edge(edge))
 }
 
-/// The preview a zone paints over a `w`×`h` pane: half of it toward an
-/// edge (where the new pane will sit), all of it for the center.
-pub(super) fn zone_preview(zone: DropZone, w: f32, h: f32) -> Rect {
-    let full = Rect {
-        x: 0.0,
-        y: 0.0,
-        w,
-        h,
-    };
-    match zone {
-        DropZone::Center => full,
-        DropZone::Edge(Edge::Left) => Rect { w: w / 2.0, ..full },
-        DropZone::Edge(Edge::Right) => Rect {
-            x: w / 2.0,
-            w: w / 2.0,
-            ..full
-        },
-        DropZone::Edge(Edge::Top) => Rect { h: h / 2.0, ..full },
-        DropZone::Edge(Edge::Bottom) => Rect {
-            y: h / 2.0,
-            h: h / 2.0,
-            ..full
-        },
-    }
-}
-
 /// Panes whose top edge is the host's: their strips live in the titlebar
 /// band, the others carry their own. Sorted left to right; together they
 /// tile the host's width.
@@ -655,11 +610,6 @@ pub(super) fn top_row(rects: &[(PaneId, Rect)]) -> Vec<(PaneId, Rect)> {
 /// Whether a pane touches the host's left edge (the outer resize seam).
 pub(super) fn touches_left(rect: &Rect) -> bool {
     rect.x < 1e-4
-}
-
-/// Whether a pane reaches the host's bottom-right corner.
-pub(super) fn touches_bottom_right(rect: &Rect) -> bool {
-    rect.right() > 1.0 - 1e-4 && rect.bottom() > 1.0 - 1e-4
 }
 
 #[cfg(test)]
@@ -771,7 +721,7 @@ mod tests {
         };
         assert_eq!(sizes, &vec![0.5, 0.5]);
         // The first pane hands over to the one after it.
-        layout.focus(layout.pane_of(1).unwrap());
+        layout.activate(1);
         layout.retain(|tab| *tab != 1);
         assert_eq!(layout.pane_count(), 1);
         assert_eq!(layout.focused(), middle);

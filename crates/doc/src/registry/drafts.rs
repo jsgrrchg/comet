@@ -12,7 +12,7 @@ impl RegistryDoc {
         if !valid_draft_id(id) || !valid_order_key(key) {
             return Err(DocError::Schema("Invalid draft order".into()));
         }
-        self.observe_sidebar_row(DRAFTS, id);
+        self.observe_row(DRAFTS, id);
         self.write(
             DRAFTS,
             id,
@@ -39,7 +39,7 @@ impl RegistryDoc {
         if self.draft_discarded(&draft.id) {
             return Ok(());
         }
-        self.observe_sidebar_row(DRAFTS, &draft.id);
+        self.observe_row(DRAFTS, &draft.id);
         if let Some(version) = self.overlay_row(REVISIONS, &draft.revision) {
             if version.fields.get("draftId").and_then(Value::as_str) == Some(draft.id.as_str())
                 && !draft.deferred
@@ -57,7 +57,7 @@ impl RegistryDoc {
             return Ok(());
         }
         if let Some(base) = &draft.base_revision {
-            self.observe_sidebar_row(REVISIONS, base);
+            self.observe_row(REVISIONS, base);
         }
         let first = self.read_drafts().first().map(|d| d.order_key.clone());
         let stamp = self.next_hlc();
@@ -232,7 +232,7 @@ impl RegistryDoc {
         if !valid_draft_id(id) {
             return Err(DocError::Schema("Invalid draft ID".into()));
         }
-        self.observe_sidebar_row(DRAFTS, id);
+        self.observe_row(DRAFTS, id);
         if let DraftChange::Consume { revision, .. } = change {
             self.write(
                 DRAFTS,

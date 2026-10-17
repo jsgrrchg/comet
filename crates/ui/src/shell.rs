@@ -83,6 +83,7 @@ use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_
 mod panel_interaction_tests;
 pub(crate) mod project_icon;
 mod pull_request_pane;
+mod right_layout;
 mod session_info;
 mod side_chats;
 mod sidebar_pins;

@@ -107,16 +107,10 @@ fn time_label(time_ago: &str) -> String {
 
 impl Shell {
     /// Reconcile from the container as well as the row: an unmounted row
-    /// cannot report hover-out or run its paint-time hit test.
-    pub(super) fn reconcile_session_hover_card(
-        &mut self,
-        sidebar_visible: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if !sidebar_visible {
-            self.dismiss_session_card(cx);
-            return;
-        }
+    /// cannot report hover-out or run its paint-time hit test. Runs in the
+    /// sidebar's render, which follows every shell notify; the shell itself
+    /// only dismisses the card while the sidebar is hidden.
+    pub(super) fn reconcile_session_hover_card(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.session_hover_card.target() else {
             return;
         };

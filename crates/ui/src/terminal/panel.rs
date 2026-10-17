@@ -10,12 +10,13 @@
 //! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
 //! (base64) feed the [`Emulator`]; query responses write back; the stream
 //! reconnects with exponential backoff resuming from `afterSeq`; Exit appends
-//! the "[process exited N]" line and stops. Keyboard bytes coalesce for 12 ms
-//! before `WriteTerminal`; viewport-driven resizes debounce 80 ms before
+//! the "[process exited N]" line and stops. Keyboard bytes flush at once when
+//! idle and coalesce for 12 ms after each `WriteTerminal`; viewport-driven
+//! resizes debounce 80 ms before
 //! `ResizeTerminal` (the emulator resizes immediately).
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use gpui::{
@@ -35,8 +36,8 @@ use crate::theme::Theme;
 
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
 use super::view::{
-    COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
-    cell_at, keystroke_bytes, paste_bytes, terminal_panel_bg,
+    COALESCE_MS, InputCoalescer, InputFlush, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD,
+    TerminalElement, cell_at, keystroke_bytes, paste_bytes, terminal_panel_bg,
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
@@ -895,7 +896,8 @@ impl TerminalPanel {
 
     // ---- input ----
 
-    /// Queue keyboard bytes on the active tab (12 ms coalescing window).
+    /// Queue keyboard bytes on the active tab: sent at once when idle, else
+    /// at the end of the 12 ms window opened by the previous send.
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         let chat = self.selected_chat(cx);
         let Some(tabs) = self.chats.get_mut(&chat) else {
@@ -913,16 +915,18 @@ impl TerminalPanel {
             tab.emulator.scroll_to_bottom();
         }
         let key = tab.key;
-        if tab.coalescer.push(bytes) {
-            tab.flush_task = Some(Self::schedule_flush(chat, key, cx));
+        match tab.coalescer.push(bytes, Instant::now()) {
+            InputFlush::Now => self.flush_input(chat, key, cx),
+            InputFlush::After(delay) => {
+                tab.flush_task = Some(Self::schedule_flush(chat, key, delay, cx));
+            }
+            InputFlush::Pending => {}
         }
     }
 
-    fn schedule_flush(chat: String, key: u64, cx: &mut Context<Self>) -> Task<()> {
+    fn schedule_flush(chat: String, key: u64, delay: Duration, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(COALESCE_MS))
-                .await;
+            cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |panel, cx| panel.flush_input(chat, key, cx));
         })
     }
@@ -940,11 +944,12 @@ impl TerminalPanel {
         let Some(id) = tab.terminal_id.clone() else {
             // OpenTerminal still in flight — keep the buffer, retry shortly.
             if tab.exited.is_none() {
-                tab.flush_task = Some(Self::schedule_flush(chat, key, cx));
+                let retry = Duration::from_millis(COALESCE_MS);
+                tab.flush_task = Some(Self::schedule_flush(chat, key, retry, cx));
             }
             return;
         };
-        let bytes = tab.coalescer.take();
+        let bytes = tab.coalescer.take(Instant::now());
         let params = tab.write_params(id, &bytes);
         send_write(&engine, params, cx);
     }

@@ -3,7 +3,8 @@
 //!
 //! - `open` spawns the user's login shell in the chat's cwd; `subscribe` replays a
 //!   bounded 1MB window (resumable via `afterSeq`) then tails live output, batched
-//!   at [`TERMINAL_OUTPUT_BATCH_MS`]; data rides base64 (PTY bytes ≠ UTF-8).
+//!   leading-edge at [`TERMINAL_OUTPUT_BATCH_MS`] (an echo after a quiet spell
+//!   goes out at once); data rides base64 (PTY bytes ≠ UTF-8).
 //! - Live shells survive subscriber detach — a detached session is the user's
 //!   running process, kept until its tab is explicitly closed or the engine exits.
 //!   Only EXITED sessions expire (30min TTL on their inert replay buffers), and
@@ -23,11 +24,13 @@ use portable_pty::PtySize;
 #[cfg(not(windows))]
 use portable_pty::{CommandBuilder, native_pty_system};
 mod input_order;
+mod output_batch;
 #[cfg(windows)]
 mod windows;
 use tokio::sync::mpsc;
 
 use input_order::InputOrder;
+use output_batch::{OutputBatch, OutputStep};
 
 use zeron_doc::TERMINAL_OUTPUT_BATCH_MS;
 use zeron_proto::{TerminalEvent, TerminalSession};
@@ -603,7 +606,8 @@ fn read_pty(mut reader: Box<dyn Read + Send>, tx: mpsc::UnboundedSender<Vec<u8>>
     }
 }
 
-/// Batches raw chunks into `Data` events every [`TERMINAL_OUTPUT_BATCH_MS`].
+/// Batches raw chunks into `Data` events per [`TERMINAL_OUTPUT_BATCH_MS`] window,
+/// leading-edge (see `output_batch`): a keystroke's echo goes out at once.
 /// ConPTY keeps its output pipe open while the pseudoconsole handle is alive, even after
 /// the child exits, so child wait and output reads must be driven concurrently. Once the
 /// child is gone we close the PTY handles, drain its final buffered output, then emit `Exit`.
@@ -627,21 +631,31 @@ async fn pump_output(
         true
     };
 
-    // Start a batch only when output arrives; idle terminals need no timer.
+    // Armed only while output waits for its window to close; idle terminals
+    // need no timer.
     let flush = tokio::time::sleep(batch);
     tokio::pin!(flush);
-    let mut buffer = Vec::new();
+    let mut output = OutputBatch::new(batch);
     let mut raw_open = true;
     let mut exit_code = None;
 
     while raw_open || exit_code.is_none() {
         tokio::select! {
             chunk = raw_rx.recv(), if raw_open => match chunk {
-                Some(chunk) => {
-                    if buffer.is_empty() {
-                        flush.as_mut().reset(tokio::time::Instant::now() + batch);
+                Some(mut chunk) => {
+                    // Chunks the reader already queued join this event for free.
+                    while let Ok(more) = raw_rx.try_recv() {
+                        chunk.extend_from_slice(&more);
                     }
-                    buffer.extend_from_slice(&chunk);
+                    match output.push(&chunk, tokio::time::Instant::now()) {
+                        OutputStep::Emit(bytes) => {
+                            if !emit(bytes) {
+                                return;
+                            }
+                        }
+                        OutputStep::Arm(end) => flush.as_mut().reset(end),
+                        OutputStep::Wait => {}
+                    }
                 },
                 None => raw_open = false,
             },
@@ -680,15 +694,15 @@ async fn pump_output(
                     }).await;
                 }
             }
-            _ = &mut flush, if !buffer.is_empty() => {
-                if !emit(std::mem::take(&mut buffer)) {
+            _ = &mut flush, if !output.is_empty() => {
+                if !emit(output.flush(tokio::time::Instant::now())) {
                     return;
                 }
             }
         }
     }
 
-    if !buffer.is_empty() && !emit(buffer) {
+    if !output.is_empty() && !emit(output.flush(tokio::time::Instant::now())) {
         return;
     }
     if let Some(session) = session.upgrade() {

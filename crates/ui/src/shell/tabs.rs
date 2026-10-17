@@ -98,7 +98,9 @@ impl Shell {
             && self.right_pane_open(cx)
             && self.navigation_focus.in_right(window, cx)
         {
-            let rows = self.right_surface_rows(cx);
+            // A split cycles within the focused pane.
+            let pane = self.right_split(cx).map(|layout| layout.focused());
+            let rows = self.right_pane_rows(pane, cx);
             if rows.len() <= 1 {
                 return;
             }

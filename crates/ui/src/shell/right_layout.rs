@@ -411,6 +411,16 @@ impl<T: Copy + PartialEq> SplitLayout<T> {
         self.focused = id;
     }
 
+    /// File a tab no pane holds into the focused pane without showing it.
+    pub fn adopt(&mut self, tab: T) {
+        if self.pane_of(tab).is_none() {
+            let focused = self.focused;
+            if let Some(pane) = self.pane_mut(focused) {
+                pane.tabs.push(tab);
+            }
+        }
+    }
+
     /// Move `tab` into a new pane on `edge` of `target`, focused. Refused
     /// when it would only empty and recreate the same pane.
     pub fn split(&mut self, tab: T, target: PaneId, edge: Edge) -> bool {
@@ -494,7 +504,10 @@ impl<T: Copy + PartialEq> SplitLayout<T> {
             pane.tabs.retain(|tab| keep(tab));
             if pane.tabs.len() != before {
                 changed = true;
-                if pane.active.is_some_and(|active| !pane.tabs.contains(&active)) {
+                if pane
+                    .active
+                    .is_some_and(|active| !pane.tabs.contains(&active))
+                {
                     pane.active = None;
                 }
             }
@@ -601,7 +614,12 @@ pub(super) fn drop_zone(x: f32, y: f32, w: f32, h: f32) -> DropZone {
 /// The preview a zone paints over a `w`×`h` pane: half of it toward an
 /// edge (where the new pane will sit), all of it for the center.
 pub(super) fn zone_preview(zone: DropZone, w: f32, h: f32) -> Rect {
-    let full = Rect { x: 0.0, y: 0.0, w, h };
+    let full = Rect {
+        x: 0.0,
+        y: 0.0,
+        w,
+        h,
+    };
     match zone {
         DropZone::Center => full,
         DropZone::Edge(Edge::Left) => Rect { w: w / 2.0, ..full },
@@ -798,12 +816,24 @@ mod tests {
 
     #[test]
     fn drop_zones_prefer_the_nearest_edge_the_pane_can_split_along() {
-        assert_eq!(drop_zone(10.0, 300.0, 600.0, 600.0), DropZone::Edge(Edge::Left));
-        assert_eq!(drop_zone(590.0, 300.0, 600.0, 600.0), DropZone::Edge(Edge::Right));
-        assert_eq!(drop_zone(300.0, 595.0, 600.0, 600.0), DropZone::Edge(Edge::Bottom));
+        assert_eq!(
+            drop_zone(10.0, 300.0, 600.0, 600.0),
+            DropZone::Edge(Edge::Left)
+        );
+        assert_eq!(
+            drop_zone(590.0, 300.0, 600.0, 600.0),
+            DropZone::Edge(Edge::Right)
+        );
+        assert_eq!(
+            drop_zone(300.0, 595.0, 600.0, 600.0),
+            DropZone::Edge(Edge::Bottom)
+        );
         assert_eq!(drop_zone(300.0, 300.0, 600.0, 600.0), DropZone::Center);
         // Too narrow to split into columns: the left band is just the center.
         assert_eq!(drop_zone(10.0, 300.0, 300.0, 600.0), DropZone::Center);
-        assert_eq!(drop_zone(150.0, 590.0, 300.0, 600.0), DropZone::Edge(Edge::Bottom));
+        assert_eq!(
+            drop_zone(150.0, 590.0, 300.0, 600.0),
+            DropZone::Edge(Edge::Bottom)
+        );
     }
 }

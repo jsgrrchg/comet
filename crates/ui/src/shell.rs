@@ -84,6 +84,7 @@ mod panel_interaction_tests;
 pub(crate) mod project_icon;
 mod pull_request_pane;
 mod right_layout;
+mod right_panes;
 mod session_info;
 mod side_chats;
 mod sidebar_pins;
@@ -726,6 +727,9 @@ pub enum RightSurface {
     PullRequest(u64),
 }
 
+/// One surface tab as its strip draws it: `(surface, title, unsaved, detail)`.
+type RightRow = (RightSurface, SharedString, bool, Option<SharedString>);
+
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
     if tabs.contains(&surface) {
         false
@@ -774,6 +778,9 @@ pub struct SessionPanels {
     map: std::collections::HashMap<String, ChatPanels>,
     /// Unique surface visits, oldest first, independent of the strip order.
     right_tab_history: std::collections::HashMap<String, Vec<RightSurface>>,
+    /// Split surface hosts. A chat has an entry only while its host holds
+    /// two or more panes; `right_active` is then the focused pane's tab.
+    right_layouts: std::collections::HashMap<String, right_layout::SplitLayout<RightSurface>>,
 }
 
 impl SessionPanels {
@@ -805,7 +812,16 @@ impl SessionPanels {
             let history = self.right_tab_history.entry(key.to_string()).or_default();
             history.retain(|visited| *visited != surface);
             history.push(surface);
+            // Showing a tab focuses its pane; a tab just opened joins the
+            // focused one.
+            if let Some(layout) = self.right_layouts.get_mut(key) {
+                layout.activate(surface);
+            }
         }
+    }
+
+    fn right_layout(&self, key: &str) -> Option<&right_layout::SplitLayout<RightSurface>> {
+        self.right_layouts.get(key)
     }
 
     fn forget_right_surface(&mut self, key: &str, surface: RightSurface) {
@@ -3407,16 +3423,32 @@ impl Shell {
     /// The right pane's surface tabs in the STORED (drag-reorderable) order —
     /// `(surface, title)`; entries whose backing tab/entity is gone are
     /// skipped.
-    fn right_surface_rows(
-        &self,
-        cx: &App,
-    ) -> Vec<(RightSurface, SharedString, bool, Option<SharedString>)> {
+    fn right_surface_rows(&self, cx: &App) -> Vec<RightRow> {
         let key = self.panel_key(cx);
         let stored: &[RightSurface] = self
             .right_tabs
             .get(&key)
             .map(|v| v.as_slice())
             .unwrap_or(&[]);
+        match self.panels.right_layout(&key) {
+            // Split: panes in layout order, each in its strip order.
+            Some(layout) => {
+                let mut ordered = layout.tabs();
+                let unfiled: Vec<RightSurface> = stored
+                    .iter()
+                    .filter(|tab| !ordered.contains(tab))
+                    .copied()
+                    .collect();
+                ordered.extend(unfiled);
+                self.right_rows_for(&ordered, cx)
+            }
+            None => self.right_rows_for(stored, cx),
+        }
+    }
+
+    /// Rows for `stored` surfaces; entries whose backing tab/entity is gone
+    /// are skipped.
+    fn right_rows_for(&self, stored: &[RightSurface], cx: &App) -> Vec<RightRow> {
         let terminals: Vec<(u64, SharedString, bool)> = self
             .right_terminal
             .as_ref()
@@ -3582,7 +3614,11 @@ impl Shell {
     /// Terminal keys go stale when their tab closes/exits — never render a dead surface.
     fn resolved_right_active(&self, cx: &App) -> RightSurface {
         let picked = self.panels.get(&self.panel_key(cx)).right_active;
-        let rows = self.right_surface_rows(cx);
+        // Split: the focused pane's tab, resolved among that pane's own.
+        let rows = match self.right_split(cx) {
+            Some(layout) => self.right_pane_rows(Some(layout.focused()), cx),
+            None => self.right_surface_rows(cx),
+        };
         let exists = match picked {
             RightSurface::Picker => true,
             surface => rows.iter().any(|(s, _, _, _)| *s == surface),
@@ -3627,9 +3663,7 @@ impl Shell {
             self.state
                 .update(cx, |state, cx| state.focus_subagent_sync(&doc_id, cx));
         }
-        if self.resolved_right_active(cx) != surface {
-            self.suspend_file_images(cx);
-        }
+        self.suspend_replaced_file_images(surface, cx);
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
         match surface {
@@ -4470,7 +4504,7 @@ impl Shell {
         cx: &App,
     ) -> Vec<RightSurface> {
         let tabs: Vec<_> = self
-            .right_surface_rows(cx)
+            .right_pane_rows(self.right_pane_of(surface, cx), cx)
             .into_iter()
             .map(|(tab, _, _, _)| tab)
             .collect();
@@ -4524,6 +4558,7 @@ impl Shell {
         if let Some(tabs) = self.right_tabs.get_mut(&key) {
             tabs.retain(|s| *s != surface);
         }
+        self.sync_right_layout(&key, cx);
         match surface {
             RightSurface::File(_) => {}
             RightSurface::Browser(id) => {
@@ -4717,6 +4752,7 @@ impl Shell {
         if let Some(tabs) = self.right_tabs.get_mut(panel_key) {
             tabs.retain(|candidate| *candidate != surface);
         }
+        self.sync_right_layout(panel_key, cx);
         match surface {
             RightSurface::File(id) => {
                 self.file_surfaces.remove(&id);

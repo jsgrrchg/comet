@@ -290,6 +290,7 @@ impl Shell {
                 })
                 .collect();
             for key in keys {
+                self.sync_right_layout(&key, cx);
                 self.panels.forget_right_surface(&key, surface);
                 let fallback = self.panels.right_surface_fallback(
                     &key,

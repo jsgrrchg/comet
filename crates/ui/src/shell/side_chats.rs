@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) struct SideChatTab {
     pub state: Entity<AppState>,
-    transcript: Entity<Transcript>,
+    pub(super) transcript: Entity<Transcript>,
     pub(super) composer: Entity<Composer>,
     _events: Vec<Subscription>,
 }
@@ -307,11 +307,13 @@ impl Shell {
     }
 
     /// `width` is the pane's laid-out width (a split pane's share of the
-    /// host).
+    /// host). `under_titlebar` is false in a lower split pane, whose own
+    /// strip sits above the transcript in flow: nothing overlays its top.
     pub(super) fn render_side_chat(
         &mut self,
         id: u64,
         width: f32,
+        under_titlebar: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let Some(tab) = self
@@ -323,6 +325,14 @@ impl Shell {
         };
         let transcript = tab.transcript.clone();
         let composer = tab.composer.clone();
+        let top_chrome = if under_titlebar {
+            Theme::TITLEBAR_HEIGHT
+        } else {
+            0.0
+        };
+        transcript.update(cx, |transcript, cx| {
+            transcript.set_top_chrome(top_chrome, cx)
+        });
         // Share the main chat's docked width cap and responsive padding. Size
         // from the width the pane lays out at, not its mask, which an open or
         // close animates.
@@ -362,7 +372,7 @@ impl Shell {
                             false,
                             div().size_full().child(transcript),
                         )
-                        .inset_top(Theme::TITLEBAR_HEIGHT),
+                        .inset_top(top_chrome),
                     )
                     .children(pill),
             )

@@ -12227,7 +12227,7 @@ impl Shell {
             self.render_right_split(&layout, host_width, cx)
         } else {
             let surface = self.resolved_right_active(cx);
-            let content = self.render_right_surface(surface, host_width, cx);
+            let content = self.render_right_surface(surface, host_width, true, cx);
             self.right_pane_drop_target(None, content, cx)
         };
         // Flush panel (user request — the inset card is gone): full window
@@ -12289,11 +12289,13 @@ impl Shell {
     }
 
     /// One surface's content, laid out `width` wide (the side chat's
-    /// composer sizes itself from it).
+    /// composer sizes itself from it). `under_titlebar`: the surface's top
+    /// runs under the titlebar band rather than below a pane's own strip.
     fn render_right_surface(
         &mut self,
         surface: RightSurface,
         width: f32,
+        under_titlebar: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = Theme::of(cx).clone();
@@ -12346,7 +12348,7 @@ impl Shell {
                 });
                 panel.into_any_element()
             }
-            RightSurface::SideChat(id) => self.render_side_chat(id, width, cx),
+            RightSurface::SideChat(id) => self.render_side_chat(id, width, under_titlebar, cx),
             RightSurface::PullRequest(id) => self
                 .render_chat_pull_request(id, cx)
                 .unwrap_or_else(|| self.render_surface_picker(cx)),

@@ -659,7 +659,7 @@ impl Shell {
     ) -> AnyElement {
         let surface = self.resolved_pane_active(id, cx);
         let top = rect.y < 1e-4;
-        let content = self.render_right_surface(surface, rect.w * width, cx);
+        let content = self.render_right_surface(surface, rect.w * width, top, cx);
         let content = self.right_pane_drop_target(Some(id), content, cx);
         let header = (!top).then(|| {
             div()

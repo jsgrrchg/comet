@@ -247,3 +247,40 @@ fn each_chat_keeps_its_own_split(cx: &mut TestAppContext) {
         assert!(shell.right_split(cx).is_some());
     });
 }
+
+/// A lower pane's own strip sits above a side chat in flow: its transcript
+/// fades and parks prompts from its top, not below a titlebar band.
+#[gpui::test]
+fn a_lower_side_chat_clears_no_titlebar(cx: &mut TestAppContext) {
+    let (shell, cx) = setup(cx);
+    let inset = |cx: &mut VisualTestContext| {
+        cx.update(|window, cx| window.draw(cx).clear());
+        shell.read_with(cx, |shell, cx| {
+            let id = shell.side_chat_seq;
+            shell.side_chats[&id]
+                .transcript
+                .read(cx)
+                .own_send_top_inset()
+        })
+    };
+    shell.update(cx, |shell, cx| {
+        let chat = serde_json::from_value(serde_json::json!({
+            "id": "side", "parentChatId": "parent", "deviceId": "local",
+            "archived": false, "createdAt": Utc::now(),
+        }))
+        .unwrap();
+        shell.open_side_chat(chat, shell.panel_key(cx), cx);
+    });
+    let under_titlebar = inset(cx);
+    shell.update(cx, |shell, cx| {
+        let side = RightSurface::SideChat(shell.side_chat_seq);
+        assert!(shell.split_right_tab(side, None, Edge::Bottom, cx));
+    });
+    assert_eq!(inset(cx), under_titlebar - Theme::TITLEBAR_HEIGHT);
+    // Back under the band once the pane above it closes.
+    for id in 1..=3 {
+        close(&shell, cx, tab(id));
+    }
+    assert!(shell.read_with(cx, |shell, cx| shell.right_split(cx).is_none()));
+    assert_eq!(inset(cx), under_titlebar);
+}

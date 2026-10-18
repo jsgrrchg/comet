@@ -17,6 +17,7 @@ pub mod projectless;
 pub mod sidebar_pins;
 pub mod view;
 pub mod voice;
+pub mod web_mentions;
 pub mod workspace;
 
 pub use agent::*;

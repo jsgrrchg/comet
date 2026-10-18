@@ -30,6 +30,7 @@ mod composer_dock;
 mod composer_markdown;
 mod context_usage;
 mod dictation;
+mod favicons;
 pub mod edge_fade;
 pub mod rounded_clip;
 pub mod file_icons;

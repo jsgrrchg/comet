@@ -2269,7 +2269,7 @@ pub struct Shell {
     session_info_last_reserve: f32,
     /// The lanes card's folds and pages.
     session_lanes: session_lanes::LaneState,
-    /// The working-tree diffs behind the card's branch-row totals.
+    /// The branch diff behind the card's branch-row totals.
     session_diffs: session_info::SessionDiffs,
     files_content_tween: Option<WidthTween>,
     /// The last tracked frame: its chat, the window fit, and for each of
@@ -3996,6 +3996,12 @@ impl Shell {
     /// panels, user request).
     fn add_diff_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+        self.register_diff_surface(changes, window, cx);
+    }
+
+    /// A Diff tab opened on *Branch changes* (the session card's totals).
+    fn add_branch_diff_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let changes = cx.new(|cx| Changes::for_branch(self.state.clone(), cx));
         self.register_diff_surface(changes, window, cx);
     }
 

@@ -3999,8 +3999,13 @@ impl Shell {
         self.register_diff_surface(changes, window, cx);
     }
 
-    /// A Diff tab opened on *Branch changes* (the session card's totals).
+    /// A Diff tab opened on *Branch changes* (the session card's totals),
+    /// opening the pane when it is closed.
     fn add_branch_diff_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        self.set_surfaces_open(true, cx);
         let changes = cx.new(|cx| Changes::for_branch(self.state.clone(), cx));
         self.register_diff_surface(changes, window, cx);
     }

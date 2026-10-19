@@ -12228,7 +12228,13 @@ impl Shell {
         } else {
             let surface = self.resolved_right_active(cx);
             let content = self.render_right_surface(surface, host_width, true, cx);
-            self.right_pane_drop_target(None, content, cx)
+            // Only a side chat runs under the titlebar band unsplit.
+            let band = if matches!(surface, RightSurface::SideChat(_)) {
+                Theme::TITLEBAR_HEIGHT
+            } else {
+                0.0
+            };
+            self.right_pane_drop_target(None, band, content, cx)
         };
         // Flush panel (user request — the inset card is gone): full window
         // height with a left hairline, glass-friendly like the terminal dock

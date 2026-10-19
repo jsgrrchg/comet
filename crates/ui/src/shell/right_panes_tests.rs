@@ -70,6 +70,29 @@ fn setup(cx: &mut TestAppContext) -> (Entity<Shell>, &mut VisualTestContext) {
     (shell, cx)
 }
 
+/// The app's geometry: the titlebar overlays the full-height content, so a
+/// side chat's transcript runs under the strip.
+struct OverlayHost {
+    shell: Entity<Shell>,
+}
+
+impl Render for OverlayHost {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.shell.update(cx, |shell, cx| {
+            let right = shell.render_right_pane(window, cx);
+            div().size_full().relative().child(right).child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(Theme::TITLEBAR_HEIGHT))
+                    .child(shell.render_right_titlebar_strips(-8.0, cx)),
+            )
+        })
+    }
+}
+
 fn tab(id: u64) -> RightSurface {
     RightSurface::Subagent(id)
 }
@@ -283,4 +306,57 @@ fn a_lower_side_chat_clears_no_titlebar(cx: &mut TestAppContext) {
     }
     assert!(shell.read_with(cx, |shell, cx| shell.right_split(cx).is_none()));
     assert_eq!(inset(cx), under_titlebar);
+}
+
+/// Over a side chat, the titlebar strip sits on the chat's drop target: a
+/// tab dragged along the strip reorders instead of splitting the host.
+#[gpui::test]
+fn reordering_over_a_side_chat_does_not_split(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, MouseButton};
+    let (shell, _) = setup(cx);
+    let (_, cx) = cx.add_window_view(|_, _| OverlayHost {
+        shell: shell.clone(),
+    });
+    shell.update(cx, |shell, cx| {
+        let chat = serde_json::from_value(serde_json::json!({
+            "id": "side", "parentChatId": "parent", "deviceId": "local",
+            "archived": false, "createdAt": Utc::now(),
+        }))
+        .unwrap();
+        shell.open_side_chat(chat, shell.panel_key(cx), cx);
+    });
+    cx.update(|window, cx| window.draw(cx).clear());
+    let drag_to = |cx: &mut VisualTestContext, to: Point<Pixels>| {
+        let from = cx.debug_bounds("right-surface-tab-0").unwrap().center();
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        let armed = shell.read_with(cx, |shell, _| shell.right_pane_drop.map(|drop| drop.zone));
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::default());
+        cx.update(|window, cx| window.draw(cx).clear());
+        armed
+    };
+    let over = cx.debug_bounds("right-surface-tab-2").unwrap().center();
+    assert_eq!(drag_to(cx, over), None);
+    shell.read_with(cx, |shell, cx| {
+        assert!(shell.right_split(cx).is_none());
+        assert_eq!(
+            panes(shell, cx),
+            vec![vec![tab(2), tab(3), tab(1), RightSurface::SideChat(1)]]
+        );
+    });
+    // Just below the band the chat's top edge still splits.
+    let below = gpui::point(over.x, px(Theme::TITLEBAR_HEIGHT + 8.0));
+    assert_eq!(drag_to(cx, below), Some(DropZone::Edge(Edge::Top)));
+    shell.read_with(cx, |shell, cx| {
+        assert_eq!(
+            panes(shell, cx),
+            vec![
+                vec![tab(2)],
+                vec![tab(3), tab(1), RightSurface::SideChat(1)]
+            ]
+        );
+    });
 }

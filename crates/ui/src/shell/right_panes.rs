@@ -482,10 +482,13 @@ impl Shell {
 
     /// Wrap a pane's content so tabs dragged over it can land: its edges
     /// split it, its middle takes the tab. Nothing shows until a drag
-    /// reaches a zone that would change something.
+    /// reaches a zone that would change something. `top_inset` is the
+    /// titlebar band content runs under (a side chat's): the tab strip
+    /// there owns the drag, so zones start below it.
     pub(super) fn right_pane_drop_target(
         &mut self,
         pane: Option<PaneId>,
+        top_inset: f32,
         content: AnyElement,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -506,27 +509,28 @@ impl Shell {
                         return;
                     }
                     let position = event.event.position;
-                    let next = if event.bounds.contains(&position) {
-                        let local = position - event.bounds.origin;
-                        let zone = this.right_drop_zone(
-                            payload,
-                            pane,
-                            f32::from(local.x),
-                            f32::from(local.y),
-                            f32::from(event.bounds.size.width),
-                            f32::from(event.bounds.size.height),
-                            cx,
-                        );
-                        zone.map(|zone| RightPaneDrop {
-                            pane,
-                            zone,
-                            surface: payload.surface,
-                        })
-                    } else if this.right_pane_drop.is_some_and(|drop| drop.pane == pane) {
-                        None
-                    } else {
-                        return;
-                    };
+                    let local = position - event.bounds.origin;
+                    let next =
+                        if event.bounds.contains(&position) && f32::from(local.y) >= top_inset {
+                            let zone = this.right_drop_zone(
+                                payload,
+                                pane,
+                                f32::from(local.x),
+                                f32::from(local.y) - top_inset,
+                                f32::from(event.bounds.size.width),
+                                f32::from(event.bounds.size.height) - top_inset,
+                                cx,
+                            );
+                            zone.map(|zone| RightPaneDrop {
+                                pane,
+                                zone,
+                                surface: payload.surface,
+                            })
+                        } else if this.right_pane_drop.is_some_and(|drop| drop.pane == pane) {
+                            None
+                        } else {
+                            return;
+                        };
                     if this.right_pane_drop != next {
                         this.right_pane_drop = next;
                         cx.notify();
@@ -566,7 +570,15 @@ impl Shell {
                         .bottom(px(4.0))
                         .h(gpui::relative(0.5)),
                 };
-                el.child(preview)
+                el.child(
+                    div()
+                        .absolute()
+                        .top(px(top_inset))
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(preview),
+                )
             })
             .into_any_element()
     }
@@ -660,7 +672,14 @@ impl Shell {
         let surface = self.resolved_pane_active(id, cx);
         let top = rect.y < 1e-4;
         let content = self.render_right_surface(surface, rect.w * width, top, cx);
-        let content = self.right_pane_drop_target(Some(id), content, cx);
+        // A side chat's transcript runs under the band, as unsplit.
+        let under_band = top && matches!(surface, RightSurface::SideChat(_));
+        let band = if under_band {
+            Theme::TITLEBAR_HEIGHT
+        } else {
+            0.0
+        };
+        let content = self.right_pane_drop_target(Some(id), band, content, cx);
         let header = (!top).then(|| {
             div()
                 .h(px(crate::surface_chrome::HEADER_HEIGHT))
@@ -689,10 +708,7 @@ impl Shell {
             .capture_any_mouse_down(cx.listener(move |this, _, _, cx| {
                 this.focus_right_pane(id, cx);
             }))
-            // A side chat's transcript runs under the band, as unsplit.
-            .when(top && !matches!(surface, RightSurface::SideChat(_)), |el| {
-                el.pt(px(Theme::TITLEBAR_HEIGHT))
-            })
+            .when(top && !under_band, |el| el.pt(px(Theme::TITLEBAR_HEIGHT)))
             .children(header)
             .child(div().flex_1().min_h_0().relative().child(content))
             .into_any_element()

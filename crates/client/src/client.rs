@@ -708,6 +708,8 @@ impl Client {
     /// before any session doc opens, so the host never reads it as legacy.
     pub fn create_session(&self, new: NewSession) -> Result<String> {
         let (state, _) = self.inner.workspace.state();
+        let id = crate::new_id();
+        let now = Utc::now();
         let (device_id, space_id, cwd) = match &new.target {
             SessionTarget::Project { space_id } => {
                 let space = state
@@ -732,12 +734,22 @@ impl Client {
                         "that device can't host sessions".into(),
                     ));
                 }
-                (device_id.clone(), None, "~".to_owned())
+                // Its own folder on the host, created when the first run
+                // spawns; a host that predates scratch folders runs it in `~`.
+                let cwd = if host
+                    .capabilities
+                    .iter()
+                    .any(|c| c == crate::rpc::capability::PROJECTLESS_SCRATCH_V1)
+                {
+                    zeron_proto::projectless::scratch_cwd(&id, now)
+                } else {
+                    "~".to_owned()
+                };
+                (device_id.clone(), None, cwd)
             }
         };
-        let now = Utc::now();
         let chat = Chat {
-            id: crate::new_id(),
+            id,
             device_id,
             title: new.title.filter(|t| !t.trim().is_empty()),
             archived: false,
@@ -862,6 +874,20 @@ impl Client {
         })
     }
 
+    /// Pin between neighbours (either may be `None` at the ends).
+    pub fn pin_session_at(
+        &self,
+        chat_id: &str,
+        after: Option<String>,
+        before: Option<String>,
+    ) -> Result<()> {
+        self.pin_change(SidebarPinChange::Pin {
+            session_id: chat_id.to_owned(),
+            after,
+            before,
+        })
+    }
+
     pub fn unpin_session(&self, chat_id: &str) -> Result<()> {
         self.pin_change(SidebarPinChange::Unpin {
             session_id: chat_id.to_owned(),
@@ -918,11 +944,23 @@ impl Client {
 
     /// Move a session into a section (`None` = back to the recent list).
     pub fn assign_section(&self, chat_id: &str, section_id: Option<String>) -> Result<()> {
+        self.place_session(chat_id, section_id, None, None)
+    }
+
+    /// Move a session into a section between its members (either neighbour
+    /// may be `None` at the ends; both `None` appends).
+    pub fn place_session(
+        &self,
+        chat_id: &str,
+        section_id: Option<String>,
+        after: Option<String>,
+        before: Option<String>,
+    ) -> Result<()> {
         self.section_change(SidebarSectionChange::Assign {
             session_id: chat_id.to_owned(),
             section_id,
-            after: None,
-            before: None,
+            after,
+            before,
         })
     }
 

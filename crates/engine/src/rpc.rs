@@ -63,7 +63,7 @@ use tokio::sync::watch;
 
 use zeron_doc::{MessagePart, SessionCommandPayload};
 use zeron_proto::{
-    ChatConfig, CreateWorktreeOutcome, EngineInfo, HarnessId, HarnessUpdatePolicy,
+    AgentEvent, ChatConfig, CreateWorktreeOutcome, EngineInfo, HarnessId, HarnessUpdatePolicy,
     ProjectActionDraft, Space, ToolCall, WorkspaceScope,
 };
 use zeron_rpc::{
@@ -395,12 +395,13 @@ fn resolve_open_terminal_cwd(
     explicit: Option<String>,
     chat_cwd: Option<String>,
     space_cwd: Option<String>,
-) -> Result<String, &'static str> {
+    scratch_root: &std::path::Path,
+) -> Result<String, String> {
     let raw = meaningful_cwd(explicit)
         .or_else(|| meaningful_cwd(chat_cwd))
         .or_else(|| meaningful_cwd(space_cwd))
         .unwrap_or_else(|| "~".to_string());
-    crate::repos::expand_home(&raw)
+    crate::repos::resolve_chat_cwd(&raw, scratch_root)
 }
 
 #[derive(Debug, Deserialize)]
@@ -498,6 +499,71 @@ struct ReadAttachmentChunkParams {
     path: String,
     #[serde(default)]
     offset: u64,
+}
+
+const _: () = assert!(zeron_proto::VISUAL_MAX_BYTES == zeron_visual::MAX_SCRIPT_BYTES);
+const _: () = assert!(zeron_proto::VISUAL_MAX_ASSETS == zeron_visual::assets::MAX_ASSETS);
+const _: () = assert!(zeron_proto::VISUAL_MAX_ASSET_BYTES == zeron_visual::assets::MAX_ASSET_BYTES);
+const _: () =
+    assert!(zeron_proto::VISUAL_MAX_TOTAL_ASSET_BYTES == zeron_visual::assets::MAX_TOTAL_ASSET_BYTES);
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PublishVisualParams {
+    chat_id: String,
+    title: String,
+    script: String,
+    /// Files the script uses, base64 by name.
+    #[serde(default)]
+    assets: std::collections::BTreeMap<String, String>,
+}
+
+fn no_turn_for_visual() -> RpcError {
+    RpcError::Failed(
+        "This chat has no running turn on this device; show_visual only works from inside a turn.".into(),
+    )
+}
+
+/// Decode and bound a visual's assets.
+fn decode_visual_assets(
+    assets: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<(String, Vec<u8>)>, RpcError> {
+    use base64::Engine as _;
+    use zeron_visual::assets::{MAX_ASSET_BYTES, MAX_ASSETS, MAX_TOTAL_ASSET_BYTES, valid_name};
+    if assets.len() > MAX_ASSETS {
+        return Err(RpcError::BadParams(format!(
+            "a visual takes at most {MAX_ASSETS} assets"
+        )));
+    }
+    let mut total = 0;
+    let mut out = Vec::with_capacity(assets.len());
+    let mut seen = std::collections::HashSet::new();
+    for (name, data) in assets {
+        if !valid_name(name) {
+            return Err(RpcError::BadParams(format!(
+                "asset name '{name}' must be a plain file name"
+            )));
+        }
+        // Stored as files, and file systems often ignore case.
+        if !seen.insert(name.to_ascii_lowercase()) {
+            return Err(RpcError::BadParams(format!(
+                "asset names must differ by more than case ('{name}')"
+            )));
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|e| RpcError::BadParams(format!("asset '{name}' is not base64: {e}")))?;
+        total += bytes.len();
+        if bytes.len() > MAX_ASSET_BYTES || total > MAX_TOTAL_ASSET_BYTES {
+            return Err(RpcError::BadParams(format!(
+                "asset '{name}' is too large ({} MB each, {} MB together)",
+                MAX_ASSET_BYTES / (1024 * 1024),
+                MAX_TOTAL_ASSET_BYTES / (1024 * 1024)
+            )));
+        }
+        out.push((name.clone(), bytes));
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Deserialize)]
@@ -803,9 +869,9 @@ impl EngineRpc {
             }
             if chat.space_id.is_none() {
                 let cwd = chat.cwd.as_deref().unwrap_or("~");
-                return crate::repos::expand_home(cwd)
+                return crate::repos::resolve_chat_cwd(cwd, &self.repos.scratch_root())
                     .map(std::path::PathBuf::from)
-                    .map_err(|error| RpcError::Failed(error.to_string()));
+                    .map_err(RpcError::Failed);
             }
         }
         self.file_search_root(p).await
@@ -1462,6 +1528,8 @@ fn forwardable(method: &str) -> bool {
             | methods::FETCH_ALL
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
+            | methods::GET_WORKTREE_SETTINGS
+            | methods::SET_WORKTREE_SETTINGS
             | methods::LIST_DRIVES
             | methods::SEARCH_HOME_FOLDERS
             | methods::RELEASE_HOME_FOLDER_SEARCH
@@ -3163,6 +3231,16 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "branch": branch }))
             }
+            methods::GET_WORKTREE_SETTINGS => RpcReply::value(&self.repos.worktree_settings()),
+            methods::SET_WORKTREE_SETTINGS => {
+                let settings: zeron_proto::WorktreeSettings = parse_params(params)?;
+                let status = self
+                    .repos
+                    .set_worktree_settings(settings)
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&status)
+            }
             methods::LIST_FOLDERS => {
                 let p: ListFoldersParams = parse_params(params)?;
                 let listing = self
@@ -3524,8 +3602,13 @@ impl RpcService for EngineRpc {
                         .flatten()
                         .map(|space| space.path)
                 });
-                let cwd = resolve_open_terminal_cwd(p.cwd, chat_cwd, space_cwd)
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                let cwd = resolve_open_terminal_cwd(
+                    p.cwd,
+                    chat_cwd,
+                    space_cwd,
+                    &self.repos.scratch_root(),
+                )
+                .map_err(|error| RpcError::Failed(error.to_string()))?;
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -3672,6 +3755,76 @@ impl RpcService for EngineRpc {
                 .map_err(|e| RpcError::Failed(e.to_string()))?
                 .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&chunk)
+            }
+            methods::PUBLISH_VISUAL => {
+                let p: PublishVisualParams = parse_params(params)?;
+                let title: String = p
+                    .title
+                    .trim()
+                    .chars()
+                    .take(zeron_proto::VISUAL_MAX_TITLE_CHARS)
+                    .collect();
+                if title.is_empty() {
+                    return Err(RpcError::BadParams("title is empty".into()));
+                }
+                if p.script.trim().is_empty() || p.script.len() > zeron_proto::VISUAL_MAX_BYTES {
+                    return Err(RpcError::BadParams(format!(
+                        "script must be 1 to {} bytes",
+                        zeron_proto::VISUAL_MAX_BYTES
+                    )));
+                }
+                // Before decoding and storing anything (checked again below).
+                if !self.sessions.has_run(&p.chat_id) {
+                    return Err(no_turn_for_visual());
+                }
+                let id = format!("v:{}", crate::new_id());
+                let assets = decode_visual_assets(&p.assets)?;
+                // Run the script the way the desktop will (setup, render,
+                // every draw, every control) before anyone sees it, so the
+                // agent gets its errors with line numbers and can fix them.
+                let uploads = self.uploads.clone();
+                let (stored_id, script) = (id.clone(), p.script);
+                let (path, report) = tokio::task::spawn_blocking(move || {
+                    let files = zeron_visual::Assets::new(
+                        assets
+                            .iter()
+                            .map(|(name, bytes)| (name.clone(), bytes.as_slice().into()))
+                            .collect(),
+                    );
+                    let checked = zeron_visual::check_with_assets(
+                        &script,
+                        zeron_visual::seed_for(&stored_id),
+                        files,
+                    );
+                    let report = checked
+                        .map_err(|e| RpcError::BadParams(format!("visual script failed: {e}")))?;
+                    // Assets first: a script is only ever found with its files.
+                    uploads
+                        .store_visual_assets(&stored_id, &assets)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let path = uploads.store_visual(&stored_id, &script).map_err(|e| {
+                        uploads.remove_visual(&stored_id);
+                        RpcError::Failed(e.to_string())
+                    })?;
+                    Ok::<_, RpcError>((path, report))
+                })
+                .await
+                .map_err(|e| RpcError::Failed(e.to_string()))??;
+                let event = AgentEvent::Visual {
+                    id: id.clone(),
+                    path: path.clone(),
+                    title: title.clone(),
+                };
+                if !self.sessions.inject_event(&p.chat_id, event) {
+                    self.uploads.remove_visual(&id);
+                    return Err(no_turn_for_visual());
+                }
+                RpcReply::value(&serde_json::json!({
+                    "id": id,
+                    "title": title,
+                    "checkedInteractions": report.interactions,
+                    "printed": report.logs,
+                }))
             }
             methods::FETCH_TOOL_BLOB => {
                 let p: FetchToolBlobParams = parse_params(params)?;
@@ -4327,31 +4480,65 @@ mod tests {
             resolve_open_terminal_cwd(
                 Some("/proj".into()),
                 Some("/chat".into()),
-                Some("/space".into())
+                Some("/space".into()),
+                std::path::Path::new("/scratch")
             )
             .unwrap(),
             "/proj"
         );
         assert_eq!(
-            resolve_open_terminal_cwd(None, Some("/chat".into()), Some("/space".into())).unwrap(),
+            resolve_open_terminal_cwd(
+                None,
+                Some("/chat".into()),
+                Some("/space".into()),
+                std::path::Path::new("/scratch")
+            )
+            .unwrap(),
             "/chat"
         );
         assert_eq!(
-            resolve_open_terminal_cwd(Some("~".into()), None, Some("/space".into())).unwrap(),
+            resolve_open_terminal_cwd(
+                Some("~".into()),
+                None,
+                Some("/space".into()),
+                std::path::Path::new("/scratch")
+            )
+            .unwrap(),
             "/space",
             "tilde is a fallback, not an override of the selected project"
         );
         assert_eq!(
-            resolve_open_terminal_cwd(None, None, Some("/space".into())).unwrap(),
+            resolve_open_terminal_cwd(
+                None,
+                None,
+                Some("/space".into()),
+                std::path::Path::new("/scratch")
+            )
+            .unwrap(),
             "/space"
         );
-        assert_eq!(resolve_open_terminal_cwd(None, None, None).unwrap(), home);
         assert_eq!(
-            resolve_open_terminal_cwd(Some("~".into()), Some("/chat".into()), None).unwrap(),
+            resolve_open_terminal_cwd(None, None, None, std::path::Path::new("/scratch")).unwrap(),
+            home
+        );
+        assert_eq!(
+            resolve_open_terminal_cwd(
+                Some("~".into()),
+                Some("/chat".into()),
+                None,
+                std::path::Path::new("/scratch")
+            )
+            .unwrap(),
             "/chat"
         );
         assert_eq!(
-            resolve_open_terminal_cwd(Some("  ".into()), Some("/chat".into()), None).unwrap(),
+            resolve_open_terminal_cwd(
+                Some("  ".into()),
+                Some("/chat".into()),
+                None,
+                std::path::Path::new("/scratch")
+            )
+            .unwrap(),
             "/chat"
         );
         assert_eq!(canvas_space_id("space-canvas:s1"), Some("s1"));

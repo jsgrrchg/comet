@@ -89,11 +89,14 @@ impl NotificationService {
         if self.harness_update_task.is_some() || !has_unseen {
             return;
         }
-        let owner = owner.clone();
+        let owner = owner.downgrade();
         self.harness_update_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             this.update(cx, |this, cx| {
                 this.harness_update_task = None;
+                let Some(owner) = owner.upgrade() else {
+                    return;
+                };
                 let count = this.harness_updates.take_unseen(owner.read(cx));
                 if count == 0 {
                     return;
@@ -449,6 +452,42 @@ mod tests {
                 .is_empty()
         );
         assert!(detector.sessions.contains_key(&id));
+    }
+
+    #[gpui::test]
+    fn pending_agent_update_notice_does_not_retain_application_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (owner, service) = cx.update(|cx| {
+            let owner = cx.new(|_| AppState::new());
+            let service = init(owner.clone(), cx);
+            owner.update(cx, |state, cx| {
+                state.harness_updates = vec![
+                    serde_json::from_value(serde_json::json!({
+                        "harness": "codex", "phase": "available", "latestVersion": "2.0.0",
+                        "policy": "notify", "source": "unknown", "canApply": true
+                    }))
+                    .unwrap(),
+                ];
+                cx.notify();
+            });
+            (owner, service)
+        });
+        cx.run_until_parked();
+        assert!(service.read_with(cx, |service, _| service.harness_update_task.is_some()));
+        let weak = owner.downgrade();
+        drop(owner);
+        cx.run_until_parked();
+        assert!(
+            weak.upgrade().is_none(),
+            "pending notice retained its owner"
+        );
+        cx.executor().advance_clock(Duration::from_secs(1));
+        cx.run_until_parked();
+        service.read_with(cx, |service, _| {
+            assert!(service.harness_update_task.is_none());
+            assert!(service.emitted_harness_updates.is_empty());
+        });
     }
 
     #[gpui::test]

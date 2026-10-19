@@ -15,6 +15,12 @@ pub mod capabilities {
         "message-queue-clean-attachment-text-v1";
     pub const MESSAGE_QUEUE_EDIT_LEASE_V1: &str = "message-queue-edit-lease-v1";
     pub const HARNESS_UPDATES_V1: &str = "harness-updates-v1";
+    /// The host creates a projectless chat's scratch folder
+    /// (`crate::projectless`) when it runs; older hosts only know `~`.
+    pub const PROJECTLESS_SCRATCH_V1: &str = "projectless-scratch-v1";
+    /// The host accepts `SidebarSectionChange::Move` and orders sections by
+    /// their placed key; older hosts reject the action outright.
+    pub const SIDEBAR_SECTION_ORDER_V1: &str = "sidebar-section-order-v1";
 
     pub const CURRENT: &[&str] = &[
         COMPOSER_REFERENCES_V1,
@@ -24,6 +30,8 @@ pub mod capabilities {
         MESSAGE_QUEUE_CLEAN_ATTACHMENT_TEXT_V1,
         MESSAGE_QUEUE_EDIT_LEASE_V1,
         HARNESS_UPDATES_V1,
+        PROJECTLESS_SCRATCH_V1,
+        SIDEBAR_SECTION_ORDER_V1,
         crate::voice::remote::CAPABILITY,
     ];
 
@@ -105,6 +113,8 @@ mod tests {
                     "message-queue-clean-attachment-text-v1",
                     "message-queue-edit-lease-v1",
                     "harness-updates-v1",
+                    "projectless-scratch-v1",
+                    "sidebar-section-order-v1",
                     "voice-client-media-v1"
                 ],
             })

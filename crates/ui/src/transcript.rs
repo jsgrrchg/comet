@@ -486,6 +486,21 @@ fn wrap_styled_runs(runs: &[InlineRun], indent: usize, out: &mut Vec<Vec<InlineR
     let budget = THOUGHT_WRAP_COLS.saturating_sub(indent).max(16);
     let mut segments: Vec<Vec<InlineRun>> = vec![Vec::new()];
     for run in runs {
+        // Inline math shows its `$tex$` source in the code style.
+        let math;
+        let run = if run.style.math {
+            math = InlineRun {
+                text: format!("${}$", run.text),
+                style: InlineStyle {
+                    code: true,
+                    math: false,
+                    ..run.style.clone()
+                },
+            };
+            &math
+        } else {
+            run
+        };
         for (ix, piece) in run.text.split('\n').enumerate() {
             if ix > 0 {
                 segments.push(Vec::new());
@@ -590,7 +605,8 @@ fn thought_block_lines(block: &Block, indent: usize, out: &mut Vec<Vec<InlineRun
                 .collect();
             wrap_styled_runs(&bold, indent, out);
         }
-        Block::CodeBlock { code, .. } => {
+        // Interim: display math shows its TeX source like a code block.
+        Block::CodeBlock { code, .. } | Block::Math { tex: code } => {
             let style = InlineStyle {
                 code: true,
                 ..InlineStyle::default()
@@ -1025,6 +1041,12 @@ pub enum RowKind {
         name: String,
         mime_type: String,
     },
+    /// An agent's `show_visual` script, rendered inline by [`crate::visuals`].
+    Visual {
+        owner: String,
+        path: String,
+        title: String,
+    },
     User {
         /// Visible prompt (attachment-ref trailer already stripped). When the
         /// prompt carries file mentions this is the *projected* display text —
@@ -1189,7 +1211,8 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                                 | (run.style.italic as u8) << 1
                                 | (run.style.code as u8) << 2
                                 | (run.style.strikethrough as u8) << 3
-                                | (run.style.link.is_some() as u8) << 4,
+                                | (run.style.link.is_some() as u8) << 4
+                                | (run.style.math as u8) << 5,
                         );
                     }
                     acc.push(b'\n');
@@ -1622,6 +1645,28 @@ pub fn rows_for_entry(
                                 path: path.clone(),
                                 name: name.clone(),
                                 mime_type: mime_type.clone(),
+                            },
+                        });
+                    }
+                    MessagePart::Visual {
+                        id: part_id,
+                        path,
+                        title,
+                    } => {
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(
+                                format!("{}\0{path}\0{title}", entry.device_id).as_bytes(),
+                            ),
+                            turn_start: false,
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            compact_fold: None,
+                            kind: RowKind::Visual {
+                                owner: entry.device_id.clone(),
+                                path: path.clone(),
+                                title: title.clone(),
                             },
                         });
                     }
@@ -3231,6 +3276,10 @@ pub struct Transcript {
     /// Each instance owns separate scroll handles and list measurements, so
     /// every one must reset itself after a global Fit-mode transition.
     code_fences_generation: u64,
+    /// Last math-style generation applied (see
+    /// [`crate::settings::math_generation`]); like the code-fence one, each
+    /// instance remeasures its own rows.
+    math_generation: u64,
     /// Compact mode as last applied to this instance's row split. Render
     /// polls the setting each frame; a flip rebuilds every row.
     compact_mode: bool,
@@ -3339,6 +3388,8 @@ pub struct Transcript {
     /// In-flight ReadAttachmentChunk loads, keyed by device, path and validation
     /// policy; results land in the global attachment cache.
     attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
+    /// Inline `show_visual` visuals, keyed by row id.
+    visuals: HashMap<SharedString, Entity<crate::visuals::VisualFrame>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
     /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
@@ -3590,6 +3641,7 @@ impl Transcript {
             content_width: crate::settings::transcript_width(cx),
             right_reserve: 0.0,
             code_fences_generation: crate::settings::code_fences_generation(cx),
+            math_generation: crate::settings::math_generation(cx),
             compact_mode: crate::settings::transcript_compact_mode(cx),
             compact_live_entries: HashSet::new(),
             compact_last_elapsed: HashMap::new(),
@@ -3634,6 +3686,7 @@ impl Transcript {
             image_menu_focus: cx.focus_handle(),
             image_copy: None,
             attachment_loads: HashMap::new(),
+            visuals: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
@@ -6677,6 +6730,51 @@ impl Transcript {
         }
     }
 
+    fn render_visual(
+        &mut self,
+        row_id: &SharedString,
+        owner: &str,
+        path: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let link_ui = self.link_ui(cx);
+        let frame = match self.visuals.get(row_id) {
+            Some(frame) => frame.clone(),
+            None => {
+                let state = self.state.read(cx);
+                let engine = state.engine().cloned();
+                // Relay-forward only for a genuinely remote owner.
+                let target =
+                    (state.local_device_id.as_deref() != Some(owner)).then(|| owner.to_owned());
+                let frame = cx.new(|cx| {
+                    crate::visuals::VisualFrame::new(
+                        row_id.clone(),
+                        title.to_owned(),
+                        path.to_owned(),
+                        engine,
+                        target,
+                        cx,
+                    )
+                });
+                // A visual whose tree changes shape (a tab switch, a load)
+                // resizes its row, like a diagram finishing.
+                let id = row_id.clone();
+                cx.subscribe(
+                    &frame,
+                    move |this, _, _: &crate::visuals::VisualLayoutChanged, cx| {
+                        this.diagram_layout_changed(std::slice::from_ref(&id), cx);
+                    },
+                )
+                .detach();
+                self.visuals.insert(row_id.clone(), frame.clone());
+                frame
+            }
+        };
+        frame.update(cx, |frame, _| frame.set_link_ui(link_ui));
+        div().w_full().child(frame).into_any_element()
+    }
+
     /// The right-aligned thumbnail strip above a user bubble.
     fn render_user_attachments(
         &mut self,
@@ -7304,6 +7402,7 @@ impl Transcript {
                     link,
                     workspace_root: workspace_root.clone(),
                     code,
+                    math: crate::settings::math_style(cx),
                 };
                 let highlight = self.code_highlight_for(&row.id, &tree, Some(*block_ix), cx);
                 render::render_block(
@@ -7374,6 +7473,7 @@ impl Transcript {
                     link,
                     workspace_root: workspace_root.clone(),
                     code,
+                    math: crate::settings::math_style(cx),
                 };
                 if seed_history && let Some(veil) = &veil {
                     let historical = &self.historical_markdown[&row.id];
@@ -7451,6 +7551,9 @@ impl Transcript {
                 name,
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
+            RowKind::Visual { owner, path, title } => {
+                self.render_visual(&row.id, owner, path, title, cx)
+            }
             RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
         };
@@ -10004,6 +10107,12 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
                 acc.push(0);
             }
         }
+        if let MessagePart::Visual { path, title, .. } = part {
+            for field in [path, title] {
+                acc.extend_from_slice(field.as_bytes());
+                acc.push(0);
+            }
+        }
         if let MessagePart::Input { resolved, .. } = part {
             acc.push(0x10 | *resolved as u8);
         }
@@ -10047,6 +10156,20 @@ impl Render for Transcript {
             }
             // Fit changes every code row from analytic to measured height (or
             // back), including virtual rows outside the current viewport.
+            self.list.remeasure();
+            if self.pinned {
+                self.wake_spring();
+            }
+            if self.own_turn.is_some() {
+                self.own_turn_kick = true;
+            }
+        }
+        let math_generation = crate::settings::math_generation(cx);
+        if self.math_generation != math_generation {
+            self.math_generation = math_generation;
+            // Formulas change size with their face, and display math becomes
+            // a code block (or back), so every row with math changes height.
+            // The render cache drops its laid-out text on its own.
             self.list.remeasure();
             if self.pinned {
                 self.wake_spring();
@@ -10196,9 +10319,13 @@ impl Render for Transcript {
         // OVER the bottom fade gradient, which is a later sibling of this
         // outlet — an overlay here would be tinted by the fade.
         self.update_runway_minimum(cx);
-        let list_el = list(self.list.clone(), cx.processor(Self::render_row))
-            .size_full()
-            .with_sizing_behavior(gpui::ListSizingBehavior::Auto);
+        let list_el = crate::overscroll::overscroll(
+            "transcript-overscroll",
+            crate::overscroll::OverscrollSource::List(self.list.clone()),
+            list(self.list.clone(), cx.processor(Self::render_row))
+                .size_full()
+                .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+        );
         let content: AnyElement = if self.doc_override.is_some() {
             // The primary transcript's fade lives on the SHELL's outlet
             // wrapper (it spans the titlebar/composer chrome); an override
@@ -12571,6 +12698,19 @@ mod tests {
         assert!(
             line.iter()
                 .any(|r| r.style.link.is_some() && r.text.contains("docs"))
+        );
+    }
+
+    #[test]
+    fn thought_math_keeps_its_delimiters_as_code() {
+        let lines = thought_of(r"so $x_1 + y$ holds");
+        assert_eq!(line_string(&lines[0]), r"so $x_1 + y$ holds");
+        assert!(
+            lines[0]
+                .iter()
+                .any(|r| r.style.code && !r.style.math && r.text.trim_end() == r"$x_1 + y$"),
+            "{:?}",
+            lines[0]
         );
     }
 

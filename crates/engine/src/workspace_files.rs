@@ -263,7 +263,7 @@ impl WorkspaceFiles {
         &self,
         target: &WorkspaceTarget,
     ) -> Result<ResolvedWorkspace, WorkspaceFilesError> {
-        let root = match (&target.chat_id, &target.space_id) {
+        let (root, identity) = match (&target.chat_id, &target.space_id) {
             (Some(_), Some(_)) | (None, None) => {
                 return Err(WorkspaceFilesError::BadParams(
                     "workspace target needs exactly one of chatId or spaceId".into(),
@@ -290,8 +290,11 @@ impl WorkspaceFiles {
                     // The chat's cwd is the browsing boundary, even when it
                     // happens to be a subdirectory of a Git checkout.
                     let cwd = PathBuf::from(
-                        crate::repos::expand_home(chat.cwd.as_deref().unwrap_or("~"))
-                            .map_err(|error| WorkspaceFilesError::NotFound(error.to_string()))?,
+                        crate::repos::resolve_chat_cwd(
+                            chat.cwd.as_deref().unwrap_or("~"),
+                            &self.inner.repos.scratch_root(),
+                        )
+                        .map_err(|error| WorkspaceFilesError::NotFound(error.to_string()))?,
                     );
                     if !cwd.is_absolute() {
                         return Err(WorkspaceFilesError::BadParams(
@@ -327,15 +330,18 @@ impl WorkspaceFiles {
                         "chat space belongs to another device".into(),
                     ));
                 }
-                self.inner
-                    .repos
-                    .workspace_checkout(Path::new(&space.path), &cwd)
-                    .await
-                    .ok_or_else(|| {
-                        WorkspaceFilesError::Authorization(
-                            "chat folder is not a workspace checkout".into(),
-                        )
-                    })?
+                let (checkout, identity) = tokio::join!(
+                    self.inner
+                        .repos
+                        .workspace_checkout(Path::new(&space.path), &cwd),
+                    self.inner.repos.checkout_identity(&cwd),
+                );
+                let root = checkout.ok_or_else(|| {
+                    WorkspaceFilesError::Authorization(
+                        "chat folder is not a workspace checkout".into(),
+                    )
+                })?;
+                (root, identity)
             }
             (None, Some(space_id)) => {
                 let space = self
@@ -354,7 +360,8 @@ impl WorkspaceFiles {
                     .checkout_path
                     .as_deref()
                     .map_or_else(|| space_path.clone(), PathBuf::from);
-                self.inner
+                let root = self
+                    .inner
                     .repos
                     .workspace_checkout(&space_path, &requested)
                     .await
@@ -362,14 +369,16 @@ impl WorkspaceFiles {
                         WorkspaceFilesError::BadParams(
                             "checkoutPath is not a workspace checkout".into(),
                         )
-                    })?
+                    })?;
+                let identity = self.inner.repos.checkout_identity(&root).await;
+                (root, identity)
             }
         };
 
         // Spaces also support plain folders. Git checkouts use their canonical
         // git-dir identity; plain roots get a device-scoped stable key so the
         // existing SearchFiles behavior and shared watcher semantics remain intact.
-        match self.inner.repos.checkout_identity(&root).await {
+        match identity {
             Ok(identity) => Ok(ResolvedWorkspace {
                 checkout_id: identity.id,
                 root: identity.root,
@@ -1474,7 +1483,10 @@ fn search_content_blocking(
 /// File-name search also takes an empty query, listing the workspace's files
 /// by recency from the index (the palette's default Files list). "Show
 /// ignored" walks the disk with a substring match, so it still needs text.
-fn validate_name_search_query(query: &str, include_ignored: bool) -> Result<(), WorkspaceFilesError> {
+fn validate_name_search_query(
+    query: &str,
+    include_ignored: bool,
+) -> Result<(), WorkspaceFilesError> {
     if query.trim().is_empty() && !include_ignored {
         return Ok(());
     }

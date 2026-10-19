@@ -281,7 +281,7 @@ impl Shell {
                 &files,
                 window,
                 move |this: &mut Self, source, event, window, cx| match event {
-                    FilesEvent::HoldMutation { origin, path } => {
+                    FilesEvent::HoldMutation { origin, paths } => {
                         let surfaces = this
                             .files
                             .values()
@@ -290,7 +290,7 @@ impl Shell {
                             .cloned()
                             .collect::<Vec<_>>();
                         for surface in surfaces {
-                            surface.update(cx, |files, cx| files.hold_mutation(path.clone(), cx));
+                            surface.update(cx, |files, cx| files.hold_mutation(paths.clone(), cx));
                         }
                     }
                     FilesEvent::AddToChat {
@@ -312,6 +312,11 @@ impl Shell {
                     {
                         this.start_file_mutation(source.clone(), intent.clone(), cx);
                     }
+                    FilesEvent::MutateMany(intents)
+                        if this.accepts_file_navigation(&owner, &source, cx) =>
+                    {
+                        this.start_file_mutations(source.clone(), intents.clone(), cx);
+                    }
                     FilesEvent::OpenFile(path)
                         if this.accepts_file_navigation(&owner, &source, cx) =>
                     {
@@ -327,34 +332,6 @@ impl Shell {
                     FilesEvent::ShowAllFilesChanged(show_all) => {
                         this.set_files_show_all(*show_all, cx)
                     }
-                    // Footer rows land in the surface host beside the explorer,
-                    // through the same paths a spawn chip and a side-chat tab use.
-                    FilesEvent::OpenSubagent {
-                        doc_id,
-                        title,
-                        frozen,
-                    } => this.add_subagent_surface(
-                        this.active_chat.clone(),
-                        doc_id.clone(),
-                        title.clone(),
-                        *frozen,
-                        cx,
-                    ),
-                    FilesEvent::OpenChildChat(chat_id) => this.open_child_chat_tab(chat_id, cx),
-                    FilesEvent::RenameChildChat(chat_id) => {
-                        this.open_rename_chat(chat_id.clone(), cx)
-                    }
-                    FilesEvent::ChildChatContextMenu { chat_id, position } => {
-                        this.chat_menu.open(ChatMenuState {
-                            chat_id: chat_id.clone(),
-                            tab: None,
-                            position: *position,
-                            page: ChatMenuPage::Root,
-                        });
-                        cx.notify();
-                    }
-                    FilesEvent::NewChildChat => this.create_child_chat(None, cx),
-                    FilesEvent::ForkChat => this.create_side_chat(cx),
                     _ => cx.notify(),
                 },
             );

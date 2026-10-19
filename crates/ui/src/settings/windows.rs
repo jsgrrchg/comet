@@ -15,7 +15,7 @@ pub struct WindowSettings {
     pub sidebar_collapsed: bool,
     pub right_pane_width: f32,
     pub terminal_height: f32,
-    pub session_info_open: bool,
+    pub session_info_hidden: bool,
     pub geometry: Option<WindowGeometry>,
 }
 
@@ -35,7 +35,7 @@ impl WindowSettings {
             sidebar_collapsed: settings.sidebar_collapsed,
             right_pane_width: settings.right_pane_width,
             terminal_height: settings.terminal_height,
-            session_info_open: settings.session_info_open,
+            session_info_hidden: settings.session_info_hidden,
             geometry: None,
         }
     }
@@ -47,7 +47,7 @@ impl WindowSettings {
         settings.sidebar_collapsed = self.sidebar_collapsed;
         settings.right_pane_width = self.right_pane_width;
         settings.terminal_height = self.terminal_height;
-        settings.session_info_open = self.session_info_open;
+        settings.session_info_hidden = self.session_info_hidden;
     }
 }
 
@@ -115,7 +115,7 @@ const LOCAL_KEYS: &[&str] = &[
     "sidebarCollapsed",
     "rightPaneWidth",
     "terminalHeight",
-    "sessionInfoOpen",
+    "sessionInfoHidden",
     "lastSpaceId",
     "spaceFilter",
     "openTabs",
@@ -214,7 +214,7 @@ mod tests {
             let mut a = baseline.clone();
             a.sound_enabled = false;
             a.sidebar_width = 260.;
-            a.session_info_open = true;
+            a.session_info_hidden = true;
             publish(Some("a"), &baseline, &a, Some("chat-a".into()), cx);
             let mut b = baseline.clone();
             b.notifications_enabled = false;
@@ -225,9 +225,9 @@ mod tests {
             assert!(!current.notifications_enabled);
             assert_eq!(current.windows["a"].sidebar_width, 260.);
             assert_eq!(current.windows["b"].sidebar_width, 310.);
-            assert!(super::current(Some("a"), cx).session_info_open);
-            assert!(!super::current(Some("b"), cx).session_info_open);
-            assert!(!current.session_info_open);
+            assert!(super::current(Some("a"), cx).session_info_hidden);
+            assert!(!super::current(Some("b"), cx).session_info_hidden);
+            assert!(!current.session_info_hidden);
             super::super::flush(cx);
             assert_eq!(UiSettings::load(dir.path()), current);
         });

@@ -1294,6 +1294,34 @@ mod pinned_session_tests {
             assert_eq!(cx.debug_bounds("chat-time-archived").unwrap(), time);
         }
 
+        // Hiding Archived removes the whole shelf without changing its chats or disclosure state.
+        for visible in [false, true, false] {
+            shell.update(cx, |shell, cx| {
+                let open = shell.archived_open;
+                shell.activate_sidebar_view_row(SidebarViewRow::ShowArchived, cx);
+                assert_eq!(shell.settings.sidebar_show_archived, visible);
+                assert_eq!(shell.archived_open, open);
+                assert_eq!(shell.archived_sidebar_chats(cx).len(), 1);
+            });
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            assert_eq!(cx.debug_bounds("archived-toggle").is_some(), visible);
+            assert_eq!(cx.debug_bounds("chat-archived").is_some(), visible);
+        }
+
+        shell.update(cx, |shell, cx| {
+            assert!(shell.reveal_sidebar_chat("archived", cx));
+            assert!(shell.settings.sidebar_show_archived);
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(cx.debug_bounds("archived-toggle").is_some());
+        assert!(cx.debug_bounds("chat-archived").is_some());
+
         // Sessions owns all unpinned rows, including their keyboard traversal.
         for open in [false, true] {
             let toggle = cx.debug_bounds("sessions-toggle").unwrap().center();
@@ -2119,6 +2147,7 @@ enum SidebarViewRow {
     ShowPullRequest,
     ShowHarness,
     ShowProjectFilter,
+    ShowArchived,
 }
 
 impl SidebarViewRow {
@@ -2133,9 +2162,9 @@ impl SidebarViewRow {
 }
 
 const SIDEBAR_VIEW_GROUPS: [(&str, std::ops::Range<usize>); 3] =
-    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..11)];
+    [("Organize", 0..3), ("Sort", 3..5), ("Show", 5..12)];
 
-const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
+const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 12] = [
     SidebarViewRow::ByDevice,
     SidebarViewRow::ByProject,
     SidebarViewRow::InOneList,
@@ -2147,6 +2176,7 @@ const SIDEBAR_VIEW_ROWS: [SidebarViewRow; 11] = [
     SidebarViewRow::ShowProjectIcon,
     SidebarViewRow::ShowProjectLabel,
     SidebarViewRow::ShowProjectFilter,
+    SidebarViewRow::ShowArchived,
 ];
 
 // list items stay tightly related at 2px, while section boundaries use 12px
@@ -2187,7 +2217,7 @@ fn promote_local_device_group<T>(
 
 /// Project-mode group of a chat as (key, label). Projects sharing a
 /// repository identity fold into one group named for their representative
-/// space; project-less sessions group per device and read as `~`.
+/// space; project-less sessions group per device as "No project".
 fn sidebar_project_group(state: &AppState, chat: &zeron_proto::Chat) -> (String, String) {
     match state.space_for_chat(chat) {
         Some(space) => (
@@ -2196,7 +2226,7 @@ fn sidebar_project_group(state: &AppState, chat: &zeron_proto::Chat) -> (String,
         ),
         None => match chat.space_id.clone() {
             Some(space_id) => (space_id, "?".to_string()),
-            None => (format!("home:{}", chat.device_id), "~".to_string()),
+            None => (format!("home:{}", chat.device_id), "No project".to_string()),
         },
     }
 }
@@ -3829,6 +3859,9 @@ impl Shell {
             SidebarViewRow::ShowHarness => {
                 self.settings.sidebar_show_harness = !self.settings.sidebar_show_harness
             }
+            SidebarViewRow::ShowArchived => {
+                self.settings.sidebar_show_archived = !self.settings.sidebar_show_archived
+            }
             SidebarViewRow::ShowProjectFilter => {
                 self.settings.sidebar_show_project_filter =
                     !self.settings.sidebar_show_project_filter;
@@ -4007,6 +4040,7 @@ impl Shell {
             "Project icon",
             "Location",
             "Project filter",
+            "Archived",
         ];
         let icons = [
             icons::LAPTOP,
@@ -4021,6 +4055,7 @@ impl Shell {
             // Location names the host: the remote glyph sidebar rows wear.
             icons::REMOTE_SERVER,
             icons::FOLDER,
+            icons::ARCHIVE_MINIMALISTIC,
         ];
         let selected = [
             organization == SidebarOrganization::ByDevice,
@@ -4034,6 +4069,7 @@ impl Shell {
             self.settings.sidebar_show_project_icon,
             self.settings.sidebar_show_project_label,
             self.settings.sidebar_show_project_filter,
+            self.settings.sidebar_show_archived,
         ];
         let values = [
             labels[selected[..3].iter().position(|v| *v).unwrap_or(0)].to_string(),
@@ -4856,6 +4892,42 @@ impl Shell {
         visible
     }
 
+    /// Hover targets include the paged Archived shelf, unlike jump shortcuts.
+    pub(super) fn sidebar_hover_card_row_visible(&self, chat_id: &str, cx: &Context<Self>) -> bool {
+        if self
+            .sidebar_visible_order(cx)
+            .iter()
+            .any(|id| id == chat_id)
+        {
+            let in_own_section = self.active_sidebar_pins(cx).iter().any(|id| id == chat_id)
+                || self
+                    .active_sidebar_sections(cx)
+                    .iter()
+                    .any(|section| section.session_ids.iter().any(|id| id == chat_id));
+            if in_own_section {
+                return true;
+            }
+            let state = self.state.read(cx);
+            return state
+                .chats
+                .iter()
+                .find(|chat| chat.id == chat_id)
+                .is_some_and(|chat| {
+                    self.sidebar_group_key(state, chat).is_none_or(|group| {
+                        !self
+                            .sidebar_collapsed_groups
+                            .contains(&self.sidebar_group_collapse_key(&group))
+                    })
+                });
+        }
+        self.archived_open
+            && self
+                .archived_sidebar_chats(cx)
+                .iter()
+                .take(self.archived_shown.max(ARCHIVED_INITIAL_ROWS))
+                .any(|chat| chat.id == chat_id)
+    }
+
     /// The group a chat's row sits under when the sidebar groups by device or
     /// by project; `None` in one list.
     fn sidebar_group_key(&self, state: &AppState, chat: &zeron_proto::Chat) -> Option<String> {
@@ -4934,6 +5006,10 @@ impl Shell {
                 self.queue_sidebar_reveal("sessions");
             }
         } else if let Some(index) = archived {
+            if !self.settings.sidebar_show_archived {
+                self.settings.sidebar_show_archived = true;
+                self.schedule_save(cx);
+            }
             if !self.archived_open {
                 self.archived_open = true;
                 self.archived_shown = ARCHIVED_INITIAL_ROWS;
@@ -4980,23 +5056,25 @@ impl Shell {
         chat: zeron_proto::Chat,
         state: &AppState,
     ) -> ActiveChatRow {
-        // Line 1 is "project @ device" (t3code's project row);
-        // project-less sessions read as their home-dir cwd `~`.
+        // Line 1 is "project @ device" (t3code's project row); project-less
+        // sessions name only their device — no project, no folder.
         let space = state.space_for_chat(&chat);
         let project = match (space, chat.space_id.as_deref()) {
-            (Some(space), _) => space.display_name().to_string(),
-            (None, None) => "~".to_string(),
-            (None, Some(_)) => "?".to_string(),
+            (Some(space), _) => Some(space.display_name().to_string()),
+            (None, None) => None,
+            (None, Some(_)) => Some("?".to_string()),
         };
         let device = state
             .device_name(&chat.device_id)
             .unwrap_or("Unknown device")
             .to_string();
-        let mut folder = project;
         // Unknown device → no fragment, same as the archived list.
-        if state.device_name(&chat.device_id).is_some() {
-            folder = format!("{folder} @ {device}");
-        }
+        let folder = match (project, state.device_name(&chat.device_id)) {
+            (Some(project), Some(_)) => format!("{project} @ {device}"),
+            (Some(project), None) => project,
+            (None, Some(_)) => device.clone(),
+            (None, None) => String::new(),
+        };
         // The branch shows whenever the engine has stamped one —
         // main-checkout sessions included, not just worktrees.
         let branch = crate::change_requests::conversation_branch(&chat, &state.spaces)
@@ -5097,6 +5175,15 @@ impl Shell {
 
         let custom_sections = self.active_sidebar_sections(cx);
         let custom_count = custom_sections.len();
+        let section_order =
+            (custom_count > 1 && self.sidebar_sections_reorderable(cx)).then(|| {
+                std::sync::Arc::new(
+                    custom_sections
+                        .iter()
+                        .map(|section| section.id.clone())
+                        .collect::<Vec<_>>(),
+                )
+            });
         let mut custom_groups: Vec<_> = custom_sections
             .iter()
             .map(|section| {
@@ -5451,10 +5538,20 @@ impl Shell {
             };
             if let Some(id) = key.strip_prefix("section:") {
                 if let Some(section) = custom_sections.iter().find(|section| section.id == id) {
+                    let drag =
+                        section_order
+                            .clone()
+                            .zip(profile_key.clone())
+                            .map(|(ids, profile_key)| SidebarSectionDrag {
+                                section_id: section.id.clone(),
+                                profile_key,
+                                ids,
+                            });
                     rendered.push(self.render_custom_sidebar_section(
                         section.clone(),
                         rendered_rows,
                         drag_group,
+                        drag,
                         theme,
                         cx,
                     ));
@@ -5775,6 +5872,9 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if !self.settings.sidebar_show_archived {
+            return None;
+        }
         const INITIAL: usize = ARCHIVED_INITIAL_ROWS;
         const PAGE: usize = ARCHIVED_PAGE_ROWS;
         let now = Utc::now();
@@ -5834,6 +5934,7 @@ impl Shell {
             chevron,
         )
             .id("archived-toggle")
+            .debug_selector(|| "archived-toggle".into())
             .on_click(cx.listener(move |this, _, _, cx| {
                 let was_open = this.archived_open;
                 this.begin_sidebar_disclosure_motion(

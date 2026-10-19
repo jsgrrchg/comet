@@ -32,8 +32,6 @@ pub mod mutations;
 pub mod preview;
 mod rename;
 pub mod search;
-mod sections;
-mod subagents;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tree;
@@ -101,6 +99,17 @@ pub(crate) struct WorkspacePathDrag {
     pub revision: Option<String>,
     pub path: String,
     pub is_directory: bool,
+    /// Every dragged entry in visible order when a tree selection is
+    /// dragged; empty when only `path` moves. A selected child of a selected
+    /// folder travels with that folder, so `path` need not be listed.
+    pub selection: Vec<WorkspacePathItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspacePathItem {
+    pub path: String,
+    pub is_directory: bool,
+    pub revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +127,27 @@ impl WorkspacePathDrag {
             origin: None,
             source: WorkspacePathSource::Search,
             revision: None,
+            selection: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_selection(mut self, selection: Vec<WorkspacePathItem>) -> Self {
+        self.selection = match selection.as_slice() {
+            [only] if only.path == self.path => Vec::new(),
+            _ => selection,
+        };
+        self
+    }
+
+    pub(crate) fn items(&self) -> Vec<WorkspacePathItem> {
+        if self.selection.is_empty() {
+            vec![WorkspacePathItem {
+                path: self.path.clone(),
+                is_directory: self.is_directory,
+                revision: self.revision.clone(),
+            }]
+        } else {
+            self.selection.clone()
         }
     }
 
@@ -134,8 +164,12 @@ impl WorkspacePathDrag {
     }
 
     fn title(&self) -> SharedString {
-        self.path
-            .trim_end_matches('/')
+        let path = match self.selection.as_slice() {
+            [] => &self.path,
+            [only] => &only.path,
+            items => return format!("{} items", items.len()).into(),
+        };
+        path.trim_end_matches('/')
             .rsplit('/')
             .next()
             .unwrap_or(&self.path)
@@ -168,10 +202,11 @@ impl Render for WorkspacePathDragGhost {
             .text_color(theme.text)
             .opacity(0.85)
             .child({
-                let identity = if self.payload.is_directory {
-                    crate::file_icons::FileIconIdentity::directory(&self.payload.path, false)
+                let first = self.payload.items().swap_remove(0);
+                let identity = if first.is_directory {
+                    crate::file_icons::FileIconIdentity::directory(&first.path, false)
                 } else {
-                    crate::file_icons::FileIconIdentity::file(&self.payload.path)
+                    crate::file_icons::FileIconIdentity::file(&first.path)
                 };
                 crate::file_icons::icon(identity, theme.appearance)
                     .size(px(14.0))
@@ -196,11 +231,15 @@ pub enum FilesEvent {
         is_directory: bool,
         origin: mutations::WorkspaceInteractionOrigin,
     },
+    /// Pause autosave under these paths while a confirmation is open; an
+    /// empty list releases the hold.
     HoldMutation {
         origin: mutations::WorkspaceInteractionOrigin,
-        path: Option<String>,
+        paths: Vec<String>,
     },
     Mutate(mutations::MutationIntent),
+    /// A multi-entry move or delete, applied in order.
+    MutateMany(Vec<mutations::MutationIntent>),
     OpenFile(String),
     RevealFile(String),
     OpenWebLink(crate::markdown::render::LinkActivation),
@@ -213,24 +252,6 @@ pub enum FilesEvent {
     ShowAllFilesChanged(bool),
     CloseReady,
     CloseCancelled,
-    /// A footer row: open this subagent's transcript in the right pane.
-    OpenSubagent {
-        doc_id: String,
-        title: String,
-        frozen: bool,
-    },
-    /// A footer row: open this side chat (by id) in the right pane.
-    OpenChildChat(String),
-    /// A footer row's double-click: edit this side chat's title in place.
-    RenameChildChat(String),
-    ChildChatContextMenu {
-        chat_id: String,
-        position: Point<Pixels>,
-    },
-    /// The Chats header's "+": start a fresh side chat of the active chat.
-    NewChildChat,
-    /// The Chats header's fork: fork the active chat into a side chat.
-    ForkChat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,7 +290,7 @@ pub struct FilesSurface {
     deferred_file_changes: Vec<zeron_proto::WorkspaceFileChanges>,
     applied_mutations: std::collections::VecDeque<String>,
     mutation_error: Option<SharedString>,
-    mutation_hold: Option<String>,
+    mutation_hold: Vec<String>,
     tree_drag: drag::TreeDrag,
     tree_rename: Option<rename::TreeRename>,
     tree_delete: Option<rename::TreeDelete>,
@@ -306,8 +327,6 @@ pub struct FilesSurface {
     loads: HashMap<(String, Option<String>), Task<()>>,
     error: Option<SharedString>,
     started: bool,
-    /// The Subagents / Chats footer under the tree.
-    sections: sections::ExplorerSections,
     _observe: Subscription,
     _search_events: Subscription,
 }
@@ -336,9 +355,6 @@ impl Render for FilesSurface {
             self.render_explorer(&theme, cx).into_any_element()
         };
         let editor_context_menu = self.render_editor_context_menu(&theme, cx);
-        // The explorer docks its Subagents / Chats sections under the tree;
-        // an editor surface has no footer.
-        let sections = (!is_editor).then(|| self.render_sections(&theme, cx));
         div()
             .id(SharedString::from(format!(
                 "files-surface-{}",
@@ -358,7 +374,6 @@ impl Render for FilesSurface {
                     .as_ref()
                     .map(|message| crate::popover::error_row(&theme, message).into_any_element()),
             )
-            .children(sections)
             .children(editor_context_menu)
             .children(self.render_tree_context_menu(&theme, cx))
             .children(self.render_tree_delete(&theme, window, cx))
@@ -381,7 +396,13 @@ impl FilesSurface {
                     let device = state
                         .device_name(&chat.device_id)
                         .unwrap_or(&chat.device_id);
-                    format!("Files in {} · {device}", chat.cwd.as_deref().unwrap_or("~"))
+                    // A projectless chat's folder is an implementation detail.
+                    match chat.cwd.as_deref() {
+                        Some(cwd) if !zeron_proto::projectless::is_projectless_cwd(Some(cwd)) => {
+                            format!("Files in {cwd} · {device}")
+                        }
+                        _ => format!("Files · {device}"),
+                    }
                 })
         };
         let phase = self.tree.node("").map(|root| root.load.clone());
@@ -627,9 +648,6 @@ impl FilesSurface {
                 this.ensure_loaded(cx);
             }
             this.sync_active_markdown_comments(cx);
-            if !this.presentation.is_editor() {
-                this.refresh_sections(cx);
-            }
         });
         // The list state exposes no scroll handle, so the floating rail
         // bridges scroll activity through the scroll handler (the
@@ -650,7 +668,7 @@ impl FilesSurface {
             deferred_file_changes: Vec::new(),
             applied_mutations: std::collections::VecDeque::new(),
             mutation_error: None,
-            mutation_hold: None,
+            mutation_hold: Vec::new(),
             tree_drag: drag::TreeDrag::default(),
             tree_rename: None,
             tree_delete: None,
@@ -692,7 +710,6 @@ impl FilesSurface {
             loads: HashMap::new(),
             error: None,
             started: false,
-            sections: sections::ExplorerSections::default(),
             _observe: observe,
             _search_events: search_events,
         };
@@ -1137,12 +1154,12 @@ impl FilesSurface {
         if let Some(dialog) = self.tree_delete.take() {
             cx.emit(FilesEvent::HoldMutation {
                 origin: dialog.origin,
-                path: None,
+                paths: Vec::new(),
             });
         }
         self.tree_rename = None;
         self.tree_drag = drag::TreeDrag::default();
-        self.mutation_hold = None;
+        self.mutation_hold.clear();
         self.interaction_generation = self.interaction_generation.wrapping_add(1);
         self.effective_checkout_id = None;
         self.mutation_capabilities = None;

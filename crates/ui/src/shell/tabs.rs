@@ -92,7 +92,9 @@ impl Shell {
         if self.navigation_overlay_open(cx) {
             return;
         }
-        if matches!(self.route, Route::Chat)
+        if self.pull_request_pane_open() && self.navigation_focus.in_right(window, cx) {
+            self.cycle_pull_request_tabs(forward, window, cx);
+        } else if matches!(self.route, Route::Chat)
             && self.right_pane_open(cx)
             && self.navigation_focus.in_right(window, cx)
         {
@@ -123,6 +125,7 @@ impl Shell {
             || self.rename_space_dialog.is_some()
             || self.discard_working_tree.is_some()
             || self.chat_menu.get().is_some()
+            || self.pull_request_pane.menu.get().is_some()
             || self.space_menu.get().is_some()
             || self.user_menu.get().is_some()
             || self.spaces_menu.get().is_some()
@@ -420,12 +423,24 @@ impl Shell {
             content_width,
         } = self.titlebar_trailing_layout(on_canvas, cx);
 
-        let running_subagents = {
+        // What runs alongside the open chat: its working subagents and side
+        // chats, counted on the session card's toggle.
+        let running_lanes = {
             let state = self.state.read(cx);
-            state
-                .selected_chat
-                .as_deref()
-                .map_or(0, |chat| state.running_subagents_for(chat, Utc::now()))
+            let now = Utc::now();
+            state.selected_chat.as_deref().map_or(0, |chat| {
+                let side_chats = state
+                    .chats
+                    .iter()
+                    .filter(|side| {
+                        !side.archived
+                            && side.parent_chat_id.as_deref() == Some(chat)
+                            && state.display_status_for(side, now)
+                                == zeron_proto::ChatIndicator::Working
+                    })
+                    .count() as u32;
+                state.running_subagents_for(chat, now) + side_chats
+            })
         };
         let trailing: Option<gpui::AnyElement> = if on_canvas {
             None
@@ -544,15 +559,6 @@ impl Shell {
                                 .aria_label(files_panel_label)
                                 .when(self.files_panel_open(cx) && fit.files, |button| {
                                     button.bg(crate::theme::wash(0.09))
-                                })
-                                // Running subagents live in this panel: mark the
-                                // button so they are findable while it is closed.
-                                .when(running_subagents > 0, |button| {
-                                    crate::running_pill::mark_files_button(
-                                        button,
-                                        running_subagents,
-                                        &theme,
-                                    )
                                 }),
                             )
                             .child(header_icon_button_with(
@@ -580,7 +586,8 @@ impl Shell {
         // transcript's stretch of the titlebar, left of the side pane's tabs
         // when one is open, else just left of the explorer toggle.
         let session_info_toggle = (!takeover && !on_canvas).then(|| {
-            let label = if self.session_info_open() {
+            let open = self.session_info_visible(cx);
+            let label = if open {
                 "Hide session details"
             } else {
                 "Show session details"
@@ -594,8 +601,15 @@ impl Shell {
             .role(gpui::Role::Button)
             .aria_label(label)
             .flex_none()
-            .when(self.session_info_open(), |button| {
-                button.bg(crate::theme::wash(0.09))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.note_session_info_press()),
+            )
+            .when(open, |button| button.bg(crate::theme::wash(0.09)))
+            // Running subagents and side chats ride the card's lanes: the
+            // button counts them, open or closed, for as long as they run.
+            .when(running_lanes > 0, |button| {
+                crate::running_pill::mark_titlebar_button(button, running_lanes, &theme)
             })
         });
         let inner = div()

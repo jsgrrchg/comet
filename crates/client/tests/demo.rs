@@ -61,7 +61,13 @@ fn front_page_mirrors_the_desktop_sidebar() {
     // Recency order; archived + child chats never appear.
     assert_eq!(
         ids(&ws.front.recent),
-        ["chat-cjk", "chat-home", "chat-deploy", "chat-blog"]
+        [
+            "chat-visuals",
+            "chat-cjk",
+            "chat-home",
+            "chat-deploy",
+            "chat-blog"
+        ]
     );
     assert_eq!(ids(&ws.archived), ["chat-oklch", "chat-presence"]);
     assert_eq!(ids(ws.children("chat-veil")), ["chat-side"]);
@@ -105,7 +111,7 @@ fn front_page_mirrors_the_desktop_sidebar() {
     let cjk = ws.session("chat-cjk").unwrap();
     assert_eq!(cjk.project.as_ref().unwrap().color_index, zeron.color_index);
     assert_ne!(ws.project("space-edge").unwrap().group_key, zeron.group_key);
-    assert_eq!(ids(&ws.projectless), ["chat-home"]);
+    assert_eq!(ids(&ws.projectless), ["chat-visuals", "chat-home"]);
     assert!(ws.devices.iter().any(|d| d.is_self && d.id == "ios-test"));
     assert!(!ws.device("dev-studio").unwrap().online);
 
@@ -137,6 +143,49 @@ fn sidebar_writes_reorder_the_front_page() {
     let later = ws.front.sections.iter().find(|s| s.id == section).unwrap();
     assert_eq!(ids(&later.sessions), ["chat-deploy"]);
     assert!(!ids(&ws.front.recent).contains(&"chat-deploy"));
+    // A section lists its members in their placed order, as desktop does,
+    // and a placement out of Pinned unpins.
+    let members = |client: &Client| {
+        let ws = client.workspace();
+        ids(&ws
+            .front
+            .sections
+            .iter()
+            .find(|s| s.id == section)
+            .unwrap()
+            .sessions)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    };
+    client
+        .place_session(
+            "chat-home",
+            Some(section.clone()),
+            None,
+            Some("chat-deploy".into()),
+        )
+        .unwrap();
+    assert_eq!(members(&client), ["chat-home", "chat-deploy"]);
+    assert!(!ids(&client.workspace().front.pinned).contains(&"chat-home"));
+    client
+        .place_session(
+            "chat-home",
+            Some(section.clone()),
+            Some("chat-deploy".into()),
+            None,
+        )
+        .unwrap();
+    assert_eq!(members(&client), ["chat-deploy", "chat-home"]);
+    // A drop into Pinned lands between its neighbours.
+    client
+        .pin_session_at("chat-home", None, Some("chat-picker".into()))
+        .unwrap();
+    assert_eq!(
+        ids(&client.workspace().front.pinned),
+        ["chat-home", "chat-picker"]
+    );
+    assert_eq!(members(&client), ["chat-deploy"]);
     client.set_section_collapsed(&section, true).unwrap();
     client.rename_section(&section, "Someday").unwrap();
     let ws = client.workspace();

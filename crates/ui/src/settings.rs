@@ -30,6 +30,7 @@ pub mod wallpaper;
 pub mod wallpaper_colors;
 pub mod widgets;
 pub mod windows;
+mod worktrees;
 
 /// Sidebar drag-resize bounds (px). The minimum keeps the sidebar options
 /// button inside the sidebar beside the titlebar controls: 88 (past the
@@ -48,6 +49,9 @@ pub const FILES_PANEL_MAX: f32 = 440.0;
 /// for the conversation and any docked file explorer.
 pub const RIGHT_PANE_MIN: f32 = 360.0;
 pub const RIGHT_PANE_DEFAULT: f32 = 520.0;
+/// The Pull requests route's side pane defaults wider than the chat's: the
+/// detail's Code tab needs room beside the board.
+pub const PULL_REQUEST_PANE_DEFAULT: f32 = 640.0;
 /// Minimum width retained for the conversation when the right pane is open.
 pub const CHAT_PANEL_MIN: f32 = 300.0;
 
@@ -154,6 +158,125 @@ impl NewThreadBackgroundEffect {
             Self::Scanlines => "Adds a pronounced horizontal display-line texture.",
         }
     }
+}
+
+/// The face Markdown math is set in. Every face is bundled, so the choice
+/// never depends on what the device has installed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MathFont {
+    #[default]
+    Fira,
+    StixTwo,
+    ComputerModern,
+    Libertinus,
+    Pagella,
+    Euler,
+}
+
+impl MathFont {
+    pub const ALL: [Self; 6] = [
+        Self::Fira,
+        Self::StixTwo,
+        Self::ComputerModern,
+        Self::Libertinus,
+        Self::Pagella,
+        Self::Euler,
+    ];
+
+    /// The name stored in the settings file.
+    const fn key(self) -> &'static str {
+        match self {
+            Self::Fira => "fira",
+            Self::StixTwo => "stixTwo",
+            Self::ComputerModern => "computerModern",
+            Self::Libertinus => "libertinus",
+            Self::Pagella => "pagella",
+            Self::Euler => "euler",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fira => "Fira Math",
+            Self::StixTwo => "STIX Two",
+            Self::ComputerModern => "Computer Modern",
+            Self::Libertinus => "Libertinus",
+            Self::Pagella => "Palatino",
+            Self::Euler => "Euler",
+        }
+    }
+
+    /// The short note beside the label in the menu.
+    pub const fn style(self) -> &'static str {
+        match self {
+            Self::Fira => "Sans",
+            Self::StixTwo | Self::Libertinus | Self::Pagella => "Serif",
+            Self::ComputerModern => "LaTeX",
+            Self::Euler => "Upright",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Fira => "A sans face that sits beside the interface font.",
+            Self::StixTwo => "A Times-like serif face with the TeX look.",
+            Self::ComputerModern => "A serif face with the classic LaTeX look.",
+            Self::Libertinus => "A warm serif book face.",
+            Self::Pagella => "A Palatino serif face, from TeX Gyre Pagella.",
+            Self::Euler => "Zapf's upright, hand-drawn math.",
+        }
+    }
+
+    pub const fn face(self) -> zatex::bundled::Face {
+        match self {
+            Self::Fira => zatex::bundled::Face::Fira,
+            Self::StixTwo => zatex::bundled::Face::StixTwo,
+            Self::ComputerModern => zatex::bundled::Face::ComputerModern,
+            Self::Libertinus => zatex::bundled::Face::Libertinus,
+            Self::Pagella => zatex::bundled::Face::Pagella,
+            Self::Euler => zatex::bundled::Face::Euler,
+        }
+    }
+}
+
+impl Serialize for MathFont {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.key())
+    }
+}
+
+/// A face this build doesn't know (written by a newer one) reads as the
+/// default rather than failing the whole settings file.
+impl<'de> Deserialize<'de> for MathFont {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let stored = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self::ALL
+            .into_iter()
+            .find(|font| stored == font.key())
+            .unwrap_or_default())
+    }
+}
+
+/// Markdown math size as a percent of the text around it.
+pub const MATH_SIZE_DEFAULT: u16 = 100;
+pub const MATH_SIZE_MIN: u16 = 75;
+pub const MATH_SIZE_MAX: u16 = 200;
+
+/// A stored math size: any number rounds and clamps into range; anything
+/// else (`"big"`, `null`, an object) reads as the default. Like an unknown
+/// [`MathFont`], a bad value never fails the rest of the settings file.
+fn deserialize_math_size<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u16, D::Error> {
+    let stored = serde_json::Value::deserialize(deserializer)?;
+    Ok(stored
+        .as_f64()
+        .filter(|size| size.is_finite())
+        .map_or(MATH_SIZE_DEFAULT, |size| {
+            // In range, the cast is exact.
+            size.round()
+                .clamp(f64::from(MATH_SIZE_MIN), f64::from(MATH_SIZE_MAX)) as u16
+        }))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +445,9 @@ pub struct SettingsStore {
     /// the persisted revision, this advances only when the global Fit choice
     /// changes, including a change back to its previous value.
     code_fences_generation: u64,
+    /// The same token for how Markdown math renders (on or off, face and
+    /// size).
+    math_generation: u64,
     save_task: Option<Task<()>>,
 }
 
@@ -347,6 +473,12 @@ impl SettingsStore {
         if self.current.code_fences_fit_content != before.code_fences_fit_content {
             self.code_fences_generation = self.code_fences_generation.wrapping_add(1);
         }
+        if self.current.render_math != before.render_math
+            || self.current.math_font != before.math_font
+            || self.current.math_size != before.math_size
+        {
+            self.math_generation = self.math_generation.wrapping_add(1);
+        }
         self.revision = self.revision.wrapping_add(1);
         true
     }
@@ -361,6 +493,7 @@ pub fn init(settings: UiSettings, data_dir: impl Into<PathBuf>, cx: &mut App) {
         revision: 0,
         saved_revision: 0,
         code_fences_generation: 0,
+        math_generation: 0,
         save_task: None,
     });
 }
@@ -593,6 +726,50 @@ pub fn transcript_compact_mode(cx: &App) -> bool {
 pub fn set_transcript_compact_mode(enabled: bool, cx: &mut App) {
     if update(SavePolicy::Immediate, cx, |settings| {
         settings.transcript_compact_mode = enabled;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+/// How Markdown surfaces set math, read each render without cloning the
+/// settings.
+pub fn math_style(cx: &App) -> crate::markdown::math::MathStyle {
+    cx.try_global::<SettingsStore>()
+        .map(|store| crate::markdown::math::MathStyle {
+            enabled: store.current.render_math,
+            face: store.current.math_font.face(),
+            size: store.current.math_size,
+        })
+        .unwrap_or_default()
+}
+
+/// Monotonic id of [`math_style`]: Markdown surfaces that keep measured row
+/// heights compare it during render and remeasure when it moves.
+pub fn math_generation(cx: &App) -> u64 {
+    cx.try_global::<SettingsStore>()
+        .map(|store| store.math_generation)
+        .unwrap_or_default()
+}
+
+pub fn set_render_math(enabled: bool, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.render_math = enabled;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+pub fn set_math_font(font: MathFont, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.math_font = font;
+    }) {
+        cx.refresh_windows();
+    }
+}
+
+pub fn set_math_size(size: u16, cx: &mut App) {
+    if update(SavePolicy::Immediate, cx, |settings| {
+        settings.math_size = size;
     }) {
         cx.refresh_windows();
     }
@@ -849,6 +1026,8 @@ pub struct UiSettings {
     pub sidebar_show_pull_request: bool,
     /// The project filter row at the top of the sidebar.
     pub sidebar_show_project_filter: bool,
+    /// The Archived accordion below the active session list.
+    pub sidebar_show_archived: bool,
     /// The sidebar's "Star on GitHub" banner was dismissed (its close button
     /// or following the link). Device-local; never shown again once set.
     pub github_star_banner_dismissed: bool,
@@ -903,6 +1082,8 @@ pub struct UiSettings {
     /// remain enabled independently of this preference.
     pub agent_update_notifications: bool,
     pub right_pane_width: f32,
+    /// Width of the pull request pane beside the board.
+    pub pull_request_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, zeron `sessionPanels` parity). Kept for file
     /// compatibility; no longer read or written by the shell.
@@ -957,6 +1138,14 @@ pub struct UiSettings {
     /// Agent-sent Markdown fences: wrap long lines to the chat width instead
     /// of exposing their horizontal scroll plane.
     pub code_fences_fit_content: bool,
+    /// Typeset LaTeX math in Markdown. Off shows its source as code.
+    pub render_math: bool,
+    /// The bundled face typeset math is set in.
+    pub math_font: MathFont,
+    /// Typeset math size, as a percent of the text around it. Read
+    /// tolerantly ([`deserialize_math_size`]).
+    #[serde(deserialize_with = "deserialize_math_size")]
+    pub math_size: u16,
     /// Maximum message and docked composer surface width in logical pixels.
     /// The centered new-chat composer keeps its own width.
     pub transcript_width: f32,
@@ -982,9 +1171,9 @@ pub struct UiSettings {
     pub files_word_wrap: bool,
     /// Include hidden and ignored entries in workspace file trees.
     pub files_show_all: bool,
-    /// The session card (project, device, side chats, actions) beside the
-    /// transcript.
-    pub session_info_open: bool,
+    /// The user hid the session card (project, device, side chats, actions)
+    /// that otherwise shows beside a transcript with room for it.
+    pub session_info_hidden: bool,
     /// Interactive identity overlay; imported themes default to their own accent.
     pub accent: zeron_theme::AccentSelection,
     /// Glass policy, independent from the selected appearance, theme, and accent.
@@ -1036,6 +1225,7 @@ impl Default for UiSettings {
             sidebar_show_branch: true,
             sidebar_show_pull_request: true,
             sidebar_show_project_filter: true,
+            sidebar_show_archived: true,
             github_star_banner_dismissed: false,
             last_space_id: None,
             last_project_action_by_space_id: std::collections::HashMap::new(),
@@ -1054,6 +1244,7 @@ impl Default for UiSettings {
             files_panel_width: FILES_PANEL_DEFAULT,
             agent_update_notifications: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
+            pull_request_pane_width: PULL_REQUEST_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
             terminal_open: false,
@@ -1082,6 +1273,9 @@ impl Default for UiSettings {
             diff_split: false,
             diff_wrap: false,
             code_fences_fit_content: false,
+            render_math: true,
+            math_font: MathFont::Fira,
+            math_size: MATH_SIZE_DEFAULT,
             transcript_width: TRANSCRIPT_WIDTH_DEFAULT,
             open_web_links_in_zeron: true,
             transcript_compact_mode: false,
@@ -1093,7 +1287,7 @@ impl Default for UiSettings {
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_show_all: false,
-            session_info_open: false,
+            session_info_hidden: false,
             accent: zeron_theme::AccentSelection::default(),
             surface: zeron_theme::SurfacePreference::default(),
             new_thread_composer_background: None,
@@ -1719,6 +1913,7 @@ impl UiSettings {
             sidebar_show_branch,
             sidebar_show_pull_request,
             sidebar_show_project_filter,
+            sidebar_show_archived,
             github_star_banner_dismissed,
             last_space_id,
             last_project_action_by_space_id,
@@ -1737,6 +1932,7 @@ impl UiSettings {
             files_panel_width,
             agent_update_notifications,
             right_pane_width,
+            pull_request_pane_width,
             right_pane_open,
             terminal_height,
             terminal_open,
@@ -1761,6 +1957,9 @@ impl UiSettings {
             diff_split,
             diff_wrap,
             code_fences_fit_content,
+            render_math,
+            math_font,
+            math_size,
             transcript_width,
             open_web_links_in_zeron,
             transcript_compact_mode,
@@ -1768,7 +1967,7 @@ impl UiSettings {
             files_autosave_delay_ms,
             files_word_wrap,
             files_show_all,
-            session_info_open,
+            session_info_hidden,
             accent,
             surface,
             new_thread_composer_background,
@@ -1810,6 +2009,11 @@ impl UiSettings {
             FILES_PANEL_DEFAULT,
         );
         self.right_pane_width = min_or(self.right_pane_width, RIGHT_PANE_MIN, RIGHT_PANE_DEFAULT);
+        self.pull_request_pane_width = min_or(
+            self.pull_request_pane_width,
+            RIGHT_PANE_MIN,
+            PULL_REQUEST_PANE_DEFAULT,
+        );
         self.terminal_height = clamp_or(
             self.terminal_height,
             TERMINAL_MIN_HEIGHT,
@@ -1819,6 +2023,7 @@ impl UiSettings {
         self.files_autosave_delay_ms = self
             .files_autosave_delay_ms
             .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
+        self.math_size = self.math_size.clamp(MATH_SIZE_MIN, MATH_SIZE_MAX);
         self.terminal_font_size = clamp_or(
             self.terminal_font_size,
             crate::typography::FONT_SIZE_MIN,
@@ -2394,6 +2599,9 @@ mod tests {
             loaded.code_font_size,
             crate::typography::CODE_FONT_SIZE_DEFAULT
         );
+        assert!(loaded.render_math);
+        assert_eq!(loaded.math_font, MathFont::Fira);
+        assert_eq!(loaded.math_size, MATH_SIZE_DEFAULT);
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2752,6 +2960,7 @@ mod tests {
             sidebar_show_branch: false,
             sidebar_show_pull_request: false,
             sidebar_show_project_filter: false,
+            sidebar_show_archived: false,
             github_star_banner_dismissed: true,
             last_space_id: Some("space-1".into()),
             last_project_action_by_space_id: std::collections::HashMap::from([(
@@ -2785,6 +2994,7 @@ mod tests {
             files_panel_width: 310.0,
             agent_update_notifications: false,
             right_pane_width: 700.0,
+            pull_request_pane_width: 820.0,
             right_pane_open: true,
             terminal_height: 320.0,
             terminal_open: true,
@@ -2834,6 +3044,9 @@ mod tests {
             diff_split: true,
             diff_wrap: true,
             code_fences_fit_content: true,
+            render_math: false,
+            math_font: MathFont::StixTwo,
+            math_size: 135,
             transcript_width: 960.0,
             open_web_links_in_zeron: false,
             transcript_compact_mode: true,
@@ -2849,7 +3062,7 @@ mod tests {
             code_font_family: crate::typography::UiFontFamily::Geist,
             code_font_size: 11.0,
             files_show_all: true,
-            session_info_open: true,
+            session_info_hidden: true,
             accent: zeron_theme::AccentSelection::Preset(zeron_theme::AccentPreset::Cyan),
             surface: zeron_theme::SurfacePreference::Frosted,
             new_thread_composer_background: Some(NewThreadComposerBackground {
@@ -2876,6 +3089,9 @@ mod tests {
         assert!(json.contains(r#""diffWrap": true"#));
         assert_eq!(UiSettings::load(dir.path()), settings);
         assert!(json.contains(r#""codeFencesFitContent": true"#));
+        assert!(json.contains(r#""renderMath": false"#));
+        assert!(json.contains(r#""mathFont": "stixTwo""#));
+        assert!(json.contains(r#""mathSize": 135"#));
         assert!(json.contains(r#""openWebLinksInZeron": false"#));
         assert!(json.contains(r#""newThreadBackgroundEffect": "ascii""#));
         assert!(json.contains(r#""focalX": 0.25"#));
@@ -2898,6 +3114,7 @@ mod tests {
             revision: 0,
             saved_revision: 0,
             code_fences_generation: 0,
+            math_generation: 0,
             save_task: None,
         };
 
@@ -2956,6 +3173,7 @@ mod tests {
             revision: 0,
             saved_revision: 0,
             code_fences_generation: 0,
+            math_generation: 0,
             save_task: None,
         };
 
@@ -2972,17 +3190,176 @@ mod tests {
     }
 
     #[test]
+    fn math_generation_tracks_every_math_change_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = SettingsStore {
+            current: UiSettings::default(),
+            data_dir: dir.path().to_path_buf(),
+            revision: 0,
+            saved_revision: 0,
+            code_fences_generation: 0,
+            math_generation: 0,
+            save_task: None,
+        };
+
+        assert!(store.update_current(|settings| settings.code_fences_fit_content = true));
+        assert_eq!(store.math_generation, 0);
+
+        assert!(store.update_current(|settings| settings.render_math = false));
+        assert_eq!(store.math_generation, 1);
+        assert!(store.update_current(|settings| settings.math_font = MathFont::StixTwo));
+        assert_eq!(store.math_generation, 2);
+        assert!(store.update_current(|settings| settings.render_math = true));
+        assert_eq!(store.math_generation, 3);
+
+        assert!(!store.update_current(|settings| settings.math_font = MathFont::StixTwo));
+        assert_eq!(store.math_generation, 3);
+
+        assert!(store.update_current(|settings| settings.math_size = 120));
+        assert_eq!(store.math_generation, 4);
+        assert!(!store.update_current(|settings| settings.math_size = 120));
+        assert_eq!(store.math_generation, 4);
+        // A value the clamp heals back to the current size changes nothing.
+        assert!(store.update_current(|settings| settings.math_size = MATH_SIZE_MAX));
+        assert_eq!(store.math_generation, 5);
+        assert!(!store.update_current(|settings| settings.math_size = 500));
+        assert_eq!(store.math_generation, 5);
+    }
+
+    #[test]
+    fn math_settings_default_to_typeset_fira() {
+        let settings = UiSettings::default();
+        assert!(settings.render_math);
+        assert_eq!(settings.math_font, MathFont::Fira);
+        assert_eq!(settings.math_font.face(), zatex::bundled::Face::Fira);
+        assert_eq!(MathFont::StixTwo.face(), zatex::bundled::Face::StixTwo);
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["renderMath"], true);
+        assert_eq!(json["mathFont"], "fira");
+        assert_eq!(settings.math_size, 100);
+        assert_eq!(json["mathSize"], 100);
+    }
+
+    #[test]
+    fn every_math_font_round_trips_through_the_settings_file() {
+        let stored = [
+            "fira",
+            "stixTwo",
+            "computerModern",
+            "libertinus",
+            "pagella",
+            "euler",
+        ];
+        assert_eq!(MathFont::ALL.len(), zatex::bundled::Face::ALL.len());
+        for ((font, key), face) in MathFont::ALL
+            .into_iter()
+            .zip(stored)
+            .zip(zatex::bundled::Face::ALL)
+        {
+            assert_eq!(font.face(), face);
+            let settings = UiSettings {
+                math_font: font,
+                ..Default::default()
+            };
+            let json = serde_json::to_value(&settings).unwrap();
+            assert_eq!(json["mathFont"], key);
+            let decoded: UiSettings = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.math_font, font);
+        }
+    }
+
+    #[test]
+    fn an_unknown_math_font_reads_as_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        for stored in [r#""someFutureFace""#, "3", "null"] {
+            std::fs::write(
+                UiSettings::path(dir.path()),
+                format!(r#"{{"sidebarWidth":300.0,"mathFont":{stored},"mathSize":150}}"#),
+            )
+            .unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert_eq!(loaded.math_font, MathFont::Fira, "{stored}");
+            // The rest of the file survives.
+            assert_eq!(loaded.sidebar_width, 300.0);
+            assert_eq!(loaded.math_size, 150);
+        }
+    }
+
+    #[test]
+    fn math_size_heals_out_of_range_values() {
+        for (value, expected) in [
+            (10, MATH_SIZE_MIN),
+            (0, MATH_SIZE_MIN),
+            (500, MATH_SIZE_MAX),
+            (75, 75),
+            (135, 135),
+            (200, 200),
+        ] {
+            let settings = UiSettings {
+                math_size: value,
+                ..Default::default()
+            }
+            .clamped();
+            assert_eq!(settings.math_size, expected, "{value}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(UiSettings::path(dir.path()), r#"{"mathSize":10}"#).unwrap();
+        assert_eq!(UiSettings::load(dir.path()).math_size, MATH_SIZE_MIN);
+    }
+
+    #[test]
+    fn a_malformed_math_size_never_fails_the_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for (stored, expected) in [
+            // Numbers round, then clamp.
+            ("1.5", MATH_SIZE_MIN),
+            ("134.6", 135),
+            ("134.4", 134),
+            ("-1", MATH_SIZE_MIN),
+            ("1e300", MATH_SIZE_MAX),
+            ("99999999999999999999999", MATH_SIZE_MAX),
+            ("150", 150),
+            // Anything else is the default.
+            (r#""big""#, MATH_SIZE_DEFAULT),
+            (r#""150""#, MATH_SIZE_DEFAULT),
+            ("null", MATH_SIZE_DEFAULT),
+            ("true", MATH_SIZE_DEFAULT),
+            ("[150]", MATH_SIZE_DEFAULT),
+            (r#"{"size":150}"#, MATH_SIZE_DEFAULT),
+        ] {
+            std::fs::write(
+                UiSettings::path(dir.path()),
+                format!(
+                    r#"{{"sidebarWidth":300.0,"mathSize":{stored},"mathFont":"stixTwo","renderMath":false}}"#
+                ),
+            )
+            .unwrap();
+            let loaded = UiSettings::load(dir.path());
+            assert_eq!(loaded.math_size, expected, "{stored}");
+            // The rest of the file survives.
+            assert_eq!(loaded.sidebar_width, 300.0, "{stored}");
+            assert_eq!(loaded.math_font, MathFont::StixTwo, "{stored}");
+            assert!(!loaded.render_math, "{stored}");
+        }
+        // Absent, it's the default.
+        let settings: UiSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.math_size, MATH_SIZE_DEFAULT);
+    }
+
+    #[test]
     fn sidebar_display_defaults_and_preferences_round_trip() {
         let settings: UiSettings = serde_json::from_str("{}").unwrap();
         assert!(settings.sidebar_compact);
         assert!(settings.sidebar_show_project_icon);
         assert!(settings.sidebar_show_project_label);
         assert!(settings.sidebar_show_project_filter);
+        assert!(settings.sidebar_show_archived);
         let customized = UiSettings {
             sidebar_compact: false,
             sidebar_show_project_icon: false,
             sidebar_show_project_label: false,
             sidebar_show_project_filter: false,
+            sidebar_show_archived: false,
             sidebar_organization: SidebarOrganization::ByProject,
             ..settings
         };

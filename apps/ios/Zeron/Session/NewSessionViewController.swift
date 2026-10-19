@@ -90,6 +90,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
 
     /// Embedded in the iPad split's main column (no sheet chrome).
     private let embedded: Bool
+    private var composerRest: NSLayoutConstraint?
     private var backgroundObserver: NSObjectProtocol?
 
     deinit {
@@ -241,7 +242,9 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             free.bottomAnchor.constraint(equalTo: composer.topAnchor, constant: -20),
             free.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             free.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            heroStack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            // Safe area, not view: insets can differ side to side (the
+            // iPhone Duo's camera and status bar sit on one edge).
+            heroStack.centerXAnchor.constraint(equalTo: view.safeAreaLayoutGuide.centerXAnchor),
             heroStack.centerYAnchor.constraint(equalTo: free.centerYAnchor),
             heroStack.topAnchor.constraint(greaterThanOrEqualTo: free.topAnchor),
             heroStack.bottomAnchor.constraint(lessThanOrEqualTo: free.bottomAnchor),
@@ -249,8 +252,8 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             composer.leadingAnchor.constraint(greaterThanOrEqualTo: view.safeAreaLayoutGuide.leadingAnchor, constant: 12),
             composer.widthAnchor.constraint(lessThanOrEqualToConstant: 768),
             fill,
-            composer.bottomAnchor.constraint(equalTo: view.keyboardLayoutGuide.topAnchor, constant: -8),
         ])
+        composerRest = pinAboveKeyboard(composer)
         // A draft's project removed since: run where it was meant to.
         if let id = draft.projectId, !app.projectOptions.contains(where: { $0.id == id }), let row = restoring {
             draft.projectId = nil
@@ -407,6 +410,11 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if focusOnAppear { composer.becomeFirstResponder() }
+    }
+
+    override func viewWillLayoutSubviews() {
+        super.viewWillLayoutSubviews()
+        composerRest?.constant = -composerRestGap
     }
 
     override func viewDidLayoutSubviews() {

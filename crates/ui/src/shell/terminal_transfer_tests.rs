@@ -776,3 +776,51 @@ fn closing_terminal_during_open_releases_the_late_pty(cx: &mut TestAppContext) {
             .any(|frame| frame.method.as_deref() == Some(methods::SUBSCRIBE_TERMINAL))
     );
 }
+
+#[gpui::test]
+fn closing_the_window_closes_its_drawer_and_right_pane_ptys(cx: &mut TestAppContext) {
+    use zeron_rpc::methods;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = runtime.enter();
+    let (shell, sessions, cx) = setup(cx, 1, 1);
+    let (_replies, mut rx) = test_connection(&shell, cx);
+    let right = shell.read_with(cx, |shell, cx| {
+        let terminal = shell.right_terminals.values().next().unwrap();
+        terminal
+            .panel
+            .read(cx)
+            .session_for_tab("parent", terminal.key)
+            .unwrap()
+    });
+    for (session, id) in [(&sessions[0], "drawer-pty"), (&right, "right-pty")] {
+        session.update(cx, |model, cx| {
+            assert!(model.attach_reserved_session(
+                zeron_proto::TerminalSession {
+                    id: id.into(),
+                    cwd: "/project".into(),
+                    shell: "bash".into(),
+                },
+                None,
+                cx
+            ));
+        });
+    }
+    pump(&runtime, cx);
+    requests(&mut rx);
+    // Only the window keeps the shell: closing it must release the view.
+    let weak = shell.downgrade();
+    drop(shell);
+    cx.update(|window, _| window.remove_window());
+    pump(&runtime, cx);
+    assert!(weak.upgrade().is_none(), "a closed window's shell was kept alive");
+    let mut closed: Vec<String> = requests(&mut rx)
+        .into_iter()
+        .filter(|frame| frame.method.as_deref() == Some(methods::CLOSE_TERMINAL))
+        .map(|frame| frame.params["terminalId"].as_str().unwrap().to_string())
+        .collect();
+    closed.sort();
+    assert_eq!(closed, ["drawer-pty", "right-pty"]);
+}

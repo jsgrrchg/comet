@@ -531,6 +531,17 @@ impl TerminalPanel {
         }
     }
 
+    /// Close every session this panel holds: its window is going away, and a
+    /// live shell no view can reach again would keep running on its host
+    /// (the engine keeps detached shells alive on purpose).
+    pub(crate) fn close_all_sessions(&mut self, cx: &mut Context<Self>) {
+        for tabs in self.chats.values() {
+            for tab in &tabs.tabs {
+                tab.session.update(cx, |session, cx| session.close(cx));
+            }
+        }
+    }
+
     /// Transfer removes presentation only. The session and all its tasks stay
     /// alive in the returned entity; close_tab is deliberately a separate path.
     pub(crate) fn take_session(

@@ -1956,6 +1956,57 @@ impl VoiceTween {
     }
 }
 
+/// Everything that shaped one logical line. Equal keys shape identically, so
+/// an edit reshapes only the lines it changed.
+#[derive(Clone, PartialEq)]
+struct LineShapeKey {
+    text: String,
+    runs: Vec<TextRun>,
+    font_size: Pixels,
+    wrap_width: Option<Pixels>,
+    chips: Vec<Range<usize>>,
+}
+
+/// The previous layout's shaped lines, offered for reuse by the next one.
+/// Lines are found by text, so they still match after lines above them were
+/// inserted or removed.
+struct ShapedLineCache {
+    lines: Vec<Option<WrappedLine>>,
+    keys: Vec<LineShapeKey>,
+    by_text: HashMap<u64, Vec<usize>>,
+}
+
+impl ShapedLineCache {
+    fn new(lines: Vec<WrappedLine>, keys: Vec<LineShapeKey>) -> Self {
+        let mut by_text: HashMap<u64, Vec<usize>> = HashMap::new();
+        if lines.len() == keys.len() {
+            for (ix, key) in keys.iter().enumerate() {
+                by_text.entry(text_hash(&key.text)).or_default().push(ix);
+            }
+        }
+        Self {
+            lines: lines.into_iter().map(Some).collect(),
+            keys,
+            by_text,
+        }
+    }
+
+    fn take(&mut self, key: &LineShapeKey) -> Option<WrappedLine> {
+        let candidates = self.by_text.get(&text_hash(&key.text))?;
+        candidates
+            .iter()
+            .find(|ix| self.keys[**ix] == *key && self.lines[**ix].is_some())
+            .and_then(|ix| self.lines[*ix].take())
+    }
+}
+
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Shaping inputs excluding mutable viewport and selection geometry.
 #[derive(Clone, PartialEq)]
 struct InputLayoutKey {
@@ -2043,6 +2094,10 @@ pub struct ComposerInput {
     /// Row height of each logical line: `line_height`, except headings in a
     /// Markdown document, which are set larger.
     line_heights: Vec<Pixels>,
+    /// What shaped each line of `last_lines`, for reuse on the next layout.
+    line_keys: Vec<LineShapeKey>,
+    #[cfg(test)]
+    shaped_lines: usize,
     last_bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
     content_height: f32,
@@ -2167,6 +2222,9 @@ impl ComposerInput {
             line_starts: vec![0],
             line_indents: Vec::new(),
             line_heights: Vec::new(),
+            line_keys: Vec::new(),
+            #[cfg(test)]
+            shaped_lines: 0,
             last_bounds: None,
             line_height: px(INPUT_LINE_HEIGHT),
             content_height: INPUT_LINE_HEIGHT,
@@ -4552,6 +4610,11 @@ impl ComposerInput {
 
         // Each logical list line reserves its marker width for continuation
         // rows. Painting and hit testing apply the same continuation offset.
+        let mut cache = ShapedLineCache::new(
+            std::mem::take(&mut self.last_lines),
+            std::mem::take(&mut self.line_keys),
+        );
+        let mut line_keys = Vec::new();
         let mut lines = Vec::new();
         let mut indents = Vec::new();
         let mut display_at = 0;
@@ -4635,27 +4698,44 @@ impl ComposerInput {
                     })
                 })
                 .collect();
-            if let Ok(shaped) = window.text_system().shape_text(
-                text.to_string().into(),
-                line_font_size,
-                &line_runs,
-                (!self.single_line).then_some((width - indent).max(px(20.0))),
+            let chips: Vec<_> = self.projection.mentions[self
+                .projection
+                .mentions
+                .partition_point(|(_, r)| r.end <= display_at)..]
+                .iter()
+                .take_while(|(_, r)| r.start < end)
+                .filter(|(_, r)| r.start >= display_at && r.end <= end)
+                .map(|(_, r)| r.start - display_at..r.end - display_at)
+                .collect();
+            let key = LineShapeKey {
+                text: text.to_string(),
+                runs: line_runs,
+                font_size: line_font_size,
+                wrap_width: (!self.single_line).then_some((width - indent).max(px(20.0))),
+                chips,
+            };
+            if let Some(line) = cache.take(&key) {
+                lines.push(line);
+                line_keys.push(key);
+                indents.push(indent);
+                line_heights.push(line_height);
+            } else if let Ok(shaped) = window.text_system().shape_text(
+                key.text.clone().into(),
+                key.font_size,
+                &key.runs,
+                key.wrap_width,
                 None,
             ) {
-                let chips: Vec<_> = self.projection.mentions[self
-                    .projection
-                    .mentions
-                    .partition_point(|(_, r)| r.end <= display_at)..]
-                    .iter()
-                    .take_while(|(_, r)| r.start < end)
-                    .filter(|(_, r)| r.start >= display_at && r.end <= end)
-                    .map(|(_, r)| r.start - display_at..r.end - display_at)
-                    .collect();
+                #[cfg(test)]
+                {
+                    self.shaped_lines += 1;
+                }
                 for mut line in shaped {
-                    if !self.single_line {
-                        wrap_reference_chips(&mut line, &chips, (width - indent).max(px(20.0)));
+                    if let Some(wrap_width) = key.wrap_width {
+                        wrap_reference_chips(&mut line, &key.chips, wrap_width);
                     }
                     lines.push(line);
+                    line_keys.push(key.clone());
                     indents.push(indent);
                     line_heights.push(line_height);
                 }
@@ -4665,6 +4745,7 @@ impl ComposerInput {
         }
         self.line_indents = indents;
         self.line_heights = line_heights;
+        self.line_keys = line_keys;
 
         // Logical line byte offsets (each shaped line covers one \n-split line).
         let mut line_starts = Vec::with_capacity(lines.len());
@@ -5328,6 +5409,15 @@ impl gpui::Element for ComposerTextElement {
                 for (line_ix, line) in lines.iter().enumerate() {
                     let line_height = line_heights.get(line_ix).copied().unwrap_or(line_height);
                     let height = line.size(line_height).height;
+                    // Only the rows in view are painted; a long document's
+                    // other lines cost nothing per frame.
+                    if y > paint_bounds.bottom() {
+                        break;
+                    }
+                    if y + height < paint_bounds.top() {
+                        y += height;
+                        continue;
+                    }
                     let indent = indents.get(line_ix).copied().unwrap_or_default();
                     if indent > px(0.0) && !line.wrap_boundaries().is_empty() {
                         for row in 0..=line.wrap_boundaries().len() {
@@ -12066,6 +12156,32 @@ mod tests {
             input.needs_measure = true;
             input.layout_text(px(400.), &window.text_style(), window, cx);
             assert_eq!(input.line_heights[0], input.line_heights[1]);
+        });
+    }
+
+    #[gpui::test]
+    fn layout_reshapes_only_the_lines_an_edit_changed(cx: &mut gpui::TestAppContext) {
+        with_composer_input(cx, |input, window, cx| {
+            input.set_text("one\ntwo\nthree", cx);
+            input.layout_text(px(400.), &window.text_style(), window, cx);
+            let shaped = input.shaped_lines;
+            // Moving the caret over plain lines reshapes nothing.
+            input.move_to(5, cx);
+            input.layout_text(px(400.), &window.text_style(), window, cx);
+            assert_eq!(input.shaped_lines, shaped);
+            input.replace_text_in_range(None, "X", window, cx);
+            input.layout_text(px(400.), &window.text_style(), window, cx);
+            assert_eq!(input.shaped_lines, shaped + 1);
+            assert_eq!(input.last_lines.len(), 3);
+            // A line inserted above keeps the rest cached.
+            input.move_to(0, cx);
+            input.replace_text_in_range(None, "zero\n", window, cx);
+            input.layout_text(px(400.), &window.text_style(), window, cx);
+            assert_eq!(input.shaped_lines, shaped + 2);
+            assert_eq!(input.last_lines.len(), 4);
+            // A new width reshapes every line.
+            input.layout_text(px(300.), &window.text_style(), window, cx);
+            assert_eq!(input.shaped_lines, shaped + 6);
         });
     }
 

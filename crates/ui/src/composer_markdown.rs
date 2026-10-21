@@ -10,7 +10,7 @@ pub use zeron_markdown::live::*;
 /// over the whole draft colors fence bodies as strings, including identifiers.
 /// Keep prose and fence markers neutral, and retain exact source byte offsets.
 pub fn syntax_spans(text: &str) -> Vec<zeron_syntax::HighlightSpan> {
-    if text.len() > 128 * 1024 {
+    if text.len() > LIVE_MAX_BYTES {
         return Vec::new();
     }
     let mut language = None;
@@ -59,7 +59,7 @@ fn highlight_code_body(
             fence_tag: Some(language),
         },
         zeron_syntax::HighlightLimits {
-            max_source_bytes: 128 * 1024,
+            max_source_bytes: LIVE_MAX_BYTES,
             max_spans: 16_000 - result.len(),
         },
         None,
@@ -102,7 +102,7 @@ mod tests {
             && span.kind == zeron_syntax::HighlightKind::Keyword));
         assert!(spans.iter().any(|span| &text[span.range.clone()] == "def"
             && span.kind == zeron_syntax::HighlightKind::Keyword));
-        assert!(syntax_spans(&"x".repeat(128 * 1024 + 1)).is_empty());
+        assert!(syntax_spans(&"x".repeat(LIVE_MAX_BYTES + 1)).is_empty());
         assert!(
             spans
                 .iter()

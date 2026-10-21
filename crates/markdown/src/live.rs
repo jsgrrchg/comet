@@ -5,6 +5,10 @@
 use pulldown_cmark::{Event, Options, Parser, Tag};
 use std::ops::Range;
 
+/// Documents past this size get no live styling: every edit reparses the
+/// whole text. It covers the largest session notes (256 KB).
+pub const LIVE_MAX_BYTES: usize = 256 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Face {
     Bold,
@@ -16,7 +20,7 @@ pub enum Face {
 /// Headings by source range, with their level (1 for `#`). A live preview
 /// sizes them; [`faces`] already makes them bold.
 pub fn headings(text: &str) -> Vec<(Range<usize>, u8)> {
-    if text.len() > 128 * 1024 {
+    if text.len() > LIVE_MAX_BYTES {
         return Vec::new();
     }
     Parser::new_ext(
@@ -32,7 +36,7 @@ pub fn headings(text: &str) -> Vec<(Range<usize>, u8)> {
 }
 
 pub fn faces(text: &str) -> Vec<(Range<usize>, Face)> {
-    if text.len() > 128 * 1024 {
+    if text.len() > LIVE_MAX_BYTES {
         return Vec::new();
     }
     Parser::new_ext(
@@ -350,7 +354,7 @@ fn decorate_atx_heading(source: &str, offset: usize, edits: &mut Vec<(Range<usiz
 /// Hidden delimiters outside the active logical line, and typographic bullets.
 /// Each replacement retains a source range for caret/IME mapping.
 pub fn decorations(text: &str, active: Range<usize>) -> Vec<(Range<usize>, String)> {
-    if text.len() > 128 * 1024 {
+    if text.len() > LIVE_MAX_BYTES {
         return Vec::new();
     }
     let mut edits = Vec::new();
@@ -510,7 +514,7 @@ mod tests {
     #[test]
     fn dense_markdown_decorations_remain_bounded_and_ordered() {
         let text = "- **é**\n".repeat(10_000);
-        assert!(text.len() < 128 * 1024);
+        assert!(text.len() < LIVE_MAX_BYTES);
         let started = std::time::Instant::now();
         let edits = decorations(&text, text.len()..text.len());
         eprintln!("10,000 decorated lines: {:?}", started.elapsed());
@@ -527,7 +531,7 @@ mod tests {
         let edits = decorations(&tasks, tasks.len()..tasks.len());
         assert_eq!(edits.len(), 10_000);
         assert!(edits.iter().all(|(_, replacement)| replacement == "☑"));
-        assert!(decorations(&"- **é**\n".repeat(20_000), 0..0).is_empty());
+        assert!(decorations(&"- **é**\n".repeat(LIVE_MAX_BYTES / 9 + 1), 0..0).is_empty());
     }
 
     #[test]

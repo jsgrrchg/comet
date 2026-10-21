@@ -1211,13 +1211,19 @@ fn wrap_reference_chips(line: &mut WrappedLine, chips: &[Range<usize>], width: P
 
 impl TextProjection {
     fn new(raw: &str) -> Self {
-        Self::project(raw, None, false, None)
+        Self::project(raw, None, false, None, true)
     }
 
     /// `live` names the attachments the draft still holds; a chip outside it is
     /// a dangling reference and shows as its plain label.
     fn rich(raw: &str, active: Option<Range<usize>>, live: Option<&HashSet<u32>>) -> Self {
-        Self::project(raw, active, true, live)
+        Self::project(raw, active, true, live, true)
+    }
+
+    /// Markdown decorations alone, for documents where a reference link is
+    /// just a link, never a chip.
+    fn markdown(raw: &str, active: Range<usize>) -> Self {
+        Self::project(raw, Some(active), true, None, false)
     }
 
     fn project(
@@ -1225,7 +1231,11 @@ impl TextProjection {
         active: Option<Range<usize>>,
         compact: bool,
         live: Option<&HashSet<u32>>,
+        chips: bool,
     ) -> Self {
+        if !chips {
+            return Self::assemble(raw, active, Vec::new());
+        }
         let mut links = file_mention_links(raw);
         links.extend(
             zeron_proto::invocation::invocation_links(raw)
@@ -1285,8 +1295,7 @@ impl TextProjection {
         } else {
             labels
         };
-        let mut projection = Self::default();
-        let mut edits: Vec<(Range<usize>, String, Option<FileMentionLink>)> = links
+        let edits: Vec<(Range<usize>, String, Option<FileMentionLink>)> = links
             .into_iter()
             .zip(labels)
             .map(|(link, label)| {
@@ -1301,6 +1310,17 @@ impl TextProjection {
                 (link.range.clone(), display, Some(link))
             })
             .collect();
+        Self::assemble(raw, active, edits)
+    }
+
+    /// Lay chip `edits` and, around an `active` source range, the Markdown
+    /// decorations out into one display string with its offset mappings.
+    fn assemble(
+        raw: &str,
+        active: Option<Range<usize>>,
+        mut edits: Vec<(Range<usize>, String, Option<FileMentionLink>)>,
+    ) -> Self {
+        let mut projection = Self::default();
         if let Some(active) = active {
             let links: Vec<_> = edits.iter().map(|(range, _, _)| range.clone()).collect();
             for (range, replacement) in composer_markdown::decorations(raw, active) {
@@ -1529,6 +1549,8 @@ enum EditKind {
 
 const GENERIC_COMPOSER_CONTEXT: &str = "Composer";
 pub(crate) const MESSAGE_COMPOSER_CONTEXT: &str = "MessageComposer";
+/// A document: Enter breaks the line and nothing submits.
+pub(crate) const DOCUMENT_INPUT_CONTEXT: &str = "DocumentInput";
 const PALETTE_SEARCH_CONTEXT: &str = "PaletteSearch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1688,6 +1710,13 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
         Some(GENERIC_COMPOSER_CONTEXT),
     ));
 
+    let mut document_bindings = input_bindings(DOCUMENT_INPUT_CONTEXT);
+    document_bindings.push(KeyBinding::new(
+        "enter",
+        Newline,
+        Some(DOCUMENT_INPUT_CONTEXT),
+    ));
+
     let mut message_bindings = input_bindings(MESSAGE_COMPOSER_CONTEXT);
     for binding in message_enter_bindings(send_behavior, &platform_combo("mod-enter")) {
         match binding.action {
@@ -1776,6 +1805,7 @@ pub fn init(cx: &mut App, send_behavior: ComposerSendBehavior) {
     }
     cx.bind_keys(palette_bindings);
     cx.bind_keys(generic_bindings);
+    cx.bind_keys(document_bindings);
     cx.bind_keys(message_bindings);
 }
 
@@ -1914,6 +1944,7 @@ struct InputLayoutKey {
     marked_range: Option<Range<usize>>,
     placeholder: SharedString,
     mentions_enabled: bool,
+    markdown: bool,
     active_line: Option<Range<usize>>,
 }
 
@@ -2002,6 +2033,12 @@ pub struct ComposerInput {
     /// File mentions are a composer feature, not a behavior of generic inputs
     /// (picker searches and rename fields also use this type).
     mentions_enabled: bool,
+    /// Live Markdown (hidden markers off the caret's line, list editing, code
+    /// highlighting) without the composer's chips. Mentions imply it.
+    markdown: bool,
+    /// Take the parent's full height and scroll inside it, like a document
+    /// pane, instead of growing with the text up to a cap.
+    fill_height: bool,
     /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
@@ -2112,6 +2149,8 @@ impl ComposerInput {
             syntax_task: None,
             ghost: None,
             mentions_enabled: false,
+            markdown: false,
+            fill_height: false,
             layout_epoch: 0,
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
@@ -2159,6 +2198,23 @@ impl ComposerInput {
     pub fn with_single_line(mut self) -> Self {
         self.single_line = true;
         self
+    }
+
+    /// Edit Markdown as a document: markers hide off the caret's line, lists
+    /// continue and indent, fenced code is highlighted. Links stay links.
+    pub(crate) fn with_markdown(mut self) -> Self {
+        self.markdown = true;
+        self
+    }
+
+    /// Fill the parent's height (which must be definite) and scroll inside it.
+    pub(crate) fn with_fill_height(mut self) -> Self {
+        self.fill_height = true;
+        self
+    }
+
+    fn projects_markdown(&self) -> bool {
+        self.mentions_enabled || self.markdown
     }
 
     /// Join the window's Tab order, for a field the keyboard must reach.
@@ -2254,6 +2310,8 @@ impl ComposerInput {
                 Some(self.editing_source_range()),
                 live.as_ref(),
             )
+        } else if self.markdown {
+            TextProjection::markdown(&self.content, self.editing_source_range())
         } else {
             TextProjection {
                 display: self.content.clone(),
@@ -2553,6 +2611,47 @@ impl ComposerInput {
         self.reset_blink();
         self.needs_measure = true;
         cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+    }
+
+    /// Apply a change made elsewhere (another device editing a synced
+    /// document): `range` becomes `text`, and the caret, selection and scroll
+    /// position carry across it. Emits no `Edited`, since the owner already
+    /// knows. The undo history is dropped: its snapshots predate the change,
+    /// and restoring one would revert it.
+    pub(crate) fn apply_external_edit(
+        &mut self,
+        range: Range<usize>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if range.start > range.end
+            || range.end > self.content.len()
+            || !self.content.is_char_boundary(range.start)
+            || !self.content.is_char_boundary(range.end)
+        {
+            return;
+        }
+        let edit = zeron_doc::TextEdit {
+            range,
+            insert: text.to_owned(),
+        };
+        self.invalidate_mention_tooltip();
+        self.edit_revision = self.edit_revision.wrapping_add(1);
+        self.content = edit.apply(&self.content);
+        self.selected_range =
+            edit.map_offset(self.selected_range.start)..edit.map_offset(self.selected_range.end);
+        self.marked_range = self
+            .marked_range
+            .take()
+            .map(|marked| edit.map_offset(marked.start)..edit.map_offset(marked.end))
+            .filter(|marked| !marked.is_empty());
+        self.preferred_column = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.last_edit = None;
+        self.refresh_projection();
+        self.needs_measure = true;
         cx.notify();
     }
 
@@ -3557,7 +3656,8 @@ impl ComposerInput {
     }
 
     fn newline(&mut self, _: &Newline, window: &mut Window, cx: &mut Context<Self>) {
-        if self.mentions_enabled && self.selected_range.is_empty() && self.marked_range.is_none() {
+        if self.projects_markdown() && self.selected_range.is_empty() && self.marked_range.is_none()
+        {
             if let Some((range, inserted)) =
                 composer_markdown::newline_edit(&self.content, self.cursor_offset())
             {
@@ -3619,7 +3719,7 @@ impl ComposerInput {
     }
 
     fn indent_list(&mut self, outdent: bool, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if !self.mentions_enabled
+        if !self.projects_markdown()
             || self.read_only
             || self.marked_range.is_some()
             || self.mention_open
@@ -4204,7 +4304,10 @@ impl ComposerInput {
             marked_range: self.marked_range.clone(),
             placeholder: self.placeholder.clone(),
             mentions_enabled: self.mentions_enabled,
-            active_line: self.mentions_enabled.then(|| self.editing_source_range()),
+            markdown: self.markdown,
+            active_line: self
+                .projects_markdown()
+                .then(|| self.editing_source_range()),
         };
         // Height-only animation, scrolling, selection and caret blinking do
         // not change shaping. Reuse the entity's single retained layout,
@@ -4254,12 +4357,12 @@ impl ComposerInput {
             }),
             strikethrough: None,
         };
-        let raw_faces = if self.mentions_enabled && !is_placeholder {
+        let raw_faces = if self.projects_markdown() && !is_placeholder {
             composer_markdown::faces(&self.content)
         } else {
             Vec::new()
         };
-        let faces = if self.mentions_enabled && !is_placeholder {
+        let faces = if self.projects_markdown() && !is_placeholder {
             raw_faces
                 .iter()
                 .cloned()
@@ -4274,7 +4377,7 @@ impl ComposerInput {
         } else {
             Vec::new()
         };
-        let syntax: Vec<_> = if self.mentions_enabled && self.syntax_source == self.content {
+        let syntax: Vec<_> = if self.projects_markdown() && self.syntax_source == self.content {
             self.syntax_spans
                 .iter()
                 .map(|span| {
@@ -4415,7 +4518,7 @@ impl ComposerInput {
                 .next()
                 .unwrap_or_default();
             let mut indent = px(0.0);
-            if self.mentions_enabled && !is_placeholder {
+            if self.projects_markdown() && !is_placeholder {
                 if let Some(prefix) = composer_markdown::list_prefix(raw_line).filter(|prefix| {
                     let marker_at = raw_at + prefix.indent;
                     let code_ix = code_ranges.partition_point(|range| range.end <= marker_at);
@@ -4779,6 +4882,8 @@ struct ComposerTextElement {
     input: Entity<ComposerInput>,
     /// Max content height before internal scrolling kicks in.
     max_content_height: f32,
+    /// Take the parent's height rather than the text's.
+    fill_height: bool,
 }
 
 struct MentionPathTooltip {
@@ -4855,6 +4960,9 @@ impl gpui::Element for ComposerTextElement {
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
+        if self.fill_height {
+            style.size.height = relative(1.0).into();
+        }
         let input = self.input.clone();
         let text_style = window.text_style();
         let max_content = self.max_content_height;
@@ -4867,7 +4975,10 @@ impl gpui::Element for ComposerTextElement {
                 let content_height = input.update(cx, |input, cx| {
                     input.layout_text(width, &text_style, window, cx)
                 });
-                size(width, px(content_height.min(max_content)))
+                size(
+                    width,
+                    known.height.unwrap_or(px(content_height.min(max_content))),
+                )
             });
         (layout_id, ())
     }
@@ -5207,7 +5318,7 @@ impl gpui::Element for ComposerTextElement {
 
 impl Render for ComposerInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.mentions_enabled && self.syntax_source != self.content {
+        if self.projects_markdown() && self.syntax_source != self.content {
             self.syntax_source = self.content.clone();
             self.syntax_spans.clear();
             let source = self.syntax_source.clone();
@@ -5308,6 +5419,7 @@ impl Render for ComposerInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .w_full()
+            .when(self.fill_height, |el| el.h_full())
             .text_size(crate::typography::ui_rems(self.text_size))
             .line_height(crate::typography::ui_rems(self.configured_line_height))
             .text_color(text_color)
@@ -5315,6 +5427,7 @@ impl Render for ComposerInput {
             .child({
                 let input = cx.entity();
                 let ascent = self.max_ascent;
+                let fill_height = self.fill_height;
                 crate::edge_fade::edge_faded(
                     INPUT_FADE_BAND,
                     true,
@@ -5324,6 +5437,7 @@ impl Render for ComposerInput {
                         max_content_height: self
                             .viewport_height
                             .unwrap_or(TEXTAREA_MAX - TEXTAREA_PAD_V),
+                        fill_height,
                     },
                 )
                 // Fade through the existing top padding, like the transcript
@@ -5337,9 +5451,11 @@ impl Render for ComposerInput {
                         .map_or(0.0, |bounds| f32::from(bounds.size.height));
                     input_overflow_edges(
                         input.content_height,
-                        input
-                            .settled_viewport_height
-                            .unwrap_or(TEXTAREA_MAX - TEXTAREA_PAD_V),
+                        input.settled_viewport_height.unwrap_or(if fill_height {
+                            visible_height
+                        } else {
+                            TEXTAREA_MAX - TEXTAREA_PAD_V
+                        }),
                         visible_height,
                         input.scroll_top,
                     )
@@ -11786,6 +11902,94 @@ mod tests {
         }
     }
 
+    #[gpui::test]
+    fn document_inputs_break_lines_and_continue_lists_on_enter(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+            init(cx, ComposerSendBehavior::default());
+        });
+        let handle = cx.add_window(|window, cx| {
+            let mut input =
+                ComposerInput::with_context("", DOCUMENT_INPUT_CONTEXT, cx).with_markdown();
+            input.set_text("- first", cx);
+            window.focus(&input.focus_handle, cx);
+            input
+        });
+        let submitted = std::rc::Rc::new(std::cell::Cell::new(false));
+        handle
+            .update(cx, |_, _, cx| {
+                let submitted = submitted.clone();
+                cx.subscribe_self(move |_, event: &ComposerInputEvent, _| {
+                    if matches!(
+                        event,
+                        ComposerInputEvent::Submitted | ComposerInputEvent::ModifiedSubmitted
+                    ) {
+                        submitted.set(true);
+                    }
+                })
+                .detach();
+            })
+            .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| window.draw(cx).clear())
+            .unwrap();
+        cx.simulate_keystrokes(handle.into(), "enter");
+        cx.simulate_input(handle.into(), "second");
+        // Enter on the empty item ends the list.
+        cx.simulate_keystrokes(handle.into(), "enter enter");
+        cx.simulate_input(handle.into(), "after");
+        assert_eq!(
+            handle
+                .read_with(cx, |input, _| input.text().to_owned())
+                .unwrap(),
+            "- first\n- second\nafter"
+        );
+        assert!(!submitted.get(), "a document never submits");
+    }
+
+    #[gpui::test]
+    fn markdown_documents_decorate_without_chips(cx: &mut gpui::TestAppContext) {
+        let input = cx.new(|cx| ComposerInput::new("Notes", cx).with_markdown());
+        input.update(cx, |input, cx| {
+            let link = local_file_link("src/main.rs", false);
+            input.set_text(format!("**bold** {link}\nactive"), cx);
+            input.refresh_projection();
+            assert!(input.projection.mentions.is_empty(), "links stay links");
+            assert!(input.projection.display.starts_with("bold "));
+            assert!(input.projection.display.contains(&link));
+            // The caret's own line shows its source.
+            input.move_to(2, cx);
+            input.refresh_projection();
+            assert!(input.projection.display.starts_with("**bold**"));
+        });
+    }
+
+    #[gpui::test]
+    fn external_edits_carry_the_caret_and_selection(cx: &mut gpui::TestAppContext) {
+        with_composer_input(cx, |input, window, cx| {
+            input.set_text("alpha beta gamma", cx);
+            input.move_to(input.text().len(), cx);
+            input.replace_text_in_range(None, "!", window, cx);
+            assert!(!input.undo_stack.is_empty());
+            // Select "beta", then another device rewrites "alpha".
+            input.selected_range = 6..10;
+            input.apply_external_edit(0..5, "ALPHA, ALPHA", cx);
+            assert_eq!(input.text(), "ALPHA, ALPHA beta gamma!");
+            assert_eq!(&input.text()[input.selected_range.clone()], "beta");
+            // An edit after the selection leaves it alone.
+            input.apply_external_edit(input.text().len()..input.text().len(), "?", cx);
+            assert_eq!(&input.text()[input.selected_range.clone()], "beta");
+            // Undo can no longer reach back past someone else's change.
+            assert!(input.undo_stack.is_empty() && input.redo_stack.is_empty());
+            input.undo(&Undo, window, cx);
+            assert_eq!(input.text(), "ALPHA, ALPHA beta gamma!?");
+            // Out-of-bounds or mid-char ranges are ignored.
+            input.apply_external_edit(0..1000, "x", cx);
+            input.set_text("é", cx);
+            input.apply_external_edit(1..1, "x", cx);
+            assert_eq!(input.text(), "é");
+        });
+    }
     #[gpui::test]
     fn dock_morph_restores_skinny_height_with_a_continuous_editor_origin(
         cx: &mut gpui::TestAppContext,

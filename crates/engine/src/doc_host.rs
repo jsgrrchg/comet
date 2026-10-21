@@ -640,8 +640,21 @@ pub struct ChatDocHandle {
     publication_failed: AtomicBool,
     /// Local-update feed into the chat2 client (drop = unsubscribe).
     chat2_local_sub: Mutex<Option<loro::Subscription>>,
+    /// What the doc subscription has counted so far (see [`DocChanges`]).
+    #[cfg(test)]
+    changes: watch::Receiver<DocChanges>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
+}
+
+/// Running counts of the event batches a handle's doc has emitted, local
+/// commits and remote imports alike. `transcript` leaves out batches that
+/// only touched the notes: the user typing in the scratchpad, here or on
+/// another device, has nothing to republish, drain or dispatch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DocChanges {
+    any: u64,
+    transcript: u64,
 }
 
 /// A running agent explicitly owns a writer lease until its final cleanup.
@@ -1550,7 +1563,7 @@ impl DocHost {
         });
         let changed_persistence = persistence.clone();
 
-        let (changed_tx, changed_rx) = watch::channel(0u64);
+        let (changed_tx, changed_rx) = watch::channel(DocChanges::default());
         let (messages_tx, _) = watch::channel(TranscriptSnapshot::default());
         let transcript_history = Arc::new(Mutex::new(
             crate::transcript_history::TranscriptHistory::default(),
@@ -1572,7 +1585,13 @@ impl DocHost {
             if let Some(persistence) = &changed_persistence {
                 persistence.dirty(false);
             }
-            changed_tx.send_modify(|v| *v = v.wrapping_add(1));
+            let touch = zeron_doc::NotesTouch::of(&diff);
+            changed_tx.send_modify(|changes| {
+                changes.any = changes.any.wrapping_add(1);
+                if touch.other || !touch.notes {
+                    changes.transcript = changes.transcript.wrapping_add(1);
+                }
+            });
         }));
         // The mirror starts dirty and empty; watch_messages materializes it
         // once on attach instead of maintaining an unwatched transcript.
@@ -1622,6 +1641,8 @@ impl DocHost {
             chat2_pending_local: Mutex::new(Vec::new()),
             publication_failed: AtomicBool::new(false),
             chat2_local_sub: Mutex::new(None),
+            #[cfg(test)]
+            changes: changed_rx.clone(),
             _sub: sub,
         });
         // Snapshot recovery may restore several independently edited rows.
@@ -6366,7 +6387,11 @@ mod queued_message_prompt_tests {
 /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 /// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
 /// Holds only a weak handle so a dropped host tears the task down.
-async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: watch::Receiver<u64>) {
+async fn chat_task(
+    host: DocHost,
+    weak: Weak<ChatDocHandle>,
+    mut changed_rx: watch::Receiver<DocChanges>,
+) {
     // Prompt delivery may wait for mailbox capacity. Keep a separate watcher
     // for interrupt/question controls so that wait cannot block recovery.
     let control_host = host.clone();
@@ -6374,16 +6399,25 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
     let mut control_changes = changed_rx.clone();
     host.spawn_worker(async move {
         loop {
+            // Read before draining: a change landing mid-drain runs another pass.
+            let seen = control_changes.borrow_and_update().transcript;
             let Some(handle) = control_weak.upgrade() else {
                 break;
             };
             control_host.drain_command_kind(&handle, true).await;
             drop(handle);
-            if control_changes.changed().await.is_err() {
+            if control_changes
+                .wait_for(|changes| changes.transcript != seen)
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     });
+    // From the channel's start, not from now: batches that landed before this
+    // task first ran still owe the transcript a pass.
+    let mut transcript_seen = DocChanges::default().transcript;
     // Initial pass: the snapshot may already carry pending commands. The
     // mirror stays lazy — it materializes on the first watch attach.
     {
@@ -6400,13 +6434,18 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                     break; // doc handle (and its change sender) is gone
                 }
                 let Some(handle) = weak.upgrade() else { break };
-                let publishing = handle.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    publishing.publish_messages_if_watched();
-                    publishing.publish_queue();
-                }).await;
-                host.drain_commands(&handle).await;
-                host.drain_queue(&handle).await;
+                let changes = *changed_rx.borrow_and_update();
+                if changes.transcript != transcript_seen {
+                    transcript_seen = changes.transcript;
+                    let publishing = handle.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        publishing.publish_messages_if_watched();
+                        publishing.publish_queue();
+                    }).await;
+                    host.drain_commands(&handle).await;
+                    host.drain_queue(&handle).await;
+                }
+                // Notes-only batches still have to reach disk.
                 if save_deadline.is_none() {
                     save_deadline = Some(
                         tokio::time::Instant::now()
@@ -6433,6 +6472,33 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
 #[cfg(test)]
 mod publication_eviction_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn notes_only_changes_skip_the_transcript_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = DocHost::new(
+            store,
+            DocHostConfig {
+                device_id: "host".into(),
+                default_harness: HarnessId::Mock,
+                edge: None,
+            },
+        );
+        let handle = host.open_local("notes").unwrap();
+        let before = *handle.changes.borrow();
+        handle.doc().set_notes_text("scratch").unwrap();
+        let after = *handle.changes.borrow();
+        assert_eq!(after.any, before.any + 1);
+        assert_eq!(after.transcript, before.transcript);
+        handle
+            .doc()
+            .push_queued(&QueuedMessage::new("q1", "later", "host"))
+            .unwrap();
+        let queued = *handle.changes.borrow();
+        assert_eq!(queued.any, after.any + 1);
+        assert_eq!(queued.transcript, after.transcript + 1);
+    }
 
     #[tokio::test]
     async fn wakeup_handoff_waits_for_snapshot_persistence() {

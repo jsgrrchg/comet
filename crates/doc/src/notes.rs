@@ -28,6 +28,34 @@ use crate::schema::{DocError, SessionDoc};
 /// Root container name of the notes text.
 pub const NOTES_CONTAINER: &str = "notes";
 
+/// Whether a doc event diff targets the notes text. A text has no child
+/// containers, so the target alone decides.
+pub fn is_notes_container(id: &loro::ContainerID) -> bool {
+    matches!(id, loro::ContainerID::Root { name, .. } if name.as_str() == NOTES_CONTAINER)
+}
+
+/// What a batch of doc events touched, split at the notes. Lets the transcript
+/// machinery skip batches that only carried someone's typing in the notes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NotesTouch {
+    pub notes: bool,
+    pub other: bool,
+}
+
+impl NotesTouch {
+    pub fn of(event: &loro::event::DiffEvent<'_>) -> Self {
+        let mut touch = Self::default();
+        for change in &event.events {
+            if is_notes_container(change.target) {
+                touch.notes = true;
+            } else {
+                touch.other = true;
+            }
+        }
+        touch
+    }
+}
+
 /// The notes text as one viewport last saw it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -420,6 +448,65 @@ mod tests {
         let b = peer(&a);
         assert_eq!(b.notes_text(), "- [ ] ship notes\n");
         assert_eq!(b.notes_snapshot(), a.notes_snapshot());
+    }
+
+    #[test]
+    fn a_remote_batch_touching_both_classifies_as_both() {
+        use std::sync::{Arc, Mutex};
+        let doc = doc();
+        doc.push_queued(&crate::QueuedMessage::new("q1", "later", "device"))
+            .unwrap();
+        let other = peer(&doc);
+        let before = other.doc().oplog_vv();
+        doc.set_notes_text("remote notes").unwrap();
+        doc.remove_queued("q1").unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _sub = other.doc().subscribe_root(Arc::new(move |event| {
+            sink.lock().unwrap().push(NotesTouch::of(&event));
+        }));
+        other
+            .doc()
+            .import(
+                &doc.doc()
+                    .export(loro::ExportMode::updates(&before))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![NotesTouch {
+                notes: true,
+                other: true
+            }]
+        );
+    }
+
+    #[test]
+    fn local_commits_classify() {
+        use std::sync::{Arc, Mutex};
+        let doc = doc();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let _sub = doc.doc().subscribe_root(Arc::new(move |event| {
+            sink.lock().unwrap().push(NotesTouch::of(&event));
+        }));
+        doc.set_notes_text("only notes").unwrap();
+        doc.push_queued(&crate::QueuedMessage::new("q1", "later", "device"))
+            .unwrap();
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                NotesTouch {
+                    notes: true,
+                    other: false
+                },
+                NotesTouch {
+                    notes: false,
+                    other: true
+                },
+            ]
+        );
     }
 
     #[test]

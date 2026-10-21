@@ -30,8 +30,8 @@ The desktop UI holds no Loro doc; it reads and writes notes over RPC:
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `WatchSessionNotes` | `{ chatId }` | stream of `{ text, hash }` |
-| `SetSessionNotes` | `{ chatId, baseHash, text }` | `{ kind: "applied", hash }`, `{ kind: "conflict", current }` or `{ kind: "tooLarge", limit }` |
+| `WatchSessionNotes` | `{ chatId }` | stream of `{ text, hash, epoch, seq }` |
+| `SetSessionNotes` | `{ chatId, baseHash, text }` | `{ kind: "applied", hash, epoch, seq }`, `{ kind: "conflict", current }` or `{ kind: "tooLarge", limit }` |
 
 Both are served by the caller's own engine and are not relay-forwardable.
 
@@ -47,11 +47,17 @@ two single-range edits. Disjoint edits both apply. Overlapping ones honor both
 deletions and keep both insertions, the remote one first. Nobody's typing is
 dropped.
 
-The watch also reports a viewport's own writes back, sometimes after a newer
-write has landed. `NotesEchoes` remembers the hashes of a viewport's last 32
-writes so those frames are not merged as reverts. A change elsewhere that
-restores one of those exact texts waits for the viewport's next write, whose
-conflict brings it in.
+A hash says what the notes read, not when. The watch reports a viewport's own
+writes back, sometimes after a newer write has landed, and another device can
+restore text the viewport wrote earlier: the same hash with opposite meanings.
+So snapshots and `applied` replies carry a version. `seq` counts the distinct
+states one doc instance has reported, under the gate, so a version and its
+text never come apart. `epoch` is random per instance, so a reopened doc's
+restarted count never passes for an old one. A viewport drops any snapshot
+that does not supersede its base (same epoch, `seq` no higher) and merges
+every newer one, whatever its text. The only snapshot adopted without a merge
+is one naming a write whose reply was lost: that write landed, and the editor
+already holds it.
 
 The iOS client writes its local replica directly (`SessionHandle::set_notes`)
 with the same compare-and-set, and watches through `watch_notes`.

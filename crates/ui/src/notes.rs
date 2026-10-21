@@ -7,9 +7,14 @@
 //! saw from the engine, its base. One write is in flight at a time. Changes
 //! from other devices that land meanwhile are held, then merged into the
 //! editor with `rebase_notes`, which keeps both sides' typing; whatever local
-//! text remains unwritten goes out with the next write. The watch also reports
+//! text remains unwritten goes out with the next write.
+//!
+//! Snapshots are versioned (`NotesSnapshot::supersedes`). The watch reports
 //! this surface's own writes back, sometimes after a newer one has landed;
-//! `NotesEchoes` keeps those from merging as reverts.
+//! those are no newer than the base and are dropped. Anything newer is a real
+//! change and merges, even when another device restored text this surface
+//! wrote before. The one exception is a write whose reply never came: when
+//! the engine later reports exactly that text, the editor already holds it.
 //!
 //! Closing the tab while a write is in flight leaves the newest text with
 //! that write (`owed`): when it returns to a surface that is gone, it lands
@@ -23,9 +28,7 @@ use gpui::{
     App, AppContext as _, Context, Entity, Focusable as _, InteractiveElement as _, IntoElement,
     ParentElement as _, Render, SharedString, Styled as _, Subscription, Task, Window, div, px,
 };
-use zeron_doc::{
-    NotesEchoes, NotesSnapshot, NotesWrite, notes_hash, rebase_notes, single_range_diff,
-};
+use zeron_doc::{NotesSnapshot, NotesWrite, notes_hash, rebase_notes, single_range_diff};
 use zeron_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent, DOCUMENT_INPUT_CONTEXT};
@@ -46,9 +49,9 @@ pub struct NotesSurface {
     base: Option<NotesSnapshot>,
     /// A snapshot from another device that arrived during a write.
     held: Option<NotesSnapshot>,
-    /// What this surface wrote recently, so the watch echoing it back is not
-    /// mistaken for another device's change.
-    echoes: NotesEchoes,
+    /// Hash of a write that failed without a reply: it may have landed. If
+    /// the engine reports that text, the editor already holds it.
+    unconfirmed: Option<String>,
     in_flight: bool,
     /// Text a flush could not send because a write was in flight. That write
     /// sends it when it returns, even if this surface is gone by then.
@@ -95,7 +98,7 @@ impl NotesSurface {
             input,
             base: None,
             held: None,
-            echoes: NotesEchoes::default(),
+            unconfirmed: None,
             in_flight: false,
             owed: Arc::default(),
             error: None,
@@ -182,11 +185,28 @@ impl NotesSurface {
             cx.notify();
             return;
         };
-        if remote.hash == base.hash || self.echoes.contains(&remote.hash) {
+        if !remote.supersedes(base) {
             return;
         }
         if self.in_flight {
             self.held = Some(remote);
+            return;
+        }
+        self.take_remote(remote, cx);
+    }
+
+    /// A newer state from the engine: adopt it when the editor already holds
+    /// its text, merge it otherwise.
+    fn take_remote(&mut self, remote: NotesSnapshot, cx: &mut Context<Self>) {
+        let Some(base) = &self.base else {
+            return;
+        };
+        if !remote.supersedes(base) {
+            return;
+        }
+        if remote.hash == base.hash || self.unconfirmed.as_deref() == Some(remote.hash.as_str()) {
+            self.unconfirmed = None;
+            self.base = Some(remote);
             return;
         }
         self.merge(remote, cx);
@@ -276,8 +296,6 @@ impl NotesSurface {
             "baseHash": base.hash,
             "text": text,
         });
-        // Before sending: the watch can report the write before it returns.
-        self.echoes.record(notes_hash(&text));
         self.in_flight = true;
         Some((text, base, params))
     }
@@ -293,17 +311,18 @@ impl NotesSurface {
         self.owed.lock().unwrap_or_else(|e| e.into_inner()).take();
         let mut retry = Some(Duration::ZERO);
         match result {
-            Ok(NotesWrite::Applied { hash }) => {
+            Ok(NotesWrite::Applied { hash, epoch, seq }) => {
                 self.error = None;
-                self.base = Some(NotesSnapshot { text, hash });
-            }
-            Ok(NotesWrite::Conflict { current }) if self.echoes.contains(&current.hash) => {
-                // An earlier write of ours landed though its reply was lost:
-                // the editor already holds it, so it is the base now.
-                self.error = None;
-                self.base = Some(current);
+                self.unconfirmed = None;
+                self.base = Some(NotesSnapshot {
+                    text,
+                    hash,
+                    epoch,
+                    seq,
+                });
             }
             Ok(NotesWrite::Conflict { current }) => {
+                // Read at the write: newer than anything the watch sent first.
                 self.error = None;
                 self.held = Some(current);
             }
@@ -321,17 +340,12 @@ impl NotesSurface {
             Err(err) => {
                 tracing::debug!(chat = %self.chat_id, error = %err, "notes write failed");
                 self.error = Some("Couldn't save the notes. Retrying…".into());
+                self.unconfirmed = Some(notes_hash(&text));
                 retry = Some(RETRY_DELAY);
             }
         }
-        if let Some(remote) = self.held.take()
-            && !self.echoes.contains(&remote.hash)
-            && self
-                .base
-                .as_ref()
-                .is_none_or(|base| base.hash != remote.hash)
-        {
-            self.merge(remote, cx);
+        if let Some(remote) = self.held.take() {
+            self.take_remote(remote, cx);
         }
         let unwritten = self
             .base
@@ -349,8 +363,8 @@ const OWED_ATTEMPTS: usize = 4;
 
 /// Land the text a closed surface still owed. `sent` went out on `base` and
 /// came back as `result`; the owed text is newer than `sent`. Conflicts merge
-/// with `rebase_notes`, and a conflict naming text this flush wrote itself
-/// (its reply lost) is adopted rather than merged twice.
+/// with `rebase_notes`, except one naming `sent` after its reply was lost:
+/// that write landed, and the owed text already holds it.
 async fn land_owed<W, F>(
     owed: &Mutex<Option<String>>,
     base: NotesSnapshot,
@@ -364,10 +378,14 @@ async fn land_owed<W, F>(
     let Some(mut text) = owed.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
-    let mut ours = NotesEchoes::default();
-    ours.record(notes_hash(&sent));
+    let mut unconfirmed = result.is_err().then(|| notes_hash(&sent));
     let mut base = match result {
-        Ok(NotesWrite::Applied { hash }) => NotesSnapshot { text: sent, hash },
+        Ok(NotesWrite::Applied { hash, epoch, seq }) => NotesSnapshot {
+            text: sent,
+            hash,
+            epoch,
+            seq,
+        },
         // Lost or refused: start from the old base; a conflict sorts it out.
         Ok(NotesWrite::Conflict { .. }) | Err(_) => base,
         Ok(NotesWrite::TooLarge { .. }) => return,
@@ -376,9 +394,11 @@ async fn land_owed<W, F>(
         if text == base.text {
             return;
         }
-        ours.record(notes_hash(&text));
         match write(base.hash.clone(), text.clone()).await {
-            Ok(NotesWrite::Conflict { current }) if ours.contains(&current.hash) => {
+            Ok(NotesWrite::Conflict { current })
+                if unconfirmed.as_deref() == Some(current.hash.as_str()) =>
+            {
+                unconfirmed = None;
                 base = current;
             }
             Ok(NotesWrite::Conflict { current }) => {
@@ -452,8 +472,13 @@ mod tests {
         (surface, cx)
     }
 
-    fn snapshot(text: &str) -> NotesSnapshot {
-        NotesSnapshot::of(text)
+    /// The engine's report of `text` as its `seq`th state.
+    fn at(text: &str, seq: u64) -> NotesSnapshot {
+        NotesSnapshot {
+            epoch: 7,
+            seq,
+            ..NotesSnapshot::of(text)
+        }
     }
 
     fn type_text(surface: &mut NotesSurface, text: &str, cx: &mut Context<NotesSurface>) {
@@ -462,9 +487,11 @@ mod tests {
         });
     }
 
-    fn applied(text: &str) -> Result<NotesWrite, String> {
+    fn applied(text: &str, seq: u64) -> Result<NotesWrite, String> {
         Ok(NotesWrite::Applied {
             hash: notes_hash(text),
+            epoch: 7,
+            seq,
         })
     }
 
@@ -539,7 +566,7 @@ mod tests {
     fn a_flush_during_a_write_hands_the_text_to_that_write(cx: &mut TestAppContext) {
         let (surface, cx) = surface(cx);
         surface.update(cx, |surface, cx| {
-            surface.receive(snapshot("a"), cx);
+            surface.receive(at("a", 1), cx);
             type_text(surface, "ab", cx);
             let (text, _, _) = surface.begin_write(cx).unwrap();
             type_text(surface, "abc", cx);
@@ -547,7 +574,7 @@ mod tests {
             assert_eq!(surface.owed.lock().unwrap().as_deref(), Some("abc"));
             // The surface outlived the write: it takes the text back and the
             // owed text is not sent twice.
-            surface.written(text, applied("ab"), cx);
+            surface.written(text, applied("ab", 2), cx);
             assert!(surface.owed.lock().unwrap().is_none());
         });
     }
@@ -556,21 +583,46 @@ mod tests {
     fn a_late_echo_of_an_older_write_does_not_revert_the_editor(cx: &mut TestAppContext) {
         let (surface, cx) = surface(cx);
         surface.update(cx, |surface, cx| {
-            surface.receive(snapshot("a"), cx);
+            surface.receive(at("a", 1), cx);
             assert!(!surface.input.read(cx).read_only);
             // First write lands; its echo is still on the way.
             type_text(surface, "ab", cx);
             let (text, _, _) = surface.begin_write(cx).unwrap();
-            surface.written(text, applied("ab"), cx);
+            surface.written(text, applied("ab", 2), cx);
             // Second write goes out; the first one's echo arrives meanwhile.
             type_text(surface, "abc", cx);
             let (text, _, _) = surface.begin_write(cx).unwrap();
-            surface.receive(snapshot("ab"), cx);
-            surface.written(text, applied("abc"), cx);
+            surface.receive(at("ab", 2), cx);
+            surface.written(text, applied("abc", 3), cx);
             // And once more after it, as a straggler.
-            surface.receive(snapshot("ab"), cx);
+            surface.receive(at("ab", 2), cx);
             assert_eq!(surface.input.read(cx).text(), "abc");
             assert_eq!(surface.base.as_ref().unwrap().text, "abc");
+        });
+    }
+
+    #[gpui::test]
+    fn a_remote_change_restoring_our_older_text_is_kept(cx: &mut TestAppContext) {
+        let (surface, cx) = surface(cx);
+        surface.update(cx, |surface, cx| {
+            // This surface wrote "a", then "ab".
+            surface.receive(at("", 1), cx);
+            type_text(surface, "a", cx);
+            let (text, _, _) = surface.begin_write(cx).unwrap();
+            surface.written(text, applied("a", 2), cx);
+            type_text(surface, "ab", cx);
+            let (text, _, _) = surface.begin_write(cx).unwrap();
+            surface.written(text, applied("ab", 3), cx);
+            // Another device deletes "b": the text this surface wrote before,
+            // as a newer state.
+            surface.receive(at("a", 4), cx);
+            assert_eq!(surface.input.read(cx).text(), "a");
+            // The user's next edit builds on it.
+            type_text(surface, "a!", cx);
+            let (text, base, params) = surface.begin_write(cx).unwrap();
+            assert_eq!(text, "a!");
+            assert_eq!(base.text, "a");
+            assert_eq!(params["baseHash"], notes_hash("a"));
         });
     }
 
@@ -578,33 +630,32 @@ mod tests {
     fn another_devices_change_merges_with_unwritten_typing(cx: &mut TestAppContext) {
         let (surface, cx) = surface(cx);
         surface.update(cx, |surface, cx| {
-            surface.receive(snapshot("line\n"), cx);
+            surface.receive(at("line\n", 1), cx);
             type_text(surface, "line\nmine\n", cx);
-            surface.receive(snapshot("theirs\nline\n"), cx);
+            surface.receive(at("theirs\nline\n", 2), cx);
             assert_eq!(surface.input.read(cx).text(), "theirs\nline\nmine\n");
             assert_eq!(surface.base.as_ref().unwrap().text, "theirs\nline\n");
             // During a write the change waits for it, then merges.
             let (text, _, _) = surface.begin_write(cx).unwrap();
-            surface.receive(snapshot("theirs\nline\nmine\nmore\n"), cx);
+            surface.receive(at("theirs\nline\nmore\n", 3), cx);
             assert_eq!(surface.input.read(cx).text(), "theirs\nline\nmine\n");
             surface.written(
                 text,
                 Ok(NotesWrite::Conflict {
-                    current: snapshot("theirs\nline\nmore\n"),
+                    current: at("theirs\nline\nmore\n", 3),
                 }),
                 cx,
             );
-            // The conflict's current state is the newest: merged against it,
-            // their insertion first where both typed at the same spot.
+            // Their insertion first where both typed at the same spot.
             assert_eq!(surface.input.read(cx).text(), "theirs\nline\nmore\nmine\n");
         });
     }
 
     #[gpui::test]
-    fn a_conflict_naming_our_own_write_adopts_it(cx: &mut TestAppContext) {
+    fn a_write_whose_reply_was_lost_is_adopted_not_merged(cx: &mut TestAppContext) {
         let (surface, cx) = surface(cx);
         surface.update(cx, |surface, cx| {
-            surface.receive(snapshot("x"), cx);
+            surface.receive(at("x", 1), cx);
             type_text(surface, "xy", cx);
             let (text, _, _) = surface.begin_write(cx).unwrap();
             // The write landed but its reply was lost.
@@ -614,13 +665,15 @@ mod tests {
             surface.written(
                 text,
                 Ok(NotesWrite::Conflict {
-                    current: snapshot("xy"),
+                    current: at("xy", 2),
                 }),
                 cx,
             );
             // No duplicated "y": the editor already held that write.
             assert_eq!(surface.input.read(cx).text(), "xyz");
             assert_eq!(surface.base.as_ref().unwrap().text, "xy");
+            // An older text this surface wrote is not adopted that way.
+            assert!(surface.unconfirmed.is_none());
         });
     }
 }

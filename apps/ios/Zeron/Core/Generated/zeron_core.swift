@@ -8221,17 +8221,22 @@ public func FfiConverterTypeNewSession_lower(_ value: NewSession) -> RustBuffer 
 
 /**
  * The notes text as one viewport last saw it; `hash` is the base of the
- * next `set_notes`.
+ * next `set_notes`. `epoch` and `seq` order the states: see
+ * `notes_supersedes`.
  */
 public struct NotesSnapshot: Equatable, Hashable {
     public var text: String
     public var hash: String
+    public var epoch: UInt64
+    public var seq: UInt64
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(text: String, hash: String) {
+    public init(text: String, hash: String, epoch: UInt64, seq: UInt64) {
         self.text = text
         self.hash = hash
+        self.epoch = epoch
+        self.seq = seq
     }
 
     
@@ -8251,13 +8256,17 @@ public struct FfiConverterTypeNotesSnapshot: FfiConverterRustBuffer {
         return
             try NotesSnapshot(
                 text: FfiConverterString.read(from: &buf), 
-                hash: FfiConverterString.read(from: &buf)
+                hash: FfiConverterString.read(from: &buf), 
+                epoch: FfiConverterUInt64.read(from: &buf), 
+                seq: FfiConverterUInt64.read(from: &buf)
         )
     }
 
     public static func write(_ value: NotesSnapshot, into buf: inout [UInt8]) {
         FfiConverterString.write(value.text, into: &buf)
         FfiConverterString.write(value.hash, into: &buf)
+        FfiConverterUInt64.write(value.epoch, into: &buf)
+        FfiConverterUInt64.write(value.seq, into: &buf)
     }
 }
 
@@ -13388,9 +13397,10 @@ public func FfiConverterTypeMathFace_lower(_ value: MathFace) -> RustBuffer {
 public enum NotesWrite: Equatable, Hashable {
     
     /**
-     * The notes now read as written; `hash` is the new base.
+     * The notes now read as written; `hash`, `epoch` and `seq` are the new
+     * base.
      */
-    case applied(hash: String
+    case applied(hash: String, epoch: UInt64, seq: UInt64
     )
     /**
      * They changed since the base: rebase onto `current` and retry.
@@ -13423,7 +13433,7 @@ public struct FfiConverterTypeNotesWrite: FfiConverterRustBuffer {
         let variant: Int32 = try readInt(&buf)
         switch variant {
         
-        case 1: return .applied(hash: try FfiConverterString.read(from: &buf)
+        case 1: return .applied(hash: try FfiConverterString.read(from: &buf), epoch: try FfiConverterUInt64.read(from: &buf), seq: try FfiConverterUInt64.read(from: &buf)
         )
         
         case 2: return .conflict(current: try FfiConverterTypeNotesSnapshot.read(from: &buf)
@@ -13440,9 +13450,11 @@ public struct FfiConverterTypeNotesWrite: FfiConverterRustBuffer {
         switch value {
         
         
-        case let .applied(hash):
+        case let .applied(hash,epoch,seq):
             writeInt(&buf, Int32(1))
             FfiConverterString.write(hash, into: &buf)
+            FfiConverterUInt64.write(epoch, into: &buf)
+            FfiConverterUInt64.write(seq, into: &buf)
             
         
         case let .conflict(current):
@@ -17962,6 +17974,21 @@ public func notesRebase(base: String, local: String, remote: String) -> String  
 })
 }
 /**
+ * Whether `snapshot` is a state after `base`. A watch can report a write of
+ * this screen's back after a newer one: such a report is stale and must be
+ * dropped. Anything newer is a real change, even if its text is one this
+ * screen wrote before.
+ */
+public func notesSupersedes(snapshot: NotesSnapshot, base: NotesSnapshot) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_func_notes_supersedes(
+        FfiConverterTypeNotesSnapshot_lower(snapshot),
+        FfiConverterTypeNotesSnapshot_lower(base),uniffiCallStatus
+    )
+})
+}
+/**
  * The single replacement turning `old` into `new` (`None` when equal). Apply
  * it to the text storage in place so the caret and scroll position survive a
  * remote change.
@@ -18166,6 +18193,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_notes_rebase() != 13163) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_func_notes_supersedes() != 26785) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_notes_text_replacement() != 21316) {

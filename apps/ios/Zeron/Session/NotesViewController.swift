@@ -4,9 +4,10 @@ import UIKit
 /// the chat doc like the transcript, so the desktop and every other device
 /// edit the same text. Writes are compare-and-set against the notes this
 /// screen last saw; a change from another device merges into the editor in
-/// place, keeping the caret and both sides' typing. The watch also reports
-/// this screen's own writes back, sometimes after a newer one: those are
-/// recognized by hash and never merged as reverts.
+/// place, keeping the caret and both sides' typing. Snapshots are versioned:
+/// the watch can report this screen's own write back after a newer one, and
+/// such a stale report is dropped, while any newer state merges, even one
+/// that restores text this screen wrote before (`notesSupersedes`).
 final class NotesViewController: UIViewController, UITextViewDelegate {
     private let handle: SessionHandle
     private let textView = UITextView(usingTextLayoutManager: true)
@@ -14,8 +15,6 @@ final class NotesViewController: UIViewController, UITextViewDelegate {
     private let errorLabel = UILabel()
     /// The notes as last read from or written to the doc: the next write's base.
     private var base: NotesSnapshot?
-    /// Hashes of this screen's recent writes (`zeron_doc::NotesEchoes`).
-    private var ownWrites: [String] = []
     private var subscription: NotesSubscription?
     private var writeTimer: Timer?
     private var restylePending = false
@@ -116,7 +115,12 @@ final class NotesViewController: UIViewController, UITextViewDelegate {
             restyle()
             return
         }
-        if remote.hash == base.hash || ownWrites.contains(remote.hash) { return }
+        // Stale: a report of a state this screen has already moved past.
+        guard notesSupersedes(snapshot: remote, base: base) else { return }
+        if remote.hash == base.hash {
+            self.base = remote
+            return
+        }
         merge(remote)
     }
 
@@ -171,19 +175,14 @@ final class NotesViewController: UIViewController, UITextViewDelegate {
         guard let base else { return }
         let text = textView.text ?? ""
         if text == base.text { return }
-        ownWrites.append(notesHash(text: text))
-        if ownWrites.count > 32 { ownWrites.removeFirst() }
         do {
             switch try handle.setNotes(baseHash: base.hash, text: text) {
-            case let .applied(hash):
-                self.base = NotesSnapshot(text: text, hash: hash)
+            case let .applied(hash, epoch, seq):
+                self.base = NotesSnapshot(text: text, hash: hash, epoch: epoch, seq: seq)
                 showError(nil)
-            case let .conflict(current) where ownWrites.contains(current.hash):
-                // An earlier write landed after all: the editor holds it.
-                showError(nil)
-                self.base = current
-                scheduleWrite(after: 0)
             case let .conflict(current):
+                // Writes land on the local replica synchronously, so a refused
+                // one never landed: whatever is there merges.
                 showError(nil)
                 merge(current)
             case let .tooLarge(limit):

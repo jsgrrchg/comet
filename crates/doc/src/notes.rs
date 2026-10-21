@@ -17,8 +17,16 @@
 //! viewport that loses the race rebases its edit with [`rebase_notes`] and
 //! retries. The hash covers the notes text alone; doc frontiers would move on
 //! every streamed token and make every write during a turn a conflict.
+//!
+//! A hash says what the notes read, not when. A viewport's watch reports its
+//! own writes back, sometimes after a newer one has landed, and another device
+//! can restore text the viewport wrote earlier: same hash, opposite meaning.
+//! So every snapshot also carries a version, `epoch` and `seq`. `seq` counts
+//! the distinct states this doc instance has reported, and `epoch` names the
+//! instance, so a reopened doc's restarted count is never taken for an old one.
+//! A snapshot no newer than a viewport's base is stale and is dropped; any
+//! newer one is a real change, even if its text is one the viewport wrote.
 
-use std::collections::VecDeque;
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
@@ -64,13 +72,66 @@ pub struct NotesSnapshot {
     pub text: String,
     /// [`notes_hash`] of `text`: the base of the viewport's next write.
     pub hash: String,
+    /// The doc instance that reported this state (see the module docs).
+    #[serde(default)]
+    pub epoch: u64,
+    /// Which of that instance's reported states this is.
+    #[serde(default)]
+    pub seq: u64,
 }
 
 impl NotesSnapshot {
+    /// An unversioned snapshot of `text`.
     pub fn of(text: impl Into<String>) -> Self {
         let text = text.into();
         let hash = notes_hash(&text);
-        Self { text, hash }
+        Self {
+            text,
+            hash,
+            epoch: 0,
+            seq: 0,
+        }
+    }
+
+    /// Whether this state came after `base`: from another doc instance, or
+    /// later from the same one. A stale report of an older state is not.
+    pub fn supersedes(&self, base: &NotesSnapshot) -> bool {
+        self.epoch != base.epoch || self.seq > base.seq
+    }
+}
+
+/// Where a doc instance's notes reports have got to. Lives inside the notes
+/// gate, so a report and the state it names never come apart.
+#[derive(Debug)]
+pub(crate) struct NotesClock {
+    epoch: u64,
+    /// Hash of the last state reported; empty before the first.
+    hash: String,
+    seq: u64,
+}
+
+impl Default for NotesClock {
+    fn default() -> Self {
+        use std::hash::BuildHasher;
+        // Random per instance, and inside 2^53 so a JSON number keeps it.
+        let epoch = std::collections::hash_map::RandomState::new().hash_one(0u8) & ((1 << 53) - 1);
+        Self {
+            epoch,
+            hash: String::new(),
+            seq: 0,
+        }
+    }
+}
+
+impl NotesClock {
+    /// The version of a state with `hash`: the current one if nothing
+    /// changed since the last report, the next one otherwise.
+    fn observe(&mut self, hash: &str) -> u64 {
+        if self.hash != hash {
+            self.hash = hash.to_owned();
+            self.seq += 1;
+        }
+        self.seq
     }
 }
 
@@ -78,9 +139,16 @@ impl NotesSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum NotesWrite {
-    /// The notes now read as written (possibly unchanged); `hash` is their
-    /// new base.
-    Applied { hash: String },
+    /// The notes now read as written (possibly unchanged): `hash`, `epoch`
+    /// and `seq` are their new base.
+    #[serde(rename_all = "camelCase")]
+    Applied {
+        hash: String,
+        #[serde(default)]
+        epoch: u64,
+        #[serde(default)]
+        seq: u64,
+    },
     /// The notes changed since the writer's base. Nothing was written;
     /// rebase onto `current` and retry.
     Conflict { current: NotesSnapshot },
@@ -202,40 +270,27 @@ pub fn rebase_notes(base: &str, local: &str, remote: &str) -> String {
     out
 }
 
-/// How many of its own writes a viewport remembers (see [`NotesEchoes`]).
-const NOTES_ECHO_WINDOW: usize = 32;
-
-/// Hashes of the notes a viewport wrote recently. Its watch keeps reporting
-/// states the viewport itself produced, and one can arrive after a newer write
-/// has already landed. Taken for a change from another device, that stale
-/// frame would merge as a revert of the newer write. Because writes are
-/// compare-and-set, any frame that is neither the base nor one of these is a
-/// genuine change. A change elsewhere that happens to restore one of these
-/// exact texts is ignored until the viewport's next write, whose conflict
-/// brings it in.
-#[derive(Debug, Clone, Default)]
-pub struct NotesEchoes(VecDeque<String>);
-
-impl NotesEchoes {
-    pub fn record(&mut self, hash: impl Into<String>) {
-        if self.0.len() == NOTES_ECHO_WINDOW {
-            self.0.pop_front();
-        }
-        self.0.push_back(hash.into());
-    }
-
-    pub fn contains(&self, hash: &str) -> bool {
-        self.0.iter().any(|known| known == hash)
-    }
-}
-
 impl SessionDoc {
     pub fn notes_text(&self) -> String {
         self.doc().get_text(NOTES_CONTAINER).to_string()
     }
 
+    /// The notes as they read now, versioned (see the module docs).
     pub fn notes_snapshot(&self) -> NotesSnapshot {
-        NotesSnapshot::of(self.notes_text())
+        let mut clock = self.lock_notes();
+        self.snapshot_locked(&mut clock)
+    }
+
+    fn snapshot_locked(&self, clock: &mut NotesClock) -> NotesSnapshot {
+        let text = self.notes_text();
+        let hash = notes_hash(&text);
+        let seq = clock.observe(&hash);
+        NotesSnapshot {
+            text,
+            hash,
+            epoch: clock.epoch,
+            seq,
+        }
     }
 
     /// Make the notes read `text`, recording only the changed range as text
@@ -258,7 +313,7 @@ impl SessionDoc {
         self.doc().import_with(bytes, origin)
     }
 
-    fn lock_notes(&self) -> std::sync::MutexGuard<'_, ()> {
+    fn lock_notes(&self) -> std::sync::MutexGuard<'_, NotesClock> {
         self.notes_gate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -286,8 +341,8 @@ impl SessionDoc {
     pub fn write_notes(&self, base_hash: &str, text: &str) -> Result<NotesWrite, DocError> {
         // The check and the write are one step: two writers on one base must
         // not both be told Applied.
-        let _gate = self.lock_notes();
-        let current = self.notes_snapshot();
+        let mut clock = self.lock_notes();
+        let current = self.snapshot_locked(&mut clock);
         if current.hash != base_hash {
             return Ok(NotesWrite::Conflict { current });
         }
@@ -297,8 +352,13 @@ impl SessionDoc {
             });
         }
         self.apply_notes_text(text)?;
+        // Still under the gate: the notes read exactly `text`.
+        let hash = notes_hash(text);
+        let seq = clock.observe(&hash);
         Ok(NotesWrite::Applied {
-            hash: notes_hash(text),
+            hash,
+            epoch: clock.epoch,
+            seq,
         })
     }
 }
@@ -386,17 +446,6 @@ mod tests {
     }
 
     #[test]
-    fn echoes_remember_a_bounded_window() {
-        let mut echoes = NotesEchoes::default();
-        for n in 0..=NOTES_ECHO_WINDOW {
-            echoes.record(notes_hash(&n.to_string()));
-        }
-        assert!(!echoes.contains(&notes_hash("0")), "the oldest falls out");
-        assert!(echoes.contains(&notes_hash("1")));
-        assert!(echoes.contains(&notes_hash(&NOTES_ECHO_WINDOW.to_string())));
-    }
-
-    #[test]
     fn rebase_disjoint_edits_apply_both() {
         let base = "one\ntwo\nthree\n";
         let local = "one!\ntwo\nthree\n";
@@ -446,15 +495,43 @@ mod tests {
         assert_eq!(
             applied,
             NotesWrite::Applied {
-                hash: notes_hash("# Plan\n")
+                hash: notes_hash("# Plan\n"),
+                epoch: empty.epoch,
+                seq: empty.seq + 1,
             }
         );
         // A writer still on the old base loses and is told what is there.
         match doc.write_notes(&empty.hash, "other").unwrap() {
-            NotesWrite::Conflict { current } => assert_eq!(current.text, "# Plan\n"),
+            NotesWrite::Conflict { current } => {
+                assert_eq!(current.text, "# Plan\n");
+                assert_eq!(current.seq, empty.seq + 1);
+            }
             other => panic!("expected conflict, got {other:?}"),
         }
         assert_eq!(doc.notes_text(), "# Plan\n");
+    }
+
+    #[test]
+    fn versions_order_states_even_when_text_repeats() {
+        let doc = doc();
+        let a = doc.notes_snapshot();
+        doc.set_notes_text("ab").unwrap();
+        let ab = doc.notes_snapshot();
+        // Unchanged notes report the same version.
+        assert_eq!(doc.notes_snapshot().seq, ab.seq);
+        // Another device restores "a": same text as before, a newer state.
+        doc.set_notes_text("").unwrap();
+        let restored = doc.notes_snapshot();
+        assert_eq!(restored.hash, a.hash);
+        assert!(restored.supersedes(&ab));
+        assert!(
+            !a.supersedes(&ab),
+            "the old report of the same text is stale"
+        );
+        // A reopened doc counts from scratch under a new epoch.
+        let reopened = peer(&doc).notes_snapshot();
+        assert_ne!(reopened.epoch, ab.epoch);
+        assert!(reopened.supersedes(&ab));
     }
 
     #[test]
@@ -552,7 +629,7 @@ mod tests {
         a.set_notes_text("- [ ] ship notes\n").unwrap();
         let b = peer(&a);
         assert_eq!(b.notes_text(), "- [ ] ship notes\n");
-        assert_eq!(b.notes_snapshot(), a.notes_snapshot());
+        assert_eq!(b.notes_snapshot().hash, a.notes_snapshot().hash);
     }
 
     #[test]

@@ -11,11 +11,14 @@ use super::session::SessionHandle;
 use super::types::CoreResult;
 
 /// The notes text as one viewport last saw it; `hash` is the base of the
-/// next `set_notes`.
+/// next `set_notes`. `epoch` and `seq` order the states: see
+/// `notes_supersedes`.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct NotesSnapshot {
     pub text: String,
     pub hash: String,
+    pub epoch: u64,
+    pub seq: u64,
 }
 
 impl From<zc::NotesSnapshot> for NotesSnapshot {
@@ -23,15 +26,38 @@ impl From<zc::NotesSnapshot> for NotesSnapshot {
         Self {
             text: n.text,
             hash: n.hash,
+            epoch: n.epoch,
+            seq: n.seq,
         }
     }
+}
+
+impl From<NotesSnapshot> for zc::NotesSnapshot {
+    fn from(n: NotesSnapshot) -> Self {
+        Self {
+            text: n.text,
+            hash: n.hash,
+            epoch: n.epoch,
+            seq: n.seq,
+        }
+    }
+}
+
+/// Whether `snapshot` is a state after `base`. A watch can report a write of
+/// this screen's back after a newer one: such a report is stale and must be
+/// dropped. Anything newer is a real change, even if its text is one this
+/// screen wrote before.
+#[uniffi::export]
+pub fn notes_supersedes(snapshot: NotesSnapshot, base: NotesSnapshot) -> bool {
+    zc::NotesSnapshot::from(snapshot).supersedes(&base.into())
 }
 
 /// What a `set_notes` did.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum NotesWrite {
-    /// The notes now read as written; `hash` is the new base.
-    Applied { hash: String },
+    /// The notes now read as written; `hash`, `epoch` and `seq` are the new
+    /// base.
+    Applied { hash: String, epoch: u64, seq: u64 },
     /// They changed since the base: rebase onto `current` and retry.
     Conflict { current: NotesSnapshot },
     /// The write would grow them past `limit` bytes; nothing was written.
@@ -41,7 +67,7 @@ pub enum NotesWrite {
 impl From<zc::NotesWrite> for NotesWrite {
     fn from(w: zc::NotesWrite) -> Self {
         match w {
-            zc::NotesWrite::Applied { hash } => Self::Applied { hash },
+            zc::NotesWrite::Applied { hash, epoch, seq } => Self::Applied { hash, epoch, seq },
             zc::NotesWrite::Conflict { current } => Self::Conflict {
                 current: current.into(),
             },

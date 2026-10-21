@@ -341,7 +341,7 @@ pub struct SessionDoc {
     /// Held across a notes write's read and its ops, and across imports that
     /// go through [`SessionDoc::import_with`], so neither another write nor a
     /// remote change can land between them (see `notes.rs`).
-    pub(crate) notes_gate: std::sync::Mutex<()>,
+    pub(crate) notes_gate: std::sync::Mutex<crate::notes::NotesClock>,
 }
 
 impl SessionDoc {

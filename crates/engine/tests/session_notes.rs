@@ -58,16 +58,23 @@ async fn notes_stream_and_compare_and_set() {
         .await
         .expect("WatchSessionNotes");
     let empty = next_snapshot(&mut rx).await;
-    assert_eq!(empty, NotesSnapshot::of(""));
+    assert_eq!(empty.text, "");
+    assert_eq!(empty.hash, NotesSnapshot::of("").hash);
 
     let written = set(&client, &empty.hash, "# Plan\n").await;
     assert_eq!(
         written,
         NotesWrite::Applied {
-            hash: notes_hash("# Plan\n")
+            hash: notes_hash("# Plan\n"),
+            epoch: empty.epoch,
+            seq: empty.seq + 1,
         }
     );
-    assert_eq!(next_snapshot(&mut rx).await.text, "# Plan\n");
+    // The watch reports the same state under the same version.
+    let plan = next_snapshot(&mut rx).await;
+    assert_eq!(plan.text, "# Plan\n");
+    assert_eq!((plan.epoch, plan.seq), (empty.epoch, empty.seq + 1));
+    assert!(plan.supersedes(&empty));
 
     // A second writer still on the empty base loses, and learns why.
     match set(&client, &empty.hash, "stale").await {

@@ -9,6 +9,7 @@
 //!   id, kind, payload(json), issuedBy, issuedAt, basedOn?, expiresAt?, status, resolution? }
 //! - `queue`:    LoroMovableList of LoroMap {
 //!   id, text, attachments?, issuedBy, issuedAt, editedAt? }        (any device writes)
+//! - `notes`:    LoroText — the user's markdown scratchpad (any device writes; see `notes.rs`)
 //!
 //! Part maps: { id, kind: "text"|"reasoning"|"tool"|"input"|"error"|"image", text?: LoroText,
 //! reasoning?: LoroText, call?: json, isError?, questions?: json, resolved?, message? }.

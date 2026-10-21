@@ -13,6 +13,24 @@ pub enum Face {
     Strikethrough,
 }
 
+/// Headings by source range, with their level (1 for `#`). A live preview
+/// sizes them; [`faces`] already makes them bold.
+pub fn headings(text: &str) -> Vec<(Range<usize>, u8)> {
+    if text.len() > 128 * 1024 {
+        return Vec::new();
+    }
+    Parser::new_ext(
+        text,
+        Options::ENABLE_TASKLISTS | Options::ENABLE_STRIKETHROUGH,
+    )
+    .into_offset_iter()
+    .filter_map(|(event, range)| match event {
+        Event::Start(Tag::Heading { level, .. }) => Some((range, level as u8)),
+        _ => None,
+    })
+    .collect()
+}
+
 pub fn faces(text: &str) -> Vec<(Range<usize>, Face)> {
     if text.len() > 128 * 1024 {
         return Vec::new();
@@ -418,6 +436,16 @@ pub fn decorations(text: &str, active: Range<usize>) -> Vec<(Range<usize>, Strin
 mod tests {
     use super::*;
 
+    #[test]
+    fn headings_report_their_levels_and_source() {
+        let text = "# One\nbody\n### Three\n\nSetext\n---\n";
+        let found: Vec<(&str, u8)> = headings(text)
+            .into_iter()
+            .map(|(range, level)| (text[range].trim_end(), level))
+            .collect();
+        assert_eq!(found, [("# One", 1), ("### Three", 3), ("Setext\n---", 2)]);
+        assert!(headings("plain *text*").is_empty());
+    }
     #[test]
     fn decorations_preserve_rules_code_and_nested_emphasis() {
         for rule in ["- - -", "* * *", "___"] {

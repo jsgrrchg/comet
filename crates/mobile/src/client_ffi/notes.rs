@@ -130,6 +130,129 @@ pub fn notes_hash(text: String) -> String {
     zeron_doc::notes_hash(&text)
 }
 
+/// How a live preview paints one range of the notes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum LiveStyleKind {
+    /// A Markdown marker off the caret's line: takes no room.
+    Hidden,
+    /// A list bullet or task box marker, drawn quietly.
+    Marker,
+    Heading {
+        level: u8,
+    },
+    Strong,
+    Emphasis,
+    Code,
+    Strikethrough,
+}
+
+/// One styled range, in UTF-16 code units. Apply in order: later styles
+/// refine earlier ones (a heading's size, then its bold).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LiveStyle {
+    pub location: u64,
+    pub length: u64,
+    pub kind: LiveStyleKind,
+}
+
+/// The live-preview styling of `text` with the given selection (UTF-16),
+/// read by the same rules as the desktop editor: Markdown markers hide
+/// except on the lines the selection touches.
+#[uniffi::export]
+pub fn markdown_live_styles(
+    text: String,
+    selection_location: u64,
+    selection_length: u64,
+) -> Vec<LiveStyle> {
+    let start = byte_offset(&text, selection_location);
+    let end = byte_offset(&text, selection_location.saturating_add(selection_length));
+    let active = line_start(&text, start)..line_end(&text, end.max(start));
+    let mut styled: Vec<(std::ops::Range<usize>, LiveStyleKind)> = Vec::new();
+    for (range, level) in zeron_markdown::live::headings(&text) {
+        styled.push((range, LiveStyleKind::Heading { level }));
+    }
+    for (range, face) in zeron_markdown::live::faces(&text) {
+        let kind = match face {
+            zeron_markdown::live::Face::Bold => LiveStyleKind::Strong,
+            zeron_markdown::live::Face::Italic => LiveStyleKind::Emphasis,
+            zeron_markdown::live::Face::Code => LiveStyleKind::Code,
+            zeron_markdown::live::Face::Strikethrough => LiveStyleKind::Strikethrough,
+        };
+        styled.push((range, kind));
+    }
+    for (range, replacement) in zeron_markdown::live::decorations(&text, active) {
+        let kind = if replacement.is_empty() {
+            LiveStyleKind::Hidden
+        } else {
+            LiveStyleKind::Marker
+        };
+        styled.push((range, kind));
+    }
+    let units = Utf16Offsets::new(
+        &text,
+        styled
+            .iter()
+            .flat_map(|(range, _)| [range.start, range.end]),
+    );
+    styled
+        .into_iter()
+        .map(|(range, kind)| {
+            let location = units.of(range.start);
+            LiveStyle {
+                location,
+                length: units.of(range.end) - location,
+                kind,
+            }
+        })
+        .collect()
+}
+
+/// The byte offset of a UTF-16 offset, clamped to the text.
+fn byte_offset(text: &str, utf16: u64) -> usize {
+    let mut units = 0u64;
+    for (at, ch) in text.char_indices() {
+        if units >= utf16 {
+            return at;
+        }
+        units += ch.len_utf16() as u64;
+    }
+    text.len()
+}
+
+fn line_start(text: &str, at: usize) -> usize {
+    text[..at].rfind('\n').map_or(0, |ix| ix + 1)
+}
+
+fn line_end(text: &str, at: usize) -> usize {
+    text[at..].find('\n').map_or(text.len(), |ix| at + ix)
+}
+
+/// UTF-16 offsets of a set of byte offsets, in one pass over the text.
+struct Utf16Offsets(Vec<(usize, u64)>);
+
+impl Utf16Offsets {
+    fn new(text: &str, offsets: impl Iterator<Item = usize>) -> Self {
+        let mut wanted: Vec<usize> = offsets.collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut found = Vec::with_capacity(wanted.len());
+        let mut wanted = wanted.into_iter().peekable();
+        let mut units = 0u64;
+        for (at, ch) in text.char_indices().chain([(text.len(), '\0')]) {
+            while wanted.peek().is_some_and(|&next| next <= at) {
+                found.push((wanted.next().unwrap_or(at), units));
+            }
+            units += ch.len_utf16() as u64;
+        }
+        Self(found)
+    }
+
+    fn of(&self, byte: usize) -> u64 {
+        let ix = self.0.partition_point(|(at, _)| *at < byte);
+        self.0.get(ix).map_or(0, |(_, units)| *units)
+    }
+}
+
 fn utf16_len(s: &str) -> u64 {
     s.encode_utf16().count() as u64
 }
@@ -153,6 +276,47 @@ mod tests {
         let r = notes_text_replacement("x😀y".into(), "xy".into()).unwrap();
         assert_eq!((r.location, r.length, r.text.as_str()), (1, 2, ""));
         assert_eq!(notes_text_replacement("same".into(), "same".into()), None);
+    }
+
+    #[test]
+    fn live_styles_hide_markers_off_the_caret_line_in_utf16() {
+        let text = "# Título\n**negrita** 😀 _x_\n- [ ] tarea".to_owned();
+        // Caret at the very end: on the task line.
+        let caret = text.encode_utf16().count() as u64;
+        let styles = markdown_live_styles(text.clone(), caret, 0);
+        let utf16: Vec<u16> = text.encode_utf16().collect();
+        let slice = |s: &LiveStyle| {
+            String::from_utf16(&utf16[s.location as usize..(s.location + s.length) as usize])
+                .unwrap()
+        };
+        let of = |kind: LiveStyleKind| -> Vec<String> {
+            styles
+                .iter()
+                .filter(|s| s.kind == kind)
+                .map(slice)
+                .collect()
+        };
+        assert_eq!(of(LiveStyleKind::Heading { level: 1 }), ["# Título\n"]);
+        assert_eq!(of(LiveStyleKind::Strong), ["# Título\n", "**negrita**"]);
+        assert_eq!(of(LiveStyleKind::Emphasis), ["_x_"]);
+        // The heading and emphasis markers hide off the caret's line. On it,
+        // the task item keeps its box editable and only its bullet is drawn.
+        let hidden = of(LiveStyleKind::Hidden);
+        assert_eq!(hidden, ["# ", "**", "**", "_", "_"]);
+        assert_eq!(of(LiveStyleKind::Marker), ["-"]);
+        // With the caret on the heading, its marker shows, and the task item
+        // off the caret's line is drawn as a whole box.
+        let styles = markdown_live_styles(text.clone(), 0, 0);
+        assert!(
+            styles
+                .iter()
+                .any(|s| s.kind == LiveStyleKind::Marker && slice(s) == "- [ ]")
+        );
+        assert!(
+            !styles
+                .iter()
+                .any(|s| s.kind == LiveStyleKind::Hidden && slice(s) == "# ")
+        );
     }
 
     #[test]

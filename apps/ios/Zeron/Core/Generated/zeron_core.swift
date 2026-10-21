@@ -7881,6 +7881,68 @@ public func FfiConverterTypeLiveStatus_lower(_ value: LiveStatus) -> RustBuffer 
 }
 
 
+/**
+ * One styled range, in UTF-16 code units. Apply in order: later styles
+ * refine earlier ones (a heading's size, then its bold).
+ */
+public struct LiveStyle: Equatable, Hashable {
+    public var location: UInt64
+    public var length: UInt64
+    public var kind: LiveStyleKind
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(location: UInt64, length: UInt64, kind: LiveStyleKind) {
+        self.location = location
+        self.length = length
+        self.kind = kind
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension LiveStyle: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLiveStyle: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LiveStyle {
+        return
+            try LiveStyle(
+                location: FfiConverterUInt64.read(from: &buf), 
+                length: FfiConverterUInt64.read(from: &buf), 
+                kind: FfiConverterTypeLiveStyleKind.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: LiveStyle, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.location, into: &buf)
+        FfiConverterUInt64.write(value.length, into: &buf)
+        FfiConverterTypeLiveStyleKind.write(value.kind, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLiveStyle_lift(_ buf: RustBuffer) throws -> LiveStyle {
+    return try FfiConverterTypeLiveStyle.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLiveStyle_lower(_ value: LiveStyle) -> RustBuffer {
+    return FfiConverterTypeLiveStyle.lower(value)
+}
+
+
 public struct ModelInfo: Equatable, Hashable {
     public var id: String
     public var label: String
@@ -13090,6 +13152,119 @@ public func FfiConverterTypeFadeEdge_lower(_ value: FadeEdge) -> RustBuffer {
 
 
 /**
+ * How a live preview paints one range of the notes.
+ */
+
+public enum LiveStyleKind: Equatable, Hashable {
+    
+    /**
+     * A Markdown marker off the caret's line: takes no room.
+     */
+    case hidden
+    /**
+     * A list bullet or task box marker, drawn quietly.
+     */
+    case marker
+    case heading(level: UInt8
+    )
+    case strong
+    case emphasis
+    case code
+    case strikethrough
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension LiveStyleKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeLiveStyleKind: FfiConverterRustBuffer {
+    typealias SwiftType = LiveStyleKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> LiveStyleKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .hidden
+        
+        case 2: return .marker
+        
+        case 3: return .heading(level: try FfiConverterUInt8.read(from: &buf)
+        )
+        
+        case 4: return .strong
+        
+        case 5: return .emphasis
+        
+        case 6: return .code
+        
+        case 7: return .strikethrough
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: LiveStyleKind, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .hidden:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .marker:
+            writeInt(&buf, Int32(2))
+        
+        
+        case let .heading(level):
+            writeInt(&buf, Int32(3))
+            FfiConverterUInt8.write(level, into: &buf)
+            
+        
+        case .strong:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .emphasis:
+            writeInt(&buf, Int32(5))
+        
+        
+        case .code:
+            writeInt(&buf, Int32(6))
+        
+        
+        case .strikethrough:
+            writeInt(&buf, Int32(7))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLiveStyleKind_lift(_ buf: RustBuffer) throws -> LiveStyleKind {
+    return try FfiConverterTypeLiveStyleKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeLiveStyleKind_lower(_ value: LiveStyleKind) -> RustBuffer {
+    return FfiConverterTypeLiveStyleKind.lower(value)
+}
+
+
+
+/**
  * The face formulas are laid out in (STIX Two for what it lacks). Every
  * face paints from the [`math_font_data`] table, so switching never
  * re-registers fonts.
@@ -16862,6 +17037,31 @@ fileprivate struct FfiConverterSequenceTypeLinkHit: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeLiveStyle: FfiConverterRustBuffer {
+    typealias SwiftType = [LiveStyle]
+
+    public static func write(_ value: [LiveStyle], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeLiveStyle.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [LiveStyle] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [LiveStyle]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeLiveStyle.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeModelInfo: FfiConverterRustBuffer {
     typealias SwiftType = [ModelInfo]
 
@@ -17722,6 +17922,21 @@ public func workosAuthorizeUrl(state: String) -> String  {
 })
 }
 /**
+ * The live-preview styling of `text` with the given selection (UTF-16),
+ * read by the same rules as the desktop editor: Markdown markers hide
+ * except on the lines the selection touches.
+ */
+public func markdownLiveStyles(text: String, selectionLocation: UInt64, selectionLength: UInt64) -> [LiveStyle]  {
+    return try!  FfiConverterSequenceTypeLiveStyle.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_zeron_mobile_fn_func_markdown_live_styles(
+        FfiConverterString.lower(text),
+        FfiConverterUInt64.lower(selectionLocation),
+        FfiConverterUInt64.lower(selectionLength),uniffiCallStatus
+    )
+})
+}
+/**
  * The base hash of `text`, for writes from a viewport that only has text.
  */
 public func notesHash(text: String) -> String  {
@@ -17942,6 +18157,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_workos_authorize_url() != 35994) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zeron_mobile_checksum_func_markdown_live_styles() != 54797) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zeron_mobile_checksum_func_notes_hash() != 27287) {

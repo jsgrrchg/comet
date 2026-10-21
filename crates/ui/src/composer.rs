@@ -929,6 +929,47 @@ struct EditSnapshot {
     caret_affinity: CaretAffinity,
 }
 
+/// Carry an undo (or redo) history across a change made elsewhere, `before`
+/// becoming `after`. Snapshots are walked from the newest: each differs from
+/// the next by one step of the user's, so the change moves into it exactly
+/// as long as that step and the change touch different text. At the first
+/// step that overlaps the change, that snapshot and every older one go:
+/// restoring them would revert or garble someone else's typing.
+fn rebase_history(stack: Vec<EditSnapshot>, before: &str, after: &str) -> Vec<EditSnapshot> {
+    let mut kept = Vec::new();
+    let (mut base, mut moved) = (before.to_owned(), after.to_owned());
+    for snapshot in stack.into_iter().rev() {
+        let step = zeron_doc::single_range_diff(&base, &snapshot.content);
+        let change = zeron_doc::single_range_diff(&base, &moved);
+        let overlaps = step
+            .as_ref()
+            .zip(change.as_ref())
+            .is_some_and(|(step, change)| {
+                !(change.range.end <= step.range.start || step.range.end <= change.range.start)
+            });
+        if overlaps {
+            break;
+        }
+        let content = zeron_doc::rebase_notes(&base, &snapshot.content, &moved);
+        let shift = zeron_doc::single_range_diff(&snapshot.content, &content);
+        let map = |offset: usize| {
+            shift
+                .as_ref()
+                .map_or(offset, |edit| edit.map_offset(offset))
+        };
+        let selected_range = map(snapshot.selected_range.start)..map(snapshot.selected_range.end);
+        base = snapshot.content;
+        moved = content.clone();
+        kept.push(EditSnapshot {
+            content,
+            selected_range,
+            ..snapshot
+        });
+    }
+    kept.reverse();
+    kept
+}
+
 /// A strict, local-only Markdown representation of a file mention. The
 /// underlying prompt always contains this form; the editor projects it to a
 /// chip for display without leaking a second data model into submission.
@@ -2704,8 +2745,8 @@ impl ComposerInput {
     /// Apply a change made elsewhere (another device editing a synced
     /// document): `range` becomes `text`, and the caret, selection and scroll
     /// position carry across it. Emits no `Edited`, since the owner already
-    /// knows. The undo history is dropped: its snapshots predate the change,
-    /// and restoring one would revert it.
+    /// knows. Undo and redo keep working and never revert the change: see
+    /// [`rebase_history`].
     pub(crate) fn apply_external_edit(
         &mut self,
         range: Range<usize>,
@@ -2725,7 +2766,12 @@ impl ComposerInput {
         };
         self.invalidate_mention_tooltip();
         self.edit_revision = self.edit_revision.wrapping_add(1);
-        self.content = edit.apply(&self.content);
+        let before = std::mem::take(&mut self.content);
+        self.content = edit.apply(&before);
+        self.undo_stack =
+            rebase_history(std::mem::take(&mut self.undo_stack), &before, &self.content);
+        self.redo_stack =
+            rebase_history(std::mem::take(&mut self.redo_stack), &before, &self.content);
         self.selected_range =
             edit.map_offset(self.selected_range.start)..edit.map_offset(self.selected_range.end);
         self.marked_range = self
@@ -2734,8 +2780,6 @@ impl ComposerInput {
             .map(|marked| edit.map_offset(marked.start)..edit.map_offset(marked.end))
             .filter(|marked| !marked.is_empty());
         self.preferred_column = None;
-        self.undo_stack.clear();
-        self.redo_stack.clear();
         self.last_edit = None;
         self.refresh_projection();
         self.needs_measure = true;
@@ -12226,9 +12270,10 @@ mod tests {
             // An edit after the selection leaves it alone.
             input.apply_external_edit(input.text().len()..input.text().len(), "?", cx);
             assert_eq!(&input.text()[input.selected_range.clone()], "beta");
-            // Undo can no longer reach back past someone else's change.
-            assert!(input.undo_stack.is_empty() && input.redo_stack.is_empty());
+            // Undo takes back only this side's "!", never the other's edits.
             input.undo(&Undo, window, cx);
+            assert_eq!(input.text(), "ALPHA, ALPHA beta gamma?");
+            input.redo(&Redo, window, cx);
             assert_eq!(input.text(), "ALPHA, ALPHA beta gamma!?");
             // Out-of-bounds or mid-char ranges are ignored.
             input.apply_external_edit(0..1000, "x", cx);
@@ -12237,6 +12282,37 @@ mod tests {
             assert_eq!(input.text(), "é");
         });
     }
+    #[gpui::test]
+    fn undo_history_survives_changes_elsewhere_and_stops_at_overlaps(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        with_composer_input(cx, |input, window, cx| {
+            input.set_text("top\nmiddle\nbottom", cx);
+            // Two steps of our own at the bottom, a pause apart.
+            input.move_to(input.text().len(), cx);
+            input.replace_text_in_range(None, " one", window, cx);
+            input.last_edit = None;
+            input.replace_text_in_range(None, " two", window, cx);
+            assert_eq!(input.undo_stack.len(), 2);
+            // Another device edits the top: both steps survive.
+            input.apply_external_edit(0..3, "TOP", cx);
+            assert_eq!(input.undo_stack.len(), 2);
+            input.undo(&Undo, window, cx);
+            assert_eq!(input.text(), "TOP\nmiddle\nbottom one");
+            input.undo(&Undo, window, cx);
+            assert_eq!(input.text(), "TOP\nmiddle\nbottom");
+            input.redo(&Redo, window, cx);
+            input.redo(&Redo, window, cx);
+            assert_eq!(input.text(), "TOP\nmiddle\nbottom one two");
+            // A change inside our latest step drops it and all older ones.
+            let at = input.text().find("two").unwrap();
+            input.apply_external_edit(at..at + 3, "2", cx);
+            assert!(input.undo_stack.is_empty());
+            input.undo(&Undo, window, cx);
+            assert_eq!(input.text(), "TOP\nmiddle\nbottom one 2");
+        });
+    }
+
     #[gpui::test]
     fn dock_morph_restores_skinny_height_with_a_continuous_editor_origin(
         cx: &mut gpui::TestAppContext,

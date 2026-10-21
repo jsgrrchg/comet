@@ -149,6 +149,9 @@ final class NotesViewController: UIViewController, UITextViewDelegate {
         let start = map(selection.location)
         let end = map(NSMaxRange(selection))
         textView.selectedRange = NSRange(location: start, length: max(0, end - start))
+        // UIKit's undo steps hold ranges from before this change; replaying
+        // one would land in the wrong place or revert the other device's text.
+        textView.undoManager?.removeAllActions()
         updatePlaceholder()
         restyle()
     }

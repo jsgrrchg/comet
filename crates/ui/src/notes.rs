@@ -10,7 +10,13 @@
 //! text remains unwritten goes out with the next write. The watch also reports
 //! this surface's own writes back, sometimes after a newer one has landed;
 //! `NotesEchoes` keeps those from merging as reverts.
+//!
+//! Closing the tab while a write is in flight leaves the newest text with
+//! that write (`owed`): when it returns to a surface that is gone, it lands
+//! the text itself (`land_owed`).
 
+use std::future::Future;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gpui::{
@@ -44,6 +50,9 @@ pub struct NotesSurface {
     /// mistaken for another device's change.
     echoes: NotesEchoes,
     in_flight: bool,
+    /// Text a flush could not send because a write was in flight. That write
+    /// sends it when it returns, even if this surface is gone by then.
+    owed: Arc<Mutex<Option<String>>>,
     error: Option<SharedString>,
     focus_pending: bool,
     write_task: Option<Task<()>>,
@@ -88,6 +97,7 @@ impl NotesSurface {
             held: None,
             echoes: NotesEchoes::default(),
             in_flight: false,
+            owed: Arc::default(),
             error: None,
             focus_pending: true,
             write_task: None,
@@ -107,9 +117,14 @@ impl NotesSurface {
     }
 
     /// Write any unwritten edits now (tab closing, editor blurred). The write
-    /// outlives this surface.
+    /// outlives this surface; one already in flight takes the text along.
     pub fn flush(&mut self, cx: &mut Context<Self>) {
         self.write_task = None;
+        if self.in_flight {
+            let text = self.input.read(cx).text().to_owned();
+            *self.owed.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+            return;
+        }
         self.write(cx);
     }
 
@@ -207,28 +222,51 @@ impl NotesSurface {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let Some((text, params)) = self.begin_write(cx) else {
+        let Some((text, base, params)) = self.begin_write(cx) else {
             return;
         };
+        let chat_id = self.chat_id.clone();
+        let owed = self.owed.clone();
         // Detached: a closing tab's last write still lands.
         cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call_as::<NotesWrite>(methods::SET_SESSION_NOTES, params)
-                .await;
-            this.update(cx, |this, cx| this.written(text, result, cx))
-                .ok();
+                .await
+                .map_err(|err| err.to_string());
+            let alive = this
+                .update(cx, |this, cx| {
+                    this.written(text.clone(), result.clone(), cx)
+                })
+                .is_ok();
+            if !alive {
+                let write = |base_hash: String, text: String| {
+                    let engine = engine.clone();
+                    let params = serde_json::json!({
+                        "chatId": chat_id,
+                        "baseHash": base_hash,
+                        "text": text,
+                    });
+                    async move {
+                        engine
+                            .client()
+                            .call_as::<NotesWrite>(methods::SET_SESSION_NOTES, params)
+                            .await
+                    }
+                };
+                land_owed(&owed, base, text, result, write).await;
+            }
         })
         .detach();
     }
 
     /// The text to write and its request, if there is anything to write and
     /// no write in flight (that one checks for newer edits when it lands).
-    fn begin_write(&mut self, cx: &App) -> Option<(String, serde_json::Value)> {
+    fn begin_write(&mut self, cx: &App) -> Option<(String, NotesSnapshot, serde_json::Value)> {
         if self.in_flight {
             return None;
         }
-        let base = self.base.as_ref()?;
+        let base = self.base.clone()?;
         let text = self.input.read(cx).text().to_owned();
         if text == base.text {
             return None;
@@ -241,16 +279,18 @@ impl NotesSurface {
         // Before sending: the watch can report the write before it returns.
         self.echoes.record(notes_hash(&text));
         self.in_flight = true;
-        Some((text, params))
+        Some((text, base, params))
     }
 
     fn written(
         &mut self,
         text: String,
-        result: Result<NotesWrite, zeron_rpc::RpcError>,
+        result: Result<NotesWrite, String>,
         cx: &mut Context<Self>,
     ) {
         self.in_flight = false;
+        // Still here: the editor holds the owed text and writes it below.
+        self.owed.lock().unwrap_or_else(|e| e.into_inner()).take();
         let mut retry = Some(Duration::ZERO);
         match result {
             Ok(NotesWrite::Applied { hash }) => {
@@ -301,6 +341,56 @@ impl NotesSurface {
             self.schedule_write(delay, cx);
         }
         cx.notify();
+    }
+}
+
+/// How many writes an orphaned flush tries before giving up on conflicts.
+const OWED_ATTEMPTS: usize = 4;
+
+/// Land the text a closed surface still owed. `sent` went out on `base` and
+/// came back as `result`; the owed text is newer than `sent`. Conflicts merge
+/// with `rebase_notes`, and a conflict naming text this flush wrote itself
+/// (its reply lost) is adopted rather than merged twice.
+async fn land_owed<W, F>(
+    owed: &Mutex<Option<String>>,
+    base: NotesSnapshot,
+    sent: String,
+    result: Result<NotesWrite, String>,
+    write: W,
+) where
+    W: Fn(String, String) -> F,
+    F: Future<Output = Result<NotesWrite, zeron_rpc::RpcError>>,
+{
+    let Some(mut text) = owed.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+        return;
+    };
+    let mut ours = NotesEchoes::default();
+    ours.record(notes_hash(&sent));
+    let mut base = match result {
+        Ok(NotesWrite::Applied { hash }) => NotesSnapshot { text: sent, hash },
+        // Lost or refused: start from the old base; a conflict sorts it out.
+        Ok(NotesWrite::Conflict { .. }) | Err(_) => base,
+        Ok(NotesWrite::TooLarge { .. }) => return,
+    };
+    for _ in 0..OWED_ATTEMPTS {
+        if text == base.text {
+            return;
+        }
+        ours.record(notes_hash(&text));
+        match write(base.hash.clone(), text.clone()).await {
+            Ok(NotesWrite::Conflict { current }) if ours.contains(&current.hash) => {
+                base = current;
+            }
+            Ok(NotesWrite::Conflict { current }) => {
+                text = rebase_notes(&base.text, &text, &current.text);
+                base = current;
+            }
+            Ok(NotesWrite::Applied { .. } | NotesWrite::TooLarge { .. }) => return,
+            Err(err) => {
+                tracing::debug!(error = %err, "owed notes write failed");
+                return;
+            }
+        }
     }
 }
 
@@ -372,10 +462,94 @@ mod tests {
         });
     }
 
-    fn applied(text: &str) -> Result<NotesWrite, zeron_rpc::RpcError> {
+    fn applied(text: &str) -> Result<NotesWrite, String> {
         Ok(NotesWrite::Applied {
             hash: notes_hash(text),
         })
+    }
+
+    /// The engine side of a write, on a real doc.
+    fn doc_writer(
+        doc: &std::rc::Rc<zeron_doc::SessionDoc>,
+    ) -> impl Fn(String, String) -> std::future::Ready<Result<NotesWrite, zeron_rpc::RpcError>>
+    {
+        let doc = doc.clone();
+        move |base_hash: String, text: String| {
+            std::future::ready(Ok(doc.write_notes(&base_hash, &text).unwrap()))
+        }
+    }
+
+    #[test]
+    fn closing_during_a_write_still_lands_the_newest_text() {
+        let doc = std::rc::Rc::new(zeron_doc::SessionDoc::init("chat").unwrap());
+        doc.set_notes_text("a").unwrap();
+        let base = doc.notes_snapshot();
+        // "ab" is in flight when the user types "c" and closes the tab.
+        let sent = doc.write_notes(&base.hash, "ab").unwrap();
+        let owed = Mutex::new(Some("abc".to_owned()));
+        futures::executor::block_on(land_owed(
+            &owed,
+            base,
+            "ab".into(),
+            Ok(sent),
+            doc_writer(&doc),
+        ));
+        assert_eq!(doc.notes_text(), "abc");
+        assert!(owed.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn an_owed_write_merges_changes_from_elsewhere() {
+        let doc = std::rc::Rc::new(zeron_doc::SessionDoc::init("chat").unwrap());
+        doc.set_notes_text("mine\n").unwrap();
+        let base = doc.notes_snapshot();
+        let sent = doc.write_notes(&base.hash, "mine\nab\n").unwrap();
+        // Another device edits before the owed text goes out.
+        doc.set_notes_text("theirs\nmine\nab\n").unwrap();
+        let owed = Mutex::new(Some("mine\nab\nc\n".to_owned()));
+        futures::executor::block_on(land_owed(
+            &owed,
+            base,
+            "mine\nab\n".into(),
+            Ok(sent),
+            doc_writer(&doc),
+        ));
+        assert_eq!(doc.notes_text(), "theirs\nmine\nab\nc\n");
+    }
+
+    #[test]
+    fn an_owed_write_after_a_lost_reply_does_not_duplicate() {
+        let doc = std::rc::Rc::new(zeron_doc::SessionDoc::init("chat").unwrap());
+        doc.set_notes_text("x").unwrap();
+        let base = doc.notes_snapshot();
+        // "xy" landed, but its reply was lost.
+        doc.write_notes(&base.hash, "xy").unwrap();
+        let owed = Mutex::new(Some("xyz".to_owned()));
+        futures::executor::block_on(land_owed(
+            &owed,
+            base,
+            "xy".into(),
+            Err("connection closed".into()),
+            doc_writer(&doc),
+        ));
+        assert_eq!(doc.notes_text(), "xyz");
+    }
+
+    #[gpui::test]
+    fn a_flush_during_a_write_hands_the_text_to_that_write(cx: &mut TestAppContext) {
+        let (surface, cx) = surface(cx);
+        surface.update(cx, |surface, cx| {
+            surface.receive(snapshot("a"), cx);
+            type_text(surface, "ab", cx);
+            let (text, _, _) = surface.begin_write(cx).unwrap();
+            type_text(surface, "abc", cx);
+            surface.flush(cx);
+            assert_eq!(surface.owed.lock().unwrap().as_deref(), Some("abc"));
+            // The surface outlived the write: it takes the text back and the
+            // owed text is not sent twice.
+            surface.written(text, applied("ab"), cx);
+            assert!(surface.owed.lock().unwrap().is_none());
+        });
     }
 
     #[gpui::test]
@@ -386,11 +560,11 @@ mod tests {
             assert!(!surface.input.read(cx).read_only);
             // First write lands; its echo is still on the way.
             type_text(surface, "ab", cx);
-            let (text, _) = surface.begin_write(cx).unwrap();
+            let (text, _, _) = surface.begin_write(cx).unwrap();
             surface.written(text, applied("ab"), cx);
             // Second write goes out; the first one's echo arrives meanwhile.
             type_text(surface, "abc", cx);
-            let (text, _) = surface.begin_write(cx).unwrap();
+            let (text, _, _) = surface.begin_write(cx).unwrap();
             surface.receive(snapshot("ab"), cx);
             surface.written(text, applied("abc"), cx);
             // And once more after it, as a straggler.
@@ -410,7 +584,7 @@ mod tests {
             assert_eq!(surface.input.read(cx).text(), "theirs\nline\nmine\n");
             assert_eq!(surface.base.as_ref().unwrap().text, "theirs\nline\n");
             // During a write the change waits for it, then merges.
-            let (text, _) = surface.begin_write(cx).unwrap();
+            let (text, _, _) = surface.begin_write(cx).unwrap();
             surface.receive(snapshot("theirs\nline\nmine\nmore\n"), cx);
             assert_eq!(surface.input.read(cx).text(), "theirs\nline\nmine\n");
             surface.written(
@@ -432,11 +606,11 @@ mod tests {
         surface.update(cx, |surface, cx| {
             surface.receive(snapshot("x"), cx);
             type_text(surface, "xy", cx);
-            let (text, _) = surface.begin_write(cx).unwrap();
+            let (text, _, _) = surface.begin_write(cx).unwrap();
             // The write landed but its reply was lost.
-            surface.written(text, Err(zeron_rpc::RpcError::Closed), cx);
+            surface.written(text, Err("connection closed".into()), cx);
             type_text(surface, "xyz", cx);
-            let (text, _) = surface.begin_write(cx).unwrap();
+            let (text, _, _) = surface.begin_write(cx).unwrap();
             surface.written(
                 text,
                 Ok(NotesWrite::Conflict {

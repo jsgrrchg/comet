@@ -2221,6 +2221,40 @@ impl RpcService for EngineRpc {
                     .boxed(),
                 ))
             }
+            methods::WATCH_SESSION_NOTES => {
+                let p: ChatParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let rx = handle.watch_notes();
+                Ok(RpcReply::Stream(
+                    futures::stream::unfold((rx, true), |(mut rx, first)| async move {
+                        if !first {
+                            rx.changed().await.ok()?;
+                        }
+                        let snapshot = rx.borrow_and_update().clone();
+                        let value = serde_json::to_value(snapshot).ok()?;
+                        Some((value, (rx, false)))
+                    })
+                    .boxed(),
+                ))
+            }
+            methods::SET_SESSION_NOTES => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct SetSessionNotesParams {
+                    chat_id: String,
+                    base_hash: String,
+                    text: String,
+                }
+                let p: SetSessionNotesParams = parse_params(params)?;
+                let outcome = self
+                    .doc_host
+                    .set_session_notes(&p.chat_id, &p.base_hash, &p.text)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&outcome)
+            }
             methods::QUEUE_MESSAGE => {
                 let p: QueueMessageParams = parse_params(params)?;
                 let id = self

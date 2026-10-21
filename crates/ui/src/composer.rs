@@ -202,6 +202,31 @@ fn input_overflow_edges(
 
 /// During the reveal, stop at a complete row boundary instead of slicing
 /// glyphs with a moving clip. Scrolling offsets the row grid inside the box.
+/// Text and line-height scale of a Markdown heading in a document editor:
+/// a quick step down toward body size, like the transcript's headings.
+fn heading_scale(level: u8) -> (f32, f32) {
+    match level {
+        1 => (1.5, 1.4),
+        2 => (1.28, 1.22),
+        3 => (1.14, 1.1),
+        _ => (1.0, 1.0),
+    }
+}
+
+/// The heading level of the source line starting at `line_start`, if a
+/// heading covers it. A setext underline belongs to its heading but is not
+/// set large itself.
+fn heading_level_at(headings: &[(Range<usize>, u8)], line_start: usize, line: &str) -> Option<u8> {
+    let ix = headings.partition_point(|(range, _)| range.end <= line_start);
+    let (range, level) = headings.get(ix)?;
+    let underline = {
+        let trimmed = line.trim();
+        !trimmed.is_empty()
+            && (trimmed.chars().all(|c| c == '=') || trimmed.chars().all(|c| c == '-'))
+    };
+    (range.start <= line_start && !underline).then_some(*level)
+}
+
 fn input_reveal_height(visible: f32, scroll: f32, line_height: f32, resizing: bool) -> f32 {
     if !resizing {
         return visible;
@@ -2015,6 +2040,9 @@ pub struct ComposerInput {
     last_lines: Vec<WrappedLine>,
     line_starts: Vec<usize>,
     line_indents: Vec<Pixels>,
+    /// Row height of each logical line: `line_height`, except headings in a
+    /// Markdown document, which are set larger.
+    line_heights: Vec<Pixels>,
     last_bounds: Option<Bounds<Pixels>>,
     line_height: Pixels,
     content_height: f32,
@@ -2138,6 +2166,7 @@ impl ComposerInput {
             last_lines: Vec::new(),
             line_starts: vec![0],
             line_indents: Vec::new(),
+            line_heights: Vec::new(),
             last_bounds: None,
             line_height: px(INPUT_LINE_HEIGHT),
             content_height: INPUT_LINE_HEIGHT,
@@ -3357,7 +3386,13 @@ impl ComposerInput {
     fn vertical_target(&self, dir: f32) -> Option<(usize, CaretAffinity, Pixels)> {
         let current = self.cursor_point()?;
         let column = self.preferred_column.unwrap_or(current.x);
-        let target_y = f32::from(current.y) + dir * f32::from(self.line_height);
+        // Into the row below this one, or just inside the bottom of the one
+        // above: rows may differ in height.
+        let target_y = if dir > 0.0 {
+            f32::from(current.y) + f32::from(self.caret_height())
+        } else {
+            f32::from(current.y) - 1.0
+        };
         if target_y < 0.0 {
             return Some((0, CaretAffinity::Downstream, column));
         }
@@ -3819,6 +3854,28 @@ impl ComposerInput {
     /// Content-local point for a shaped projection byte index. The icon layer
     /// uses this to occupy its explicit projection slot without inventing a
     /// second coordinate system beside the custom text editor.
+    /// Row height of logical line `line_ix`.
+    fn line_height_at(&self, line_ix: usize) -> Pixels {
+        self.line_heights
+            .get(line_ix)
+            .copied()
+            .unwrap_or(self.line_height)
+    }
+
+    /// Row height of the logical line holding projected byte `index`.
+    fn line_height_for_display_index(&self, index: usize) -> Pixels {
+        let line_ix = self
+            .line_starts
+            .partition_point(|start| *start <= index)
+            .saturating_sub(1);
+        self.line_height_at(line_ix)
+    }
+
+    /// Row height at the caret.
+    fn caret_height(&self) -> Pixels {
+        self.line_height_for_display_index(self.projection.raw_to_display(self.cursor_offset()))
+    }
+
     fn point_for_display_index(&self, index: usize) -> Option<Point<Pixels>> {
         self.point_for_display_index_with_affinity(index, CaretAffinity::Downstream)
     }
@@ -3836,6 +3893,7 @@ impl ComposerInput {
             }
             if index <= line_start + line_len {
                 let relative_index = index - line_start;
+                let line_height = self.line_height_at(line_ix);
                 let local = if affinity == CaretAffinity::Downstream {
                     line.wrap_boundaries()
                         .iter()
@@ -3843,16 +3901,17 @@ impl ComposerInput {
                             line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index
                                 == relative_index
                         })
-                        .map(|row| point(px(0.0), self.line_height * (row + 1)))
-                        .or_else(|| line.position_for_index(relative_index, self.line_height))?
+                        .map(|row| point(px(0.0), line_height * (row + 1)))
+                        .or_else(|| line.position_for_index(relative_index, line_height))?
                 } else {
-                    line.position_for_index(relative_index, self.line_height)?
+                    line.position_for_index(relative_index, line_height)?
                 };
                 let y_offset: f32 = self
                     .last_lines
                     .iter()
                     .take(line_ix)
-                    .map(|l| f32::from(l.size(self.line_height).height))
+                    .enumerate()
+                    .map(|(ix, l)| f32::from(l.size(self.line_height_at(ix)).height))
                     .sum();
                 let indent = if local.y > px(0.0) {
                     self.line_indents.get(line_ix).copied().unwrap_or_default()
@@ -3883,7 +3942,7 @@ impl ComposerInput {
                 &line.unwrapped_layout,
                 label - start,
                 row_top,
-                self.line_height,
+                self.line_height_at(line_ix),
                 room,
                 window,
             ),
@@ -3900,6 +3959,7 @@ impl ComposerInput {
         let mut bounds = Vec::new();
         let mut y_offset = px(0.0);
         for (line_ix, line) in self.last_lines.iter().enumerate() {
+            let line_height = self.line_height_at(line_ix);
             let line_start = self.line_starts.get(line_ix).copied().unwrap_or(0);
             let local_start = range.start.saturating_sub(line_start).min(line.len());
             let local_end = range.end.saturating_sub(line_start).min(line.len());
@@ -3907,7 +3967,7 @@ impl ComposerInput {
                 || range.end <= line_start
                 || range.start >= line_start + line.len()
             {
-                y_offset += line.size(self.line_height).height;
+                y_offset += line.size(line_height).height;
                 continue;
             }
 
@@ -3919,15 +3979,15 @@ impl ComposerInput {
             for (row_ix, row_start, segment) in
                 display_row_segments(local_start..local_end, row_ends)
             {
-                let row_y = y_offset + self.line_height * row_ix;
+                let row_y = y_offset + line_height * row_ix;
                 let start_x = if segment.start == row_start {
                     px(0.0)
                 } else {
-                    line.position_for_index(segment.start, self.line_height)
+                    line.position_for_index(segment.start, line_height)
                         .map(|point| point.x)
                         .unwrap_or(px(0.0))
                 };
-                if let Some(end_point) = line.position_for_index(segment.end, self.line_height)
+                if let Some(end_point) = line.position_for_index(segment.end, line_height)
                     && end_point.x > start_x
                 {
                     bounds.push(Bounds::new(
@@ -3940,11 +4000,11 @@ impl ComposerInput {
                                 },
                             row_y,
                         ),
-                        size(end_point.x - start_x, self.line_height),
+                        size(end_point.x - start_x, line_height),
                     ));
                 }
             }
-            y_offset += line.size(self.line_height).height;
+            y_offset += line.size(line_height).height;
         }
         bounds
     }
@@ -3959,17 +4019,18 @@ impl ComposerInput {
             return (0, CaretAffinity::Downstream);
         }
         for (line_ix, line) in self.last_lines.iter().enumerate() {
-            let height = f32::from(line.size(self.line_height).height);
+            let line_height = self.line_height_at(line_ix);
+            let height = f32::from(line.size(line_height).height);
             let line_start = self.line_starts.get(line_ix).copied().unwrap_or(0);
             if y < height || line_ix + 1 == self.last_lines.len() {
-                let indent = if y >= f32::from(self.line_height) {
+                let indent = if y >= f32::from(line_height) {
                     self.line_indents.get(line_ix).copied().unwrap_or_default()
                 } else {
                     px(0.0)
                 };
                 let local = point(position.x - indent, px(y.min(height - 1.0).max(0.0)));
                 let ix = line
-                    .closest_index_for_position(local, self.line_height)
+                    .closest_index_for_position(local, line_height)
                     .unwrap_or_else(|ix| ix);
                 let affinity = line
                     .wrap_boundaries()
@@ -3977,7 +4038,7 @@ impl ComposerInput {
                     .position(|boundary| {
                         line.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index == ix
                     })
-                    .filter(|row| local.y < self.line_height * (row + 1))
+                    .filter(|row| local.y < line_height * (row + 1))
                     .map_or(CaretAffinity::Downstream, |_| CaretAffinity::Upstream);
                 let mut raw = self
                     .projection
@@ -4509,6 +4570,13 @@ impl ComposerInput {
             .filter(|(_, face)| *face == composer_markdown::Face::Code)
             .map(|(range, _)| range)
             .collect();
+        // Documents size their headings; the message composer keeps one size.
+        let headings = if self.markdown && !is_placeholder {
+            composer_markdown::headings(&self.content)
+        } else {
+            Vec::new()
+        };
+        let mut line_heights = Vec::new();
         for text in display.split('\n') {
             let raw_line = self
                 .content
@@ -4540,6 +4608,17 @@ impl ComposerInput {
                         .min(width * 0.4);
                 }
             }
+            let (line_font_size, line_height) = match heading_level_at(&headings, raw_at, raw_line)
+            {
+                Some(level) => {
+                    let (text_scale, height_scale) = heading_scale(level);
+                    (
+                        font_size * text_scale,
+                        px(self.configured_line_height * height_scale),
+                    )
+                }
+                None => (font_size, px(self.configured_line_height)),
+            };
             let end = display_at + text.len();
             let first_run = run_ranges.partition_point(|(r, _)| r.end <= display_at);
             let line_runs: Vec<TextRun> = run_ranges[first_run..]
@@ -4558,7 +4637,7 @@ impl ComposerInput {
                 .collect();
             if let Ok(shaped) = window.text_system().shape_text(
                 text.to_string().into(),
-                font_size,
+                line_font_size,
                 &line_runs,
                 (!self.single_line).then_some((width - indent).max(px(20.0))),
                 None,
@@ -4578,12 +4657,14 @@ impl ComposerInput {
                     }
                     lines.push(line);
                     indents.push(indent);
+                    line_heights.push(line_height);
                 }
             }
             display_at = end + 1;
             raw_at += raw_line.len() + 1;
         }
         self.line_indents = indents;
+        self.line_heights = line_heights;
 
         // Logical line byte offsets (each shaped line covers one \n-split line).
         let mut line_starts = Vec::with_capacity(lines.len());
@@ -4598,7 +4679,8 @@ impl ComposerInput {
 
         let content_height: f32 = lines
             .iter()
-            .map(|l| f32::from(l.size(self.line_height).height))
+            .zip(&self.line_heights)
+            .map(|(l, height)| f32::from(l.size(*height).height))
             .sum();
         let max_line_width: f32 = lines
             .iter()
@@ -4666,7 +4748,7 @@ impl ComposerInput {
                 self.scroll_top = input_scroll_offset_for_cursor(
                     self.scroll_top,
                     f32::from(cursor.y),
-                    f32::from(self.line_height),
+                    f32::from(self.caret_height()),
                     self.content_height,
                     element_height,
                     self.settled_viewport_height,
@@ -4863,7 +4945,7 @@ impl EntityInputHandler for ComposerInput {
             bounds.left() + start.x - px(self.scroll_left),
             bounds.top() + start.y - px(self.scroll_top),
         );
-        Some(Bounds::new(origin, size(px(2.0), self.line_height)))
+        Some(Bounds::new(origin, size(px(2.0), self.caret_height())))
     }
 
     fn character_index_for_point(
@@ -5080,7 +5162,7 @@ impl gpui::Element for ComposerTextElement {
                 cursor = Some(fill(
                     Bounds::new(
                         point(origin.x + p.x, origin.y + p.y),
-                        size(px(2.0), input.line_height),
+                        size(px(2.0), input.caret_height()),
                     ),
                     caret_color,
                 ));
@@ -5097,12 +5179,19 @@ impl gpui::Element for ComposerTextElement {
                 CaretAffinity::Upstream,
             ),
         ) {
-            let lh = input.line_height;
+            // Rows may differ in height (Markdown headings): the first and
+            // last rows take their own lines' heights.
+            let start_lh = input.line_height_for_display_index(
+                input.projection.raw_to_display(input.selected_range.start),
+            );
+            let end_lh = input.line_height_for_display_index(
+                input.projection.raw_to_display(input.selected_range.end),
+            );
             if start.y == end.y {
                 selection_quads.push(fill(
                     Bounds::from_corners(
                         point(origin.x + start.x, origin.y + start.y),
-                        point(origin.x + end.x, origin.y + start.y + lh),
+                        point(origin.x + end.x, origin.y + start.y + start_lh),
                     ),
                     selection_color,
                 ));
@@ -5111,14 +5200,14 @@ impl gpui::Element for ComposerTextElement {
                 selection_quads.push(fill(
                     Bounds::from_corners(
                         point(origin.x + start.x, origin.y + start.y),
-                        point(bounds.right(), origin.y + start.y + lh),
+                        point(bounds.right(), origin.y + start.y + start_lh),
                     ),
                     selection_color,
                 ));
-                if end.y > start.y + lh {
+                if end.y > start.y + start_lh {
                     selection_quads.push(fill(
                         Bounds::from_corners(
-                            point(origin.x, origin.y + start.y + lh),
+                            point(origin.x, origin.y + start.y + start_lh),
                             point(bounds.right(), origin.y + end.y),
                         ),
                         selection_color,
@@ -5127,7 +5216,7 @@ impl gpui::Element for ComposerTextElement {
                 selection_quads.push(fill(
                     Bounds::from_corners(
                         point(origin.x, origin.y + end.y),
-                        point(origin.x + end.x, origin.y + end.y + lh),
+                        point(origin.x + end.x, origin.y + end.y + end_lh),
                     ),
                     selection_color,
                 ));
@@ -5210,11 +5299,12 @@ impl gpui::Element for ComposerTextElement {
 
         // WrappedLine isn't Clone — temporarily take the shaped lines out of the
         // entity for painting, then put them back for mouse mapping.
-        let (lines, indents, line_height, scroll, scroll_left) =
+        let (lines, indents, line_heights, line_height, scroll, scroll_left) =
             self.input.update(cx, |input, _| {
                 (
                     std::mem::take(&mut input.last_lines),
                     input.line_indents.clone(),
+                    input.line_heights.clone(),
                     input.line_height,
                     input.scroll_top,
                     input.scroll_left,
@@ -5236,6 +5326,7 @@ impl gpui::Element for ComposerTextElement {
                 }
                 let mut y = bounds.top() - px(scroll);
                 for (line_ix, line) in lines.iter().enumerate() {
+                    let line_height = line_heights.get(line_ix).copied().unwrap_or(line_height);
                     let height = line.size(line_height).height;
                     let indent = indents.get(line_ix).copied().unwrap_or_default();
                     if indent > px(0.0) && !line.wrap_boundaries().is_empty() {
@@ -11945,6 +12036,46 @@ mod tests {
             "- first\n- second\nafter"
         );
         assert!(!submitted.get(), "a document never submits");
+    }
+
+    #[gpui::test]
+    fn document_headings_take_taller_rows_for_layout_caret_and_hits(cx: &mut gpui::TestAppContext) {
+        with_composer_input(cx, |input, window, cx| {
+            input.markdown = true;
+            input.set_text("# Title\nbody", cx);
+            input.layout_text(px(400.), &window.text_style(), window, cx);
+            let (heading, body) = (input.line_heights[0], input.line_heights[1]);
+            assert!(heading > body);
+            assert_eq!(body, px(input.configured_line_height));
+            assert_eq!(input.content_height, f32::from(heading + body));
+            // The body line starts below the taller heading row.
+            input.move_to(input.text().len(), cx);
+            assert_eq!(input.cursor_point().unwrap().y, heading);
+            assert_eq!(input.caret_height(), body);
+            // A press low in the heading row still lands on the heading.
+            let (ix, _) = input.caret_for_point(point(px(1.0), heading - px(2.0)));
+            assert!(ix <= "# Title".len(), "{ix}");
+            // Up from the body reaches the heading, and down comes back.
+            let (up, _, _) = input.vertical_target(-1.0).unwrap();
+            assert!(up <= "# Title".len(), "{up}");
+            input.move_to(up, cx);
+            let (down, _, _) = input.vertical_target(1.0).unwrap();
+            assert!(down > "# Title".len(), "{down}");
+            // The message composer keeps one row height.
+            input.markdown = false;
+            input.needs_measure = true;
+            input.layout_text(px(400.), &window.text_style(), window, cx);
+            assert_eq!(input.line_heights[0], input.line_heights[1]);
+        });
+    }
+
+    #[test]
+    fn setext_underlines_keep_body_size() {
+        let text = "Title\n===\nbody";
+        let headings = composer_markdown::headings(text);
+        assert_eq!(heading_level_at(&headings, 0, "Title"), Some(1));
+        assert_eq!(heading_level_at(&headings, 6, "==="), None);
+        assert_eq!(heading_level_at(&headings, 10, "body"), None);
     }
 
     #[gpui::test]

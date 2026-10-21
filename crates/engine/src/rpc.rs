@@ -2154,6 +2154,14 @@ impl RpcService for EngineRpc {
                         })
                         .map_err(|e| RpcError::Failed(e.to_string()))?;
                 }
+                // The fork takes the source's notes with it. A retried fork
+                // that already has notes keeps its own.
+                if target.doc().notes_text().is_empty() {
+                    target
+                        .doc()
+                        .set_notes_text(&source_doc.doc().notes_text())
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                }
                 self.doc_host.persist_fork(&target).map_err(failed)?;
                 self.workspace.import_chat_row(&chat).map_err(failed)?;
                 RpcReply::value(&chat)

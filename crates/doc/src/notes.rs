@@ -242,6 +242,30 @@ impl SessionDoc {
     /// ops. Unconditional: for copies between docs (forks, rebuilds) and
     /// writers that already hold the doc. `false` when nothing changed.
     pub fn set_notes_text(&self, text: &str) -> Result<bool, DocError> {
+        let _gate = self.lock_notes();
+        self.apply_notes_text(text)
+    }
+
+    /// Updates from other replicas, imported under the notes gate so they
+    /// never land between a notes write's read and its ops. Live sync imports
+    /// into a shared doc go through here.
+    pub fn import_with(
+        &self,
+        bytes: &[u8],
+        origin: &str,
+    ) -> Result<loro::ImportStatus, loro::LoroError> {
+        let _gate = self.lock_notes();
+        self.doc().import_with(bytes, origin)
+    }
+
+    fn lock_notes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.notes_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The edit behind [`Self::set_notes_text`]; the caller holds the gate.
+    fn apply_notes_text(&self, text: &str) -> Result<bool, DocError> {
         let notes = self.doc().get_text(NOTES_CONTAINER);
         let Some(edit) = single_range_diff(&notes.to_string(), text) else {
             return Ok(false);
@@ -260,6 +284,9 @@ impl SessionDoc {
     /// is always allowed, so notes that arrived over the limit from another
     /// device can still be trimmed.
     pub fn write_notes(&self, base_hash: &str, text: &str) -> Result<NotesWrite, DocError> {
+        // The check and the write are one step: two writers on one base must
+        // not both be told Applied.
+        let _gate = self.lock_notes();
         let current = self.notes_snapshot();
         if current.hash != base_hash {
             return Ok(NotesWrite::Conflict { current });
@@ -269,7 +296,7 @@ impl SessionDoc {
                 limit: NOTES_MAX_BYTES,
             });
         }
-        self.set_notes_text(text)?;
+        self.apply_notes_text(text)?;
         Ok(NotesWrite::Applied {
             hash: notes_hash(text),
         })
@@ -428,6 +455,45 @@ mod tests {
             other => panic!("expected conflict, got {other:?}"),
         }
         assert_eq!(doc.notes_text(), "# Plan\n");
+    }
+
+    #[test]
+    fn concurrent_writers_on_one_base_never_both_apply() {
+        use std::sync::{Arc, Barrier};
+        for _ in 0..200 {
+            let doc = Arc::new(doc());
+            doc.set_notes_text("base").unwrap();
+            let base = doc.notes_snapshot().hash;
+            let barrier = Arc::new(Barrier::new(2));
+            let writers: Vec<_> = ["base + left", "right + base"]
+                .into_iter()
+                .map(|text| {
+                    let (doc, base, barrier) = (doc.clone(), base.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        (text, doc.write_notes(&base, text).unwrap())
+                    })
+                })
+                .collect();
+            let results: Vec<_> = writers.into_iter().map(|w| w.join().unwrap()).collect();
+            let applied: Vec<_> = results
+                .iter()
+                .filter(|(_, write)| matches!(write, NotesWrite::Applied { .. }))
+                .collect();
+            assert_eq!(applied.len(), 1, "{results:?}");
+            // The winner's text is exactly what the doc holds; the loser was
+            // told so and shown it.
+            assert_eq!(doc.notes_text(), applied[0].0);
+            let lost = results
+                .iter()
+                .find(|(_, write)| matches!(write, NotesWrite::Conflict { .. }));
+            match lost {
+                Some((_, NotesWrite::Conflict { current })) => {
+                    assert_eq!(current.text, applied[0].0)
+                }
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+        }
     }
 
     #[test]

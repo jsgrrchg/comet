@@ -18,6 +18,7 @@
 //! retries. The hash covers the notes text alone; doc frontiers would move on
 //! every streamed token and make every write during a turn a conflict.
 
+use std::collections::VecDeque;
 use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
@@ -201,6 +202,33 @@ pub fn rebase_notes(base: &str, local: &str, remote: &str) -> String {
     out
 }
 
+/// How many of its own writes a viewport remembers (see [`NotesEchoes`]).
+const NOTES_ECHO_WINDOW: usize = 32;
+
+/// Hashes of the notes a viewport wrote recently. Its watch keeps reporting
+/// states the viewport itself produced, and one can arrive after a newer write
+/// has already landed. Taken for a change from another device, that stale
+/// frame would merge as a revert of the newer write. Because writes are
+/// compare-and-set, any frame that is neither the base nor one of these is a
+/// genuine change. A change elsewhere that happens to restore one of these
+/// exact texts is ignored until the viewport's next write, whose conflict
+/// brings it in.
+#[derive(Debug, Clone, Default)]
+pub struct NotesEchoes(VecDeque<String>);
+
+impl NotesEchoes {
+    pub fn record(&mut self, hash: impl Into<String>) {
+        if self.0.len() == NOTES_ECHO_WINDOW {
+            self.0.pop_front();
+        }
+        self.0.push_back(hash.into());
+    }
+
+    pub fn contains(&self, hash: &str) -> bool {
+        self.0.iter().any(|known| known == hash)
+    }
+}
+
 impl SessionDoc {
     pub fn notes_text(&self) -> String {
         self.doc().get_text(NOTES_CONTAINER).to_string()
@@ -328,6 +356,17 @@ mod tests {
         assert_eq!(edit.map_offset(3), 5);
         assert_eq!(edit.map_offset(4), 5);
         assert_eq!(edit.map_offset(6), 7);
+    }
+
+    #[test]
+    fn echoes_remember_a_bounded_window() {
+        let mut echoes = NotesEchoes::default();
+        for n in 0..=NOTES_ECHO_WINDOW {
+            echoes.record(notes_hash(&n.to_string()));
+        }
+        assert!(!echoes.contains(&notes_hash("0")), "the oldest falls out");
+        assert!(echoes.contains(&notes_hash("1")));
+        assert!(echoes.contains(&notes_hash(&NOTES_ECHO_WINDOW.to_string())));
     }
 
     #[test]

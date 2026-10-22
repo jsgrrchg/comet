@@ -446,6 +446,13 @@ impl RowBuilder {
                             let text = format!("Forked from {source_title}");
                             rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "arrow.triangle.branch", ColorRole::TextTertiary, &text)), gap });
                         }
+                        MessagePart::Switch { id, from, to, from_harness, to_harness } => {
+                            let gap = gap_for(&rows, false);
+                            rows.push(Placed {
+                                core: Arc::new(switch_row(ctx, &entry.id, id, (from, from_harness.as_deref()), (to, to_harness.as_deref()))),
+                                gap,
+                            });
+                        }
                         _ => {}
                     }
                 }
@@ -704,6 +711,7 @@ fn prepare_user_text(ctx: &mut Ctx, body: &str, style: super::style::Resolved, l
         links,
         chip: ((lh - chip_h) / 2.0, chip_h),
         badges,
+        marks: Vec::new(),
         math: Vec::new(),
     }
 }
@@ -723,6 +731,58 @@ fn chip_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, icon: &'static str, co
             text: prepare_plain(ctx, text, style, lh, if color == ColorRole::Danger { ColorRole::Danger } else { ColorRole::TextSecondary }, WhiteSpace::Normal),
         }),
         copy_text: text.to_owned(),
+    }
+}
+
+/// The provider-switch seam: "Switched from [logo] to [logo]", each
+/// provider by its logo alone (its name stays in the copied text). A seam
+/// written without harness ids names them instead.
+fn switch_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, from: (&str, Option<&str>), to: (&str, Option<&str>)) -> RowCore {
+    let (size, lh) = TYPE.small;
+    let style = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
+    let lh = ctx.typo.px(lh);
+    let mark = ctx.typo.px(14.0);
+    let mut text = String::new();
+    let mut spans = Vec::new();
+    let mut marks = Vec::new();
+    let mut push = |text: &mut String, piece: &str, harness: Option<&str>| {
+        let start = text.len();
+        // A logo stands in for the name: a zero-width word joiner carries the
+        // padding the logo is drawn in.
+        text.push_str(if harness.is_some() { "\u{2060}" } else { piece });
+        let pad = if harness.is_some() { mark + 4.0 } else { 0.0 };
+        spans.push(zeron_text::Span { range: start..text.len(), style: style.id, pad_start: pad, pad_end: 0.0, atomic: harness.is_some(), inline_box: None });
+        if let Some(harness) = harness {
+            marks.push((spans.len() - 1, format!("brand:{harness}")));
+        }
+    };
+    push(&mut text, "Switched from ", None);
+    push(&mut text, from.0, from.1.filter(|h| !h.is_empty()));
+    push(&mut text, " to ", None);
+    push(&mut text, to.0, to.1.filter(|h| !h.is_empty()));
+    let paints = spans
+        .iter()
+        .map(|_| super::markdown::SpanPaint { color: ColorRole::TextSecondary, decoration: super::display::Decoration::None, link: None, chip: false })
+        .collect();
+    let p = zeron_text::prepare(
+        &ctx.typo.book,
+        ctx.cache,
+        &text,
+        &spans,
+        &zeron_text::PrepareOptions { white_space: WhiteSpace::Normal, overflow_wrap: zeron_text::OverflowWrap::Anywhere, ..Default::default() },
+    );
+    let copy_text = format!("Switched from {} to {}", from.0, to.0);
+    RowCore {
+        key: row_key(&format!("{entry_id}#{part_id}")),
+        version: next_version(),
+        kind: RowKind::Chip,
+        entry_id: Arc::from(entry_id),
+        content: Content::Chip(Chip {
+            icon: "arrow.left.arrow.right",
+            color: ColorRole::TextTertiary,
+            text: PText { p, lh, base: super::style::baseline(lh, style), paints, links: Vec::new(), chip: (0.0, 0.0), badges: Vec::new(), marks, math: Vec::new() },
+        }),
+        copy_text,
     }
 }
 

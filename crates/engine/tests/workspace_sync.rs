@@ -157,6 +157,7 @@ fn run_request(prompt: &str) -> RunRequest {
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        env: Default::default(),
     }
 }
 
@@ -697,6 +698,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 git_checked_at: Some(now),
                 checkout_id: Some("co-1".into()),
                 repository_id: None,
+                github_repo: None,
                 created_at: now,
             })
             .unwrap();
@@ -718,6 +720,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 room_gen: None,
                 parent_chat_id: None,
                 harness_session_cwd: Some("/tmp/legacy".into()),
+                harness_session_harness: None,
                 space_id: Some("space-legacy".into()),
                 last_seen_at: Some(now),
             })
@@ -725,6 +728,8 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
         legacy
             .upsert_session(&Session {
                 last_completed_turn: None,
+                last_turn_outcome: None,
+                terminal_activity: None,
                 running_subagents: 0,
                 chat_id: "chat-legacy".into(),
                 device_id: "dev-a".into(),
@@ -807,4 +812,45 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
             .is_some(),
         "legacy snapshot retained for rollback"
     );
+}
+
+#[tokio::test]
+async fn a_cloud_project_names_its_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = assemble(dir.path(), "dev-a");
+
+    // Only the logical Cloud device takes a repository at create.
+    assert!(
+        a.workspace
+            .create_cloud_space("space-x", "dev-a", "/home/user/app", None, "acme/app")
+            .is_err()
+    );
+    a.workspace
+        .create_cloud_space("space-c", "cloud-acct", "/home/user/app", None, "acme/app")
+        .expect("create Cloud project");
+    // The same repository on Cloud again is the same project.
+    a.workspace
+        .create_cloud_space(
+            "space-d",
+            "cloud-acct",
+            "/home/user/app-2",
+            None,
+            "Acme/App",
+        )
+        .expect("idempotent");
+    let spaces = a.workspace.read_spaces().expect("spaces");
+    let cloud: Vec<_> = spaces
+        .iter()
+        .filter(|s| s.device_id == "cloud-acct")
+        .collect();
+    assert_eq!(cloud.len(), 1);
+    assert_eq!(cloud[0].id, "space-c");
+    assert_eq!(cloud[0].github_repo.as_deref(), Some("acme/app"));
+    assert!(cloud[0].git_detected);
+    assert_eq!(
+        cloud[0].repository_id.as_deref(),
+        Some("github.com/acme/app")
+    );
+
+    a.shutdown().await;
 }

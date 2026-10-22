@@ -497,7 +497,7 @@ final class SessionFlowTests: XCTestCase {
         XCTAssertTrue(app.buttons["Photo Library"].waitForExistence(timeout: 5), "attach menu opens from the card")
     }
 
-    /// Regression: the model chip's menu completed off the main thread.
+    /// The model chip opens the picker sheet; a pick names the model on the chip.
     func testModelPickerInSession() {
         let app = launch(["-route", "chat:chat-deploy"])
         let input = app.textViews["composer-input"]
@@ -506,11 +506,91 @@ final class SessionFlowTests: XCTestCase {
         let chip = app.buttons["composer-chip-model"]
         XCTAssertTrue(chip.waitForExistence(timeout: 5))
         chip.tap()
-        let item = app.collectionViews.buttons.element(boundBy: 0)
-        XCTAssertTrue(item.waitForExistence(timeout: 5), "models load")
-        item.tap()
-        XCTAssertTrue(input.waitForExistence(timeout: 5))
+        let lists = app.collectionViews.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-list'"))
+        XCTAssertTrue(lists.firstMatch.waitForExistence(timeout: 5), "the picker opens")
+        // The page on screen (the others sit beside it, swipeable).
+        let list = lists.allElementsBoundByIndex.first { $0.isHittable } ?? lists.firstMatch
+        let row = list.cells.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-row-'")).element(boundBy: 1)
+        XCTAssertTrue(row.waitForExistence(timeout: 5), "models load")
+        // A row reads "name, what it's for".
+        let picked = row.label.components(separatedBy: ", ").first ?? row.label
+        row.tap()
+        expectation(for: NSPredicate(format: "label == %@", picked), evaluatedWith: chip)
+        waitForExpectations(timeout: 5)
         XCTAssertEqual(app.state, .runningForeground)
+    }
+
+    /// Between turns, on a host that switches providers, the picker's tabs
+    /// move the chat to another provider; an older host's chat shows only its
+    /// own, and says why.
+    func testModelPickerSwitchesProviderWhereTheHostCan() {
+        let app = launch(["-route", "chat:chat-tabs"])
+        let input = app.textViews["composer-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        input.tap()
+        let chip = app.buttons["composer-chip-model"]
+        XCTAssertTrue(chip.waitForExistence(timeout: 5))
+        let before = chip.label
+        chip.tap()
+        // The demo's chat-tabs runs Codex on the Mac.
+        let claude = app.buttons["model-picker-tab-claude-code"]
+        XCTAssertTrue(claude.waitForExistence(timeout: 5), "other providers have tabs")
+        XCTAssertTrue(app.buttons["model-picker-tab-codex"].exists)
+        snapshot(app, "model-picker")
+        // Swiping the list moves to the next provider, and its tab follows.
+        app.collectionViews["model-picker-list-codex"].swipeLeft()
+        expectation(for: NSPredicate(format: "isSelected == true"), evaluatedWith: claude)
+        waitForExpectations(timeout: 5)
+        app.buttons["model-picker-tab-codex"].tap()
+        expectation(for: NSPredicate(format: "isSelected == true"), evaluatedWith: app.buttons["model-picker-tab-codex"])
+        waitForExpectations(timeout: 5)
+        claude.tap()
+        let row = app.collectionViews["model-picker-list-claude-code"].cells.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-row-'")).element(boundBy: 0)
+        XCTAssertTrue(row.waitForExistence(timeout: 5), "Claude's models load")
+        // A row reads "name, what it's for".
+        let picked = row.label.components(separatedBy: ", ").first ?? row.label
+        row.tap()
+        expectation(for: NSPredicate(format: "label == %@", picked), evaluatedWith: chip)
+        waitForExpectations(timeout: 5)
+        XCTAssertNotEqual(chip.label, before)
+
+        // The studio's engine predates provider switching.
+        let older = launch(["-route", "chat:chat-blog"])
+        let field = older.textViews["composer-input"]
+        XCTAssertTrue(field.waitForExistence(timeout: 10))
+        field.tap()
+        older.buttons["composer-chip-model"].tap()
+        XCTAssertTrue(older.collectionViews.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-list'")).firstMatch.waitForExistence(timeout: 5))
+        XCTAssertFalse(older.buttons["model-picker-tab-codex"].exists, "an older host keeps its provider")
+        XCTAssertTrue(older.staticTexts["This computer needs a newer Zeron to switch provider."].exists)
+        // A chat started without picking a model runs (and shows) the default.
+        XCTAssertTrue(older.cells.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-row-' AND value == 'Current'")).firstMatch.waitForExistence(timeout: 5), "the default model is ticked")
+        older.buttons["model-picker-close"].tap()
+        XCTAssertNotEqual(older.buttons["composer-chip-model"].label, "Claude Code", "the chip names the default model, not the provider")
+    }
+
+    /// A computer offering every agent: the switcher scrolls, and the chosen
+    /// provider stays in view as the pages are swiped.
+    func testModelPickerWithEveryProviderKeepsTheChosenOneInView() {
+        let app = launch(["-route", "chat:chat-tabs", "-all-providers"])
+        let input = app.textViews["composer-input"]
+        XCTAssertTrue(input.waitForExistence(timeout: 10))
+        input.tap()
+        app.buttons["composer-chip-model"].tap()
+        let first = app.buttons["model-picker-tab-codex"]
+        XCTAssertTrue(first.waitForExistence(timeout: 5))
+        snapshot(app, "picker-every-provider-start")
+        for id in ["claude-code", "opencode", "cursor", "devin", "grok"] {
+            app.collectionViews.matching(NSPredicate(format: "identifier BEGINSWITH 'model-picker-list'"))
+                .allElementsBoundByIndex.first { $0.isHittable }?.swipeLeft()
+            let tab = app.buttons["model-picker-tab-\(id)"]
+            expectation(for: NSPredicate(format: "isSelected == true AND isHittable == true"), evaluatedWith: tab)
+            waitForExpectations(timeout: 5)
+        }
+        snapshot(app, "picker-every-provider-middle")
+        app.buttons["model-picker-tab-hermes"].tap()
+        expectation(for: NSPredicate(format: "isSelected == true AND isHittable == true"), evaluatedWith: app.buttons["model-picker-tab-hermes"])
+        waitForExpectations(timeout: 5)
     }
 
     /// Regression: a drag that starts at the tail re-latched follow at once,

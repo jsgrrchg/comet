@@ -134,7 +134,7 @@ fn setup(dir: &std::path::Path, harness: Arc<NativeStore>) -> EngineCore {
         )
         .unwrap();
     core.workspace
-        .set_chat_harness_session("main", "canonical", "/tmp");
+        .set_chat_harness_session("main", "canonical", "/tmp", Some(provider));
     let doc = core.doc_host.open("main").unwrap();
     for (id, role) in [
         ("u1", MessageRole::User),

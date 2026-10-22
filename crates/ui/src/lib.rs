@@ -25,6 +25,7 @@ pub mod browser;
 pub mod change_requests;
 pub mod changes;
 mod chat_store;
+pub mod cloud;
 mod comment_ui;
 pub mod comments;
 pub mod composer;
@@ -55,7 +56,8 @@ mod new_thread_background_mask;
 mod notice;
 mod notification_service;
 pub mod notes;
-pub mod notify;
+pub use zeron_notify as notify;
+pub mod onboarding;
 pub mod orb;
 pub mod overscroll;
 pub mod pickers;
@@ -240,6 +242,14 @@ fn run_application(
         shell::apply_keymap(cx, &ui_settings.keymap, ui_settings.composer_send_behavior);
         cx.spawn(async move |cx| {
             while let Some(url) = url_rx.next().await {
+                // A banner the background engine posted, clicked: the engine
+                // opens the app on `zeron://notification/<target>`, which lands
+                // like an in-process banner click.
+                if let Some(target) = notify::link_target(&url) {
+                    let target = target.to_owned();
+                    let _ = cx.update(|cx| window_manager::notified_target(target, cx));
+                    continue;
+                }
                 let _ = cx.update(|cx| window_manager::deep_link(url, cx));
             }
         })
@@ -256,6 +266,14 @@ fn run_application(
             }
         })
         .detach();
+        // Sessions run in the background engine, which outlives every window
+        // (and posts the desktop banners); embedding stays the fallback, or
+        // the choice with ZERON_EMBED_ENGINE=1. An embedded engine posts the
+        // banners itself.
+        zeron_engine::desktop_notify::enable();
+        if std::env::var_os("ZERON_EMBED_ENGINE").is_none_or(|value| value.is_empty() || value == "0") {
+            state::launch_background_engine();
+        }
         state::AppState::bootstrap(owner, config.boot(), cx);
         window_manager::open(
             if config.initial_new_window {

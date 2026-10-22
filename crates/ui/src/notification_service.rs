@@ -102,7 +102,9 @@ impl NotificationService {
                     return;
                 }
                 let settings = crate::settings::current(cx);
-                let banner = settings.notifications_enabled
+                // The engine posts the banners when it can; the app then posts none.
+                let banner = !owner.read(cx).engine_posts_banners()
+                    && settings.notifications_enabled
                     && settings.agent_update_notifications
                     && !(settings.notifications_background_only && cx.active_window().is_some());
                 #[cfg(not(test))]
@@ -167,8 +169,11 @@ impl Detector {
             self.connectivity = Default::default();
             return Vec::new();
         }
-        let banner =
-            settings.notifications_enabled && !(settings.notifications_background_only && focused);
+        // The engine posts the banners when it can (with every window closed
+        // too); the app then only chimes.
+        let banner = !state.engine_posts_banners()
+            && settings.notifications_enabled
+            && !(settings.notifications_background_only && focused);
         let mut notices = Vec::new();
         self.sessions.retain(|chat, _| {
             state
@@ -182,7 +187,9 @@ impl Detector {
                 .sessions
                 .insert(session.chat_id.clone(), status.clone());
             if let Some(sound) = previous.and_then(|previous| {
-                status.sound_since(&previous, state.send_pending(&session.chat_id, now))
+                status
+                    .ping_since(&previous, state.send_pending(&session.chat_id, now))
+                    .map(Sound::from)
             }) {
                 // Child chats and voice orchestrators have their own surfaces.
                 // Keep their baselines without separate session notifications.
@@ -208,11 +215,15 @@ impl Detector {
                 });
             }
         }
-        if let Some(sound) = self.connectivity.update(
-            state.connectivity.state,
-            state.connectivity_observed,
-            instant,
-        ) {
+        if let Some(sound) = self
+            .connectivity
+            .update(
+                state.connectivity.state,
+                state.connectivity_observed,
+                instant,
+            )
+            .map(Sound::from)
+        {
             notices.push(Notice {
                 chat_id: None,
                 title: "Connection unavailable".into(),
@@ -296,12 +307,15 @@ mod tests {
             started_at: Some(Utc::now()),
             updated_at: Utc::now(),
             last_completed_turn: None,
+            last_turn_outcome: None,
+            terminal_activity: None,
             running_subagents: 0,
         }
     }
 
     fn chat(parent_chat_id: Option<&str>) -> zeron_proto::Chat {
         zeron_proto::Chat {
+            harness_session_harness: None,
             id: "shared".into(),
             device_id: "local".into(),
             title: None,

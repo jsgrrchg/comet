@@ -199,7 +199,7 @@ impl TitleGenerator {
             serde_json::to_string(prompt).ok()?
         );
         for attempt in 0..=RETRY_DELAYS_MS.len() {
-            let request = RunRequest {
+            let mut request = RunRequest {
                 mcp: None,
                 prompt: title_prompt.clone(),
                 harness: Some(harness_id),
@@ -213,7 +213,15 @@ impl TitleGenerator {
                 resume: None,
                 resume_policy: Default::default(),
                 worktree: None,
+                env: Default::default(),
             };
+            // A Cloud device's credential broker supplies the CLI's login;
+            // without one there is no title to generate.
+            self.inner
+                .registry
+                .prepare_run(harness_id, &mut request)
+                .await
+                .ok()?;
             match tokio::time::timeout(
                 std::time::Duration::from_secs(30),
                 collect_text(harness.as_ref(), request, Some(execution_lease.clone())),
@@ -384,6 +392,7 @@ mod tests {
             resume_policy: Default::default(),
             attachments: vec![],
             worktree: None,
+            env: Default::default(),
         };
         let result = collect_text(&harness, request, None).await;
         assert!(

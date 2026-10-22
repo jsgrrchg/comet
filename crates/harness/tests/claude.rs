@@ -51,6 +51,7 @@ fn request(prompt: &str) -> RunRequest {
         worktree: None,
         resume: None,
         resume_policy: Default::default(),
+        env: Default::default(),
     }
 }
 

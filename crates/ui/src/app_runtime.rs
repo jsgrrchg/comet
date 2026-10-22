@@ -31,12 +31,22 @@ pub(crate) fn init(boot: EngineBootConfig, cx: &mut App) -> Entity<AppState> {
     cx.on_app_quit(move |cx| {
         crate::settings::flush(cx);
         crate::app_update::install_on_quit(cx);
+        // The background engine outlives this app: every window reports its
+        // viewport unfocused, so banners resume at once rather than after the
+        // last focus report goes stale.
+        let unfocus: Vec<_> = crate::window_manager::views(cx)
+            .into_iter()
+            .filter_map(|shell| shell.read(cx).state.read(cx).viewport_closing())
+            .collect();
         let shutdown = owner
             .read(cx)
             .engine()
             .cloned()
             .map(|engine| gpui_tokio::Tokio::spawn(cx, async move { engine.shutdown().await }));
         async move {
+            for unfocus in unfocus {
+                unfocus.await;
+            }
             if let Some(task) = shutdown {
                 let _ = task.await;
             }

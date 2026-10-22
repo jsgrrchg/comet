@@ -408,6 +408,14 @@ fn tabs(host: &str, now: i64) -> Vec<SessionMessageEntry> {
             host,
             now - 950_000,
             vec![
+                // The chat moved from Claude Code to Codex before this turn.
+                MessagePart::Switch {
+                    id: "s0".into(),
+                    from: "Claude Code".into(),
+                    to: "Codex".into(),
+                    from_harness: Some("claude-code".into()),
+                    to_harness: Some("codex".into()),
+                },
                 tool(
                     "k1",
                     ToolCall::Search {

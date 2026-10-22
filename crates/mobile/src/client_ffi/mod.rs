@@ -11,6 +11,9 @@
 //! through [`CoreClient::session_handle`] → [`zeron_client::SessionHandle`]
 //! (`snapshot()` / `subscribe()`), never over FFI.
 
+mod cloud;
+mod providers;
+pub use providers::UsageWindowInfo;
 mod session;
 mod voice;
 pub use voice::*;
@@ -20,6 +23,7 @@ use std::sync::Arc;
 
 use zeron_client as zc;
 
+pub use cloud::*;
 pub use session::*;
 pub use types::*;
 
@@ -248,6 +252,16 @@ impl CoreClient {
         Ok(self.client.pin_session(&chat_id)?)
     }
 
+    /// Pin between neighbours (`None` at either end).
+    pub fn pin_session_at(
+        &self,
+        chat_id: String,
+        after: Option<String>,
+        before: Option<String>,
+    ) -> CoreResult<()> {
+        Ok(self.client.pin_session_at(&chat_id, after, before)?)
+    }
+
     pub fn unpin_session(&self, chat_id: String) -> CoreResult<()> {
         Ok(self.client.unpin_session(&chat_id)?)
     }
@@ -282,6 +296,20 @@ impl CoreClient {
     /// Move a session into a section (`None` = back to recent).
     pub fn assign_section(&self, chat_id: String, section_id: Option<String>) -> CoreResult<()> {
         Ok(self.client.assign_section(&chat_id, section_id)?)
+    }
+
+    /// Move a session into a section between its members (`None` at either
+    /// end), as a drop into the section does.
+    pub fn place_session(
+        &self,
+        chat_id: String,
+        section_id: Option<String>,
+        after: Option<String>,
+        before: Option<String>,
+    ) -> CoreResult<()> {
+        Ok(self
+            .client
+            .place_session(&chat_id, section_id, after, before)?)
     }
 
     /// Create (or find) the project for `path` on `device_id`. Returns its id.
@@ -351,6 +379,19 @@ impl CoreClient {
         let client = self.client.clone();
         let fallback = harness.clone();
         on_runtime(async move { Ok(client.list_models(&device_id, &harness).await) })
+            .await
+            .unwrap_or_else(|_| zc::catalog::fallback_models(&fallback))
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// Cloud's model catalog for `harness`: the edge's list, else the last
+    /// one read, else the static list.
+    pub async fn cloud_models(&self, harness: String) -> Vec<ModelInfo> {
+        let client = self.client.clone();
+        let fallback = harness.clone();
+        on_runtime(async move { Ok(client.cloud_models(&harness).await) })
             .await
             .unwrap_or_else(|_| zc::catalog::fallback_models(&fallback))
             .into_iter()

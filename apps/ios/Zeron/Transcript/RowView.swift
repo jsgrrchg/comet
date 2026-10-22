@@ -309,6 +309,13 @@ final class RowView: UIView {
 
     static func asset(_ name: String) -> UIImage? {
         if let hit = assets[name] { return hit }
+        // `brand:<harness>`: a provider's logo (a switch seam's), drawn large
+        // and scaled down; tinted marks keep their colour.
+        if name.hasPrefix("brand:") {
+            let image = BrandMarks.image(for: String(name.dropFirst("brand:".count)), side: 32)
+            assets[name] = image
+            return image
+        }
         let image = (name.hasPrefix("tool-") || name.hasPrefix("fileicon-")) ? UIImage(named: name) : nil
         assets[name] = image
         return image

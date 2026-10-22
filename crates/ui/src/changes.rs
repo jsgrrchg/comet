@@ -5121,12 +5121,10 @@ impl Render for Changes {
                     .items_center()
                     .justify_center()
                     .gap(px(Theme::SPACE_SM))
-                    .child(crate::loaders::gradient_spinner(
+                    .child(crate::loaders::ring_spinner(
                         "changes-preparing",
-                        &theme,
-                        3.0,
-                        cx.entity_id(),
-                        cx,
+                        20.0,
+                        theme.text_muted,
                     ))
                     .child(
                         div()
@@ -5174,12 +5172,10 @@ impl Render for Changes {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(crate::loaders::gradient_spinner(
+                            .child(crate::loaders::ring_spinner(
                                 "changes-parsing",
-                                &theme,
-                                3.0,
-                                cx.entity_id(),
-                                cx,
+                                20.0,
+                                theme.text_muted,
                             ))
                             .into_any_element()
                     }
@@ -5918,18 +5914,8 @@ rename to new_name.rs
     /// Uses the native font backend, not TestAppContext's simulated metrics.
     #[test]
     fn native_diff_font_geometry() {
-        // Windows headless mode uses NoopTextSystem. This regression needs
-        // actual DirectWrite metrics, as it does CoreText/fontconfig elsewhere.
-        let platform = gpui_platform::current_platform(!cfg!(windows));
-        let text_system =
-            gpui::WindowTextSystem::new(Arc::new(gpui::TextSystem::new(platform.text_system())));
-        text_system
-            .add_fonts(
-                crate::typography::bundled_font_faces()
-                    .map(std::borrow::Cow::Borrowed)
-                    .collect(),
-            )
-            .unwrap();
+        // This regression needs actual DirectWrite/CoreText/fontconfig metrics.
+        let (_native, text_system) = crate::typography::native_text_system();
         let mut theme = Theme::dark();
         theme.font_mono = "Geist".into();
         let wide = "W".repeat(100);
@@ -6130,6 +6116,7 @@ rename to new_name.rs
             created_at: Utc::now(),
             harness_session_id: None,
             harness_session_cwd: None,
+            harness_session_harness: None,
             parent_chat_id: None,
             space_id: None,
             last_seen_at: None,

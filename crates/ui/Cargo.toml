@@ -7,7 +7,6 @@ publish.workspace = true
 
 [features]
 native-forks-fixture = ["gpui_platform/test-support", "gpui/bench"]
-multi-window-fixture = []
 voice-experimental = [] # Compatibility flag; native subscription voice uses Codex's packaged helper.
 project-palette-fixture = []
 compact-picker-fixture = ["gpui_platform/test-support"]
@@ -19,10 +18,6 @@ windows-render-fixture = []
 appshots-fixture = ["gpui_platform/test-support"]
 pull-request-fixture = ["gpui_platform/test-support"]
 resource-profile = ["gpui/bench", "gpui_platform/test-support"]
-
-[[example]]
-name = "multi-window-fixture"
-required-features = ["multi-window-fixture"]
 
 [[example]]
 name = "macos-resource-profile"

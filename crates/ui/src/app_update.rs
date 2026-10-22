@@ -428,9 +428,9 @@ pub fn strip_for(
     }
 }
 
-/// "Check for Updates…" from a menu: surface the most recent window, then check.
+/// "Check for Updates…" from a menu: surface the main window, then check.
 pub fn check_for_updates(cx: &mut App) {
-    crate::window_manager::activate(cx);
+    crate::activate_main_window(cx);
     if let Some(update) = AppUpdate::global(cx) {
         update.update(cx, |update, cx| update.check_for_updates(cx));
     }

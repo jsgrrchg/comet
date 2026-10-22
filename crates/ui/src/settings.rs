@@ -31,7 +31,6 @@ pub mod thread_naming;
 pub mod wallpaper;
 pub mod wallpaper_colors;
 pub mod widgets;
-pub mod windows;
 mod worktrees;
 
 /// Sidebar drag-resize bounds (px). The minimum keeps the sidebar options
@@ -505,10 +504,6 @@ pub fn current(cx: &App) -> UiSettings {
     cx.try_global::<SettingsStore>()
         .map(|store| store.current.clone())
         .unwrap_or_default()
-}
-
-pub(crate) fn initialized(cx: &App) -> bool {
-    cx.has_global::<SettingsStore>()
 }
 
 /// Read the picker preference without cloning the full settings for each model row.
@@ -992,8 +987,6 @@ pub const SKILL_COMPLETION_HARNESSES: [(zeron_proto::HarnessId, &str); 9] = [
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct UiSettings {
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub windows: std::collections::BTreeMap<String, windows::WindowSettings>,
     pub dictation_enabled: bool,
     /// Dictation microphone as a `zeron_voice::InputDevice` id; `None`
     /// follows the system default.
@@ -1215,7 +1208,6 @@ pub struct UiSettings {
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            windows: Default::default(),
             dictation_enabled: false,
             dictation_input: None,
             window_geometry: None,
@@ -1353,7 +1345,6 @@ pub enum ShortcutId {
     ToggleTerminal,
     NewSession,
     NewProject,
-    NewWindow,
     OpenModelPicker,
     NextSession,
     PrevSession,
@@ -1362,7 +1353,7 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
-    pub const ALL: [ShortcutId; 16 + JUMP_SLOTS] = [
+    pub const ALL: [ShortcutId; 15 + JUMP_SLOTS] = [
         ShortcutId::ToggleDictation,
         ShortcutId::CaptureAppshot,
         ShortcutId::RandomWallpaper,
@@ -1374,7 +1365,6 @@ impl ShortcutId {
         ShortcutId::ToggleTerminal,
         ShortcutId::NewSession,
         ShortcutId::NewProject,
-        ShortcutId::NewWindow,
         ShortcutId::OpenModelPicker,
         ShortcutId::NextSession,
         ShortcutId::PrevSession,
@@ -1408,7 +1398,6 @@ impl ShortcutId {
             ShortcutId::ToggleTerminal => "Toggle terminal",
             ShortcutId::NewSession => "New session",
             ShortcutId::NewProject => "New project",
-            ShortcutId::NewWindow => "New window",
             ShortcutId::OpenModelPicker => "Open model picker",
             ShortcutId::NextSession => "Next session or right pane tab",
             ShortcutId::PrevSession => "Previous session or right pane tab",
@@ -1438,7 +1427,6 @@ impl ShortcutId {
             ShortcutId::ToggleTerminal => "mod-j",
             ShortcutId::NewSession => "mod-n",
             ShortcutId::NewProject => "mod-shift-n",
-            ShortcutId::NewWindow => "mod-alt-n",
             ShortcutId::OpenModelPicker => "mod-/",
             // Ctrl+Tab on every platform — but spelled the way THAT platform's
             // recorder spells ctrl (see `combo_from_keystroke`). Off macOS
@@ -1488,7 +1476,6 @@ pub struct KeymapConfig {
     pub toggle_terminal: String,
     pub new_session: String,
     pub new_project: String,
-    pub new_window: String,
     pub open_model_picker: String,
     pub next_session: String,
     pub prev_session: String,
@@ -1555,7 +1542,6 @@ impl Default for KeymapConfig {
             toggle_terminal: ShortcutId::ToggleTerminal.default_combo().into(),
             new_session: ShortcutId::NewSession.default_combo().into(),
             new_project: ShortcutId::NewProject.default_combo().into(),
-            new_window: ShortcutId::NewWindow.default_combo().into(),
             open_model_picker: ShortcutId::OpenModelPicker.default_combo().into(),
             next_session: ShortcutId::NextSession.default_combo().into(),
             prev_session: ShortcutId::PrevSession.default_combo().into(),
@@ -1566,29 +1552,6 @@ impl Default for KeymapConfig {
 }
 
 impl KeymapConfig {
-    /// New-window bindings must never displace an existing customization.
-    /// Compare parsed chords so modifier spelling/order cannot hide a clash.
-    pub fn new_window_binding(&self) -> Option<String> {
-        if self.new_window.trim().is_empty() {
-            return None;
-        }
-        let combo = platform_combo(&self.new_window);
-        let candidate = gpui::Keystroke::parse(&combo).ok()?;
-        if ShortcutId::ALL
-            .into_iter()
-            .filter(|id| *id != ShortcutId::NewWindow)
-            .any(|id| {
-                gpui::Keystroke::parse(&platform_combo(self.get(id)))
-                    .ok()
-                    .as_ref()
-                    == Some(&candidate)
-            })
-        {
-            return None;
-        }
-        Some(combo)
-    }
-
     pub fn get(&self, id: ShortcutId) -> &str {
         match id {
             ShortcutId::ToggleDictation => &self.toggle_dictation,
@@ -1602,7 +1565,6 @@ impl KeymapConfig {
             ShortcutId::ToggleTerminal => &self.toggle_terminal,
             ShortcutId::NewSession => &self.new_session,
             ShortcutId::NewProject => &self.new_project,
-            ShortcutId::NewWindow => &self.new_window,
             ShortcutId::OpenModelPicker => &self.open_model_picker,
             ShortcutId::NextSession => &self.next_session,
             ShortcutId::PrevSession => &self.prev_session,
@@ -1628,7 +1590,6 @@ impl KeymapConfig {
             ShortcutId::ToggleTerminal => self.toggle_terminal = combo,
             ShortcutId::NewSession => self.new_session = combo,
             ShortcutId::NewProject => self.new_project = combo,
-            ShortcutId::NewWindow => self.new_window = combo,
             ShortcutId::OpenModelPicker => self.open_model_picker = combo,
             ShortcutId::NextSession => self.next_session = combo,
             ShortcutId::PrevSession => self.prev_session = combo,
@@ -1900,7 +1861,6 @@ impl UiSettings {
             }};
         }
         merge!(
-            windows,
             dictation_enabled,
             dictation_input,
             window_geometry,
@@ -2052,11 +2012,6 @@ impl UiSettings {
         }
         self.keymap.heal_jump_slots();
         self.keymap.heal_reserved_composer_shortcuts();
-        if self.keymap.new_window == ShortcutId::NewWindow.default_combo()
-            && self.keymap.new_window_binding().is_none()
-        {
-            self.keymap.new_window.clear();
-        }
         self
     }
 
@@ -2973,7 +2928,6 @@ mod tests {
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let settings = UiSettings {
-            windows: Default::default(),
             dictation_enabled: false,
             dictation_input: Some("coreaudio:usb-mic".into()),
             window_geometry: None,
@@ -3951,30 +3905,6 @@ mod tests {
         assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-y");
         keymap.reset(ShortcutId::ArchiveSession);
         assert_eq!(keymap.get(ShortcutId::ArchiveSession), "mod-shift-a");
-    }
-
-    #[test]
-    fn new_window_shortcut_is_portable_and_preserves_custom_bindings() {
-        for (mac, physical) in [(true, "cmd-alt-n"), (false, "ctrl-alt-n")] {
-            assert_eq!(
-                platform_combo_on(mac, ShortcutId::NewWindow.default_combo_on(mac)),
-                physical
-            );
-            assert_eq!(ShortcutId::NewProject.default_combo_on(mac), "mod-shift-n");
-            assert_eq!(ShortcutId::NewSession.default_combo_on(mac), "mod-n");
-        }
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            UiSettings::path(dir.path()),
-            r#"{"keymap":{"toggleTerminal":"mod-alt-n"}}"#,
-        )
-        .unwrap();
-        let settings = UiSettings::load(dir.path());
-        assert_eq!(settings.keymap.toggle_terminal, "mod-alt-n");
-        assert_eq!(settings.keymap.new_window, "");
-        assert!(settings.keymap.new_window_binding().is_none());
-        settings.save(dir.path()).unwrap();
-        assert_eq!(UiSettings::load(dir.path()).keymap.new_window, "");
     }
 
     #[test]

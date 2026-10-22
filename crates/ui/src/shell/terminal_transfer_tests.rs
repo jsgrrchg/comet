@@ -778,54 +778,6 @@ fn closing_terminal_during_open_releases_the_late_pty(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn closing_the_window_closes_its_drawer_and_right_pane_ptys(cx: &mut TestAppContext) {
-    use zeron_rpc::methods;
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let _guard = runtime.enter();
-    let (shell, sessions, cx) = setup(cx, 1, 1);
-    let (_replies, mut rx) = test_connection(&shell, cx);
-    let right = shell.read_with(cx, |shell, cx| {
-        let terminal = shell.right_terminals.values().next().unwrap();
-        terminal
-            .panel
-            .read(cx)
-            .session_for_tab("parent", terminal.key)
-            .unwrap()
-    });
-    for (session, id) in [(&sessions[0], "drawer-pty"), (&right, "right-pty")] {
-        session.update(cx, |model, cx| {
-            assert!(model.attach_reserved_session(
-                zeron_proto::TerminalSession {
-                    id: id.into(),
-                    cwd: "/project".into(),
-                    shell: "bash".into(),
-                },
-                None,
-                cx
-            ));
-        });
-    }
-    pump(&runtime, cx);
-    requests(&mut rx);
-    // Only the window keeps the shell: closing it must release the view.
-    let weak = shell.downgrade();
-    drop(shell);
-    cx.update(|window, _| window.remove_window());
-    pump(&runtime, cx);
-    assert!(weak.upgrade().is_none(), "a closed window's shell was kept alive");
-    let mut closed: Vec<String> = requests(&mut rx)
-        .into_iter()
-        .filter(|frame| frame.method.as_deref() == Some(methods::CLOSE_TERMINAL))
-        .map(|frame| frame.params["terminalId"].as_str().unwrap().to_string())
-        .collect();
-    closed.sort();
-    assert_eq!(closed, ["drawer-pty", "right-pty"]);
-}
-
-#[gpui::test]
 fn writes_keep_one_ordered_sequence_across_a_transfer(cx: &mut TestAppContext) {
     use zeron_rpc::methods;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -883,46 +835,4 @@ fn writes_keep_one_ordered_sequence_across_a_transfer(cx: &mut TestAppContext) {
     assert_eq!(&writes[1].params["writerId"], writer, "the move kept the writer");
     assert_eq!(writes[0].params["seq"], 0);
     assert_eq!(writes[1].params["seq"], 1);
-}
-
-#[gpui::test]
-fn closing_the_window_writes_notes_still_inside_their_debounce(cx: &mut TestAppContext) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let _guard = runtime.enter();
-    let (shell, _, cx) = setup(cx, 0, 0);
-    let (_replies, mut rx) = test_connection(&shell, cx);
-    cx.update(|window, cx| {
-        shell.update(cx, |shell, cx| {
-            shell.state.update(cx, |state, _| {
-                state.chats.push(
-                    serde_json::from_value(serde_json::json!({
-                        "id": "parent", "title": "Parent", "deviceId": "local",
-                        "archived": false, "createdAt": chrono::Utc::now(),
-                    }))
-                    .unwrap(),
-                );
-            });
-            shell.open_session_notes(window, cx);
-            let notes = shell.notes_surfaces.values().next().unwrap().clone();
-            notes.update(cx, |notes, cx| notes.test_type_after("old", "typed", cx));
-        })
-    });
-    pump(&runtime, cx);
-    requests(&mut rx);
-    // Close before the 750 ms debounce writes it.
-    let weak = shell.downgrade();
-    drop(shell);
-    cx.update(|window, _| window.remove_window());
-    pump(&runtime, cx);
-    assert!(weak.upgrade().is_none());
-    let writes: Vec<_> = requests(&mut rx)
-        .into_iter()
-        .filter(|frame| frame.method.as_deref() == Some(zeron_rpc::methods::SET_SESSION_NOTES))
-        .collect();
-    assert_eq!(writes.len(), 1, "{writes:?}");
-    assert_eq!(writes[0].params["chatId"], "parent");
-    assert_eq!(writes[0].params["text"], "typed");
 }

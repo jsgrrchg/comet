@@ -119,23 +119,6 @@ impl NotesSurface {
         cx.notify();
     }
 
-    /// Test hook: the engine reported `base`, then the user typed `text`
-    /// (still inside the write debounce).
-    #[cfg(test)]
-    pub(crate) fn test_type_after(&mut self, base: &str, text: &str, cx: &mut Context<Self>) {
-        self.receive(
-            NotesSnapshot {
-                epoch: 1,
-                seq: 1,
-                ..NotesSnapshot::of(base)
-            },
-            cx,
-        );
-        self.input.update(cx, |input, cx| {
-            input.apply_external_edit(0..input.text().len(), text, cx)
-        });
-    }
-
     /// Write any unwritten edits now (tab closing, editor blurred). The write
     /// outlives this surface; one already in flight takes the text along.
     pub fn flush(&mut self, cx: &mut Context<Self>) {

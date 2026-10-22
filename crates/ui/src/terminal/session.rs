@@ -3,10 +3,10 @@
 
 use super::emulator::Emulator;
 use super::panel::{backoff_ms, decode_base64, encode_base64, exit_message, with_target};
-use super::view::{COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS};
+use super::view::{COALESCE_MS, InputCoalescer, InputFlush, RESIZE_DEBOUNCE_MS};
 use crate::state::{AppState, EngineHandle};
 use gpui::{App, Context, Entity, SharedString, Task};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeron_proto::{TerminalEvent, TerminalSession};
 use zeron_rpc::methods;
 
@@ -21,6 +21,11 @@ pub(crate) struct TerminalSessionModel {
     pub(super) scroll_remainder: f32,
     pub(crate) exited: Option<i32>,
     pub(crate) last_seq: u64,
+    /// `WriteTerminal` ordering stamp: the host applies this session's frames
+    /// in `seq` order even when concurrent RPC handling swaps them. It lives
+    /// with the session, so a tab moved to another view keeps its sequence.
+    writer_id: String,
+    next_write_seq: u64,
     coalescer: InputCoalescer,
     flush_task: Option<Task<()>>,
     resize_task: Option<Task<()>>,
@@ -46,6 +51,8 @@ impl TerminalSessionModel {
             scroll_remainder: 0.0,
             exited: None,
             last_seq: 0,
+            writer_id: uuid::Uuid::new_v4().to_string(),
+            next_write_seq: 0,
             coalescer: InputCoalescer::default(),
             flush_task: None,
             resize_task: None,
@@ -304,7 +311,6 @@ impl TerminalSessionModel {
         if self.closed {
             return StreamDisposition::Stop;
         }
-        let target = self.target_device_id.clone();
         match event {
             TerminalEvent::Data { seq, data } => {
                 self.last_seq = seq;
@@ -312,22 +318,10 @@ impl TerminalSessionModel {
                 if !responses.is_empty()
                     && let Some(id) = self.terminal_id.clone()
                 {
-                    // Query responses (DSR etc.) go straight back, no coalescing.
-                    let engine = engine.clone();
-                    let data = encode_base64(&responses);
-                    cx.spawn(async move |_, _| {
-                        let _ = engine
-                            .client()
-                            .call(
-                                methods::WRITE_TERMINAL,
-                                with_target(
-                                    serde_json::json!({ "terminalId": id, "data": data }),
-                                    &target,
-                                ),
-                            )
-                            .await;
-                    })
-                    .detach();
+                    // Query responses (DSR etc.) go straight back, no coalescing,
+                    // but share the keyboard's sequence so neither overtakes.
+                    let params = self.write_params(id, &responses);
+                    send_write(engine, params, cx);
                 }
                 cx.notify();
                 StreamDisposition::Continue
@@ -342,7 +336,23 @@ impl TerminalSessionModel {
         }
     }
 
-    /// Queue keyboard bytes on the active tab (12 ms coalescing window).
+    /// `WriteTerminal` params for `bytes`, stamped with this session's next seq.
+    fn write_params(&mut self, terminal_id: String, bytes: &[u8]) -> serde_json::Value {
+        let seq = self.next_write_seq;
+        self.next_write_seq += 1;
+        with_target(
+            serde_json::json!({
+                "terminalId": terminal_id,
+                "data": encode_base64(bytes),
+                "writerId": self.writer_id,
+                "seq": seq,
+            }),
+            &self.target_device_id,
+        )
+    }
+
+    /// Queue keyboard bytes: sent at once when idle, else at the end of the
+    /// 12 ms window opened by the previous send.
     pub(super) fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if self.closed || self.exited.is_some() {
             return;
@@ -351,16 +361,16 @@ impl TerminalSessionModel {
         if self.emulator.display_offset() > 0 {
             self.emulator.scroll_to_bottom();
         }
-        if self.coalescer.push(bytes) {
-            self.flush_task = Some(Self::schedule_flush(cx));
+        match self.coalescer.push(bytes, Instant::now()) {
+            InputFlush::Now => self.flush_input(cx),
+            InputFlush::After(delay) => self.flush_task = Some(Self::schedule_flush(delay, cx)),
+            InputFlush::Pending => {}
         }
     }
 
-    fn schedule_flush(cx: &mut Context<Self>) -> Task<()> {
+    fn schedule_flush(delay: Duration, cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(COALESCE_MS))
-                .await;
+            cx.background_executor().timer(delay).await;
             let _ = this.update(cx, |model, cx| model.flush_input(cx));
         })
     }
@@ -372,31 +382,20 @@ impl TerminalSessionModel {
         if self.closed {
             return;
         }
-        let target = self.target_device_id.clone();
         if self.coalescer.is_empty() {
             return;
         }
         let Some(id) = self.terminal_id.clone() else {
             // OpenTerminal still in flight — keep the buffer, retry shortly.
             if self.exited.is_none() {
-                self.flush_task = Some(Self::schedule_flush(cx));
+                let retry = Duration::from_millis(COALESCE_MS);
+                self.flush_task = Some(Self::schedule_flush(retry, cx));
             }
             return;
         };
-        let data = encode_base64(&self.coalescer.take());
-        cx.spawn(async move |_, _| {
-            let _ = engine
-                .client()
-                .call(
-                    methods::WRITE_TERMINAL,
-                    with_target(
-                        serde_json::json!({ "terminalId": id, "data": data }),
-                        &target,
-                    ),
-                )
-                .await;
-        })
-        .detach();
+        let bytes = self.coalescer.take(Instant::now());
+        let params = self.write_params(id, &bytes);
+        send_write(&engine, params, cx);
     }
 
     /// Resize the emulator immediately; debounce only the host RPC. Timers
@@ -452,4 +451,16 @@ impl TerminalSessionModel {
 enum StreamDisposition {
     Continue,
     Stop,
+}
+
+fn send_write(
+    engine: &EngineHandle,
+    params: serde_json::Value,
+    cx: &mut Context<TerminalSessionModel>,
+) {
+    let engine = engine.clone();
+    cx.spawn(async move |_, _| {
+        let _ = engine.client().call(methods::WRITE_TERMINAL, params).await;
+    })
+    .detach();
 }

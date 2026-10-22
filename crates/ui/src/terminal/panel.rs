@@ -10,8 +10,9 @@
 //! Data path per tab: `OpenTerminal` → `SubscribeTerminal` stream; Data frames
 //! (base64) feed the [`Emulator`]; query responses write back; the stream
 //! reconnects with exponential backoff resuming from `afterSeq`; Exit appends
-//! the "[process exited N]" line and stops. Keyboard bytes coalesce for 12 ms
-//! before `WriteTerminal`; viewport-driven resizes debounce 80 ms before
+//! the "[process exited N]" line and stops. Keyboard bytes flush at once when
+//! idle and coalesce for 12 ms after each `WriteTerminal`; viewport-driven
+//! resizes debounce 80 ms before
 //! `ResizeTerminal` (the emulator resizes immediately).
 
 use std::collections::HashMap;

@@ -824,3 +824,63 @@ fn closing_the_window_closes_its_drawer_and_right_pane_ptys(cx: &mut TestAppCont
     closed.sort();
     assert_eq!(closed, ["drawer-pty", "right-pty"]);
 }
+
+#[gpui::test]
+fn writes_keep_one_ordered_sequence_across_a_transfer(cx: &mut TestAppContext) {
+    use zeron_rpc::methods;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = runtime.enter();
+    let (shell, sessions, cx) = setup(cx, 1, 0);
+    let session = &sessions[0];
+    let key = session.read_with(cx, |model, _| model.key);
+    let (_replies, mut rx) = test_connection(&shell, cx);
+    session.update(cx, |model, cx| {
+        assert!(model.attach_reserved_session(
+            zeron_proto::TerminalSession {
+                id: "seq-pty".into(),
+                cwd: "/project".into(),
+                shell: "bash".into(),
+            },
+            None,
+            cx
+        ));
+    });
+    pump(&runtime, cx);
+    cx.update(|window, cx| {
+        window.focus(
+            &shell
+                .read(cx)
+                .terminal
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .focus_handle(),
+            cx,
+        );
+    });
+    cx.simulate_keystrokes("a");
+    let to = cx.debug_bounds("right-surface-strip").unwrap().center();
+    begin_drag(cx, key, to);
+    drop_at(cx, to);
+    cx.executor().advance_clock(Duration::from_millis(100));
+    // The drop focuses the destination panel: keep typing there.
+    cx.simulate_keystrokes("b");
+    pump(&runtime, cx);
+    cx.executor().advance_clock(Duration::from_millis(100));
+    pump(&runtime, cx);
+    let writes: Vec<_> = requests(&mut rx)
+        .into_iter()
+        .filter(|frame| frame.method.as_deref() == Some(methods::WRITE_TERMINAL))
+        .collect();
+    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert_eq!(writes[0].params["data"], encode(b"a"));
+    assert_eq!(writes[1].params["data"], encode(b"b"));
+    let writer = &writes[0].params["writerId"];
+    assert!(writer.is_string());
+    assert_eq!(&writes[1].params["writerId"], writer, "the move kept the writer");
+    assert_eq!(writes[0].params["seq"], 0);
+    assert_eq!(writes[1].params["seq"], 1);
+}

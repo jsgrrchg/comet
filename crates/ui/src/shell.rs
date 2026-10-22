@@ -80,6 +80,7 @@ mod navigation_focus;
 #[cfg(test)]
 mod navigation_tests;
 mod panel_layout;
+mod session_notes;
 use panel_layout::{AuxiliaryPanel, FitInputs, HorizontalPanelFit, panel_content_tween};
 #[cfg(test)]
 mod panel_interaction_tests;
@@ -744,6 +745,8 @@ pub enum RightSurface {
     SideChat(u64),
     /// A pull request opened from the chat — keys [`Shell::chat_pull_requests`].
     PullRequest(u64),
+    /// The session's notes — keys [`Shell::notes_surfaces`].
+    Notes(u64),
 }
 
 /// One surface tab as its strip draws it: `(surface, title, unsaved, detail)`.
@@ -2129,6 +2132,9 @@ pub struct Shell {
     /// Pull request tabs in session panes, keyed like the other surfaces.
     chat_pull_requests: std::collections::HashMap<u64, chat_pull_requests::ChatPullRequest>,
     chat_pull_request_seq: u64,
+    /// Session notes tabs, at most one per chat pane.
+    notes_surfaces: std::collections::HashMap<u64, Entity<crate::notes::NotesSurface>>,
+    notes_surface_seq: u64,
     browser_context: crate::browser::BrowserContext,
     browser_profile: Option<crate::browser::profile::BrowserProfile>,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
@@ -2458,9 +2464,15 @@ impl Shell {
             cx.notify();
         });
         // A closed window takes its terminals with it: nothing can reattach a
-        // detached shell, so leaving it running would orphan the process.
-        cx.on_release(|shell: &mut Shell, cx| shell.close_window_terminals(cx))
-            .detach();
+        // detached shell, so leaving it running would orphan the process. Its
+        // notes save the typing still inside their debounce.
+        cx.on_release(|shell: &mut Shell, cx| {
+            shell.close_window_terminals(cx);
+            for notes in shell.notes_surfaces.values() {
+                notes.update(cx, |notes, cx| notes.flush(cx));
+            }
+        })
+        .detach();
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         transcript.update(cx, |transcript, _| transcript.retain_for_route_exit());
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
@@ -2695,6 +2707,8 @@ impl Shell {
             browser_seq: 0,
             chat_pull_requests: std::collections::HashMap::new(),
             chat_pull_request_seq: 0,
+            notes_surfaces: std::collections::HashMap::new(),
+            notes_surface_seq: 0,
             browser_context: crate::browser::BrowserContext::default(),
             browser_profile: None,
             right_tabs: std::collections::HashMap::new(),
@@ -2956,6 +2970,7 @@ impl Shell {
             self.last_appshot_chat = None;
             self.terminal = None;
             self.right_terminals.clear();
+            self.notes_surfaces.clear();
             for browser in self.browsers.values() {
                 browser.update(cx, |browser, cx| browser.close(cx));
             }
@@ -3542,6 +3557,10 @@ impl Shell {
                 RightSurface::PullRequest(id) => self
                     .chat_pull_request_title(*id, cx)
                     .map(|(title, detail)| (*surface, title, false, Some(detail))),
+                RightSurface::Notes(id) => self
+                    .notes_surfaces
+                    .contains_key(id)
+                    .then(|| (*surface, SharedString::from("Notes"), false, None)),
                 RightSurface::Picker => None,
             })
             .collect()
@@ -3595,7 +3614,8 @@ impl Shell {
             | RightSurface::SideChat(_)
             | RightSurface::Subagent(_)
             | RightSurface::Browser(_)
-            | RightSurface::PullRequest(_) => {
+            | RightSurface::PullRequest(_)
+            | RightSurface::Notes(_) => {
                 return None;
             }
         };
@@ -3789,6 +3809,11 @@ impl Shell {
                         composer.focus_pending = true;
                         cx.notify();
                     });
+                }
+            }
+            RightSurface::Notes(id) => {
+                if let Some(notes) = self.notes_surfaces.get(&id) {
+                    notes.update(cx, |notes, cx| notes.request_focus(cx));
                 }
             }
             RightSurface::Subagent(_) | RightSurface::Browser(_) | RightSurface::PullRequest(_) => {
@@ -4755,6 +4780,12 @@ impl Shell {
                 // A comment being posted outlives its view; see
                 // `PullRequestCache::submissions`.
                 self.chat_pull_requests.remove(&id);
+            }
+            RightSurface::Notes(id) => {
+                // The last write is detached, so it lands after the tab goes.
+                if let Some(notes) = self.notes_surfaces.remove(&id) {
+                    notes.update(cx, |notes, cx| notes.flush(cx));
+                }
             }
             RightSurface::Terminal(id) => {
                 if let Some(terminal) = self.right_terminals.remove(&id) {
@@ -6708,6 +6739,9 @@ impl Shell {
                 }
                 if let RightSurface::PullRequest(id) = surface {
                     self.chat_pull_requests.remove(id);
+                }
+                if let RightSurface::Notes(id) = surface {
+                    self.notes_surfaces.remove(id);
                 }
             }
         }
@@ -12537,6 +12571,12 @@ impl Shell {
             RightSurface::PullRequest(id) => self
                 .render_chat_pull_request(id, cx)
                 .unwrap_or_else(|| self.render_surface_picker(cx)),
+            RightSurface::Notes(id) => self
+                .notes_surfaces
+                .get(&id)
+                .cloned()
+                .map(|notes| notes.into_any_element())
+                .unwrap_or_else(|| self.render_surface_picker(cx)),
             RightSurface::Subagent(id) if self.subagent_tabs.contains_key(&id) => {
                 let transcript = self
                     .subagent_tabs
@@ -12922,6 +12962,7 @@ impl Shell {
                 RightSurface::Terminal(_) => icons::TERMINAL,
                 RightSurface::Browser(_) => icons::GLOBE,
                 RightSurface::PullRequest(_) => icons::PULL_REQUEST,
+                RightSurface::Notes(_) => icons::NOTEBOOK,
                 RightSurface::Picker => icons::PLUS,
             };
             // Working chats and subagents swap their harness icon for the

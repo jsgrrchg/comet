@@ -54,6 +54,7 @@ mod new_thread_background_image;
 mod new_thread_background_mask;
 mod notice;
 mod notification_service;
+pub mod notes;
 pub mod notify;
 pub mod orb;
 pub mod overscroll;

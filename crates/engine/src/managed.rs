@@ -9,8 +9,10 @@
 //! were with the in-process engine, and needs no background-item approval;
 //! everywhere it works the same way. Nothing restarts it behind the app's
 //! back: the app starts it again the next time it opens (or when its
-//! connection drops), and after an app update it restarts itself into the
-//! new version once nothing is running.
+//! connection drops). After an app update it restarts into the new version
+//! once nothing is running — on macOS only while the app runs, by stopping
+//! so the app starts the new one as its child; elsewhere by relaunching
+//! itself.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -233,6 +235,55 @@ fn stop_when_uninstalled(
     });
 }
 
+/// Whether the app that starts this engine runs now. On macOS an engine
+/// the app starts is its child and attributed to it — Keychain and privacy
+/// permissions included. One this engine relaunched itself (orphaned when
+/// this one exits) was found outside the user's Keychain after an update:
+/// Claude Code reported "Not logged in" and sign-ins failed until the app
+/// started the engine again. So on macOS a restart into a new version only
+/// happens while the app runs, and leaves the start to it (its reconnect
+/// starts the engine when the port goes quiet); until then this engine keeps
+/// serving — the running image outlives the update on disk.
+#[cfg(target_os = "macos")]
+fn app_starts_engine() -> bool {
+    let Some(bundle) = std::env::var_os(APP_ENV).map(PathBuf::from) else {
+        return false;
+    };
+    app_running(&bundle.join("Contents").join("MacOS"))
+}
+
+/// A process runs from `dir` (the bundle's `Contents/MacOS`) that isn't one
+/// of the engine's own executables: the app.
+#[cfg(target_os = "macos")]
+fn app_running(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut pids = vec![0 as libc::pid_t; 8192];
+    let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+    // SAFETY: the buffer is `bytes` long; the call writes at most that.
+    let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    let mut path = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    for &pid in pids.iter().take(count.max(0) as usize) {
+        if pid <= 0 {
+            continue;
+        }
+        // SAFETY: `path` is PROC_PIDPATHINFO_MAXSIZE bytes, as the call needs.
+        let len = unsafe { libc::proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) };
+        if len <= 0 {
+            continue;
+        }
+        let exe = Path::new(std::ffi::OsStr::from_bytes(&path[..len as usize]));
+        let is_engine = exe
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| ENGINE_EXECUTABLES.contains(&name));
+        if exe.parent() == Some(dir.as_path()) && !is_engine {
+            return true;
+        }
+    }
+    false
+}
+
 /// Relaunch this engine with its own arguments and environment; the new one
 /// waits for this one to release the data directory.
 fn relaunch_self() -> anyhow::Result<()> {
@@ -279,8 +330,17 @@ impl Engine {
         };
 
         let restart_stop = stop_tx.clone();
+        // macOS: the new version is only ever started by the app (see
+        // `app_starts_engine`), so the restart waits for the app to run and
+        // this engine keeps serving the old version until then.
+        #[cfg(target_os = "macos")]
+        zeron_update::set_managed_restart_ready(app_starts_engine);
         zeron_update::set_managed_restart(move || {
-            relaunch_self()?;
+            if cfg!(target_os = "macos") {
+                tracing::info!("restarting into the update: the app starts the new engine");
+            } else {
+                relaunch_self()?;
+            }
             let _ = restart_stop.send(());
             Ok(())
         });
@@ -395,5 +455,49 @@ mod tests {
             app_path(Path::new("/home/me/.zeron/app/current/zeron")),
             PathBuf::from("/home/me/.zeron/app/current/zeron")
         );
+    }
+
+    /// The app is found by where it runs from — its bundle's `Contents/MacOS`
+    /// — and never mistaken for the engine's own executables there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_running_app_is_found_in_its_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let macos = dir.path().join("Bundle").join("Contents").join("MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        // A program of our own (copies of system binaries are killed on
+        // launch): it just waits.
+        let source = dir.path().join("wait.c");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void){sleep(30);return 0;}\n",
+        )
+        .unwrap();
+        let built = dir.path().join("wait");
+        let compiled = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(&built)
+            .arg(&source)
+            .status();
+        if !compiled.is_ok_and(|status| status.success()) {
+            eprintln!("no C compiler: skipping");
+            return;
+        }
+        let start = |name: &str| {
+            let exe = macos.join(name);
+            std::fs::copy(&built, &exe).unwrap();
+            std::process::Command::new(&exe).spawn().unwrap()
+        };
+        assert!(!app_running(&macos), "nothing runs from the bundle yet");
+        let mut engine = start("Zeron Engine");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!app_running(&macos), "the engine isn't the app");
+        let mut app = start("zeron");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(app_running(&macos));
+        for child in [&mut engine, &mut app] {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }

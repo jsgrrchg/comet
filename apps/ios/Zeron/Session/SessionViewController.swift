@@ -18,7 +18,6 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
     private let bottom = UIStackView()
     private var bottomRest: NSLayoutConstraint?
     private let jump = Glass.circleButton(symbol: "arrow.down", size: 40, pointSize: 15)
-    private let titleView = SessionTitleView()
     private var shown = SessionChrome()
     private let openedAt = CACurrentMediaTime()
     private var reportedOpen = false
@@ -42,8 +41,11 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             self?.saveDraft()
         }
         navigationItem.largeTitleDisplayMode = .never
-        navigationItem.titleView = titleView
-        navigationItem.rightBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "ellipsis"), menu: sessionMenu())
+        // The title and "project @ device" head the ⋯ menu instead of
+        // crowding the bar.
+        navigationItem.titleView = UIView()
+        navigationItem.rightBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "ellipsis"), menu: sessionMenu(title: "", subtitle: ""))
+        navigationItem.rightBarButtonItem?.accessibilityIdentifier = "session-menu"
         // The session has its own composer, so the tab bar's voice control
         // steps aside with the accessory; the call stays a tap away up here.
         let voiceBar = VoiceBarItem(app: app, host: self)
@@ -98,6 +100,17 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
             self.navigationController?.pushViewController(SubagentViewController(app: self.app, docId: docId, title: title, frozen: frozen), animated: true)
         }
         // Hidden while following (the runway glide and tail spring travel).
+        // An error card's "Log in": that provider's sign-in, started at once.
+        list.onAction = { [weak self] action in
+            guard let self, action == "sign-in", let target = self.source.signInTarget() else { return }
+            let accounts = AgentAccountsViewController(app: self.app, target: target, signIn: true)
+            let nav = UINavigationController(rootViewController: accounts)
+            if let sheet = nav.sheetPresentationController {
+                sheet.detents = [.medium(), .large()]
+                sheet.prefersGrabberVisible = true
+            }
+            self.present(nav, animated: true)
+        }
         list.onDistanceFromBottom = { [weak self] d in
             guard let self else { return }
             self.setJumpVisible(d > 140 && !self.list.following)
@@ -231,7 +244,6 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        setAccessory(visible: false)
         // Coming back on screen (e.g. after a second copy of this chat was
         // popped and detached it): live again.
         if hasAppeared { source.reattach() }
@@ -247,44 +259,6 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
 
     deinit {
         if let backgroundObserver { NotificationCenter.default.removeObserver(backgroundObserver) }
-    }
-
-    /// Swap the tab accessory *inside* the push/pop animation so it travels
-    /// with the tab bar instead of snapping ahead of it (no empty glass pill,
-    /// no composer ghosting over the tab bar).
-    private func setAccessory(visible: Bool) {
-        guard let tabs = tabBarController as? MainTabController else { return }
-        guard let coordinator = transitionCoordinator else {
-            return tabs.setAccessoryVisible(visible, animated: false)
-        }
-        // Our bottom glass (composer stack) and the tab bar's glass never
-        // overlap: the stack fades opposite to the tab bar, tracking an
-        // interactive swipe-back too.
-        let bottomStack = bottom
-        let jumpButton = jump
-        if visible {
-            bottomStack.alpha = 1
-            tabs.prepareAccessoryForReveal()
-        } else {
-            bottomStack.alpha = 0
-        }
-        coordinator.animate(alongsideTransition: { _ in
-            if visible {
-                tabs.setAccessoryContentAlpha(1)
-                jumpButton.alpha = 0
-            } else {
-                tabs.setAccessoryVisible(false, animated: false)
-            }
-            bottomStack.alpha = visible ? 0 : 1
-        }, completion: { context in
-            // An interactive pop that's cancelled keeps the session on screen.
-            // Re-derive the accessory from what's actually on top rather than
-            // flipping: a cancelled pop also re-runs viewWillAppear, and two
-            // flips left "New session" showing over the session.
-            if context.isCancelled { bottomStack.alpha = 1 }
-            tabs.syncAccessory()
-            tabs.setAccessoryContentAlpha(1)
-        })
     }
 
     // MARK: Opening (loader, then the transcript)
@@ -361,7 +335,6 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
                 self.showTranscriptIfReady()
             }
         }
-        (tabBarController as? MainTabController)?.syncAccessory()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
@@ -369,10 +342,6 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         // Leaving mid-edit: give the queued row back and the draft its place.
         if editingQueueId != nil { endEdit(commit: nil) }
         saveDraft()
-        // Back to the list — not to the session this one hangs off.
-        if isMovingFromParent, !MainTabController.hidesAccessory(navigationController?.topViewController) {
-            setAccessory(visible: true)
-        }
     }
 
     /// Tear down only once the pop has really happened: an interactive
@@ -583,7 +552,10 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         let c = source.chrome
         let old = shown
         shown = c
-        titleView.set(title: c.title, subtitle: c.subtitle)
+        if c.title != old.title || c.subtitle != old.subtitle || navigationItem.title == nil {
+            navigationItem.title = c.title
+            navigationItem.rightBarButtonItem?.menu = sessionMenu(title: c.title, subtitle: c.subtitle)
+        }
         list.uploadProgress = c.uploadProgress
         composer.running = c.running
         composer.canSteer = c.canSteer
@@ -702,8 +674,12 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
         }
     }
 
-    private func sessionMenu() -> UIMenu {
-        UIMenu(children: [UIDeferredMenuElement.uncached { [weak self] done in
+    /// Headed by the session's title over "project @ device".
+    private func sessionMenu(title: String, subtitle: String) -> UIMenu {
+        // The header wraps: title, then where it runs, on its own line (a
+        // menu's subtitle isn't drawn in the header).
+        let header = subtitle.isEmpty ? title : "\(title)\n\(subtitle)"
+        return UIMenu(title: header, children: [UIDeferredMenuElement.uncached { [weak self] done in
             guard let self else { return done([]) }
             let vm = self.app.session(self.chatId)
             let pinned = vm?.pinned ?? false
@@ -722,22 +698,48 @@ final class SessionViewController: UIViewController, UIGestureRecognizerDelegate
                     UIAction(title: "New Side Chat", image: UIImage(systemName: "plus.bubble")) { _ in self.newSideChat() },
                     UIAction(title: "Fork into Side Chat", image: UIImage(systemName: "arrow.triangle.branch"), attributes: self.forking ? .disabled : []) { _ in self.forkSideChat() },
                 ]),
-                UIAction(title: "Archive", image: UIImage(systemName: "archivebox"), attributes: .destructive) { _ in
+                UIAction(title: "Archive", image: UIImage(systemName: "archivebox")) { _ in
                     self.app.archive(self.chatId)
-                    // Beside the iPad sidebar there's nothing to pop back to.
-                    if let split = self.splitViewController as? SplitRootController, !split.isCollapsed {
-                        split.showDraft(prompt: nil, focus: false)
-                    } else {
-                        self.navigationController?.popViewController(animated: true)
-                    }
+                    self.leave()
+                },
+                UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive) { _ in
+                    self.confirmDelete(app: self.app, self.chatId) { self.leave() }
                 },
             ]
             done(items.compactMap { $0 })
         }])
     }
+
+    /// Off this session once it's gone from the list. Beside the iPad
+    /// sidebar there's nothing to pop back to.
+    private func leave() {
+        if let split = splitViewController as? SplitRootController, !split.isCollapsed {
+            split.showDraft(prompt: nil, focus: false)
+        } else {
+            navigationController?.popViewController(animated: true)
+        }
+    }
 }
 
 extension UIViewController {
+    /// "Delete session?" — permanent, like the desktop's dialog; a Cloud
+    /// session's machine goes with it. `then` runs after the delete.
+    func confirmDelete(app: AppModel?, _ id: String, then: @escaping () -> Void) {
+        guard let app else { return }
+        let row = app.row(id)
+        let title = row.map { $0.hasTitle ? $0.title : "New session" } ?? "This session"
+        let message = row?.isCloud == true
+            ? "\u{201C}\(title)\u{201D} and its Cloud machine will be permanently deleted, with anything not pushed from it. This can\u{2019}t be undone."
+            : "\u{201C}\(title)\u{201D} will be permanently deleted. This can\u{2019}t be undone."
+        let alert = UIAlertController(title: "Delete session?", message: message, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Delete", style: .destructive) { _ in
+            app.delete(id)
+            then()
+        })
+        present(alert, animated: true)
+    }
+
     /// Pins a composer 8pt above the keyboard; at rest it sits on the safe
     /// area, `composerRestGap` up. Returns the rest constraint.
     func pinAboveKeyboard(_ bar: UIView) -> NSLayoutConstraint {
@@ -758,43 +760,6 @@ extension UIViewController {
     var composerRestGap: CGFloat {
         guard tabBarController == nil, let split = splitViewController, !split.isCollapsed else { return 8 }
         return 0
-    }
-}
-
-/// Two-line navigation title: session title over "project @ device".
-final class SessionTitleView: UIView {
-    private let title = FadingLabel()
-    private let subtitle = FadingLabel()
-
-    override init(frame: CGRect) {
-        super.init(frame: frame)
-        title.font = Fonts.ui(.sansSemibold, 16)
-        title.textColor = Palette.text
-        title.fitsAlignment = .center
-        subtitle.font = Fonts.ui(.sans, 12)
-        subtitle.textColor = Palette.secondary
-        subtitle.fitsAlignment = .center
-        let stack = UIStackView(arrangedSubviews: [title, subtitle])
-        stack.axis = .vertical
-        stack.alignment = .center
-        stack.spacing = 1
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: topAnchor),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
-            widthAnchor.constraint(lessThanOrEqualToConstant: 240),
-        ])
-    }
-
-    required init?(coder: NSCoder) { fatalError() }
-
-    func set(title t: String, subtitle s: String) {
-        title.text = t
-        subtitle.text = s
-        subtitle.isHidden = s.isEmpty
     }
 }
 

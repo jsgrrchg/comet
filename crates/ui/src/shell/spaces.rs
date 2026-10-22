@@ -7014,9 +7014,9 @@ impl Shell {
             git_detected,
             git_checked_at: None,
             checkout_id: None,
-            repository_id: github_repo
-                .as_deref()
-                .map(|repo| format!("github.com/{}", repo.to_lowercase())),
+            repository_id: github_repo.as_deref().map(|repo| {
+                zeron_proto::view::cloud_repository_id(&self.state.read(cx).spaces, repo)
+            }),
             github_repo: github_repo.clone(),
             created_at: Utc::now(),
         };

@@ -786,6 +786,20 @@ pub fn set_managed_restart(restart: impl Fn() -> anyhow::Result<()> + Send + Syn
     let _ = MANAGED_RESTART.set(Box::new(restart));
 }
 
+type ManagedRestartReady = Box<dyn Fn() -> bool + Send + Sync>;
+static MANAGED_RESTART_READY: std::sync::OnceLock<ManagedRestartReady> = std::sync::OnceLock::new();
+
+/// When the background engine may restart into a newer installed version,
+/// on top of nothing running (e.g. only while the app that starts it runs).
+/// Checked on every pass, so a restart it holds back happens on a later one.
+pub fn set_managed_restart_ready(ready: impl Fn() -> bool + Send + Sync + 'static) {
+    let _ = MANAGED_RESTART_READY.set(Box::new(ready));
+}
+
+fn managed_restart_ready() -> bool {
+    MANAGED_RESTART_READY.get().is_none_or(|ready| ready())
+}
+
 /// Whether this process is the engine service [`restart_service`] manages:
 /// the desktop app's background engine ([`set_managed_restart`]); systemd
 /// places a service in the `zeron.service` cgroup; launchd names the job in
@@ -1397,7 +1411,12 @@ impl SupersededRestart {
         let Some(installed) = installed_version(&detect_install()) else {
             return;
         };
-        self.poll_installed(&installed, current_version(), quiescent, restart_service);
+        self.poll_installed(
+            &installed,
+            current_version(),
+            || quiescent() && managed_restart_ready(),
+            restart_service,
+        );
     }
 
     fn poll_installed(
@@ -1416,7 +1435,7 @@ impl SupersededRestart {
                 tracing::info!(
                     installed,
                     running,
-                    "newer version installed; restart deferred: sessions or terminals active"
+                    "newer version installed; restart deferred: sessions or terminals active, or waiting for the app"
                 );
             }
             return;

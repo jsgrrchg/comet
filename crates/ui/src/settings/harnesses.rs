@@ -191,6 +191,9 @@ pub struct HarnessesPage {
     install_task: Option<Task<()>>,
 
     expanded_harness: Option<HarnessId>,
+    /// A transcript's "Log in": open this provider and start its sign-in
+    /// once the rows land.
+    pending_sign_in: Option<HarnessId>,
     /// The expanded provider's Accounts section — one page, retargeted as
     /// providers expand, so every provider shares the same sign-in flow.
     accounts_page: Option<Entity<AccountsPage>>,
@@ -228,6 +231,7 @@ impl HarnessesPage {
             install_task: None,
 
             expanded_harness: None,
+            pending_sign_in: None,
             accounts_page: None,
             _observe_accounts: None,
             update_task: None,
@@ -353,6 +357,38 @@ impl HarnessesPage {
             }
         }
         cx.notify();
+    }
+
+    /// A failed run's "Log in": show `target`'s providers with `harness`
+    /// open, and start its first sign-in option.
+    pub(crate) fn sign_in(
+        &mut self,
+        target: Option<String>,
+        harness: HarnessId,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_sign_in = Some(harness);
+        self.set_target_device(target, cx);
+        self.run_pending_sign_in(cx);
+    }
+
+    fn run_pending_sign_in(&mut self, cx: &mut Context<Self>) {
+        let Some(harness) = self.pending_sign_in else {
+            return;
+        };
+        if self.switching || !matches!(self.harnesses, Loadable::Ready(_)) {
+            return;
+        }
+        self.pending_sign_in = None;
+        if self.expanded_harness != Some(harness) {
+            self.toggle_agent_details(harness, cx);
+        }
+        if self.expanded_harness != Some(harness) {
+            return;
+        }
+        if let Some(accounts) = &self.accounts_page {
+            accounts.update(cx, |page, cx| page.start_first_login(harness, cx));
+        }
     }
 
     fn render_agent_details(
@@ -635,6 +671,7 @@ impl HarnessesPage {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
+                page.run_pending_sign_in(cx);
                 cx.notify();
             })
             .ok();
@@ -1479,6 +1516,52 @@ impl Render for HarnessesPage {
 
 #[cfg(test)]
 mod tests {
+    /// A failed run's "Log in" waits for the rows, then opens that agent's
+    /// Accounts section (where its sign-in starts).
+    #[gpui::test]
+    fn sign_in_opens_the_agent_once_its_rows_land(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext;
+        let dir = tempfile::tempdir().unwrap();
+        cx.update(|cx| {
+            crate::settings::init(Default::default(), dir.path(), cx);
+            gpui_base::init(cx);
+            cx.set_global(crate::theme::Theme::default());
+        });
+        let window = cx.add_window(|_, cx| {
+            let state = cx.new(|_| crate::state::AppState::new());
+            super::HarnessesPage::new(state, cx)
+        });
+        window
+            .update(cx, |page, _, cx| {
+                page.harnesses = super::Loadable::Loading;
+                page.sign_in(None, zeron_proto::HarnessId::Codex, cx);
+                assert_eq!(page.expanded_harness, None, "nothing to open yet");
+                page.harnesses =
+                    super::Loadable::Ready(vec![zeron_engine::registry::HarnessDescriptor {
+                        id: zeron_proto::HarnessId::Codex,
+                        name: "Codex".into(),
+                        supports_steering: false,
+                        steering_mode: zeron_proto::SteeringMode::TurnBoundary,
+                        reasoning_levels: Vec::new(),
+                        installed: true,
+                        can_install: false,
+                        enabled: Some(true),
+                    }]);
+                page.run_pending_sign_in(cx);
+                assert_eq!(page.expanded_harness, Some(zeron_proto::HarnessId::Codex));
+                assert_eq!(
+                    page.accounts_page
+                        .as_ref()
+                        .unwrap()
+                        .read(cx)
+                        .embedded_harness(),
+                    Some(zeron_proto::HarnessId::Codex)
+                );
+                assert_eq!(page.pending_sign_in, None, "started once");
+            })
+            .unwrap();
+    }
+
     #[gpui::test]
     fn expanded_agent_preferences_render_inside_the_agent_row(cx: &mut gpui::TestAppContext) {
         use gpui::AppContext;

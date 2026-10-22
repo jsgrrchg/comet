@@ -245,7 +245,22 @@ struct Inner {
     /// Serializes writes of the managed files.
     files: tokio::sync::Mutex<FileState>,
     refresher: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Whether this machine's Codex CLI can start ([`CredentialBroker::ensure_codex_starts`]).
+    codex_check: tokio::sync::Mutex<CodexCheck>,
 }
+
+/// The Codex install check: done once it passes; a failed repair is retried
+/// after [`CODEX_REPAIR_RETRY`] (a network blip mid-install must not leave
+/// Codex broken until the machine restarts).
+#[derive(Default)]
+enum CodexCheck {
+    #[default]
+    Unchecked,
+    Passed,
+    FailedAt(Instant),
+}
+
+const CODEX_REPAIR_RETRY: Duration = Duration::from_secs(10 * 60);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -273,6 +288,7 @@ impl CredentialBroker {
                 grant_gate: tokio::sync::Mutex::new(()),
                 files: tokio::sync::Mutex::new(FileState::default()),
                 refresher: Mutex::new(None),
+                codex_check: tokio::sync::Mutex::new(CodexCheck::Unchecked),
             }),
         }
     }
@@ -474,6 +490,9 @@ impl CredentialBroker {
         // GitHub: the credential store and hosts.yml (refreshed in place),
         // never the run's environment (fixed at spawn, outlived by the token).
         let _ = self.github_token().await;
+        if harness == HarnessId::Codex {
+            self.ensure_codex_starts().await;
+        }
         match harness {
             HarnessId::Codex => match self.codex_home().await {
                 Some(home) => {
@@ -529,6 +548,29 @@ impl CredentialBroker {
             GrantOutcome::NotConnected(_) => Some("none".into()),
             GrantOutcome::Unavailable(_) => None,
         }
+    }
+
+    /// Before the first Codex run: a machine image whose global npm Codex
+    /// lacks its native binary (an optional dependency) fails every spawn,
+    /// so reinstall it once. Later runs wait on a repair in progress.
+    async fn ensure_codex_starts(&self) {
+        let mut check = self.inner.codex_check.lock().await;
+        match *check {
+            CodexCheck::Passed => return,
+            CodexCheck::FailedAt(at) if at.elapsed() < CODEX_REPAIR_RETRY => return,
+            _ => {}
+        }
+        *check = match zeron_harness::codex::npm_repair::repair().await {
+            Ok(zeron_harness::codex::npm_repair::Repair::NotNeeded) => CodexCheck::Passed,
+            Ok(zeron_harness::codex::npm_repair::Repair::Repaired { version }) => {
+                tracing::info!(%version, "reinstalled Codex with its native binary");
+                CodexCheck::Passed
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Codex is missing its native binary and the reinstall failed");
+                CodexCheck::FailedAt(Instant::now())
+            }
+        };
     }
 
     /// A Codex login the sandbox has on its own (`codex login` inside it, or

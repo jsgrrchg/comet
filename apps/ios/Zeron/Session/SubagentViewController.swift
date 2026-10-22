@@ -115,7 +115,6 @@ final class SubagentViewController: UIViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        (tabBarController as? MainTabController)?.setAccessoryVisible(false, animated: false)
         if closed {
             closed = false
             handle?.setViewAttached(attached: true)
@@ -151,5 +150,42 @@ final class SubagentViewController: UIViewController {
             self.loader.alpha = 0
             self.empty.alpha = 1
         }
+    }
+}
+
+/// Two-line navigation title: session title over "project @ device".
+final class SessionTitleView: UIView {
+    private let title = FadingLabel()
+    private let subtitle = FadingLabel()
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        title.font = Fonts.ui(.sansSemibold, 16)
+        title.textColor = Palette.text
+        title.fitsAlignment = .center
+        subtitle.font = Fonts.ui(.sans, 12)
+        subtitle.textColor = Palette.secondary
+        subtitle.fitsAlignment = .center
+        let stack = UIStackView(arrangedSubviews: [title, subtitle])
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 1
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            widthAnchor.constraint(lessThanOrEqualToConstant: 240),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func set(title t: String, subtitle s: String) {
+        title.text = t
+        subtitle.text = s
+        subtitle.isHidden = s.isEmpty
     }
 }

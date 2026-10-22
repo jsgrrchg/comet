@@ -4,9 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use futures::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
-use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{ClientFrame, RpcError, ServerFrame};
 
@@ -44,6 +42,8 @@ pub struct RpcClient {
     reader: tokio::task::JoinHandle<()>,
     /// Flips to true once the server side of the duplex is gone.
     closed: tokio::sync::watch::Receiver<bool>,
+    /// Why the transport failed, when it did; set before `closed` flips.
+    close_reason: Arc<std::sync::OnceLock<String>>,
 }
 
 /// Owned stream receiver whose drop immediately cancels the server task.
@@ -140,7 +140,14 @@ impl RpcClient {
             next_id: AtomicU64::new(1),
             reader,
             closed,
+            close_reason: Arc::default(),
         }
+    }
+
+    /// Why the connection failed (an oversized frame, a reset socket), once
+    /// [`Self::closed`] resolved; `None` for a clean close.
+    pub fn close_reason(&self) -> Option<String> {
+        self.close_reason.get().cloned()
     }
 
     /// Resolves once the connection has closed (the server went away). An
@@ -443,45 +450,30 @@ async fn dial(url: &str, token: Option<&str>) -> Result<RpcClient, DialError> {
             HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_| DialError::Malformed)?;
         request.headers_mut().insert(header::AUTHORIZATION, value);
     }
-    let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
-        .await
-        .map_err(|_| DialError::Other(RpcError::Transport(format!("timed out dialing {url}"))))?
-        .map_err(|e| match e {
-            tokio_tungstenite::tungstenite::Error::Http(response)
-                if response.status() == StatusCode::UNAUTHORIZED =>
-            {
-                DialError::Unauthorized
-            }
-            other => DialError::Other(RpcError::Transport(other.to_string())),
-        })?;
-    let (mut sink, mut stream) = ws.split();
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
+    let (ws, _) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_with_config(request, Some(crate::ws::config()), false),
+    )
+    .await
+    .map_err(|_| DialError::Other(RpcError::Transport(format!("timed out dialing {url}"))))?
+    .map_err(|e| match e {
+        tokio_tungstenite::tungstenite::Error::Http(response)
+            if response.status() == StatusCode::UNAUTHORIZED =>
+        {
+            DialError::Unauthorized
+        }
+        other => DialError::Other(RpcError::Transport(other.to_string())),
+    })?;
+    let (out_tx, out_rx) = mpsc::channel::<String>(256);
     let (in_tx, in_rx) = mpsc::channel::<String>(256);
+    let client = RpcClient::new(out_tx, in_rx);
+    let close_reason = client.close_reason.clone();
+    let url = url.to_owned();
     tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                frame = out_rx.recv() => match frame {
-                    Some(text) => {
-                        if sink.send(WsMessage::Text(text)).await.is_err() {
-                            break;
-                        }
-                    }
-                    None => {
-                        let _ = sink.send(WsMessage::Close(None)).await;
-                        break;
-                    }
-                },
-                message = stream.next() => match message {
-                    Some(Ok(WsMessage::Text(text))) => {
-                        if in_tx.send(text).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break,
-                    Some(Ok(_)) => {}
-                },
-            }
+        if let Some(reason) = crate::ws::pump(ws, out_rx, in_tx).await {
+            tracing::warn!(%reason, %url, "rpc: lost the connection");
+            let _ = close_reason.set(reason);
         }
     });
-    Ok(RpcClient::new(out_tx, in_rx))
+    Ok(client)
 }

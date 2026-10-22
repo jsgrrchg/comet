@@ -47,6 +47,7 @@
 pub(crate) mod catalog;
 mod fork;
 mod normalize;
+pub mod npm_repair;
 pub mod realtime;
 mod subagents;
 

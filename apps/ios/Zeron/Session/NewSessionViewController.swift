@@ -127,12 +127,6 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
         app.newSessionImages = composer.images
     }
 
-    override func viewWillAppear(_ animated: Bool) {
-        super.viewWillAppear(animated)
-        // Pushed over a session: the tab accessory stays away.
-        if sideOf != nil { (tabBarController as? MainTabController)?.setAccessoryVisible(false, animated: false) }
-    }
-
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         rememberDraft()

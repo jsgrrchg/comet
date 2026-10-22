@@ -41,9 +41,9 @@ final class Toast: UIView {
         }
         if let tabs, !tabs.tabBar.isHidden, tabs.tabBar.window != nil {
             top = min(top, tabs.tabBar.convert(tabs.tabBar.bounds, to: window).minY)
-            if let accessory = (tabs as? MainTabController)?.accessoryFrame(in: window) {
-                top = min(top, accessory.minY)
-            }
+        }
+        if let bar = (tabs as? MainTabController)?.bottomBarFrame(in: window) {
+            top = min(top, bar.minY)
         }
         // A pushed screen's own bottom bar (e.g. the composer) isn't tab
         // chrome; keep clear of the keyboard / home indicator either way.

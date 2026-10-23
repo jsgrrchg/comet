@@ -244,6 +244,16 @@ final class SessionFlowTests: XCTestCase {
         app.navigationBars["Settings"].buttons.firstMatch.tap()
         XCTAssertTrue(app.navigationBars["Sessions"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.buttons["new-session"].waitForExistence(timeout: 5))
+        // Regression: popping a screen that hides the bottom bar brought a
+        // (hidden) tab bar back over the bottom bar on device.
+        XCTAssertFalse(app.tabBars.firstMatch.exists, "no tab bar after Settings")
+        app.cells["session-chat-cjk"].firstMatch.tap()
+        XCTAssertTrue(app.scrollViews["transcript"].waitForExistence(timeout: 10))
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(app.buttons["new-session"].waitForExistence(timeout: 5))
+        sleep(1)
+        XCTAssertFalse(app.tabBars.firstMatch.exists, "no tab bar after a session")
+        snapshot(app, "bottom-bar-after-pop")
     }
 
     /// Render Math toggles the Math Font row; the font picks from a sheet of

@@ -220,7 +220,7 @@ class SessionListController: UIViewController, UICollectionViewDelegate {
             return
         }
         guard let session = SessionViewController(app: app, chatId: id) else {
-            (tabBarController as? MainTabController)?.showSessionOpenError()
+            mainShell?.showSessionOpenError()
             return
         }
         navigationController?.pushViewController(session, animated: true)

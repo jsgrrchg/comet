@@ -2,9 +2,10 @@ import UIKit
 
 /// Root on iPhone: the Sessions list, with a Liquid Glass bottom bar of
 /// native toolbar items — Settings, Search (the system's toolbar-integrated
-/// field), voice, and New session — instead of tabs. The tab bar controller
-/// stays as the container (one tab, its bar hidden) for routing.
-final class MainTabController: UITabBarController, AppRouter {
+/// field), voice, and New session — instead of tabs. A plain container for
+/// the Sessions navigation stack: a hidden tab bar came back on device
+/// whenever a screen that hides the bottom bar was popped.
+final class MainTabController: UIViewController, AppRouter {
     private let app: AppModel
 
     init(app: AppModel) {
@@ -15,24 +16,24 @@ final class MainTabController: UITabBarController, AppRouter {
     required init?(coder: NSCoder) { fatalError() }
 
     private lazy var sessionsList = SessionsViewController(app: app)
+    private lazy var nav = sessionsNav()
     private var voiceToken: AnyObject?
     private var appToken: AnyObject?
 
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = Palette.background
-        let sessions = UITab(title: "Sessions", image: UIImage(named: "tab-chat"), identifier: "sessions") { [weak self] _ in
-            self?.sessionsNav() ?? UIViewController()
-        }
-        tabs = [sessions]
-        selectedTab = sessions
-        // Not setTabBarHidden: hiding it that way before the list's first
-        // layout opens the list with its large title collapsed.
-        tabBar.isHidden = true
+        addChild(nav)
+        nav.view.frame = view.bounds
+        nav.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        view.addSubview(nav.view)
+        nav.didMove(toParent: self)
         voiceToken = app.voice.observe { [weak self] in self?.updateBottomBar() }
         // Hosts coming and going decide whether voice is offered.
         appToken = app.observe { [weak self] in self?.updateBottomBar() }
     }
+
+    override var childForStatusBarStyle: UIViewController? { nav }
 
     private func sessionsNav() -> UINavigationController {
         sessionsList.enableToolbarSearch()
@@ -95,8 +96,7 @@ final class MainTabController: UITabBarController, AppRouter {
 
     /// The bottom bar's frame when it's on screen (toast placement).
     func bottomBarFrame(in window: UIWindow) -> CGRect? {
-        guard let nav = selectedTab?.viewController as? UINavigationController,
-              nav.topViewController === sessionsList, !nav.isToolbarHidden, nav.toolbar.window != nil
+        guard nav.topViewController === sessionsList, !nav.isToolbarHidden, nav.toolbar.window != nil
         else { return nil }
         return nav.toolbar.convert(nav.toolbar.bounds, to: window)
     }
@@ -128,7 +128,6 @@ final class MainTabController: UITabBarController, AppRouter {
 
     /// Settings over the list (the bottom bar steps aside).
     func showSettings() {
-        guard let nav = tabs.first?.viewController as? UINavigationController else { return }
         if presentedViewController != nil { dismiss(animated: false) }
         if nav.topViewController is MoreViewController { return }
         nav.popToRootViewController(animated: false)
@@ -146,11 +145,7 @@ final class MainTabController: UITabBarController, AppRouter {
     /// the sheet leaves without its slide, and the handoff animation carries
     /// the draft (page, composer, message) into the chat.
     func openSession(_ chatId: String, handoff: DraftHandoff?) {
-        guard let handoff, let window = view.window,
-              let tab = tabs.first(where: { $0.identifier == "sessions" })
-        else { return openSession(chatId) }
-        selectedTab = tab
-        guard let nav = tab.viewController as? UINavigationController else { return openSession(chatId) }
+        guard let handoff, let window = view.window else { return openSession(chatId) }
         guard let session = SessionViewController(app: app, chatId: chatId) else {
             return showSessionOpenError()
         }
@@ -179,29 +174,37 @@ final class MainTabController: UITabBarController, AppRouter {
     /// Back to the Sessions list, releasing any pushed session (the iPad
     /// split takes the open session back into its own column).
     func popToFrontPage() {
-        guard let nav = tabs.first(where: { $0.identifier == "sessions" })?.viewController as? UINavigationController else { return }
         nav.popToRootViewController(animated: false)
     }
 
     func showSessionOpenError() {
         if presentedViewController != nil { dismiss(animated: false) }
         view.endEditing(true)
-        selectedTab = tabs.first { $0.identifier == "sessions" }
         popToFrontPage()
         view.layoutIfNeeded()
         Toast.show("Couldn't open session. Try again.", in: view.window)
     }
 
-    /// Push a session on the Sessions tab (from new-session, deep links, search).
+    /// Push a session on the Sessions list (from new-session, deep links, search).
     func openSession(_ chatId: String) {
-        guard let tab = tabs.first(where: { $0.identifier == "sessions" }) else { return }
-        selectedTab = tab
-        guard let nav = tab.viewController as? UINavigationController else { return }
         guard let session = SessionViewController(app: app, chatId: chatId) else {
             return showSessionOpenError()
         }
         if presentedViewController != nil { dismiss(animated: true) }
         nav.popToRootViewController(animated: false)
         nav.pushViewController(session, animated: true)
+    }
+}
+
+extension UIViewController {
+    /// The iPhone shell this screen sits in, if any (not beside the iPad
+    /// sidebar, not a standalone sheet).
+    var mainShell: MainTabController? {
+        var ancestor = parent
+        while let current = ancestor {
+            if let shell = current as? MainTabController { return shell }
+            ancestor = current.parent
+        }
+        return nil
     }
 }

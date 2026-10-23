@@ -47,6 +47,7 @@ pub mod catalog;
 mod discovery;
 mod fork;
 mod normalize;
+pub mod refresh_lock;
 mod wire;
 
 use std::path::PathBuf;
@@ -382,7 +383,17 @@ impl ClaudeHarness {
             ))
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
-        shutdown_child(&mut child, self.kill_grace).await;
+        // A probe starts right when an expired login gets refreshed, and
+        // answers before that refresh is saved: retire it in the background
+        // once no refresh is in flight, stdin still open (EOF would make the
+        // CLI exit after waiting only 2s for the save — see `refresh_lock`).
+        let kill_grace = self.kill_grace;
+        let lock_dir = refresh_lock::config_dir();
+        tokio::spawn(async move {
+            refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
+            drop(stdin);
+            shutdown_child(&mut child, kill_grace).await;
+        });
         match result {
             Ok(inner) => inner,
             Err(_) => Err(HarnessError::Protocol("Claude initialize timed out".into())),
@@ -682,8 +693,9 @@ impl ClaudeHarness {
             });
         }
 
+        let lock_dir = refresh_lock::config_dir_for(&request.env);
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<StdinMsg>();
-        tokio::spawn(stdin_writer(stdin, stdin_rx));
+        tokio::spawn(stdin_writer(stdin, stdin_rx, lock_dir.clone()));
         if !title_only {
             let _ = stdin_tx.send(StdinMsg::Line(wire::initialize_request_line(
                 "zeron_initialize",
@@ -721,6 +733,7 @@ impl ClaudeHarness {
             config: request,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            lock_dir,
             stderr_tail,
         }));
 
@@ -812,8 +825,13 @@ async fn load_image_blocks(paths: &[String]) -> Vec<wire::ImageBlock> {
 }
 
 /// Owns the child's stdin; a write failure (EPIPE after the child died) is
-/// tolerated and logged.
-async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<StdinMsg>) {
+/// tolerated and logged. EOF makes the CLI exit, so it waits out a login
+/// refresh in flight first (see [`refresh_lock`]).
+async fn stdin_writer(
+    mut stdin: ChildStdin,
+    mut rx: mpsc::UnboundedReceiver<StdinMsg>,
+    lock_dir: PathBuf,
+) {
     while let Some(msg) = rx.recv().await {
         match msg {
             StdinMsg::Line(line) => {
@@ -828,6 +846,7 @@ async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Std
                 }
             }
             StdinMsg::Close => {
+                refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
                 let _ = stdin.shutdown().await;
                 return;
             }
@@ -851,6 +870,9 @@ struct Session {
     config: RunRequest,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    /// Claude's credential dir: no signal lands mid-refresh (see
+    /// [`refresh_lock`]).
+    lock_dir: PathBuf,
     /// Rolling stderr tail for the crash message on an unexpected exit.
     stderr_tail: crate::StderrTail,
 }
@@ -871,6 +893,7 @@ async fn run_session(session: Session) {
         mut config,
         interrupt_grace,
         kill_grace,
+        lock_dir,
         stderr_tail,
     } = session;
     let RunControls {
@@ -1237,12 +1260,16 @@ async fn run_session(session: Session) {
                 let _ = stdin_tx.send(StdinMsg::Line(wire::interrupt_request_line("int_1")));
                 // Escalate if the CLI doesn't wind down within the grace
                 // periods: SIGTERM (kills bash trees, runs SessionEnd hooks),
-                // then SIGKILL. Aborted once the child is reaped.
+                // then SIGKILL — neither while a login refresh is being
+                // saved. Aborted once the child is reaped.
                 if let Some(pid) = crate::process::signal_target(&child) {
+                    let lock_dir = lock_dir.clone();
                     escalation = Some(tokio::spawn(async move {
                         tokio::time::sleep(interrupt_grace).await;
+                        refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
                         send_signal(&pid, Signal::Term);
                         tokio::time::sleep(kill_grace).await;
+                        refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
                         send_signal(&pid, Signal::Kill);
                     }));
                 }
@@ -1310,6 +1337,9 @@ async fn run_session(session: Session) {
         }
     }
 
+    if matches!(child.try_wait(), Ok(None)) {
+        refresh_lock::settle(&lock_dir, refresh_lock::SETTLE_MAX).await;
+    }
     crate::shutdown_agent(&mut child, torn_down, kill_grace).await;
     if let Some(handle) = escalation {
         handle.abort();

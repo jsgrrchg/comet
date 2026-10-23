@@ -11,6 +11,9 @@ use std::process::Stdio;
 
 const MISSING: &str = "Missing optional dependency";
 const PACKAGE: &str = "@openai/codex";
+/// A `--version` (or `sudo -n true`) that takes longer than this is hung:
+/// the repair runs before a Codex spawn, which must not wait on it forever.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What [`repair`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,14 +57,19 @@ pub(crate) async fn repair_with(
     }
     let version = installed_version(codex).unwrap_or_else(|| "latest".into());
     let spec = format!("{PACKAGE}@{version}");
-    let args = [
-        "install",
-        "-g",
+    // Reinstall into the prefix that owns this Codex, whichever npm runs it:
+    // another Node's npm would otherwise add a second copy elsewhere.
+    let prefix = global_prefix(codex).map(|prefix| prefix.to_string_lossy().into_owned());
+    let mut args = vec!["install", "-g"];
+    if let Some(prefix) = &prefix {
+        args.extend(["--prefix", prefix.as_str()]);
+    }
+    args.extend([
         "--include=optional",
         "--no-audit",
         "--no-fund",
         spec.as_str(),
-    ];
+    ]);
     let mut output = run(npm, &args).await?;
     if !output.status.success()
         && let Some(sudo) = sudo
@@ -91,7 +99,10 @@ enum Probe {
 }
 
 async fn probe(codex: &Path) -> Probe {
-    match command(codex).arg("--version").output().await {
+    let output = tokio::time::timeout(PROBE_TIMEOUT, command(codex).arg("--version").output())
+        .await
+        .unwrap_or_else(|_| Err(std::io::Error::other("`codex --version` timed out")));
+    match output {
         Ok(out) if out.status.success() => Probe::Starts,
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -119,6 +130,21 @@ fn installed_version(codex: &Path) -> Option<String> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+'))
         .then(|| version.to_string())
+}
+
+/// The npm prefix the package behind `codex` was installed into globally:
+/// `<prefix>/lib/node_modules/@openai/codex` (Unix) or
+/// `<prefix>/node_modules/@openai/codex` (Windows).
+fn global_prefix(codex: &Path) -> Option<PathBuf> {
+    let script = std::fs::canonicalize(codex).ok()?;
+    let node_modules = script
+        .ancestors()
+        .find(|dir| dir.file_name().is_some_and(|name| name == "node_modules"))?;
+    let parent = node_modules.parent()?;
+    Some(match parent.file_name() {
+        Some(name) if name == "lib" && !cfg!(windows) => parent.parent()?.to_path_buf(),
+        _ => parent.to_path_buf(),
+    })
 }
 
 fn permission_denied(output: &std::process::Output) -> bool {
@@ -158,11 +184,9 @@ async fn run_args(
 }
 
 async fn succeeds(program: &Path, args: &[&str]) -> bool {
-    command(program)
-        .args(args)
-        .output()
+    tokio::time::timeout(PROBE_TIMEOUT, command(program).args(args).output())
         .await
-        .is_ok_and(|out| out.status.success())
+        .is_ok_and(|out| out.is_ok_and(|out| out.status.success()))
 }
 
 fn command(program: &Path) -> tokio::process::Command {
@@ -234,9 +258,13 @@ mod tests {
             })
         );
         let calls = std::fs::read_to_string(calls).unwrap();
+        let prefix = dir.path().canonicalize().unwrap();
         assert_eq!(
             calls.trim(),
-            "install -g --include=optional --no-audit --no-fund @openai/codex@0.163.0"
+            format!(
+                "install -g --prefix {} --include=optional --no-audit --no-fund @openai/codex@0.163.0",
+                prefix.display()
+            )
         );
         // Healthy now: nothing more to do.
         assert_eq!(repair_with(&codex, &npm, None).await, Ok(Repair::NotNeeded));

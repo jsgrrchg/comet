@@ -23,6 +23,7 @@ pub mod chat2_host;
 mod chat_persistence;
 mod cloud_accounts;
 pub mod cloud_client;
+pub mod commit_credit;
 pub mod credentials;
 pub mod deferred;
 pub mod desktop_notify;
@@ -928,6 +929,13 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
+        // Agents' commits credit Zeron (always on Cloud, else per the
+        // device's setting).
+        core.registry
+            .set_commit_credit(Arc::new(commit_credit::CommitCredit::open(
+                &config.data_dir,
+                runner::is_cloud_platform(),
+            )));
         // Cloud runner: the credential broker fills agent spawns' env (and
         // backs ListGithubRepos / CloneRepo); the heartbeat feeds idle sleep.
         // Attached before the host relay so relayed RPCs see the broker.

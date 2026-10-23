@@ -1191,9 +1191,8 @@ impl WorkspaceHost {
                 git_detected: true,
                 git_checked_at: Some(Utc::now()),
                 checkout_id: None,
-                // Groups with every clone of the repository (the normalized
-                // remote form a device stamps for a shallow history).
-                repository_id: Some(format!("github.com/{}", github_repo.to_lowercase())),
+                // Groups with the clones of the repository on other devices.
+                repository_id: Some(zeron_proto::view::cloud_repository_id(&spaces, github_repo)),
                 github_repo: Some(github_repo.to_string()),
                 created_at: Utc::now(),
             })
@@ -1252,6 +1251,55 @@ impl WorkspaceHost {
             }
             None => Ok(false),
         }
+    }
+
+    /// Cloud projects of `github_repo` that still carry another identity
+    /// than `repository_id` (a full clone's `commit:<root>`) take it, so they
+    /// group with this device's clone. Cloud projects have no engine of their
+    /// own to stamp them; only ever toward the commit form, so a shallow clone
+    /// elsewhere (remote form) can't flip them back. Returns how many moved.
+    pub fn align_cloud_spaces(
+        &self,
+        github_repo: &str,
+        repository_id: &str,
+    ) -> Result<usize, EngineError> {
+        if !repository_id.starts_with("commit:") || repository_id["commit:".len()..].contains(':') {
+            return Ok(0);
+        }
+        let stale: Vec<Space> = self
+            .read(|doc| doc.read_spaces())?
+            .into_iter()
+            .filter(|s| s.device_id.starts_with(zeron_proto::CLOUD_DEVICE_PREFIX))
+            .filter(|s| {
+                s.github_repo
+                    .as_deref()
+                    .is_some_and(|repo| repo.eq_ignore_ascii_case(github_repo))
+            })
+            .filter(|s| {
+                s.repository_id.as_deref() != Some(repository_id)
+                    && !s
+                        .repository_id
+                        .as_deref()
+                        .is_some_and(|id| id.starts_with("commit:"))
+            })
+            .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        self.mutate(|doc| {
+            for space in &stale {
+                doc.set_space_git(
+                    &space.id,
+                    space.git_detected,
+                    space.checkout_id.as_deref(),
+                    Some(repository_id),
+                    space.github_repo.as_deref(),
+                    space.git_checked_at.unwrap_or_else(Utc::now),
+                )?;
+            }
+            Ok::<_, zeron_doc::DocError>(true)
+        })?;
+        Ok(stale.len())
     }
 
     pub fn read_spaces(&self) -> Result<Vec<Space>, EngineError> {

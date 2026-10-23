@@ -576,7 +576,11 @@ impl Client {
             git_detected: true,
             git_checked_at: Some(Utc::now()),
             checkout_id: None,
-            repository_id: Some(format!("github.com/{}", repo_full_name.to_lowercase())),
+            // Groups with the clones of the repository on the user's devices.
+            repository_id: Some(zeron_proto::view::cloud_repository_id(
+                &state.spaces,
+                repo_full_name,
+            )),
             github_repo: Some(repo_full_name.to_owned()),
             created_at: Utc::now(),
         };

@@ -2768,9 +2768,28 @@ impl AgentAccounts {
             // wherever Claude Code will READ it (see `read_claude_credentials`):
             // the Keychain whenever it holds an item or no file exists; the
             // file only for a file-only (Keychain-less) login.
-            if keychain::has_item(service).await || !self.inner.config.claude_creds_file().exists()
-            {
-                return keychain::write_credentials(service, &json).await;
+            let has_item = keychain::has_item(service).await;
+            if has_item || !self.inner.config.claude_creds_file().exists() {
+                match keychain::write_credentials(service, &json).await {
+                    Ok(()) => return Ok(()),
+                    // Claude Code's own fallback when the Keychain can't be
+                    // used (no item it can see, writes refused — e.g. an
+                    // engine outside the login session): the plaintext file,
+                    // which it reads whenever the Keychain holds nothing. A
+                    // failed write must not leave the CLI signed out.
+                    Err(err) if !has_item => {
+                        tracing::warn!(error = %err, "Keychain write failed; using Claude Code's credentials file");
+                    }
+                    // An item we can't update would shadow the file (the
+                    // Keychain is read first): say how to recover.
+                    Err(err) => {
+                        return Err(EngineError::Other(format!(
+                            "macOS Keychain wouldn't update the Claude Code login, so it can't \
+                             be switched here. Run `claude` in a terminal and sign in with \
+                             /login, then refresh. ({err})"
+                        )));
+                    }
+                }
             }
         }
         std::fs::create_dir_all(&self.inner.config.claude_config_dir)?;
@@ -3191,6 +3210,19 @@ mod keychain {
 
     const EXEC_TIMEOUT: Duration = Duration::from_secs(15);
 
+    /// Tests stand a fake `security` in (never a real Keychain).
+    #[cfg(test)]
+    pub(super) static SECURITY_OVERRIDE: std::sync::Mutex<Option<std::path::PathBuf>> =
+        std::sync::Mutex::new(None);
+
+    fn security_bin() -> std::path::PathBuf {
+        #[cfg(test)]
+        if let Some(path) = SECURITY_OVERRIDE.lock().unwrap().clone() {
+            return path;
+        }
+        std::path::PathBuf::from("/usr/bin/security")
+    }
+
     async fn exec(args: &[&str]) -> (bool, String, String) {
         // A Cloud device never uses a keychain (see `detect`); this also
         // covers lookups that don't go through the config.
@@ -3202,7 +3234,7 @@ mod keychain {
             );
         }
         // Absolute path: a PATH-planted `security` must never see secrets.
-        let run = tokio::process::Command::new("/usr/bin/security")
+        let run = tokio::process::Command::new(security_bin())
             .args(args)
             .stdin(std::process::Stdio::null())
             .output();
@@ -4549,6 +4581,73 @@ fn stage_file_atomic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Keychain the engine can't use (the search and the write both
+    /// refused, as reported from an engine outside the login session) must
+    /// not leave Claude Code signed out: the login lands in its credentials
+    /// file, Claude Code's own fallback. An item it can't update would shadow
+    /// that file, so then it errs with the way out.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn claude_login_falls_back_to_the_file_when_the_keychain_refuses() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let security = dir.path().join("security");
+        let item = dir.path().join("item-exists");
+        std::fs::write(
+            &security,
+            format!(
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 find-generic-password) [ -f '{}' ] && exit 0; exit 44 ;;\n\
+                 add-generic-password) echo 'security: SecKeychainSearchCreateFromAttributes: One or more parameters passed to a function were not valid.' >&2;\n\
+                   echo 'security: SecKeychainItemCreateFromContent (<default>): Unable to obtain authorization for this operation.' >&2; exit 1 ;;\n\
+                 esac\nexit 1\n",
+                item.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o755)).unwrap();
+        *keychain::SECURITY_OVERRIDE.lock().unwrap() = Some(security);
+
+        let mut config = AgentAccountsConfig::isolated(&dir.path().join("root"));
+        config.claude_keychain_service = Some("Claude Code-credentials-test".into());
+        let accounts = AgentAccounts::new(config.clone());
+        let creds =
+            serde_json::json!({ "claudeAiOauth": { "accessToken": "a", "refreshToken": "r" } });
+
+        accounts
+            .write_claude_credentials(&creds)
+            .await
+            .expect("falls back to the file");
+        let written: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(config.claude_creds_file()).unwrap()).unwrap();
+        assert_eq!(written, creds);
+        assert_eq!(
+            std::fs::metadata(config.claude_creds_file())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        // Read back the same way Claude Code would: Keychain empty → the file.
+        assert_eq!(
+            accounts.read_claude_credentials().await.0,
+            Some(creds.clone())
+        );
+
+        std::fs::remove_file(config.claude_creds_file()).unwrap();
+        std::fs::write(&item, "").unwrap();
+        let err = accounts.write_claude_credentials(&creds).await.unwrap_err();
+        assert!(err.to_string().contains("/login"), "{err}");
+        assert!(
+            !config.claude_creds_file().exists(),
+            "no file the Keychain item would shadow"
+        );
+
+        *keychain::SECURITY_OVERRIDE.lock().unwrap() = None;
+    }
 
     #[test]
     fn plan_labels() {

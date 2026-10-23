@@ -23,6 +23,7 @@ import {
   QUIESCE_BUSY_EXIT,
   QUIESCE_ENGINE_COMMAND,
   RESTART_ENGINE_COMMAND,
+  START_ENGINE_COMMAND,
   STOP_ENGINE_COMMAND,
   installCommand,
   type SessionEnv
@@ -312,9 +313,9 @@ export class ProvisionWorkflow extends WorkflowEntrypoint<Env, ProvisionParams> 
 }
 
 /**
- * WakeWorkflow — resume the sandbox and wait for the engine's first contact.
- * Enabled system units come back on resume; if the engine stays silent, one
- * idempotent `systemctl restart` before giving up.
+ * WakeWorkflow — resume the sandbox, start the engine, and wait for its first
+ * contact. If the engine stays silent, one idempotent `systemctl restart`
+ * before giving up.
  */
 export class WakeWorkflow extends WorkflowEntrypoint<Env, LifecycleParams> {
   async run(event: WorkflowEvent<LifecycleParams>, step: WorkflowStep): Promise<void> {
@@ -323,6 +324,19 @@ export class WakeWorkflow extends WorkflowEntrypoint<Env, LifecycleParams> {
     try {
       const provider = requireProvider(this.env, p.provider);
       await ensureRunning(step, provider, p.sandboxId, ttlFor(this.env, provider), "wake");
+      // Start the engine rather than trust the resume to: a machine resumed
+      // from its sleep snapshot comes back with the unit stopped, and waited
+      // out the full silence below (5 minutes) before the restart.
+      await step.do("start-engine", { retries: { limit: 2, delay: "5 seconds", backoff: "constant" }, timeout: "2 minutes" }, async () => {
+        try {
+          const result = await provider.exec(p.sandboxId, { command: START_ENGINE_COMMAND, timeoutSeconds: 60 });
+          return { exitCode: result.exitCode };
+        } catch (e) {
+          // Best effort: the wait (and its restart) below still covers it.
+          console.warn("cloud wake: starting the engine failed", String(e));
+          return { exitCode: null };
+        }
+      });
       const online = () => account.wfOnline(p.chatId, p.generation);
       let up = await awaitSignal(step, "online", "", online, "5 minutes");
       if (!up) {

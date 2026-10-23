@@ -55,9 +55,13 @@ final class AgentAccountsViewController: UITableViewController {
         var message: String?
     }
 
-    init(app: AppModel, target: Target, accounts: [DeviceAccountInfo]? = nil) {
+    /// Open straight into this provider's sign-in (an error card's "Log in").
+    private var signInOnAppear: Bool
+
+    init(app: AppModel, target: Target, accounts: [DeviceAccountInfo]? = nil, signIn: Bool = false) {
         self.app = app
         self.target = target
+        self.signInOnAppear = signIn
         switch target {
         case let .cloud(agent):
             rules = agentLoginRules(harness: agent.harness)
@@ -111,6 +115,14 @@ final class AgentAccountsViewController: UITableViewController {
             token = cloud.observe { [weak self] in self?.tableView.reloadData() }
         }
         load()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        if signInOnAppear, signIn == nil, let option = rules.options.first {
+            signInOnAppear = false
+            startSignIn(option)
+        }
     }
 
     // MARK: Data

@@ -3384,6 +3384,9 @@ impl AppState {
         let Some(config) = self.boot_config.clone() else {
             return;
         };
+        // A transport failure (an oversized frame, a reset socket) loses the
+        // connection while the engine runs on; say which it was.
+        let reason = handle.client().close_reason();
         let respawn = record_engine_loss(&mut self.engine_losses, std::time::Instant::now());
         self.engine = None;
         self.watch_tasks.clear();
@@ -3395,16 +3398,24 @@ impl AppState {
             let log = config.data_dir.join("logs").join("zeron-engine.log");
             tracing::error!(
                 losses = self.engine_losses.len(),
-                "the background engine keeps stopping; giving up until Retry"
+                reason = reason.as_deref().unwrap_or("the engine went away"),
+                "the engine connection keeps dropping; giving up until Retry"
             );
-            self.connection = ConnectionStatus::Failed(format!(
-                "Zeron's engine keeps stopping unexpectedly. Details are in {}.",
-                log.display()
-            ));
+            self.connection = ConnectionStatus::Failed(match reason {
+                Some(reason) => format!(
+                    "Zeron keeps losing its connection to the engine: {reason}. \
+                     Details are in {}.",
+                    log.display()
+                ),
+                None => format!(
+                    "Zeron's engine keeps stopping unexpectedly. Details are in {}.",
+                    log.display()
+                ),
+            });
             cx.notify();
             return;
         };
-        tracing::warn!(?delay, "lost the engine connection; reconnecting");
+        tracing::warn!(?delay, ?reason, "lost the engine connection; reconnecting");
         self.reconnect_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(delay).await;
             let _ = cx.update(|cx| {

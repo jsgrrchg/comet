@@ -206,6 +206,12 @@ export const installCommand = (env: SessionEnv): string => {
 /** Wake fallback when the engine doesn't come back on its own after resume. */
 export const RESTART_ENGINE_COMMAND = `sudo systemctl restart ${CLOUD_UNIT_NAME}`;
 
+/** A wake's first command once the sandbox runs: the sleep stopped the unit
+ * before the provider snapshotted the machine, and a resume from that
+ * snapshot can bring systemd back with the unit still stopped. Idempotent:
+ * a no-op when the engine is already running. */
+export const START_ENGINE_COMMAND = `sudo systemctl start ${CLOUD_UNIT_NAME}`;
+
 /** A sleep's first step: the engine starts no new work, so nothing begins that
  * the stop would cut off; what arrives meanwhile waits for the woken machine.
  * Exits {@link QUIESCE_BUSY_EXIT} when a turn is in flight or a message is

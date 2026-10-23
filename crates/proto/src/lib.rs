@@ -18,6 +18,7 @@ pub mod preview;
 pub mod program_status;
 pub mod projectless;
 pub mod providers;
+pub mod run_errors;
 pub mod sidebar_pins;
 pub mod view;
 pub mod voice;

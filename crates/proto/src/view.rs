@@ -206,6 +206,28 @@ pub fn project_key(space: &Space) -> String {
     }
 }
 
+/// The repository identity for a Cloud project of `github_repo`. A Cloud
+/// project lives on the logical Cloud device, where no engine runs, so
+/// whoever creates it stamps it: with the identity a clone of the same
+/// repository already has (a full clone's `commit:<root>`), so the two read
+/// as one project, else the normalized remote form. Pure.
+pub fn cloud_repository_id(spaces: &[Space], github_repo: &str) -> String {
+    spaces
+        .iter()
+        .filter(|s| !s.device_id.starts_with(crate::CLOUD_DEVICE_PREFIX))
+        .filter(|s| {
+            s.github_repo
+                .as_deref()
+                .is_some_and(|repo| repo.eq_ignore_ascii_case(github_repo))
+        })
+        .filter_map(|s| s.repository_id.as_deref().map(|id| (s, id)))
+        // The repository itself, not a folder inside it (`<identity>:<path>`).
+        .filter(|(_, id)| !id.strip_prefix("commit:").unwrap_or(id).contains(':'))
+        .min_by_key(|(s, id)| (!id.starts_with("commit:"), s.created_at, s.id.as_str()))
+        .map(|(_, id)| id.to_string())
+        .unwrap_or_else(|| format!("github.com/{}", github_repo.to_lowercase()))
+}
+
 /// The space that speaks for `space`'s whole project: the oldest member, id
 /// tiebreak. Its name and color stand for every member, and the choice is
 /// the same on every device, so a repository looks alike everywhere. Pure.
@@ -291,6 +313,36 @@ mod project_tests {
             github_repo: None,
             created_at: DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::minutes(minutes),
         }
+    }
+
+    #[test]
+    fn a_cloud_project_takes_the_identity_of_a_clone_of_its_repository() {
+        let github = |mut s: Space, repo: &str| {
+            s.github_repo = Some(repo.into());
+            s
+        };
+        // No clone yet: the remote form.
+        assert_eq!(cloud_repository_id(&[], "Acme/App"), "github.com/acme/app");
+        let spaces = vec![
+            github(
+                space("shallow", "vps", Some("github.com/acme/app"), 0),
+                "acme/app",
+            ),
+            github(space("full", "mac", Some("commit:abc"), 1), "Acme/App"),
+            github(space("sub", "mac", Some("commit:abc:web"), 0), "acme/app"),
+            github(
+                space("cloud", "cloud-1", Some("github.com/acme/app"), 0),
+                "acme/app",
+            ),
+            github(space("other", "mac", Some("commit:def"), 0), "acme/other"),
+        ];
+        // A full clone's commit identity wins over a shallow clone's remote
+        // form; a folder inside the repository and Cloud's own rows don't count.
+        assert_eq!(cloud_repository_id(&spaces, "acme/app"), "commit:abc");
+        assert_eq!(
+            cloud_repository_id(&spaces[..1], "acme/app"),
+            "github.com/acme/app"
+        );
     }
 
     #[test]

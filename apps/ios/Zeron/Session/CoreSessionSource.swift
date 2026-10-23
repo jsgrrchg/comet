@@ -328,6 +328,18 @@ final class CoreSessionSource: SessionSource {
         }
     }
 
+    /// The chat's provider, where it runs: Cloud's account for a Cloud chat,
+    /// else the computer hosting it.
+    func signInTarget() -> AgentAccountsViewController.Target? {
+        guard let row = app?.row(chatId) else { return nil }
+        let harness = row.harness ?? "claude-code"
+        if row.isCloud {
+            return CloudStore.agents.first { $0.harness == harness }.map { .cloud($0) }
+        }
+        guard !hostDevice.isEmpty, let app else { return nil }
+        return .device(id: hostDevice, name: app.deviceName(hostDevice), harness: harness, label: row.harnessLabel ?? HarnessNames.label(harness))
+    }
+
     /// The model a chat without one runs: the host's default for its
     /// provider. The built-in list answers at once; the host's (or Cloud's)
     /// own list replaces it when it arrives.

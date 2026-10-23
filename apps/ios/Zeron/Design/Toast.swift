@@ -35,15 +35,12 @@ final class Toast: UIView {
     /// Top edge of the bottom chrome in window coordinates.
     private static func chromeTop(in window: UIWindow) -> CGFloat {
         var top = window.bounds.height - window.safeAreaInsets.bottom
-        var tabs: UITabBarController? = window.rootViewController as? UITabBarController
-        if tabs == nil, let split = window.rootViewController as? UISplitViewController, split.isCollapsed {
-            tabs = split.viewController(for: .compact) as? UITabBarController
+        var shell = window.rootViewController as? MainTabController
+        if shell == nil, let split = window.rootViewController as? UISplitViewController, split.isCollapsed {
+            shell = split.viewController(for: .compact) as? MainTabController
         }
-        if let tabs, !tabs.tabBar.isHidden, tabs.tabBar.window != nil {
-            top = min(top, tabs.tabBar.convert(tabs.tabBar.bounds, to: window).minY)
-            if let accessory = (tabs as? MainTabController)?.accessoryFrame(in: window) {
-                top = min(top, accessory.minY)
-            }
+        if let bar = shell?.bottomBarFrame(in: window) {
+            top = min(top, bar.minY)
         }
         // A pushed screen's own bottom bar (e.g. the composer) isn't tab
         // chrome; keep clear of the keyboard / home indicator either way.

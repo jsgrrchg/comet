@@ -2,7 +2,7 @@ import { SELF, env, introspectWorkflow, runDurableObjectAlarm, runInDurableObjec
 import { describe, expect, it } from "vitest";
 import { authenticate } from "../../src/auth";
 import { handleAuthRoute } from "../../src/auth-routes";
-import { QUIESCE_ENGINE_COMMAND, STOP_ENGINE_COMMAND } from "../../src/cloud/install-script";
+import { QUIESCE_ENGINE_COMMAND, START_ENGINE_COMMAND, STOP_ENGINE_COMMAND } from "../../src/cloud/install-script";
 import { listLedger, listSandboxes, listUsage } from "../../src/cloud/metering";
 import { cloudAccountName } from "../../src/cloud/policy";
 import type { Env } from "../../src/env";
@@ -503,6 +503,16 @@ describe("idle sleep, waking on sends and the awake cap", () => {
       .poll(async () => (await boatState()).calls.some((c) => c.path.endsWith("/resume") && c.sandboxId === sandboxId))
       .toBe(true);
     expect((await boatState()).calls.find((c) => c.path.endsWith("/resume") && c.sandboxId === sandboxId)!.body).toEqual({ ttlSeconds: 7200 });
+    // The engine is started right after the resume, not left to the unit:
+    // the sleep stopped it before the snapshot.
+    await expect
+      .poll(async () => {
+        const calls = (await boatState()).calls.filter((c) => c.sandboxId === sandboxId);
+        const resume = calls.findIndex((c) => c.path.endsWith("/resume"));
+        const start = calls.findIndex((c) => c.path.endsWith("/commands") && c.body?.command === START_ENGINE_COMMAND);
+        return resume >= 0 && start > resume;
+      })
+      .toBe(true);
     await runnerToken(u, deviceId, key);
     await waitForSession(u, chatId, "ready");
   });

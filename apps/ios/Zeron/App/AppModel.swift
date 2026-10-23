@@ -517,6 +517,8 @@ final class AppModel {
         Toast.show("Archived", action: "Undo", in: window) { [weak self] in self?.unarchive(id) }
     }
     func unarchive(_ id: String) { attempt("unarchive") { try client?.unarchiveSession(chatId: id) } }
+    /// Permanently: the row on every device (a Cloud chat's machine too).
+    func delete(_ id: String) { attempt("delete") { try client?.deleteSession(chatId: id) } }
     func move(_ id: String, toSection section: String?) { attempt("assign") { try client?.assignSection(chatId: id, sectionId: section) } }
     func movePin(_ id: String, after: String?, before: String?) {
         attempt("move pin") { try client?.movePin(chatId: id, after: after, before: before) }

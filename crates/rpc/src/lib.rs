@@ -22,6 +22,7 @@ mod client;
 pub mod device_room;
 pub mod ipc_auth;
 mod server;
+mod ws;
 
 pub use client::{RpcClient, RpcSubscription, connect_ipc, connect_ws};
 pub use device_room::{
@@ -743,6 +744,55 @@ mod tests {
         assert_eq!(items.recv().await, Some(serde_json::json!(0)));
         assert_eq!(items.recv().await, Some(serde_json::json!(1)));
         assert_eq!(items.recv().await, None);
+    }
+
+    /// A reply past tungstenite's default 16 MiB frame cap (a long chat's
+    /// transcript watch) must arrive, not drop the connection.
+    #[tokio::test]
+    async fn websocket_carries_messages_past_the_default_frame_cap() {
+        let token = ipc_auth::generate_token().unwrap();
+        let port = serve_test(&token).await;
+        // Multi-byte chars so fragment boundaries land mid-codepoint.
+        let big = "é".repeat(9_500_000);
+
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}"), Some(&token))
+            .await
+            .unwrap();
+        let echoed = client.call("Echo", serde_json::json!(big)).await.unwrap();
+        assert_eq!(echoed.as_str().map(str::len), Some(big.len()));
+        assert_eq!(client.close_reason(), None);
+
+        // A peer still on tungstenite's default limits (an older app build)
+        // reassembles the fragmented reply too.
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::{Message, client::IntoClientRequest};
+        let mut req = format!("ws://127.0.0.1:{port}")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let (mut legacy, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let request = serde_json::to_string(&ClientFrame {
+            id: 1,
+            method: Some("Echo".into()),
+            params: serde_json::json!(big),
+            cancel: false,
+        })
+        .unwrap();
+        // It sends one unfragmented frame past 16 MiB: the raised cap takes it.
+        assert!(request.len() > 16 << 20);
+        legacy.send(Message::Text(request)).await.unwrap();
+        let reply = loop {
+            match legacy.next().await.unwrap().unwrap() {
+                Message::Text(text) => break text,
+                _ => continue,
+            }
+        };
+        let frame: ServerFrame = serde_json::from_str(&reply).unwrap();
+        assert_eq!(
+            frame.ok.and_then(|v| v.as_str().map(str::len)),
+            Some(big.len())
+        );
     }
 
     /// Raw handshake status for a dial with the given headers (`None` = served).

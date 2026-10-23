@@ -124,6 +124,7 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Pi => "pi",
         HarnessId::Opencode => "opencode",
         HarnessId::Antigravity => "Antigravity",
+        HarnessId::Muse => "muse",
         HarnessId::Mock => "mock",
     }
 }
@@ -152,6 +153,29 @@ fn harness_update_label(status: &HarnessUpdateStatus, theme: &Theme) -> (SharedS
         None => detail.to_owned(),
     };
     let version_only = || installed.clone().unwrap_or_default();
+    // An installed release this Zeron can't run explains failing runs: it
+    // outranks everything but an update in flight.
+    if let Some(compatibility) = &status.compatibility
+        && matches!(
+            status.phase,
+            HarnessUpdatePhase::Dormant
+                | HarnessUpdatePhase::Checking
+                | HarnessUpdatePhase::Current
+                | HarnessUpdatePhase::Available
+                | HarnessUpdatePhase::ManualActionRequired
+                | HarnessUpdatePhase::Failed
+        )
+    {
+        return (compatibility.message.clone().into(), theme.danger_muted);
+    }
+    if status.phase == HarnessUpdatePhase::Current
+        && let Some(held) = &status.held_back
+    {
+        return (
+            with(&format!("v{} held back: not supported yet", held.version)).into(),
+            theme.text_muted.opacity(0.75),
+        );
+    }
     let label = match status.phase {
         HarnessUpdatePhase::Dormant
         | HarnessUpdatePhase::Checking

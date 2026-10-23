@@ -7,7 +7,8 @@
 //! begin. Reinstalling that same version with optional dependencies fixes it.
 
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+
+use crate::process::{Command, Stdio};
 
 const MISSING: &str = "Missing optional dependency";
 const PACKAGE: &str = "@openai/codex";
@@ -70,13 +71,19 @@ pub(crate) async fn repair_with(
         "--no-fund",
         spec.as_str(),
     ]);
-    let mut output = run(npm, &args).await?;
+    let (program, lead) = npm_launch(npm);
+    let args: Vec<OsArg> = args
+        .iter()
+        .map(|arg| OsArg::Str((*arg).to_string()))
+        .collect();
+    let mut output = run_args(&program, &lead, &args).await?;
     if !output.status.success()
         && let Some(sudo) = sudo
         && permission_denied(&output)
     {
-        let mut with_npm = vec![OsArg::Path(npm.to_path_buf())];
-        with_npm.extend(args.iter().map(|arg| OsArg::Str((*arg).to_string())));
+        let mut with_npm = vec![OsArg::Path(program.clone())];
+        with_npm.extend(lead.iter().cloned());
+        with_npm.extend(args.iter().cloned());
         output = run_args(sudo, &[OsArg::Str("-n".into())], &with_npm).await?;
     }
     if !output.status.success() {
@@ -116,11 +123,27 @@ async fn probe(codex: &Path) -> Probe {
     }
 }
 
-/// The version of the npm package behind `codex`
-/// (`…/node_modules/@openai/codex/bin/codex.js`, usually through a symlink).
+/// The version of the npm package behind `codex`: on Unix the bin entry is a
+/// symlink into `…/node_modules/@openai/codex/bin/codex.js`; on Windows it
+/// is a `codex.cmd` shim beside a `node_modules` folder holding the package
+/// (`%APPDATA%\npm\node_modules\@openai\codex`).
 fn installed_version(codex: &Path) -> Option<String> {
-    let script = std::fs::canonicalize(codex).ok()?;
-    let manifest = script.parent()?.parent()?.join("package.json");
+    let linked = std::fs::canonicalize(codex)
+        .ok()
+        .and_then(|script| Some(script.parent()?.parent()?.join("package.json")));
+    let beside = codex.parent().map(|dir| {
+        dir.join("node_modules")
+            .join("@openai")
+            .join("codex")
+            .join("package.json")
+    });
+    linked
+        .into_iter()
+        .chain(beside)
+        .find_map(|manifest| package_version(&manifest))
+}
+
+fn package_version(manifest: &Path) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(manifest).ok()?).ok()?;
     if value["name"] != PACKAGE {
         return None;
@@ -134,17 +157,28 @@ fn installed_version(codex: &Path) -> Option<String> {
 
 /// The npm prefix the package behind `codex` was installed into globally:
 /// `<prefix>/lib/node_modules/@openai/codex` (Unix) or
-/// `<prefix>/node_modules/@openai/codex` (Windows).
+/// `<prefix>/node_modules/@openai/codex` (Windows), in its plain form: npm
+/// does not take the `\\?\` verbatim paths Windows canonicalizes to.
 fn global_prefix(codex: &Path) -> Option<PathBuf> {
-    let script = std::fs::canonicalize(codex).ok()?;
-    let node_modules = script
+    let script = super::plain_executable(std::fs::canonicalize(codex).ok()?);
+    if let Some(node_modules) = script
         .ancestors()
-        .find(|dir| dir.file_name().is_some_and(|name| name == "node_modules"))?;
-    let parent = node_modules.parent()?;
-    Some(match parent.file_name() {
-        Some(name) if name == "lib" && !cfg!(windows) => parent.parent()?.to_path_buf(),
-        _ => parent.to_path_buf(),
-    })
+        .find(|dir| dir.file_name().is_some_and(|name| name == "node_modules"))
+    {
+        let parent = node_modules.parent()?;
+        return Some(match parent.file_name() {
+            Some(name) if name == "lib" && !cfg!(windows) => parent.parent()?.to_path_buf(),
+            _ => parent.to_path_buf(),
+        });
+    }
+    // Windows: `<prefix>\codex.cmd` is a shim file, not a link into the
+    // package, which sits beside it in `<prefix>\node_modules\@openai\codex`.
+    let dir = script.parent()?;
+    dir.join("node_modules")
+        .join("@openai")
+        .join("codex")
+        .is_dir()
+        .then(|| dir.to_path_buf())
 }
 
 fn permission_denied(output: &std::process::Output) -> bool {
@@ -152,17 +186,31 @@ fn permission_denied(output: &std::process::Output) -> bool {
     stderr.contains("EACCES") || stderr.contains("EPERM") || stderr.contains("permission denied")
 }
 
+#[derive(Clone)]
 enum OsArg {
     Str(String),
     Path(PathBuf),
 }
 
-async fn run(program: &Path, args: &[&str]) -> Result<std::process::Output, String> {
-    let args: Vec<OsArg> = args
-        .iter()
-        .map(|arg| OsArg::Str((*arg).to_string()))
-        .collect();
-    run_args(program, &[], &args).await
+/// How to launch `npm`. On Windows the discovered npm is its `npm-cli.js`
+/// (`<node root>\node_modules\npm\bin\npm-cli.js`, see
+/// `adapter_install::find_npm`), which only runs through the node beside it.
+fn npm_launch(npm: &Path) -> (PathBuf, Vec<OsArg>) {
+    let script = npm
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("js"));
+    if !script {
+        return (npm.to_path_buf(), Vec::new());
+    }
+    let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+    let node = npm
+        .ancestors()
+        .nth(4)
+        .map(|root| root.join(node_name))
+        .filter(|node| node.is_file())
+        .or_else(|| crate::executable::find_on_paths("node", Vec::new()))
+        .unwrap_or_else(|| PathBuf::from(node_name));
+    (node, vec![OsArg::Path(npm.to_path_buf())])
 }
 
 async fn run_args(
@@ -189,8 +237,11 @@ async fn succeeds(program: &Path, args: &[&str]) -> bool {
         .is_ok_and(|out| out.is_ok_and(|out| out.status.success()))
 }
 
-fn command(program: &Path) -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(program);
+/// The crate's owned launcher: on Windows it runs `.cmd` shims without a
+/// console window flashing up from the GUI, and its job object takes npm's
+/// whole process tree down when a timed-out install is dropped.
+fn command(program: &Path) -> Command {
+    let mut cmd = Command::new(program);
     cmd.stdin(Stdio::null()).kill_on_drop(true);
     cmd
 }
@@ -199,6 +250,70 @@ fn tail(text: &str) -> String {
     let text = text.trim();
     let start = text.char_indices().rev().nth(399).map_or(0, |(i, _)| i);
     text[start..].to_string()
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// Windows npm: `%APPDATA%\npm\codex.cmd` is a shim file (not a link);
+    /// the package lives in the `node_modules` folder beside it.
+    #[test]
+    fn version_is_read_beside_a_windows_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("node_modules/@openai/codex");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"@openai/codex","version":"0.164.0"}"#,
+        )
+        .unwrap();
+        let shim = dir.path().join("codex.cmd");
+        std::fs::write(&shim, "@ECHO off\r\nnode codex.js %*\r\n").unwrap();
+        assert_eq!(installed_version(&shim).as_deref(), Some("0.164.0"));
+        // Another package's manifest is never taken for Codex's.
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"evil","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        assert_eq!(installed_version(&shim), None);
+    }
+
+    /// The same Windows layout: the shim's own folder is the global prefix
+    /// npm reinstalls into, never whatever prefix the found npm defaults to.
+    #[test]
+    fn a_windows_shim_folder_is_its_global_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("codex.cmd");
+        std::fs::write(&shim, "@ECHO off\r\nnode codex.js %*\r\n").unwrap();
+        // A lone shim names no package: no prefix to pin.
+        assert_eq!(global_prefix(&shim), None);
+        std::fs::create_dir_all(dir.path().join("node_modules/@openai/codex")).unwrap();
+        let prefix = super::super::plain_executable(dir.path().canonicalize().unwrap());
+        assert_eq!(global_prefix(&shim), Some(prefix.clone()));
+        // Plain form: npm takes no `\\?\` verbatim path.
+        assert!(!prefix.to_string_lossy().starts_with(r"\\?\"));
+    }
+
+    #[test]
+    fn a_js_npm_cli_runs_through_the_node_beside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("node_modules/npm/bin/npm-cli.js");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "").unwrap();
+        let node = dir
+            .path()
+            .join(if cfg!(windows) { "node.exe" } else { "node" });
+        std::fs::write(&node, "").unwrap();
+        let (program, lead) = npm_launch(&cli);
+        assert_eq!(program, node);
+        assert!(matches!(lead.as_slice(), [OsArg::Path(p)] if *p == cli));
+        let plain = dir.path().join("npm");
+        let (program, lead) = npm_launch(&plain);
+        assert_eq!(program, plain);
+        assert!(lead.is_empty());
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -268,6 +383,53 @@ mod tests {
         );
         // Healthy now: nothing more to do.
         assert_eq!(repair_with(&codex, &npm, None).await, Ok(Repair::NotNeeded));
+    }
+
+    /// A shim-style install (a launcher file beside `node_modules`, as npm
+    /// lays out Windows' global prefix) reinstalls into the shim's folder.
+    #[tokio::test]
+    async fn a_shim_install_reinstalls_into_its_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("node_modules/@openai/codex");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"@openai/codex","version":"0.162.0"}"#,
+        )
+        .unwrap();
+        let fixed = dir.path().join("fixed");
+        let codex = dir.path().join("codex");
+        script(
+            &codex,
+            &format!(
+                "if [ -f '{}' ]; then echo 'codex-cli 0.162.0'; exit 0; fi\n\
+                 echo 'Error: Missing optional dependency @openai/codex-win32-x64' >&2; exit 1",
+                fixed.display()
+            ),
+        );
+        let npm = dir.path().join("npm");
+        let calls = dir.path().join("calls");
+        script(
+            &npm,
+            &format!(
+                "echo \"$@\" >> '{}'; touch '{}'",
+                calls.display(),
+                fixed.display()
+            ),
+        );
+        let outcome = repair_with(&codex, &npm, None).await;
+        assert!(
+            matches!(outcome, Ok(Repair::Repaired { .. })),
+            "{outcome:?}"
+        );
+        let calls = std::fs::read_to_string(calls).unwrap();
+        assert_eq!(
+            calls.trim(),
+            format!(
+                "install -g --prefix {} --include=optional --no-audit --no-fund @openai/codex@0.162.0",
+                dir.path().canonicalize().unwrap().display()
+            )
+        );
     }
 
     #[tokio::test]

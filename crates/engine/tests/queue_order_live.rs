@@ -132,6 +132,7 @@ impl Rig {
             worktree: None,
             resume: None,
             resume_policy: Default::default(),
+            env: Default::default(),
         }
     }
 

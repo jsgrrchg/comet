@@ -53,6 +53,7 @@ async fn main() {
         worktree: None,
         resume: None,
         resume_policy: Default::default(),
+        env: Default::default(),
     };
     let mut stream = AcpHarness::grok()
         .run(request, controls)

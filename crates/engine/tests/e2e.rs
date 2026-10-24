@@ -40,6 +40,7 @@ fn run_request(prompt: &str) -> RunRequest {
         worktree: None,
         resume: None,
         resume_policy: Default::default(),
+        env: Default::default(),
     }
 }
 
@@ -766,6 +767,38 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         core.sessions.session_status(CHAT).map(|s| s.status),
         Some(SessionStatus::Idle)
     );
+    assert_eq!(
+        core.sessions
+            .session_status(CHAT)
+            .unwrap()
+            .last_turn_outcome.map(|o| o.status),
+        Some(DoneStatus::Interrupted)
+    );
+    wait_for(
+        || {
+            core.sessions
+                .watch_sessions()
+                .borrow()
+                .iter()
+                .any(|s| s.chat_id == CHAT && s.last_turn_outcome.is_some_and(|o| o.status == DoneStatus::Interrupted))
+        },
+        "interrupted activity projection",
+    )
+    .await;
+    let tools = zeron_mcp::Tools::new(Arc::new(zeron_mcp::Zeron::with_client(
+        zeron_rpc::memory_client(core.rpc_service()),
+        zeron_mcp::Origin::default(),
+    )));
+    let waited = tools
+        .call(
+            "wait_for_turn",
+            serde_json::json!({"chat":CHAT,"timeout_secs":1}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(waited["turn"]["outcome"], "interrupted");
+    assert_eq!(waited["turn"]["status"], "idle");
+    core.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2446,6 +2479,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         resume: None,
         resume_policy: Default::default(),
         worktree: None,
+        env: Default::default(),
     };
     core.doc_host
         .queue_command(
@@ -2589,6 +2623,8 @@ async fn parked_session_ignores_trailing_frames_and_stays_idle() {
     script.push(AgentEvent::TextDelta {
         text: "trailing flush".into(),
     });
+    // Retiring the parked runtime does not cancel the already completed turn.
+    script.push(done(DoneStatus::Interrupted));
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(MockHarness { script }));
     let handle = core.doc_host.open(CHAT).unwrap();
@@ -2615,6 +2651,11 @@ async fn parked_session_ignores_trailing_frames_and_stays_idle() {
             core.sessions.session_status(CHAT).map(|s| s.status),
             Some(SessionStatus::Idle),
             "trailing frames must not re-arm Working"
+        );
+        assert_eq!(
+            core.sessions.session_status(CHAT).unwrap().last_turn_outcome.map(|o| o.status),
+            Some(DoneStatus::Completed),
+            "parked teardown must preserve the real turn outcome"
         );
         let all = entries_now(&core);
         assert!(

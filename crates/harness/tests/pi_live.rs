@@ -98,6 +98,7 @@ async fn real_pi_mock_lifecycle() {
             worktree: None,
             resume_policy: Default::default(),
             mcp: None,
+            env: Default::default(),
         };
         let previous_session = session.clone();
         let mut stream = harness.run(request, controls).await.unwrap();
@@ -207,6 +208,7 @@ async fn real_pi_mock_lifecycle() {
         attachments: vec![],
         worktree: None,
         mcp: None,
+        env: Default::default(),
     };
     let events: Vec<_> = tokio::time::timeout(
         Duration::from_secs(20),
@@ -270,6 +272,7 @@ async fn real_pi_native_fork_cuts_history_and_requires_child_resume() {
         let (tx, steering) = mpsc::channel(8);
         drop(tx);
         let request = RunRequest {
+            env: Default::default(),
             prompt: prompt.into(),
             harness: None,
             model: Some("zeron-probe/mock".into()),
@@ -432,6 +435,7 @@ async fn real_pi_native_fork_cuts_history_and_requires_child_resume() {
         let (tx, steering) = mpsc::channel(1);
         drop(tx);
         let missing = RunRequest {
+            env: Default::default(),
             prompt: "must not execute".into(),
             harness: None,
             model: Some("zeron-probe/mock".into()),
@@ -470,6 +474,7 @@ async fn real_pi_native_fork_cuts_history_and_requires_child_resume() {
     drop(tx);
     let interrupt = CancellationToken::new();
     let active = RunRequest {
+        env: Default::default(),
         prompt: "burst hold".into(),
         harness: None,
         model: Some("zeron-probe/mock".into()),
@@ -561,6 +566,7 @@ async fn real_pi_steering_bursts_share_the_next_model_call() {
         attachments: vec![],
         worktree: None,
         mcp: None,
+        env: Default::default(),
     };
     let mut stream = harness.run(request, controls).await.unwrap();
     let calls = cwd.join("probe-model-calls.jsonl");

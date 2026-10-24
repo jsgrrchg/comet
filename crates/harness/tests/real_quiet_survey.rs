@@ -70,6 +70,7 @@ async fn probe_once(harness: Box<dyn Harness>) -> ProbeOutcome {
         worktree: None,
         resume: None,
         resume_policy: Default::default(),
+        env: Default::default(),
     };
     let mut stream = match harness.run(req, controls).await {
         Ok(s) => s,

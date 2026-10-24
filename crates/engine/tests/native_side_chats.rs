@@ -134,7 +134,7 @@ fn setup(dir: &std::path::Path, harness: Arc<NativeStore>) -> EngineCore {
         )
         .unwrap();
     core.workspace
-        .set_chat_harness_session("main", "canonical", "/tmp");
+        .set_chat_harness_session("main", "canonical", "/tmp", Some(HarnessId::Mock));
     let doc = core.doc_host.open("main").unwrap();
     for (id, role) in [
         ("u1", MessageRole::User),
@@ -547,6 +547,71 @@ async fn native_fork_availability_and_host_validation_fail_closed() {
     assert!(core.native_forks.create(bad).await.is_err());
     assert_eq!(harness.forks.load(Ordering::SeqCst), 0);
     core.shutdown().await;
+}
+
+#[tokio::test]
+async fn native_fork_provider_lock_survives_registry_roundtrip_and_upgrades() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = Arc::new(NativeStore::default());
+    let core = setup(dir.path(), harness.clone());
+    let child = core.native_forks.create(request(&core)).await.unwrap();
+    assert!(child.native_fork);
+    assert!(core.workspace.chat(&child.id).unwrap().unwrap().native_fork);
+    assert_eq!(child.harness_session_harness.as_deref(), Some("mock"));
+    let original = child.config.clone();
+    let mut changed: ChatConfig = serde_json::from_value(serde_json::json!({
+        "harness":"mock", "sandbox":"workspace-write"
+    })).unwrap();
+    changed.harness = HarnessId::Codex;
+    let client = zeron_rpc::memory_client(core.rpc_service());
+    let error = client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op":"setChatConfig", "chatId":child.id, "config":changed
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("original provider"), "{error}");
+    assert_eq!(
+        core.workspace.chat(&child.id).unwrap().unwrap().config,
+        original
+    );
+    let model_config: ChatConfig = serde_json::from_value(serde_json::json!({
+        "harness":"mock", "sandbox":"workspace-write", "model":"child-model"
+    })).unwrap();
+    client.call(methods::MUTATE, serde_json::json!({
+        "op":"setChatConfig", "chatId":child.id, "config":model_config
+    })).await.unwrap();
+    assert_eq!(core.workspace.chat(&child.id).unwrap().unwrap().config, Some(model_config));
+    // An already published fork from an older build has no registry lock hint.
+    // Its exact durable lineage is sufficient to recover it after an upgrade.
+    let mut old = core.workspace.chat(&child.id).unwrap().unwrap();
+    old.native_fork = false;
+    old.harness_session_harness = None;
+    core.workspace.import_chat_row(&old).unwrap();
+    core.workspace.flush().unwrap();
+    core.shutdown().await;
+    drop(client);
+    drop(core);
+    let registry = Arc::new(HarnessRegistry::new());
+    registry.register(harness.clone());
+    let restarted = EngineCore::assemble(dir.path(), registry, HarnessId::Mock, None).unwrap();
+    let row = restarted.workspace.chat(&child.id).unwrap().unwrap();
+    assert!(row.native_fork);
+    assert_eq!(row.harness_session_id, child.harness_session_id);
+    assert_eq!(row.harness_session_harness.as_deref(), Some("mock"));
+    assert_eq!(
+        restarted
+            .native_forks
+            .create(request(&restarted))
+            .await
+            .unwrap(),
+        row
+    );
+    assert_eq!(harness.forks.load(Ordering::SeqCst), 1);
+    restarted.shutdown().await;
 }
 
 #[tokio::test]

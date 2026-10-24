@@ -160,6 +160,7 @@ fn request(prompt: &str) -> RunRequest {
         resume_policy: Default::default(),
         attachments: vec![],
         worktree: None,
+        env: Default::default(),
     }
 }
 fn rich_text(label: &str) -> (String, String) {

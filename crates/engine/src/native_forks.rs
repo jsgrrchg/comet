@@ -89,6 +89,31 @@ impl NativeForks {
                     op.error = Some("Engine stopped before the provider result was recorded; creation will not be retried".into());
                     this.save(&op)?;
                 }
+                Phase::Published => {
+                    // Rows created before provider switching have no lock hint.
+                    // Recover it only from this operation's durable lineage.
+                    if let Some(mut row) = this.0.workspace.chat(&op.chat.id).map_err(err)?
+                        && !row.native_fork
+                    {
+                        let doc = this.0.docs.open(&row.id).map_err(err)?;
+                        if doc
+                            .doc()
+                            .native_fork_lineage()
+                            .map_err(err)?
+                            .is_some_and(|lineage| {
+                                lineage.request_id == op.request.request_id
+                                    && Some(lineage.child) == op.child
+                            })
+                        {
+                            row.native_fork = true;
+                            row.harness_session_harness = Some(op.point.harness.as_str().into());
+                            this.0.workspace.import_chat_row(&row).map_err(err)?;
+                            this.0.workspace.flush().map_err(err)?;
+                            op.chat = row;
+                            this.save(&op)?;
+                        }
+                    }
+                }
                 Phase::ProviderCreated => {
                     if let Err(error) = this.publish(&mut op) {
                         tracing::warn!(%error, "native fork publication recovery deferred");
@@ -364,6 +389,8 @@ impl NativeForks {
         chat.last_message_preview = None;
         chat.last_seen_at = None;
         chat.room_gen = Some(2);
+        chat.native_fork = true;
+        chat.harness_session_harness = None;
         chat.harness_session_id = None;
         chat.harness_session_cwd = None;
         let op = Operation {
@@ -435,7 +462,7 @@ impl NativeForks {
         }) {
             return Err("Destination belongs to another operation".into());
         }
-        if let Some(row) = self.0.workspace.chat(&op.chat.id).map_err(err)? {
+        if let Some(mut row) = self.0.workspace.chat(&op.chat.id).map_err(err)? {
             if lineage.is_none()
                 || row.harness_session_id.as_deref() != Some(child.session_id.as_str())
             {
@@ -445,6 +472,9 @@ impl NativeForks {
             }
             // The row may exist only in memory after a failed flush. Preserve
             // subsequent edits, but confirm persistence before acknowledging it.
+            row.native_fork = true;
+            row.harness_session_harness = Some(op.point.harness.as_str().into());
+            self.0.workspace.import_chat_row(&row).map_err(err)?;
             op.chat = row;
             self.0.workspace.flush().map_err(err)?;
             op.phase = Phase::Published;
@@ -510,8 +540,10 @@ impl NativeForks {
                 .map_err(err)?;
         }
         self.0.docs.persist_fork(&target).map_err(err)?;
+        op.chat.native_fork = true;
         op.chat.harness_session_id = Some(child.session_id);
         op.chat.harness_session_cwd = Some(child.cwd);
+        op.chat.harness_session_harness = Some(op.point.harness.as_str().into());
         self.0.workspace.import_chat_row(&op.chat).map_err(err)?;
         self.0.workspace.flush().map_err(err)?;
         op.phase = Phase::Published;

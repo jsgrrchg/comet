@@ -482,7 +482,9 @@ final class AppModel {
             timeLabel: r.timeLabel,
             unseen: r.unseen,
             pinned: r.pinned,
-            sendFailed: r.sendState == .failed
+            sendFailed: r.sendState == .failed,
+            runningSubagents: Int(r.runningSubagents),
+            workingSideChats: Int(r.workingSideChats)
         )
     }
 

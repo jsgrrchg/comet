@@ -58,6 +58,9 @@ final class AppModel {
     private var refreshScheduled = false
     private var clock: Timer?
     private let path = NWPathMonitor()
+    /// The network path's shape last seen (interfaces in order), so only a
+    /// real change re-pairs direct connections.
+    private var pathShape: String?
 
     var onSignedIn: (() -> Void)?
     var onSignOut: (() -> Void)?
@@ -100,7 +103,21 @@ final class AppModel {
     init() {
         // Online/offline + interface changes cut sync backoff short.
         path.pathUpdateHandler = { [weak self] p in
-            DispatchQueue.main.async { self?.client?.setNetworkOnline(online: p.status == .satisfied) }
+            // What a direct connection's path depends on: the interfaces in
+            // use and their order (Wi-Fi first, or cellular), and whether
+            // there's a route at all. Re-delivered paths with the same shape
+            // must not tear down a healthy direct link.
+            let shape = p.status == .satisfied
+                ? p.availableInterfaces.map { "\($0.type)/\($0.name)" }.joined(separator: ",") + (p.isExpensive ? "!" : "")
+                : ""
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.client?.setNetworkOnline(online: p.status == .satisfied)
+                if let last = self.pathShape, last != shape, !shape.isEmpty {
+                    self.client?.networkPathChanged()
+                }
+                self.pathShape = shape
+            }
         }
         path.start(queue: DispatchQueue(label: "sh.zeron.path"))
         let args = ProcessInfo.processInfo.arguments

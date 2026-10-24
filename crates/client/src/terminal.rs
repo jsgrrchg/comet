@@ -1,23 +1,29 @@
-//! Terminals on a chat's host: the engine's PTY sessions (`OpenTerminal`,
-//! `SubscribeTerminal`, `WriteTerminal`, `ResizeTerminal`, `CloseTerminal`),
-//! reached over the device relay like every other host RPC.
+//! Terminals on a chat's host: the engine's PTY sessions, carried by the hub
+//! every viewer runs (`zeron_term_link::remote`, the desktop engine's too):
 //!
-//! A [`TerminalLink`] keeps one terminal attached: its output stream resumes
-//! from the last sequence number after any drop (the host keeps a replay
-//! window and the shell outlives its viewers), and input is numbered so a
-//! write retried after a reconnect lands once. Typing never waits on the
-//! network — keystrokes queue and go out batched, one call in flight.
+//! - **Direct when it can be.** A terminal starts on a direct WebRTC link to
+//!   its host when one is up, else on the relay while pairing runs beside it,
+//!   then moves onto the direct link mid-stream — and back to the relay if
+//!   the link dies — resuming after the last output it showed: no gap, no
+//!   repeat. A network change or the app coming back to the foreground
+//!   re-pairs at once ([`Client::network_path_changed`], [`Client::on_foreground`]).
+//! - **No keystroke lost or doubled.** Input is numbered and held until the
+//!   host acknowledges it; whichever path takes over replays what's pending
+//!   and the host applies each number once. Writes never wait on the network.
+//! - **The stream outlives the network.** When every path drops, it resumes
+//!   from the last sequence seen (the host keeps a replay window and the
+//!   shell outlives its viewers).
 
-use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use serde_json::json;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use zeron_proto::TerminalEvent;
-use zeron_rpc::methods;
+use zeron_rpc::{RpcError, methods};
+use zeron_term_link::remote::{Direct, Relay, TerminalPath, Write};
 
 use crate::client::{Client, ClientInner};
 use crate::error::{ClientError, Result};
@@ -45,11 +51,14 @@ const MAX_WRITE: usize = 64 * 1024;
 pub enum TerminalUpdate {
     /// The output stream is (re)attached.
     Connected,
+    /// The path carrying the terminal now.
+    Path(TerminalPath),
     /// PTY output, raw bytes (not necessarily valid UTF-8).
     Output(Vec<u8>),
     /// The shell exited; the stream is over.
     Exited { code: i32, signal: Option<String> },
-    /// The stream dropped; the next attempt is `retry_in_ms` away.
+    /// Every path dropped; the next attempt is `retry_in_ms` away (or
+    /// sooner: the network coming back, the app back in front).
     Reconnecting { retry_in_ms: u64 },
     /// The host no longer has this terminal (it exited long ago, or the
     /// host restarted).
@@ -61,31 +70,98 @@ pub trait TerminalSink: Send + Sync {
     fn update(&self, update: TerminalUpdate);
 }
 
-enum Op {
-    Input(Vec<u8>),
-    Resize(u16, u16),
-    Close,
+/// The relay path: host RPCs over the device relay (or the demo host).
+struct ClientRelay(Weak<ClientInner>);
+
+fn rpc_error(error: ClientError) -> RpcError {
+    match error {
+        ClientError::HostError(message) => RpcError::Failed(message),
+        ClientError::Unsupported(message) => RpcError::UnknownMethod(message),
+        other => RpcError::Transport(other.to_string()),
+    }
+}
+
+#[async_trait::async_trait]
+impl Relay for ClientRelay {
+    async fn call(
+        &self,
+        target: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, RpcError> {
+        let inner = self.0.upgrade().ok_or(RpcError::Closed)?;
+        inner
+            .host_rpc(target, method, params)
+            .await
+            .map_err(rpc_error)
+    }
+
+    async fn subscribe(
+        &self,
+        target: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> std::result::Result<BoxStream<'static, serde_json::Value>, RpcError> {
+        let inner = self.0.upgrade().ok_or(RpcError::Closed)?;
+        let stream = inner
+            .host_subscribe(target, method, params)
+            .await
+            .map_err(rpc_error)?;
+        Ok(futures::stream::unfold(stream, |mut stream| async move {
+            stream.recv().await.map(|item| (item, stream))
+        })
+        .boxed())
+    }
+}
+
+/// The paths for a terminal on `inner`'s client.
+fn paths(inner: &Arc<ClientInner>) -> (Arc<dyn Relay>, Option<Arc<dyn Direct>>) {
+    let relay: Arc<dyn Relay> = Arc::new(ClientRelay(Arc::downgrade(inner)));
+    let direct = inner
+        .live()
+        .and_then(|live| live.direct())
+        .map(|peers| Arc::new(peers.clone()) as Arc<dyn Direct>);
+    (relay, direct)
 }
 
 /// One attached terminal. Dropping it detaches (the shell keeps running on
-/// the host); [`TerminalLink::close`] ends it — the close still goes out if
-/// the link is dropped right after (only the output stream stops at once).
+/// the host); [`TerminalLink::close`] ends it — the close goes out even if
+/// the link is dropped right after.
 pub struct TerminalLink {
     info: TerminalInfo,
-    ops: mpsc::UnboundedSender<Op>,
+    inner: Weak<ClientInner>,
+    relay: Arc<dyn Relay>,
     stream: CancellationToken,
 }
 
 /// Writes the terminal's own query answers back (hosts without host
 /// replies). Doesn't keep the link alive.
 #[derive(Clone)]
-pub struct TerminalReplies(mpsc::WeakUnboundedSender<Op>);
+pub struct TerminalReplies {
+    info: TerminalInfo,
+    inner: Weak<ClientInner>,
+    relay: Arc<dyn Relay>,
+}
 
 impl TerminalReplies {
     pub fn write(&self, bytes: Vec<u8>) {
-        if let (false, Some(ops)) = (bytes.is_empty(), self.0.upgrade()) {
-            let _ = ops.send(Op::Input(bytes));
+        if let Some(inner) = self.inner.upgrade() {
+            write(&inner, &self.relay, &self.info, bytes);
         }
+    }
+}
+
+/// Queue input for the host, in typed order, never waiting on the network.
+fn write(inner: &Arc<ClientInner>, relay: &Arc<dyn Relay>, info: &TerminalInfo, bytes: Vec<u8>) {
+    // The hub spawns its relay writer on first use.
+    let _runtime = crate::runtime::handle().enter();
+    for chunk in bytes.chunks(MAX_WRITE).filter(|c| !c.is_empty()) {
+        let _ = inner.remote_terminals.send(
+            relay,
+            &info.device_id,
+            &info.id,
+            Write::Input(chunk.to_vec()),
+        );
     }
 }
 
@@ -96,30 +172,63 @@ impl TerminalLink {
 
     /// Bytes for the shell (typed keys, a paste). Queued in order.
     pub fn write(&self, bytes: Vec<u8>) {
-        if !bytes.is_empty() {
-            let _ = self.ops.send(Op::Input(bytes));
+        if let Some(inner) = self.inner.upgrade() {
+            write(&inner, &self.relay, &self.info, bytes);
         }
     }
 
     /// The viewport's grid size changed.
     pub fn resize(&self, cols: u16, rows: u16) {
-        let _ = self.ops.send(Op::Resize(cols.max(2), rows.max(1)));
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        let _runtime = crate::runtime::handle().enter();
+        let _ = inner.remote_terminals.send(
+            &self.relay,
+            &self.info.device_id,
+            &self.info.id,
+            Write::Resize {
+                cols: cols.max(2),
+                rows: rows.max(1),
+            },
+        );
     }
 
-    /// End the shell on the host, then stop.
+    /// End the shell on the host. The stream reports the exit when it lands.
     pub fn close(&self) {
-        let _ = self.ops.send(Op::Close);
+        let (relay, info, weak) = (self.relay.clone(), self.info.clone(), self.inner.clone());
+        crate::runtime::shared().spawn(async move {
+            let params = json!({ "terminalId": info.id });
+            for attempt in 0..5u64 {
+                if attempt > 0 {
+                    tokio::time::sleep(Duration::from_millis(300 * attempt)).await;
+                }
+                match relay
+                    .call(&info.device_id, methods::CLOSE_TERMINAL, params.clone())
+                    .await
+                {
+                    Ok(_) | Err(RpcError::Failed(_) | RpcError::UnknownMethod(_)) => break,
+                    Err(_) => {}
+                }
+            }
+            if let Some(inner) = weak.upgrade() {
+                inner.remote_terminals.ended(&info.device_id, &info.id);
+            }
+        });
     }
 
     /// For answering the terminal's queries when the host doesn't.
     pub fn replies(&self) -> TerminalReplies {
-        TerminalReplies(self.ops.downgrade())
+        TerminalReplies {
+            info: self.info.clone(),
+            inner: self.inner.clone(),
+            relay: self.relay.clone(),
+        }
     }
 }
 
 impl Drop for TerminalLink {
-    /// The output stream stops; queued writes (a close above all) drain,
-    /// then the writer ends with the channel.
+    /// Detach: the output stream stops (the shell keeps running on the host).
     fn drop(&mut self) {
         self.stream.cancel();
     }
@@ -127,8 +236,13 @@ impl Drop for TerminalLink {
 
 impl Client {
     /// Open a shell for `chat_id` on its host, in the chat's working folder.
+    /// Pairing with the host starts alongside, so the terminal's stream
+    /// usually begins on the direct link.
     pub async fn open_terminal(&self, chat_id: &str, cols: u16, rows: u16) -> Result<TerminalInfo> {
         let device_id = self.chat_host(chat_id)?;
+        if let Some(direct) = self.inner.live().and_then(|live| live.direct()) {
+            direct.warm(&device_id);
+        }
         let reply = self
             .inner
             .host_rpc(
@@ -157,19 +271,25 @@ impl Client {
         sink: Arc<dyn TerminalSink>,
     ) -> TerminalLink {
         let stream = CancellationToken::new();
-        let (ops, rx) = mpsc::unbounded_channel();
-        let ended = Arc::new(AtomicBool::new(false));
-        let weak = Arc::downgrade(&self.inner);
-        crate::runtime::shared().spawn(read_loop(
-            weak.clone(),
+        let (relay, direct) = paths(&self.inner);
+        if let Some(direct) = self.inner.live().and_then(|live| live.direct()) {
+            direct.warm(&info.device_id);
+        }
+        crate::runtime::shared().spawn(follow(
+            Arc::downgrade(&self.inner),
+            relay.clone(),
+            direct,
             info.clone(),
             after_seq,
             sink,
-            ended.clone(),
             stream.clone(),
         ));
-        crate::runtime::shared().spawn(write_loop(weak, info.clone(), rx, ended));
-        TerminalLink { info, ops, stream }
+        TerminalLink {
+            info,
+            inner: Arc::downgrade(&self.inner),
+            relay,
+            stream,
+        }
     }
 
     /// The device hosting `chat_id`.
@@ -182,73 +302,79 @@ impl Client {
     }
 }
 
-/// Follow the output stream, resuming from the last sequence seen after
-/// every drop (0.4s → 5s backoff).
-async fn read_loop(
-    weak: std::sync::Weak<ClientInner>,
+/// Follow the terminal over the hub, resubscribing from the last sequence
+/// whenever every path drops (0.4s → 5s, cut short by the network coming
+/// back or the app returning to the foreground).
+async fn follow(
+    weak: Weak<ClientInner>,
+    relay: Arc<dyn Relay>,
+    direct: Option<Arc<dyn Direct>>,
     info: TerminalInfo,
     mut last_seq: u64,
     sink: Arc<dyn TerminalSink>,
-    ended: Arc<AtomicBool>,
     cancel: CancellationToken,
 ) {
     let mut backoff = Duration::from_millis(400);
     loop {
         let Some(inner) = weak.upgrade() else { return };
-        let params = json!({
-            "terminalId": info.id,
-            "afterSeq": last_seq,
-            // A host that answers terminal queries itself does, so a phone
-            // over a slow link never answers them a second time, late.
-            "hostReplies": info.host_replies,
-        });
-        let subscribe = inner.host_subscribe(&info.device_id, methods::SUBSCRIBE_TERMINAL, params);
-        let stream = tokio::select! {
-            _ = cancel.cancelled() => return,
-            stream = subscribe => stream,
-        };
+        let hub = inner.remote_terminals.clone();
+        let wake = inner.terminals_wake.clone();
         drop(inner);
-        match stream {
-            Ok(mut stream) => {
+        let subscribe = hub.subscribe_tracked(
+            relay.clone(),
+            direct.clone(),
+            &info.device_id,
+            &info.id,
+            last_seq,
+            info.host_replies,
+        );
+        let subscribed = tokio::select! {
+            _ = cancel.cancelled() => return,
+            subscribed = subscribe => subscribed,
+        };
+        match subscribed {
+            Ok((mut events, mut path)) => {
                 sink.update(TerminalUpdate::Connected);
+                sink.update(TerminalUpdate::Path(*path.borrow_and_update()));
                 loop {
-                    let item = tokio::select! {
+                    tokio::select! {
                         _ = cancel.cancelled() => return,
-                        item = stream.recv() => item,
-                    };
-                    let Some(item) = item else { break };
-                    backoff = Duration::from_millis(400);
-                    match serde_json::from_value::<TerminalEvent>(item) {
-                        Ok(TerminalEvent::Data { seq, data }) => {
-                            if seq <= last_seq && last_seq > 0 {
-                                continue;
-                            }
-                            last_seq = seq;
-                            if let Some(bytes) = b64::decode(&data) {
-                                sink.update(TerminalUpdate::Output(bytes));
+                        changed = path.changed() => {
+                            if changed.is_ok() {
+                                sink.update(TerminalUpdate::Path(*path.borrow_and_update()));
                             }
                         }
-                        Ok(TerminalEvent::Exit {
-                            exit_code, signal, ..
-                        }) => {
-                            ended.store(true, Ordering::Release);
-                            sink.update(TerminalUpdate::Exited {
-                                code: exit_code,
-                                signal,
-                            });
-                            return;
+                        item = events.next() => {
+                            let Some(item) = item else { break };
+                            backoff = Duration::from_millis(400);
+                            match serde_json::from_value::<TerminalEvent>(item) {
+                                Ok(TerminalEvent::Data { seq, data }) => {
+                                    if seq <= last_seq {
+                                        continue;
+                                    }
+                                    last_seq = seq;
+                                    if let Some(bytes) = b64::decode(&data) {
+                                        sink.update(TerminalUpdate::Output(bytes));
+                                    }
+                                }
+                                Ok(TerminalEvent::Exit { exit_code, signal, .. }) => {
+                                    sink.update(TerminalUpdate::Exited {
+                                        code: exit_code,
+                                        signal,
+                                    });
+                                    return;
+                                }
+                                Err(_) => {}
+                            }
                         }
-                        Err(_) => {}
                     }
                 }
             }
-            Err(ClientError::HostError(message)) if message.contains("Terminal not found") => {
-                ended.store(true, Ordering::Release);
+            Err(RpcError::Failed(message)) if message.contains("Terminal not found") => {
                 sink.update(TerminalUpdate::Gone);
                 return;
             }
-            Err(ClientError::Unsupported(_)) => {
-                ended.store(true, Ordering::Release);
+            Err(RpcError::UnknownMethod(_)) => {
                 sink.update(TerminalUpdate::Gone);
                 return;
             }
@@ -259,146 +385,8 @@ async fn read_loop(
         });
         tokio::select! {
             _ = cancel.cancelled() => return,
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(backoff) => backoff = (backoff * 2).min(Duration::from_secs(5)),
+            _ = wake.notified() => backoff = Duration::from_millis(400),
         }
-        backoff = (backoff * 2).min(Duration::from_secs(5));
-    }
-}
-
-/// Input, resizes and close, in order, one call in flight. Keystrokes that
-/// queue behind a call go out together in the next (up to the host's cap).
-/// Runs until the link's channel closes and drains — a close queued right
-/// before the link was dropped still reaches the host.
-async fn write_loop(
-    weak: std::sync::Weak<ClientInner>,
-    info: TerminalInfo,
-    mut ops: mpsc::UnboundedReceiver<Op>,
-    ended: Arc<AtomicBool>,
-) {
-    let client_id = crate::new_id();
-    let mut input_seq = 0u64;
-    // Ops taken off the channel but not run yet, in order.
-    let mut front: VecDeque<Op> = VecDeque::new();
-    loop {
-        let op = match front.pop_front() {
-            Some(op) => op,
-            None => match ops.recv().await {
-                Some(op) => op,
-                None => return,
-            },
-        };
-        let Some(inner) = weak.upgrade() else { return };
-        match op {
-            Op::Input(mut bytes) => {
-                // Batch what was typed meanwhile (only straight off the
-                // channel, so nothing jumps the queue); a resize or close
-                // waits its turn behind this write.
-                while front.is_empty()
-                    && bytes.len() < MAX_WRITE
-                    && let Ok(next) = ops.try_recv()
-                {
-                    match next {
-                        Op::Input(more) => bytes.extend(more),
-                        other => front.push_back(other),
-                    }
-                }
-                if bytes.len() > MAX_WRITE {
-                    let rest = bytes.split_off(floor_char_boundary(&bytes, MAX_WRITE));
-                    front.push_front(Op::Input(rest));
-                }
-                send_input(
-                    &inner,
-                    &info,
-                    &client_id,
-                    &mut input_seq,
-                    bytes,
-                    &ops,
-                    &ended,
-                )
-                .await;
-            }
-            Op::Resize(mut cols, mut rows) => {
-                // Only the latest size matters.
-                while front.is_empty()
-                    && let Ok(next) = ops.try_recv()
-                {
-                    match next {
-                        Op::Resize(c, r) => (cols, rows) = (c, r),
-                        other => front.push_back(other),
-                    }
-                }
-                if !ended.load(Ordering::Acquire) {
-                    let _ = inner
-                        .host_rpc(
-                            &info.device_id,
-                            methods::RESIZE_TERMINAL,
-                            json!({ "terminalId": info.id, "cols": cols, "rows": rows }),
-                        )
-                        .await;
-                }
-            }
-            Op::Close => {
-                let _ = inner
-                    .host_rpc(
-                        &info.device_id,
-                        methods::CLOSE_TERMINAL,
-                        json!({ "terminalId": info.id }),
-                    )
-                    .await;
-                // The host ends the stream with the shell's exit, which the
-                // reader reports; a dropped link already stopped it.
-                return;
-            }
-        }
-    }
-}
-
-/// A cut at or below `at` that doesn't split a UTF-8 sequence (a paste's
-/// text; raw control bytes are single bytes either way).
-fn floor_char_boundary(bytes: &[u8], at: usize) -> usize {
-    let mut cut = at.min(bytes.len());
-    while cut > 0 && (bytes[cut] & 0xC0) == 0x80 {
-        cut -= 1;
-    }
-    cut
-}
-
-/// One numbered write. A retry after a dropped reply lands once (the host
-/// dedupes by client and sequence), so it keeps trying through a relay
-/// reconnect while the link is alive; once the link is gone it gives up
-/// after a few tries. A host refusal (an ended shell) isn't retried.
-async fn send_input(
-    inner: &Arc<ClientInner>,
-    info: &TerminalInfo,
-    client_id: &str,
-    input_seq: &mut u64,
-    bytes: Vec<u8>,
-    ops: &mpsc::UnboundedReceiver<Op>,
-    ended: &AtomicBool,
-) {
-    if ended.load(Ordering::Acquire) || bytes.is_empty() {
-        return;
-    }
-    *input_seq += 1;
-    let params = json!({
-        "terminalId": info.id,
-        "data": b64::encode(&bytes),
-        "clientId": client_id,
-        "inputSeq": *input_seq,
-    });
-    let mut delay = Duration::from_millis(250);
-    for attempt in 0u32.. {
-        match inner
-            .host_rpc(&info.device_id, methods::WRITE_TERMINAL, params.clone())
-            .await
-        {
-            Ok(_) | Err(ClientError::HostError(_) | ClientError::Unsupported(_)) => return,
-            Err(_) => {}
-        }
-        if ended.load(Ordering::Acquire) || (ops.is_closed() && attempt >= 3) {
-            return;
-        }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(Duration::from_secs(2));
     }
 }

@@ -552,6 +552,18 @@ impl CoreClient {
         self.client.set_network_online(online);
     }
 
+    /// The OS network path changed (another interface or route): direct
+    /// connections re-pair now; terminals ride the relay meanwhile.
+    pub fn network_path_changed(&self) {
+        self.client.network_path_changed();
+    }
+
+    /// Start pairing with the computer hosting `chat_id` (a terminal is
+    /// about to open there), so it starts on the direct link.
+    pub fn warm_direct(&self, chat_id: String) {
+        self.client.warm_direct(&chat_id);
+    }
+
     /// App returned to the foreground: resume, redial/probe rooms.
     pub fn on_foreground(&self) {
         self.client.on_foreground();

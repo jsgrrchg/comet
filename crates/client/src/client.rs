@@ -99,6 +99,13 @@ pub(crate) struct ClientInner {
     /// `owner/name`): starting a Cloud session needs one, and reading it
     /// again would hold the new chat up.
     pub(crate) cloud_repos: Mutex<HashMap<String, crate::cloud::CloudRepoRef>>,
+    /// Terminals on other devices: direct link or relay, switching
+    /// mid-session (the desktop engine runs the same hub).
+    pub(crate) remote_terminals: zeron_term_link::remote::RemoteTerminals,
+    /// Wakes terminal streams waiting to reconnect (foreground, network back).
+    pub(crate) terminals_wake: Arc<tokio::sync::Notify>,
+    /// When the app last went to the background.
+    backgrounded_at: Mutex<Option<std::time::Instant>>,
 }
 
 impl Drop for ClientInner {
@@ -492,7 +499,7 @@ impl ClientInner {
     pub(crate) async fn host_rpc(
         self: &Arc<Self>,
         device_id: &str,
-        method: &'static str,
+        method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
         match self.backend() {
@@ -506,7 +513,7 @@ impl ClientInner {
     pub(crate) async fn host_subscribe(
         self: &Arc<Self>,
         device_id: &str,
-        method: &'static str,
+        method: &str,
         params: serde_json::Value,
     ) -> Result<crate::host_stream::HostStream> {
         match self.backend() {
@@ -651,6 +658,9 @@ impl Client {
             synced: AtomicBool::new(false),
             harness_catalogs: Mutex::new(HashMap::new()),
             cloud_repos: Mutex::new(HashMap::new()),
+            remote_terminals: Default::default(),
+            terminals_wake: Arc::new(tokio::sync::Notify::new()),
+            backgrounded_at: Mutex::new(None),
             credentials: credentials.clone(),
             config,
         });
@@ -1795,6 +1805,30 @@ impl Client {
                 live.kick();
                 self.kick_rooms();
             }
+            if online {
+                self.network_path_changed();
+            }
+        }
+    }
+
+    /// The OS network path changed (another interface, a new address): the
+    /// direct connections' paths are gone, so they re-pair now and the
+    /// terminals on them carry on over the relay meanwhile.
+    pub fn network_path_changed(&self) {
+        if let Some(direct) = self.inner.live().and_then(|live| live.direct()) {
+            direct.network_changed();
+        }
+        self.inner.terminals_wake.notify_waiters();
+    }
+
+    /// Start pairing with the device hosting `chat_id`, so a terminal opened
+    /// on it next starts on the direct link (a terminal screen opening).
+    pub fn warm_direct(&self, chat_id: &str) {
+        if let (Some(direct), Ok(device)) = (
+            self.inner.live().and_then(|live| live.direct()),
+            self.chat_host(chat_id),
+        ) {
+            direct.warm(&device);
         }
     }
 
@@ -1803,6 +1837,14 @@ impl Client {
     /// restart PR watches.
     pub fn on_foreground(&self) {
         self.inner.foreground.store(true, Ordering::Release);
+        let away = lock(&self.inner.backgrounded_at)
+            .take()
+            .map(|at| at.elapsed())
+            .unwrap_or_default();
+        if let Some(direct) = self.inner.live().and_then(|live| live.direct()) {
+            direct.foreground(away);
+        }
+        self.inner.terminals_wake.notify_waiters();
         if let Some(live) = self.inner.live() {
             live.kick();
             live.probe_health();
@@ -1817,6 +1859,7 @@ impl Client {
     /// work and PR streams.
     pub fn on_background(&self) {
         self.inner.foreground.store(false, Ordering::Release);
+        *lock(&self.inner.backgrounded_at) = Some(std::time::Instant::now());
         if let Some(live) = self.inner.live() {
             live.relay.stop_watches();
             live.flush_registry(&self.inner);

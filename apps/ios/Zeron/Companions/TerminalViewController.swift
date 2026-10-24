@@ -78,6 +78,12 @@ final class TerminalViewController: UIViewController {
         if let current { show(current) }
     }
 
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        // Pair with the host while the screen slides in.
+        app.client?.warmDirect(chatId: chatId)
+    }
+
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         if current == nil, !opening { openAnother() }

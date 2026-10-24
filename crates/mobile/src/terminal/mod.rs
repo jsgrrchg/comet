@@ -146,6 +146,8 @@ pub struct TerminalFrame {
     /// The program takes touches as pointer events.
     pub mouse: bool,
     pub phase: TerminalPhase,
+    /// The terminal rides a direct link to its host (not the relay).
+    pub direct: bool,
 }
 
 /// The selection's viewport bounds, for placing the edit menu.
@@ -171,6 +173,7 @@ struct State {
     emu: Emulator,
     predictor: Predictor,
     phase: TerminalPhase,
+    direct: bool,
     /// Fraction of a row the view sits past `display_offset` (0..1).
     scroll_frac: f32,
     /// Wheel rows owed to a program (reports / arrows), below one.
@@ -224,6 +227,7 @@ impl zc::TerminalSink for Sink {
             let mut s = lock(&state);
             match update {
                 zc::TerminalUpdate::Connected => s.phase = TerminalPhase::Live,
+                zc::TerminalUpdate::Path(path) => s.direct = path == zc::TerminalPath::Direct,
                 zc::TerminalUpdate::Output(bytes) => {
                     let answers = s.emu.feed(&bytes);
                     let State { emu, predictor, .. } = &mut *s;
@@ -382,6 +386,7 @@ impl TerminalSession {
             emu: Emulator::new(cols, rows),
             predictor: Predictor::default(),
             phase: TerminalPhase::Connecting,
+            direct: false,
             scroll_frac: 0.0,
             wheel_remainder: 0.0,
             expiry: 0,
@@ -535,12 +540,18 @@ impl TerminalSession {
             alt_screen: s.emu.alt_screen(),
             mouse: s.emu.mouse_tracking().is_some(),
             phase: s.phase.clone(),
+            direct: s.direct,
         }
     }
 
     /// What the running program calls itself (cheap: no frame).
     pub fn title(&self) -> Option<String> {
         lock(&self.state).emu.title().map(str::to_owned)
+    }
+
+    /// Riding a direct link to the host right now.
+    pub fn is_direct(&self) -> bool {
+        lock(&self.state).direct
     }
 
     pub fn phase(&self) -> TerminalPhase {

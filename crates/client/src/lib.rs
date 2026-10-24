@@ -68,6 +68,7 @@ pub use workspace::{
     DeviceView, FrontPage, ProjectRef, ProjectView, PullRequestGroups, SearchField, SearchHit,
     SectionView, SessionRow, WorkspaceSnapshot, project_color_index, relative_time_label,
 };
+pub use zeron_term_link::remote::TerminalPath;
 
 /// Re-exported so consumers (the layout engine) name the exact doc types the
 /// transcript carries without a direct `zeron-doc` dependency.

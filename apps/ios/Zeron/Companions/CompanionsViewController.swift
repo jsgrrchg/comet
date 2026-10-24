@@ -150,6 +150,8 @@ final class CompanionsViewController: UIViewController, UICollectionViewDelegate
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        // A terminal may be a tap away: pair with the session's computer now.
+        app.client?.warmDirect(chatId: chatId)
         // Running agents' elapsed time ticks on screen only.
         ticker?.invalidate()
         ticker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }

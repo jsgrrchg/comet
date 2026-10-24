@@ -215,7 +215,8 @@ pub fn run_app(config: UiConfig) {
         appshots::set_enabled(ui_settings.appshots_enabled);
         terminal::panel::init(cx);
         app_menus::init(cx);
-        app_update::AppUpdate::init(config.boot().edge_url, data_dir.clone(), cx);
+        // Fork build: no desktop self-update (no check, download or
+        // install-on-quit) — it would replace this build with upstream's.
         cx.register_url_scheme("zeron").detach();
 
         let state = cx.new(|cx| {

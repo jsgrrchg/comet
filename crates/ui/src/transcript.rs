@@ -40,7 +40,7 @@ use gpui::{
 };
 
 use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry, SubagentStatus};
-use zeron_proto::ToolCall;
+use zeron_proto::{HarnessId, ToolCall};
 
 use crate::markdown::mermaid_cache::{self, MermaidCache};
 use crate::markdown::parser::{
@@ -49,7 +49,7 @@ use crate::markdown::parser::{
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _};
-use crate::notice::{NoticeChipIcon::Tile, notice_chip};
+use crate::notice::{NoticeChipIcon::Tile, notice_chip_with_action};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
@@ -120,6 +120,9 @@ const TOOL_FOLD: motion::MotionSpec = motion::MotionSpec::new(140, motion::EASE_
 const TOOL_GROUP_SHIMMER_DURATION: Duration = Duration::from_millis(3_400);
 const TOOL_GROUP_SHIMMER_HALF_WIDTH: f32 = 0.36;
 const TOOL_GROUP_SHIMMER_STRIP_WIDTH: f32 = 2.0;
+/// A send waiting on its Cloud machine names that in the working line only
+/// after this long: a send from this device shows its setup chip by then.
+const CLOUD_BOOT_WORD_AFTER_MS: i64 = 1_500;
 const TOOL_ROW_REVEAL: motion::MotionSpec = motion::MotionSpec::new(360, motion::EASE_OUT_EXPO);
 /// The connector draws briskly, then eases into the branch tip so its arrival
 /// remains visible without feeling mechanically linear.
@@ -486,6 +489,21 @@ fn wrap_styled_runs(runs: &[InlineRun], indent: usize, out: &mut Vec<Vec<InlineR
     let budget = THOUGHT_WRAP_COLS.saturating_sub(indent).max(16);
     let mut segments: Vec<Vec<InlineRun>> = vec![Vec::new()];
     for run in runs {
+        // Inline math shows its `$tex$` source in the code style.
+        let math;
+        let run = if run.style.math {
+            math = InlineRun {
+                text: format!("${}$", run.text),
+                style: InlineStyle {
+                    code: true,
+                    math: false,
+                    ..run.style.clone()
+                },
+            };
+            &math
+        } else {
+            run
+        };
         for (ix, piece) in run.text.split('\n').enumerate() {
             if ix > 0 {
                 segments.push(Vec::new());
@@ -590,7 +608,8 @@ fn thought_block_lines(block: &Block, indent: usize, out: &mut Vec<Vec<InlineRun
                 .collect();
             wrap_styled_runs(&bold, indent, out);
         }
-        Block::CodeBlock { code, .. } => {
+        // Interim: display math shows its TeX source like a code block.
+        Block::CodeBlock { code, .. } | Block::Math { tex: code } => {
             let style = InlineStyle {
                 code: true,
                 ..InlineStyle::default()
@@ -1025,6 +1044,12 @@ pub enum RowKind {
         name: String,
         mime_type: String,
     },
+    /// An agent's `show_visual` script, rendered inline by [`crate::visuals`].
+    Visual {
+        owner: String,
+        path: String,
+        title: String,
+    },
     User {
         /// Visible prompt (attachment-ref trailer already stripped). When the
         /// prompt carries file mentions this is the *projected* display text —
@@ -1082,6 +1107,13 @@ pub enum RowKind {
     ForkMarker {
         source_chat_id: SharedString,
         source_title: SharedString,
+    },
+    /// The provider-switch seam: a labeled divider over `[logo] From → [logo] To`.
+    SwitchMarker {
+        from: SharedString,
+        to: SharedString,
+        from_harness: Option<HarnessId>,
+        to_harness: Option<HarnessId>,
     },
 }
 
@@ -1189,7 +1221,8 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                                 | (run.style.italic as u8) << 1
                                 | (run.style.code as u8) << 2
                                 | (run.style.strikethrough as u8) << 3
-                                | (run.style.link.is_some() as u8) << 4,
+                                | (run.style.link.is_some() as u8) << 4
+                                | (run.style.math as u8) << 5,
                         );
                     }
                     acc.push(b'\n');
@@ -1625,6 +1658,28 @@ pub fn rows_for_entry(
                             },
                         });
                     }
+                    MessagePart::Visual {
+                        id: part_id,
+                        path,
+                        title,
+                    } => {
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(
+                                format!("{}\0{path}\0{title}", entry.device_id).as_bytes(),
+                            ),
+                            turn_start: false,
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            compact_fold: None,
+                            kind: RowKind::Visual {
+                                owner: entry.device_id.clone(),
+                                path: path.clone(),
+                                title: title.clone(),
+                            },
+                        });
+                    }
                     MessagePart::Input {
                         id: part_id,
                         questions,
@@ -1683,6 +1738,34 @@ pub fn rows_for_entry(
                             kind: RowKind::ForkMarker {
                                 source_chat_id: source_chat_id.clone().into(),
                                 source_title: single_line(source_title).into(),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                            copy_text: None,
+                            compact_fold: None,
+                        });
+                    }
+                    MessagePart::Switch {
+                        id: part_id,
+                        from,
+                        to,
+                        from_harness,
+                        to_harness,
+                    } => {
+                        let from_harness = from_harness.as_deref().and_then(HarnessId::from_slug);
+                        let to_harness = to_harness.as_deref().and_then(HarnessId::from_slug);
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(
+                                format!("{from}\u{1}{to}\u{1}{from_harness:?}\u{1}{to_harness:?}")
+                                    .as_bytes(),
+                            ),
+                            turn_start: false,
+                            kind: RowKind::SwitchMarker {
+                                from: single_line(from).into(),
+                                to: single_line(to).into(),
+                                from_harness,
+                                to_harness,
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -1774,7 +1857,10 @@ pub fn rows_for_entry(
     // change when streaming flips off (chips).
     if !streaming
         && let Some(last) = rows.last_mut()
-        && !matches!(last.kind, RowKind::ForkMarker { .. })
+        && !matches!(
+            last.kind,
+            RowKind::ForkMarker { .. } | RowKind::SwitchMarker { .. }
+        )
     {
         last.timestamp = Some(entry.created_at);
         last.copy_text = assistant_copy_text(entry);
@@ -3231,6 +3317,10 @@ pub struct Transcript {
     /// Each instance owns separate scroll handles and list measurements, so
     /// every one must reset itself after a global Fit-mode transition.
     code_fences_generation: u64,
+    /// Last math-style generation applied (see
+    /// [`crate::settings::math_generation`]); like the code-fence one, each
+    /// instance remeasures its own rows.
+    math_generation: u64,
     /// Compact mode as last applied to this instance's row split. Render
     /// polls the setting each frame; a flip rebuilds every row.
     compact_mode: bool,
@@ -3296,6 +3386,9 @@ pub struct Transcript {
     bottom_clearance: f32,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
+    /// The rail's tick stack bounds (painted last frame): maps pointer y to
+    /// a prompt index.
+    rail_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
     /// strip (zeron chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
@@ -3339,6 +3432,8 @@ pub struct Transcript {
     /// In-flight ReadAttachmentChunk loads, keyed by device, path and validation
     /// policy; results land in the global attachment cache.
     attachment_loads: HashMap<crate::attachments::AttachmentKey, Task<()>>,
+    /// Inline `show_visual` visuals, keyed by row id.
+    visuals: HashMap<SharedString, Entity<crate::visuals::VisualFrame>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
     /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
@@ -3367,6 +3462,9 @@ enum BlobFetch {
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
+    /// An error card's "Log in": sign in to the provider this chat's run
+    /// was refused by (signed out, or out of usage).
+    SignIn { chat_id: String },
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
     /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
@@ -3590,6 +3688,7 @@ impl Transcript {
             content_width: crate::settings::transcript_width(cx),
             right_reserve: 0.0,
             code_fences_generation: crate::settings::code_fences_generation(cx),
+            math_generation: crate::settings::math_generation(cx),
             compact_mode: crate::settings::transcript_compact_mode(cx),
             compact_live_entries: HashSet::new(),
             compact_last_elapsed: HashMap::new(),
@@ -3616,6 +3715,7 @@ impl Transcript {
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
+            rail_bounds: Rc::new(Cell::new(None)),
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
@@ -3634,6 +3734,7 @@ impl Transcript {
             image_menu_focus: cx.focus_handle(),
             image_copy: None,
             attachment_loads: HashMap::new(),
+            visuals: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
@@ -3694,6 +3795,14 @@ impl Transcript {
 
     pub(crate) fn set_rail_hover(&mut self, hover: Option<usize>) {
         self.rail_hover = hover;
+    }
+
+    pub(crate) fn rail_bounds(&self) -> &Rc<Cell<Option<Bounds<Pixels>>>> {
+        &self.rail_bounds
+    }
+
+    pub(crate) fn bottom_clearance(&self) -> f32 {
+        self.bottom_clearance
     }
 
     pub(crate) fn rows(&self) -> &[Row] {
@@ -4177,7 +4286,7 @@ impl Transcript {
     /// carries the titlebar chrome inside its own box (the first row's
     /// top gap), so the hold adds nothing — adding the inset on top parked
     /// a new chat's first prompt a double-chrome ~66px low (user report).
-    fn own_send_inset(anchor_ix: usize) -> f32 {
+    pub(crate) fn own_send_inset(anchor_ix: usize) -> f32 {
         if anchor_ix == 0 {
             0.0
         } else {
@@ -6677,6 +6786,51 @@ impl Transcript {
         }
     }
 
+    fn render_visual(
+        &mut self,
+        row_id: &SharedString,
+        owner: &str,
+        path: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let link_ui = self.link_ui(cx);
+        let frame = match self.visuals.get(row_id) {
+            Some(frame) => frame.clone(),
+            None => {
+                let state = self.state.read(cx);
+                let engine = state.engine().cloned();
+                // Relay-forward only for a genuinely remote owner.
+                let target =
+                    (state.local_device_id.as_deref() != Some(owner)).then(|| owner.to_owned());
+                let frame = cx.new(|cx| {
+                    crate::visuals::VisualFrame::new(
+                        row_id.clone(),
+                        title.to_owned(),
+                        path.to_owned(),
+                        engine,
+                        target,
+                        cx,
+                    )
+                });
+                // A visual whose tree changes shape (a tab switch, a load)
+                // resizes its row, like a diagram finishing.
+                let id = row_id.clone();
+                cx.subscribe(
+                    &frame,
+                    move |this, _, _: &crate::visuals::VisualLayoutChanged, cx| {
+                        this.diagram_layout_changed(std::slice::from_ref(&id), cx);
+                    },
+                )
+                .detach();
+                self.visuals.insert(row_id.clone(), frame.clone());
+                frame
+            }
+        };
+        frame.update(cx, |frame, _| frame.set_link_ui(link_ui));
+        div().w_full().child(frame).into_any_element()
+    }
+
     /// The right-aligned thumbnail strip above a user bubble.
     fn render_user_attachments(
         &mut self,
@@ -7015,78 +7169,115 @@ impl Transcript {
         // `turn` (the turn's start, ms) keys the rolling word and timer, so a
         // new turn's labels appear fresh instead of rolling from the last
         // turn's final values.
-        let (sending, queued, elapsed_secs, seed, turn) = if let Some(doc_id) = &self.doc_override {
-            // A subagent doc has no Session row — `indicator_for` would read
-            // the PARENT chat's live state into this tab. Liveness rides the
-            // doc itself instead: the sink's assistant entry streams until
-            // the subagent settles (run teardown finalizes abandoned sinks),
-            // and a trailing USER entry is a steer still awaiting its reply
-            // segment. Frozen snapshots never spin, whatever they claim.
-            if !self.doc_live {
-                return None;
-            }
-            let state = self.state.read(cx);
-            let last = state.sub_transcript(doc_id).last()?;
-            let live =
-                last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
-            if !live {
-                return None;
-            }
-            let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
-            (false, false, elapsed, flavour_seed(doc_id), last.created_at)
-        } else {
-            let chat_id = self.chat_id.clone()?;
-            // Failed-send state first: past the grace window the trailer IS
-            // the retry affordance, whatever the indicator fell back to.
-            if self.state.read(cx).send_undelivered(&chat_id, now) {
-                let theme = Theme::of(cx).clone();
-                return Some(
-                    div()
-                        .id("undelivered-retry")
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(Theme::SPACE_SM))
-                        .pt(px(Theme::SPACE_LG))
-                        .text_size(crate::typography::ui_rems(12.0))
-                        .text_color(theme.danger)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
-                        .child(SharedString::from("Not delivered — click to retry"))
-                        .into_any_element(),
-                );
-            }
-            let (sending, queued, elapsed, turn) = {
-                let state = self.state.read(cx);
-                if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
+        let (sending, queued, elapsed_secs, seed, turn, booting) =
+            if let Some(doc_id) = &self.doc_override {
+                // A subagent doc has no Session row — `indicator_for` would read
+                // the PARENT chat's live state into this tab. Liveness rides the
+                // doc itself instead: the sink's assistant entry streams until
+                // the subagent settles (run teardown finalizes abandoned sinks),
+                // and a trailing USER entry is a steer still awaiting its reply
+                // segment. Frozen snapshots never spin, whatever they claim.
+                if !self.doc_live {
                     return None;
                 }
-                // During the send→turn window the session row's `started_at`
-                // still belongs to the PREVIOUS turn — a timer based on the
-                // send counted the round-trip and then restarted when the
-                // turn actually began (user report). Bridge it as "Sending…"
-                // with no timer instead; the word + timer start with the
-                // turn.
-                let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
-                let send_started = state.pending_send_started(&chat_id, now);
-                let sending = sending_bridge(send_started, turn_started);
-                // Degraded delivery path: the send is a durable local write
-                // waiting on connectivity — say so instead of faking
-                // progress. (The overlay holds while degraded, so this line
-                // owns the surface until the ack or the failed state.)
-                let queued = sending && state.chat_delivery_degraded(&chat_id);
-                let elapsed = turn_started
-                    .map(|t| now.signed_duration_since(t).num_seconds().max(0))
-                    .unwrap_or(0);
-                // While sending, the session row still carries the PREVIOUS
-                // turn: the bridge keys on its own send instead, so it never
-                // rolls out of that turn's word or an earlier send's.
-                let turn = if sending { send_started } else { turn_started }
-                    .map_or(0, |t| t.timestamp_millis());
-                (sending, queued, elapsed, turn)
+                let state = self.state.read(cx);
+                let last = state.sub_transcript(doc_id).last()?;
+                let live =
+                    last.status == Some(MessageStatus::Streaming) || last.role == MessageRole::User;
+                if !live {
+                    return None;
+                }
+                let elapsed = ((now.timestamp_millis() - last.created_at).max(0) / 1000) as i64;
+                (
+                    false,
+                    false,
+                    elapsed,
+                    flavour_seed(doc_id),
+                    last.created_at,
+                    None,
+                )
+            } else {
+                let chat_id = self.chat_id.clone()?;
+                // Failed-send state first: past the grace window the trailer IS
+                // the retry affordance, whatever the indicator fell back to.
+                if self.state.read(cx).send_undelivered(&chat_id, now) {
+                    let theme = Theme::of(cx).clone();
+                    return Some(
+                        div()
+                            .id("undelivered-retry")
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(Theme::SPACE_SM))
+                            .pt(px(Theme::SPACE_LG))
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.danger)
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.retry_send(cx)))
+                            .child(SharedString::from("Not delivered — click to retry"))
+                            .into_any_element(),
+                    );
+                }
+                let (sending, queued, elapsed, turn, booting) = {
+                    let state = self.state.read(cx);
+                    if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
+                        return None;
+                    }
+                    // The Cloud setup steps say what the send waits on; the
+                    // line under them is the turn's working word, timed from
+                    // the send — setting the machine up is part of the work —
+                    // and keyed on it, so neither restarts when the machine's
+                    // turn begins.
+                    if let Some(sent) = state.cloud_setup_turn_started() {
+                        let elapsed = ((now.timestamp_millis() - sent).max(0) / 1000) as i64;
+                        (false, false, elapsed, sent, None)
+                    } else {
+                        // During the send→turn window the session row's `started_at`
+                        // still belongs to the PREVIOUS turn — a timer based on the
+                        // send counted the round-trip and then restarted when the
+                        // turn actually began (user report). Bridge it as "Sending…"
+                        // with no timer instead; the word + timer start with the
+                        // turn.
+                        let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
+                        let send_started = state.pending_send_started(&chat_id, now);
+                        let sending = sending_bridge(send_started, turn_started);
+                        // Degraded delivery path: the send is a durable local write
+                        // waiting on connectivity — say so instead of faking
+                        // progress. (The overlay holds while degraded, so this line
+                        // owns the surface until the ack or the failed state.)
+                        let queued = sending && state.chat_delivery_degraded(&chat_id);
+                        let elapsed = turn_started
+                            .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                            .unwrap_or(0);
+                        // While sending, the session row still carries the PREVIOUS
+                        // turn: the bridge keys on its own send instead, so it never
+                        // rolls out of that turn's word or an earlier send's.
+                        let turn = if sending { send_started } else { turn_started }
+                            .map_or(0, |t| t.timestamp_millis());
+                        // The send waits for the chat's own Cloud machine to come up.
+                        // (Past the beat in which this device's own send puts
+                        // up its setup chip, so the words never flash twice.)
+                        let booting = if sending
+                            && send_started.is_some_and(|t| {
+                                now.signed_duration_since(t).num_milliseconds()
+                                    >= CLOUD_BOOT_WORD_AFTER_MS
+                            }) {
+                            state.cloud_machine_booting(&chat_id)
+                        } else {
+                            None
+                        };
+                        (sending, queued, elapsed, turn, booting)
+                    }
+                };
+                (
+                    sending,
+                    queued,
+                    elapsed,
+                    flavour_seed(&chat_id),
+                    turn,
+                    booting,
+                )
             };
-            (sending, queued, elapsed, flavour_seed(&chat_id), turn)
-        };
         if self.compact_mode && !sending && !queued && elapsed_secs > 0 {
             let entry_id = if let Some(doc_id) = &self.doc_override {
                 self.state
@@ -7109,6 +7300,13 @@ impl Transcript {
         }
         let word = if queued {
             "Queued — will send automatically"
+        } else if let Some(state) = booting {
+            // The send waits for the chat's own Cloud machine.
+            if state == zeron_proto::CloudState::Provisioning {
+                "Starting a Cloud machine"
+            } else {
+                "Waking the Cloud machine"
+            }
         } else if sending {
             "Sending"
         } else {
@@ -7304,6 +7502,7 @@ impl Transcript {
                     link,
                     workspace_root: workspace_root.clone(),
                     code,
+                    math: crate::settings::math_style(cx),
                 };
                 let highlight = self.code_highlight_for(&row.id, &tree, Some(*block_ix), cx);
                 render::render_block(
@@ -7374,6 +7573,7 @@ impl Transcript {
                     link,
                     workspace_root: workspace_root.clone(),
                     code,
+                    math: crate::settings::math_style(cx),
                 };
                 if seed_history && let Some(veil) = &veil {
                     let historical = &self.historical_markdown[&row.id];
@@ -7451,8 +7651,32 @@ impl Transcript {
                 name,
                 mime_type,
             } => self.render_generated_image(&row.id, owner, path, name, mime_type, cx),
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::Visual { owner, path, title } => {
+                self.render_visual(&row.id, owner, path, title, cx)
+            }
+            RowKind::ErrorChip { message } => {
+                let problem = zeron_proto::run_errors::provider_problem(message);
+                let sign_in = self
+                    .chat_id
+                    .clone()
+                    .filter(|_| problem.is_some())
+                    .map(|chat_id| {
+                        let chat_id = chat_id.to_string();
+                        cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
+                            cx.emit(TranscriptEvent::SignIn {
+                                chat_id: chat_id.clone(),
+                            });
+                        })
+                    });
+                error_chip(message.clone(), problem, sign_in, &theme)
+            }
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
+            RowKind::SwitchMarker {
+                from,
+                to,
+                from_harness,
+                to_harness,
+            } => switch_marker(from.clone(), to.clone(), *from_harness, *to_harness, &theme),
         };
         // Diagram fences this row just requested start rendering after layout.
         self.ensure_diagram_worker(cx);
@@ -8929,21 +9153,63 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// The transcript ErrorChip — the shared [`notice_chip`] in its tile
+/// The transcript ErrorChip — the shared [`notice_chip_with_action`] in its tile
 /// treatment (a port of zeron chat-view.tsx `ErrorChip`, restacked for long
 /// payloads: header row with the red-washed tile and the medium "Error"
 /// label, then the human message below). Unlike the web port, the message
 /// WRAPS instead of truncating: startup-crash errors carry the agent's exit
 /// status and stderr, and a one-line ellipsis was exactly what made
 /// zeronsh/comet#95 undiagnosable from the screenshot.
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+///
+/// A refusal that signing in fixes (signed out, out of usage) says so in the
+/// label and carries a "Log in" button for that chat's provider.
+fn error_chip(
+    message: SharedString,
+    problem: Option<zeron_proto::run_errors::ProviderProblem>,
+    sign_in: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
+    theme: &Theme,
+) -> AnyElement {
+    use zeron_proto::run_errors::ProviderProblem;
+    let label = match problem {
+        Some(ProviderProblem::SignedOut) => "Signed out",
+        Some(ProviderProblem::LimitReached) => "Limit reached",
+        None => "Error",
+    };
+    let button = sign_in.map(|on_click| {
+        // The app's button metrics (popover::btn_*), compact for the card,
+        // tinted in the card's red rather than a solid fill.
+        let danger = theme.danger;
+        div()
+            .id("error-sign-in")
+            .flex_none()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .bg(danger.opacity(0.14))
+            .text_color(theme.danger_muted)
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(crate::typography::ui_rems(12.0))
+            .cursor_pointer()
+            .hover(move |s| s.bg(danger.opacity(0.22)))
+            .on_click(on_click)
+            .child(problem.map_or("Log in", ProviderProblem::action_label))
+    });
     div()
         .py(px(4.0))
         .w_full()
         .child(
-            notice_chip(theme, false, "Error", message, Tile)
-                .overflow_hidden()
-                .w_full(),
+            notice_chip_with_action(
+                theme,
+                false,
+                label,
+                message,
+                Tile,
+                button.map(IntoElement::into_any_element),
+            )
+            .overflow_hidden()
+            .w_full(),
         )
         .into_any_element()
 }
@@ -8987,6 +9253,90 @@ fn fork_marker(source_title: SharedString, theme: &Theme) -> AnyElement {
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(theme.text_muted)
                 .child(source_title),
+        )
+        .into_any_element()
+}
+
+/// The provider-switch seam: the fork divider's rule and caption over a
+/// centered `[logo] From → [logo] To`, each side in its provider's brand mark.
+/// A side without a known harness (a seam from a build that didn't record
+/// one) shows its name alone.
+fn switch_marker(
+    from: SharedString,
+    to: SharedString,
+    from_harness: Option<HarnessId>,
+    to_harness: Option<HarnessId>,
+    theme: &Theme,
+) -> AnyElement {
+    let rule = || div().flex_1().min_w_0().h(px(1.0)).bg(theme.border_strong);
+    let provider = |name: SharedString, harness: Option<HarnessId>| {
+        div()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .when_some(
+                harness.map(crate::pickers::harness_brand_icon),
+                |el, (path, tint)| {
+                    el.child(
+                        crate::icons::icon(path)
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(tint.unwrap_or(theme.text_muted)),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::typography::ui_rems(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted)
+                    .child(name),
+            )
+    };
+    div()
+        .py(px(14.0))
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .child(rule())
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(crate::typography::ui_rems(12.0))
+                        .text_color(theme.text_muted.opacity(0.7))
+                        .child("Switched provider"),
+                )
+                .child(rule()),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(10.0))
+                .child(provider(from, from_harness))
+                .child(
+                    crate::icons::icon(crate::icons::ARROW_RIGHT)
+                        .size(px(13.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(0.7)),
+                )
+                .child(provider(to, to_harness)),
         )
         .into_any_element()
 }
@@ -9059,6 +9409,12 @@ fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement
 /// quiet monochrome character keeps the tile without shipping SVGs).
 /// The glyph for a tool call (zeron tool-chip.tsx `toolIcon`, Solar set).
 fn tool_icon_path(call: &ToolCall) -> &'static str {
+    // A Cloud machine's own setup: the machine, then its git steps.
+    match zeron_proto::cloud_setup_step(call) {
+        Some("clone" | "branch") => return crate::icons::GIT_BRANCH,
+        Some(_) => return crate::icons::CLOUD,
+        None => {}
+    }
     match call {
         ToolCall::Exec { .. } => crate::icons::TERMINAL,
         ToolCall::ReadFile { .. } | ToolCall::ApplyPatch { .. } => crate::icons::DOCUMENT,
@@ -10004,6 +10360,12 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
                 acc.push(0);
             }
         }
+        if let MessagePart::Visual { path, title, .. } = part {
+            for field in [path, title] {
+                acc.extend_from_slice(field.as_bytes());
+                acc.push(0);
+            }
+        }
         if let MessagePart::Input { resolved, .. } = part {
             acc.push(0x10 | *resolved as u8);
         }
@@ -10047,6 +10409,20 @@ impl Render for Transcript {
             }
             // Fit changes every code row from analytic to measured height (or
             // back), including virtual rows outside the current viewport.
+            self.list.remeasure();
+            if self.pinned {
+                self.wake_spring();
+            }
+            if self.own_turn.is_some() {
+                self.own_turn_kick = true;
+            }
+        }
+        let math_generation = crate::settings::math_generation(cx);
+        if self.math_generation != math_generation {
+            self.math_generation = math_generation;
+            // Formulas change size with their face, and display math becomes
+            // a code block (or back), so every row with math changes height.
+            // The render cache drops its laid-out text on its own.
             self.list.remeasure();
             if self.pinned {
                 self.wake_spring();
@@ -11719,6 +12095,65 @@ mod tests {
         }
     }
 
+    fn switch_entry(from_harness: Option<&str>, to_harness: Option<&str>) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: "switch:1".into(),
+            role: MessageRole::System,
+            parts: vec![MessagePart::Switch {
+                id: "switch:1".into(),
+                from: "Claude Code".into(),
+                to: "Codex".into(),
+                from_harness: from_harness.map(Into::into),
+                to_harness: to_harness.map(Into::into),
+            }],
+            created_at: 1,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+            duration_ms: None,
+        }
+    }
+
+    #[test]
+    fn provider_switch_seam_is_one_marker_row_carrying_both_providers() {
+        let rows = rows_for_entry(
+            &switch_entry(Some("claude-code"), Some("codex")),
+            false,
+            false,
+            &mut parse,
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].timestamp.is_none(), "a seam has no metadata strip");
+        match &rows[0].kind {
+            RowKind::SwitchMarker {
+                from,
+                to,
+                from_harness,
+                to_harness,
+            } => {
+                assert_eq!(from.as_ref(), "Claude Code");
+                assert_eq!(to.as_ref(), "Codex");
+                assert_eq!(*from_harness, Some(HarnessId::ClaudeCode));
+                assert_eq!(*to_harness, Some(HarnessId::Codex));
+            }
+            _ => panic!("expected a switch marker row"),
+        }
+        // A seam written without provider ids (or by a newer peer naming a
+        // harness this build doesn't know) still renders, minus the logo.
+        for (from, to) in [(None, None), (Some("some-future-agent"), Some("codex"))] {
+            let rows = rows_for_entry(&switch_entry(from, to), false, false, &mut parse);
+            match &rows[0].kind {
+                RowKind::SwitchMarker { from_harness, .. } => assert_eq!(*from_harness, None),
+                _ => panic!("expected a switch marker row"),
+            }
+        }
+        // Changing a provider re-keys the row so a cached one is rebuilt.
+        let version = |from: Option<&str>| {
+            rows_for_entry(&switch_entry(from, Some("codex")), false, false, &mut parse)[0].version
+        };
+        assert_ne!(version(Some("claude-code")), version(Some("cursor")));
+    }
+
     #[test]
     fn generated_image_owner_candidates_and_same_length_corrections() {
         assert_eq!(
@@ -12575,6 +13010,19 @@ mod tests {
         assert!(
             line.iter()
                 .any(|r| r.style.link.is_some() && r.text.contains("docs"))
+        );
+    }
+
+    #[test]
+    fn thought_math_keeps_its_delimiters_as_code() {
+        let lines = thought_of(r"so $x_1 + y$ holds");
+        assert_eq!(line_string(&lines[0]), r"so $x_1 + y$ holds");
+        assert!(
+            lines[0]
+                .iter()
+                .any(|r| r.style.code && !r.style.math && r.text.trim_end() == r"$x_1 + y$"),
+            "{:?}",
+            lines[0]
         );
     }
 
@@ -13598,6 +14046,8 @@ mod tests {
                     this.state.update(cx, |state, _| {
                         state.sessions.push(zeron_proto::Session {
                             last_completed_turn: None,
+                            last_turn_outcome: None,
+                            terminal_activity: None,
                             running_subagents: 0,
                             chat_id: "chat".into(),
                             device_id: "test".into(),

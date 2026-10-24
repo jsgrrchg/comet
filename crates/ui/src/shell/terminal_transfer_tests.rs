@@ -411,6 +411,22 @@ fn requests(rx: &mut tokio::sync::mpsc::Receiver<String>) -> Vec<zeron_rpc::Clie
     frames
 }
 
+// Main now applies the measured grid to an attached PTY before subscribing.
+// Acknowledge those calls as the real engine does, keeping frames for assertions.
+fn acknowledge_resizes(
+    frames: &[zeron_rpc::ClientFrame],
+    replies: &tokio::sync::mpsc::Sender<String>,
+) {
+    for frame in frames
+        .iter()
+        .filter(|frame| frame.method.as_deref() == Some(zeron_rpc::methods::RESIZE_TERMINAL))
+    {
+        replies
+            .try_send(serde_json::json!({ "id": frame.id, "ok": null }).to_string())
+            .unwrap();
+    }
+}
+
 #[gpui::test]
 fn live_stream_input_and_remote_target_follow_transfer_without_reopening(cx: &mut TestAppContext) {
     use zeron_rpc::methods;
@@ -429,6 +445,7 @@ fn live_stream_input_and_remote_target_follow_transfer_without_reopening(cx: &mu
                 id: "live-pty".into(),
                 cwd: "/remote".into(),
                 shell: "bash".into(),
+                host_replies: true,
             },
             Some("remote-host".into()),
             cx
@@ -436,6 +453,9 @@ fn live_stream_input_and_remote_target_follow_transfer_without_reopening(cx: &mu
     });
     pump(&runtime, cx);
     let mut frames = requests(&mut rx);
+    acknowledge_resizes(&frames, &replies);
+    pump(&runtime, cx);
+    frames.extend(requests(&mut rx));
     let subscription = frames
         .iter()
         .find(|frame| frame.method.as_deref() == Some(methods::SUBSCRIBE_TERMINAL))
@@ -444,7 +464,7 @@ fn live_stream_input_and_remote_target_follow_transfer_without_reopening(cx: &mu
     replies
         .try_send(
             serde_json::json!({ "id": subscription, "item": {
-                "type": "data", "seq": 1, "data": encode(b"before move\r\n")
+                "type": "data", "seq": 1, "data": encode(b"before move\r\n\x1b[5n")
             }})
             .to_string(),
         )
@@ -463,11 +483,39 @@ fn live_stream_input_and_remote_target_follow_transfer_without_reopening(cx: &mu
         );
     });
     cx.simulate_keystrokes("x");
+    pump(&runtime, cx);
+    frames.extend(requests(&mut rx));
+    let writes: Vec<_> = frames
+        .iter()
+        .filter(|frame| frame.method.as_deref() == Some(methods::WRITE_TERMINAL))
+        .collect();
+    assert_eq!(
+        writes.len(),
+        1,
+        "typing must write immediately, without a timer"
+    );
+    assert_eq!(writes[0].params["data"], encode(b"x"));
+    let first_write_id = writes[0].id;
+    // This byte waits for the first acknowledgement, across the move.
+    cx.simulate_keystrokes("y");
+    pump(&runtime, cx);
+    frames.extend(requests(&mut rx));
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| { frame.method.as_deref() == Some(methods::WRITE_TERMINAL) })
+            .count(),
+        1,
+        "a second write overtook the first"
+    );
     let to = cx.debug_bounds("right-surface-strip").unwrap().center();
     begin_drag(cx, key, to);
     drop_at(cx, to);
+    replies
+        .try_send(serde_json::json!({ "id": first_write_id, "ok": null }).to_string())
+        .unwrap();
     replies.try_send(serde_json::json!({ "id": subscription, "item": {
-        "type": "data", "seq": 2, "data": encode(b"\x1b]2;after move\x07continuous output\r\n")
+        "type": "data", "seq": 2, "data": encode(b"\x1b]2;after move\x07continuous output\r\n\x1b[5n")
     }}).to_string()).unwrap();
     pump(&runtime, cx);
     cx.executor().advance_clock(Duration::from_millis(100));
@@ -494,10 +542,17 @@ fn live_stream_input_and_remote_target_follow_transfer_without_reopening(cx: &mu
         .collect();
     assert_eq!(
         writes.len(),
-        1,
+        2,
         "pending input was lost or duplicated: {frames:?}"
     );
     assert_eq!(writes[0].params["data"], encode(b"x"));
+    assert_eq!(writes[1].params["data"], encode(b"y"));
+    assert!(
+        frames
+            .iter()
+            .filter(|frame| { frame.method.as_deref() == Some(methods::SUBSCRIBE_TERMINAL) })
+            .all(|frame| frame.params["hostReplies"] == true)
+    );
     assert!(
         frames
             .iter()
@@ -531,6 +586,7 @@ fn live_stream_input_and_remote_target_follow_transfer_without_reopening(cx: &mu
         .into_iter()
         .find(|frame| frame.method.as_deref() == Some(methods::SUBSCRIBE_TERMINAL))
         .unwrap();
+    assert_eq!(reconnect.params["hostReplies"], true);
     assert_eq!(reconnect.params["afterSeq"], 2);
     assert_eq!(reconnect.params["targetDeviceId"], "remote-host");
     replies.try_send(serde_json::json!({ "id": reconnect.id, "item": { "type": "exit", "seq": 3, "exitCode": 7 }}).to_string()).unwrap();
@@ -549,7 +605,7 @@ fn pending_action_handle_attaches_after_move_and_rejects_after_close(cx: &mut Te
     let key = sessions[0].read_with(cx, |model, _| model.key);
     // This is the handle captured by run_project_action before its RPC returns.
     let pending = sessions[0].downgrade();
-    let (_replies, mut rx) = test_connection(&shell, cx);
+    let (replies, mut rx) = test_connection(&shell, cx);
     let to = cx.debug_bounds("right-surface-strip").unwrap().center();
     begin_drag(cx, key, to);
     drop_at(cx, to);
@@ -560,12 +616,15 @@ fn pending_action_handle_attaches_after_move_and_rejects_after_close(cx: &mut Te
                     id: "action-pty".into(),
                     cwd: "/project".into(),
                     shell: "bash".into(),
+                    host_replies: false,
                 },
                 None,
                 cx
             ))
             .unwrap()
     );
+    pump(&runtime, cx);
+    acknowledge_resizes(&requests(&mut rx), &replies);
     pump(&runtime, cx);
     assert!(requests(&mut rx).iter().any(|frame| frame.method.as_deref()
         == Some(zeron_rpc::methods::SUBSCRIBE_TERMINAL)
@@ -584,6 +643,7 @@ fn pending_action_handle_attaches_after_move_and_rejects_after_close(cx: &mut Te
                     id: "late-result".into(),
                     cwd: "/project".into(),
                     shell: "bash".into(),
+                    host_replies: false,
                 },
                 None,
                 cx
@@ -643,7 +703,10 @@ fn open_terminal_reply_lands_in_destination_and_resizes_to_its_grid(cx: &mut Tes
     pump(&runtime, cx);
     cx.executor().advance_clock(Duration::from_millis(100));
     pump(&runtime, cx);
-    let frames = requests(&mut rx);
+    let mut frames = requests(&mut rx);
+    acknowledge_resizes(&frames, &replies);
+    pump(&runtime, cx);
+    frames.extend(requests(&mut rx));
     assert!(!frames.iter().any(|frame| matches!(
         frame.method.as_deref(),
         Some(methods::OPEN_TERMINAL | methods::CLOSE_TERMINAL)

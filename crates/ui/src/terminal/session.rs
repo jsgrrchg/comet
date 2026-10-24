@@ -3,10 +3,11 @@
 
 use super::emulator::Emulator;
 use super::panel::{backoff_ms, decode_base64, encode_base64, exit_message, with_target};
-use super::view::{COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS};
+use super::predict::Predictor;
+use super::view::{InputQueue, RESIZE_DEBOUNCE_MS};
 use crate::state::{AppState, EngineHandle};
 use gpui::{App, Context, Entity, SharedString, Task};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeron_proto::{TerminalEvent, TerminalSession};
 use zeron_rpc::methods;
 
@@ -18,11 +19,21 @@ pub(crate) struct TerminalSessionModel {
     pub(crate) terminal_id: Option<String>,
     pub(crate) target_device_id: Option<String>,
     pub(crate) emulator: Emulator,
+    /// Fraction of a scrollback row still visible below the live grid.
     pub(super) scroll_remainder: f32,
     pub(crate) exited: Option<i32>,
     pub(crate) last_seq: u64,
-    coalescer: InputCoalescer,
-    flush_task: Option<Task<()>>,
+    /// Fractional wheel rows still owed to a program's mouse/arrow reports.
+    pub(super) wheel_remainder: f32,
+    pub(super) input: InputQueue,
+    /// Remote echo and its deadlines move with the session, not the view.
+    pub(super) predictor: Predictor,
+    predict_task: Option<Task<()>>,
+    /// Flush a synchronized update if the program leaves it open.
+    sync_task: Option<Task<()>>,
+    pub(super) marked_text: Option<String>,
+    /// Hosts answering terminal queries suppress the emulator's duplicates.
+    host_replies: bool,
     resize_task: Option<Task<()>>,
     _run: Option<Task<()>>,
     closed: bool,
@@ -46,8 +57,13 @@ impl TerminalSessionModel {
             scroll_remainder: 0.0,
             exited: None,
             last_seq: 0,
-            coalescer: InputCoalescer::default(),
-            flush_task: None,
+            wheel_remainder: 0.0,
+            input: InputQueue::default(),
+            predictor: Predictor::default(),
+            predict_task: None,
+            sync_task: None,
+            marked_text: None,
+            host_replies: false,
             resize_task: None,
             _run: None,
             closed: false,
@@ -122,7 +138,8 @@ impl TerminalSessionModel {
             return;
         }
         self.closed = true;
-        self.flush_task = None;
+        self.predict_task = None;
+        self.sync_task = None;
         self.resize_task = None;
         // An in-flight open must finish so it can release the returned PTY.
         // Its weak entity check below rejects closed/released models.
@@ -163,6 +180,7 @@ impl TerminalSessionModel {
                 .update(cx, |model, _| (model.emulator.cols() as u16, model.emulator.rows() as u16))
                 .unwrap_or((80, 24));
 
+            let opened_elsewhere = existing_session.is_some();
             let session = match existing_session {
                 Some(session) => session,
                 None => {
@@ -200,20 +218,40 @@ impl TerminalSessionModel {
             let terminal_id = session.id.clone();
             let attached = this
                 .update(cx, |model, cx| {
-                    if !model.closed {
-                        model.terminal_id = Some(terminal_id.clone());
-                        model.target_device_id = target.clone();
-                        // The destination may have resized while OpenTerminal
-                        // was pending, after its initial dimensions were sent.
-                        model.schedule_resize(cx);
-                        cx.notify();
-                        true
-                    } else {
-                        false
+                    if model.closed {
+                        return None;
                     }
+                    model.terminal_id = Some(terminal_id.clone());
+                    model.target_device_id = target.clone();
+                    model.host_replies = session.host_replies;
+                    let size = (model.emulator.cols() as u16, model.emulator.rows() as u16);
+                    model.pump_input(cx);
+                    cx.notify();
+                    Some(size)
                 })
-                .unwrap_or(false);
-            if !attached {
+                .ok()
+                .flatten();
+            // Opening (or moving an opening tab) may outlast the resize
+            // debounce. Apply the destination's measured size to the host.
+            if let Some((now_cols, now_rows)) = attached
+                && (opened_elsewhere || (now_cols, now_rows) != (cols, rows))
+            {
+                let _ = engine
+                    .client()
+                    .call(
+                        methods::RESIZE_TERMINAL,
+                        with_target(
+                            serde_json::json!({
+                                "terminalId": terminal_id,
+                                "cols": now_cols,
+                                "rows": now_rows,
+                            }),
+                            &target,
+                        ),
+                    )
+                    .await;
+            }
+            if attached.is_none() {
                 // Tab was closed before the open completed — release the PTY.
                 let _ = engine
                     .client()
@@ -230,19 +268,19 @@ impl TerminalSessionModel {
 
             let mut attempt: u32 = 0;
             loop {
-                let Ok(after_seq) = this.update(cx, |model, _| {
-                    (!model.closed).then_some(model.last_seq)
+                let Ok(resume) = this.update(cx, |model, _| {
+                    (!model.closed).then_some((model.last_seq, model.host_replies))
                 }) else {
                     return; // entity released
                 };
-                let Some(after_seq) = after_seq else { return }; // tab closed
+                let Some((after_seq, host_replies)) = resume else { return }; // tab closed
 
                 let subscribed = engine
                     .client()
                     .subscribe(
                         methods::SUBSCRIBE_TERMINAL,
                         with_target(
-                            serde_json::json!({ "terminalId": terminal_id, "afterSeq": after_seq }),
+                            serde_json::json!({ "terminalId": terminal_id, "afterSeq": after_seq, "hostReplies": host_replies }),
                             &target,
                         ),
                     )
@@ -269,7 +307,7 @@ impl TerminalSessionModel {
                     };
                     attempt = 0;
                     let outcome = this.update(cx, |model, cx| {
-                        model.apply_stream_event(&engine, event, cx)
+                        model.apply_stream_event(event, cx)
                     });
                     match outcome {
                         Ok(StreamDisposition::Continue) => {}
@@ -297,37 +335,30 @@ impl TerminalSessionModel {
 
     fn apply_stream_event(
         &mut self,
-        engine: &EngineHandle,
         event: TerminalEvent,
         cx: &mut Context<Self>,
     ) -> StreamDisposition {
         if self.closed {
             return StreamDisposition::Stop;
         }
-        let target = self.target_device_id.clone();
         match event {
             TerminalEvent::Data { seq, data } => {
                 self.last_seq = seq;
                 let responses = self.emulator.feed(&decode_base64(&data));
-                if !responses.is_empty()
-                    && let Some(id) = self.terminal_id.clone()
-                {
-                    // Query responses (DSR etc.) go straight back, no coalescing.
-                    let engine = engine.clone();
-                    let data = encode_base64(&responses);
-                    cx.spawn(async move |_, _| {
-                        let _ = engine
-                            .client()
-                            .call(
-                                methods::WRITE_TERMINAL,
-                                with_target(
-                                    serde_json::json!({ "terminalId": id, "data": data }),
-                                    &target,
-                                ),
-                            )
-                            .await;
-                    })
-                    .detach();
+                if self.emulator.alt_screen() {
+                    self.predictor.reset();
+                }
+                self.predictor.output(&self.emulator, Instant::now());
+                let sync_deadline = self.emulator.sync_deadline();
+                if !responses.is_empty() && !self.host_replies {
+                    // Query responses (DSR etc.) share the key queue, so they
+                    // reach the PTY in order with what was typed. Hosts that
+                    // answer queries themselves get none from here.
+                    self.input.push(&responses);
+                    self.pump_input(cx);
+                }
+                if let Some(deadline) = sync_deadline {
+                    self.schedule_sync_flush(deadline, cx);
                 }
                 cx.notify();
                 StreamDisposition::Continue
@@ -335,6 +366,8 @@ impl TerminalSessionModel {
             TerminalEvent::Exit { seq, exit_code, .. } => {
                 self.last_seq = seq;
                 self.exited = Some(exit_code);
+                self.predictor.reset();
+                self.marked_text = None;
                 self.emulator.feed(&exit_message(exit_code));
                 cx.notify();
                 StreamDisposition::Stop
@@ -342,49 +375,47 @@ impl TerminalSessionModel {
         }
     }
 
-    /// Queue keyboard bytes on the active tab (12 ms coalescing window).
+    /// Keyboard writes begin immediately and remain ordered across moves.
     pub(super) fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if self.closed || self.exited.is_some() {
             return;
         }
-        // A keypress while scrolled back snaps to the live bottom (xterm).
-        if self.emulator.display_offset() > 0 {
+        if self.emulator.display_offset() > 0 || self.scroll_remainder != 0.0 {
             self.emulator.scroll_to_bottom();
+            self.scroll_remainder = 0.0;
         }
-        if self.coalescer.push(bytes) {
-            self.flush_task = Some(Self::schedule_flush(cx));
-        }
+        self.input.push(bytes);
+        self.pump_input(cx);
     }
 
-    fn schedule_flush(cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(COALESCE_MS))
-                .await;
-            let _ = this.update(cx, |model, cx| model.flush_input(cx));
-        })
-    }
-
-    fn flush_input(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
+    pub(super) fn send_report(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if self.closed {
             return;
         }
-        let target = self.target_device_id.clone();
-        if self.coalescer.is_empty() {
+        self.input.push(bytes);
+        self.pump_input(cx);
+    }
+
+    fn pump_input(&mut self, cx: &mut Context<Self>) {
+        if self.closed {
             return;
         }
-        let Some(id) = self.terminal_id.clone() else {
-            // OpenTerminal still in flight — keep the buffer, retry shortly.
-            if self.exited.is_none() {
-                self.flush_task = Some(Self::schedule_flush(cx));
-            }
+        let Some(engine) = self.engine(cx) else {
             return;
         };
-        let data = encode_base64(&self.coalescer.take());
-        cx.spawn(async move |_, _| {
+        // OpenTerminal still in flight: the attach pumps once it lands.
+        let Some(id) = self.terminal_id.clone() else {
+            return;
+        };
+        let Some(bytes) = self.input.start() else {
+            return;
+        };
+        let target = self.target_device_id.clone();
+        if target.is_some() {
+            self.predictor.sent(Instant::now());
+        }
+        let data = encode_base64(&bytes);
+        cx.spawn(async move |this, cx| {
             let _ = engine
                 .client()
                 .call(
@@ -395,8 +426,55 @@ impl TerminalSessionModel {
                     ),
                 )
                 .await;
+            let _ = this.update(cx, |model, cx| {
+                model.input.finish();
+                model.pump_input(cx);
+            });
         })
         .detach();
+    }
+
+    pub(super) fn schedule_prediction_expiry(&mut self, cx: &mut Context<Self>) {
+        let Some(deadline) = self.predictor.next_deadline() else {
+            return;
+        };
+        self.predict_task = Some(cx.spawn(async move |this, cx| {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            cx.background_executor()
+                .timer(wait + Duration::from_millis(1))
+                .await;
+            let _ = this.update(cx, |model, cx| {
+                if !model.closed && model.predictor.expire(Instant::now()) {
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    fn schedule_sync_flush(&mut self, deadline: Instant, cx: &mut Context<Self>) {
+        self.sync_task = Some(cx.spawn(async move |this, cx| {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            cx.background_executor()
+                .timer(wait + Duration::from_millis(1))
+                .await;
+            let _ = this.update(cx, |model, cx| {
+                if model.closed {
+                    return;
+                }
+                if model
+                    .emulator
+                    .sync_deadline()
+                    .is_some_and(|due| due <= Instant::now())
+                {
+                    let responses = model.emulator.finish_sync();
+                    if !responses.is_empty() && !model.host_replies {
+                        model.input.push(&responses);
+                        model.pump_input(cx);
+                    }
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     /// Resize the emulator immediately; debounce only the host RPC. Timers
@@ -408,6 +486,7 @@ impl TerminalSessionModel {
             return;
         }
         self.emulator.resize(cols, rows);
+        self.predictor.reset();
         self.schedule_resize(cx);
     }
 

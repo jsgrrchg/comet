@@ -357,6 +357,16 @@ impl Repos {
     }
 
     /// Is `path` inside a git work tree? (Also the SpacesSync git-presence probe.)
+    /// The GitHub repository (`owner/name`) of `path`'s `origin` remote.
+    pub async fn github_repo(&self, path: &Path) -> Option<String> {
+        let remote = self
+            .git(&["remote", "get-url", "origin"], Some(path))
+            .await
+            .ok()?;
+        let (owner, name) = parse_github_remote(&remote)?;
+        Some(format!("{owner}/{name}"))
+    }
+
     pub async fn is_repo(&self, path: &Path) -> bool {
         matches!(
             self.git(&["rev-parse", "--is-inside-work-tree"], Some(path)).await,
@@ -407,15 +417,31 @@ impl Repos {
     /// Canonical identity shared by every chat operating in this exact worktree:
     /// `sha256(deviceId ‖ NUL ‖ canonical git dir)`.
     pub async fn checkout_identity(&self, path: &Path) -> Result<CheckoutIdentity, EngineError> {
-        let root = self
-            .git(&["rev-parse", "--show-toplevel"], Some(path))
-            .await?;
-        let git_dir = self
+        let out = self
             .git(
-                &["rev-parse", "--path-format=absolute", "--git-dir"],
+                &[
+                    "rev-parse",
+                    "--show-toplevel",
+                    "--path-format=absolute",
+                    "--git-dir",
+                ],
                 Some(path),
             )
             .await?;
+        let mut lines = out.lines();
+        let (root, git_dir) = match (lines.next(), lines.next(), lines.next()) {
+            (Some(root), Some(git_dir), None) => (root.to_owned(), git_dir.to_owned()),
+            // Fallback for a path with a `\n` in its name.
+            _ => (
+                self.git(&["rev-parse", "--show-toplevel"], Some(path))
+                    .await?,
+                self.git(
+                    &["rev-parse", "--path-format=absolute", "--git-dir"],
+                    Some(path),
+                )
+                .await?,
+            ),
+        };
         let canonical_root = std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(&root));
         let canonical_git_dir =
             std::fs::canonicalize(&git_dir).unwrap_or_else(|_| PathBuf::from(&git_dir));
@@ -613,25 +639,57 @@ impl Repos {
 
     /// `git clone <url>` under `{data_dir}/repos`. (Named `clone_repo` to keep
     /// `Clone::clone` unambiguous on the service handle.)
+    ///
+    /// Idempotent: when the destination already holds a clone whose `origin`
+    /// is the same repository (scheme, `.git`, trailing slash, embedded
+    /// credentials and owner/name case ignored), that checkout is the answer —
+    /// same reply as a fresh clone. A destination holding anything else stays
+    /// an "Already exists" error.
     pub async fn clone_repo(&self, url: &str) -> Result<Repo, EngineError> {
-        let trimmed = url.trim().trim_end_matches('/');
-        let name = trimmed
-            .trim_end_matches(".git")
-            .rsplit(['/', ':'])
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("repo")
-            .to_string();
         let repos_dir = self.inner.data_dir.join("repos");
+        self.clone_repo_into(url, &repos_dir).await
+    }
+
+    /// [`Self::clone_repo`] into `<parent>/<name>` instead: where the user
+    /// chose to keep it (New project → a folder → clone here). `parent`
+    /// must be an existing folder; the same idempotence holds.
+    pub async fn clone_repo_in(&self, url: &str, parent: &str) -> Result<Repo, EngineError> {
+        let parent = absolutize(Path::new(parent));
+        if !parent.is_dir() {
+            return Err(EngineError::Other(format!(
+                "No such folder: {}",
+                parent.display()
+            )));
+        }
+        self.clone_repo_into(url, &parent).await
+    }
+
+    async fn clone_repo_into(&self, url: &str, repos_dir: &Path) -> Result<Repo, EngineError> {
+        let trimmed = url.trim().trim_end_matches('/');
+        let name = clone_folder_name(trimmed);
         let target = repos_dir.join(&name);
         if target.exists() {
+            // `.git` must be the destination's own: `git remote` inside a
+            // plain folder would answer for an enclosing repository.
+            let origin = if target.join(".git").exists() {
+                self.git(&["remote", "get-url", "origin"], Some(&target))
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            if origin.is_some_and(|origin| same_remote(&origin, trimmed)) {
+                self.register(&target.to_string_lossy())?;
+                return self.to_repo(&target).await;
+            }
             return Err(EngineError::Other(format!(
                 "Already exists: {}",
                 target.display()
             )));
         }
-        std::fs::create_dir_all(&repos_dir)?;
-        self.git(&["clone", trimmed, &target.to_string_lossy()], None)
+        std::fs::create_dir_all(repos_dir)?;
+        // `--`: a URL is never read as an option (`--upload-pack=…`).
+        self.git(&["clone", "--", trimmed, &target.to_string_lossy()], None)
             .await?;
         self.register(&target.to_string_lossy())?;
         self.to_repo(&target).await
@@ -1236,19 +1294,34 @@ impl Repos {
         Some(path.to_string_lossy().into_owned())
     }
 
+    /// Every checkout of the repository at `repo_path`, main one first.
+    /// NUL-terminated so a `\n` in a worktree's path can't forge another entry.
+    async fn worktree_paths(&self, repo_path: &Path) -> Result<Vec<PathBuf>, EngineError> {
+        let out = match self
+            .git(&["worktree", "list", "--porcelain", "-z"], Some(repo_path))
+            .await
+        {
+            Ok(out) => out,
+            // Git before 2.36 has no `-z`.
+            Err(_) => self
+                .git(&["worktree", "list", "--porcelain"], Some(repo_path))
+                .await?
+                .replace('\n', "\0"),
+        };
+        Ok(out
+            .split('\0')
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .map(PathBuf::from)
+            .collect())
+    }
+
     /// Whether `candidate` is the repository root or one of its linked
     /// worktrees. Filesystem resolution happens on a disposable thread because
     /// user-selected paths may be dead mounts.
     pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
         let repo_path = repo_path.to_path_buf();
         let candidate = candidate.to_path_buf();
-        let worktrees: Vec<_> = self
-            .refs(&repo_path)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|row| row.worktree_path.map(PathBuf::from))
-            .collect();
+        let worktrees = self.worktree_paths(&repo_path).await.unwrap_or_default();
         disposable_worker("checkout-auth", move || {
             let candidate = std::fs::canonicalize(candidate).ok()?;
             std::iter::once(repo_path)
@@ -2093,6 +2166,52 @@ fn compact_history_commits(
         .collect()
 }
 
+/// Whether two remote URLs name the same repository: `https://`, `ssh://` and
+/// scp-style spellings, a `.git` suffix, a trailing slash, embedded
+/// credentials, and host/owner/name case are all ignored.
+/// The folder a clone of `url` lands in: its last path segment minus
+/// `.git`. Local paths split on `\\` too (a Windows path must not become an
+/// absolute "name" that replaces the destination), and a segment that would
+/// step out of the destination (`.`, `..`) falls back to `repo`.
+fn clone_folder_name(url: &str) -> String {
+    url.trim_end_matches(['/', '\\'])
+        .trim_end_matches(".git")
+        .rsplit(['/', '\\', ':'])
+        .next()
+        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+        .unwrap_or("repo")
+        .to_string()
+}
+
+pub(crate) fn same_remote(a: &str, b: &str) -> bool {
+    fn key(url: &str) -> String {
+        if let Some(remote) = crate::source_control::parse_git_remote(url) {
+            return format!(
+                "{}/{}/{}",
+                remote.host,
+                remote.owner.to_ascii_lowercase(),
+                remote.repository.to_ascii_lowercase()
+            );
+        }
+        // Not owner/name shaped (nested groups, local paths): compare the
+        // URL minus scheme, credentials, trailing slash and `.git`.
+        let url = url.trim().trim_end_matches('/');
+        let url = url.strip_suffix(".git").unwrap_or(url);
+        let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+        let rest = match rest.split_once('/') {
+            Some((authority, path)) => format!(
+                "{}/{path}",
+                authority
+                    .rsplit_once('@')
+                    .map_or(authority, |(_, host)| host)
+            ),
+            None => rest.to_string(),
+        };
+        rest.to_ascii_lowercase()
+    }
+    key(a) == key(b)
+}
+
 fn search_files_blocking(
     search: &WorkspaceSearch,
     root: &Path,
@@ -2743,6 +2862,197 @@ mod tests {
     }
 
     #[test]
+    fn same_remote_ignores_scheme_suffix_slash_credentials_and_case() {
+        let canonical = "https://github.com/Acme/App";
+        for same in [
+            "https://github.com/acme/app.git",
+            "https://github.com/Acme/App/",
+            "https://x-access-token:ghu_secret@github.com/acme/app.git",
+            "git@github.com:acme/app.git",
+            "ssh://git@github.com/acme/app",
+            "http://GitHub.com/acme/app",
+        ] {
+            assert!(same_remote(canonical, same), "{same}");
+        }
+        for other in [
+            "https://github.com/acme/app2",
+            "https://github.com/other/app",
+            "https://gitlab.com/acme/app",
+        ] {
+            assert!(!same_remote(canonical, other), "{other}");
+        }
+        assert!(same_remote("/srv/git/src.git", "file:///srv/git/src.git/"));
+        assert!(!same_remote("/srv/git/src.git", "/srv/other/src.git"));
+    }
+
+    #[tokio::test]
+    async fn github_repo_names_the_origins_owner_and_name() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let repos = Repos::new(&root.path().join("data"), "device-1");
+        git(&["init", "-q"]);
+        assert_eq!(repos.github_repo(root.path()).await, None, "no origin");
+        git(&["remote", "add", "origin", "git@github.com:Acme/app.git"]);
+        assert_eq!(
+            repos.github_repo(root.path()).await.as_deref(),
+            Some("Acme/app")
+        );
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "https://gitlab.com/acme/app.git",
+        ]);
+        assert_eq!(repos.github_repo(root.path()).await, None, "not GitHub");
+    }
+
+    #[tokio::test]
+    async fn clone_repo_in_puts_the_checkout_where_the_user_chose() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        let work = root.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&["init", "-q", "-b", "main"], &work);
+        std::fs::write(work.join("README.md"), "hi").unwrap();
+        git(&["add", "."], &work);
+        git(&["commit", "-q", "-m", "init"], &work);
+        let bare = root.path().join("app.git");
+        git(
+            &[
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().unwrap(),
+                bare.to_str().unwrap(),
+            ],
+            root.path(),
+        );
+        let code = root.path().join("code");
+        std::fs::create_dir_all(&code).unwrap();
+        let repos = Repos::new(&root.path().join("data"), "device-1");
+        let repo = repos
+            .clone_repo_in(bare.to_str().unwrap(), code.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(repo.path, code.join("app").to_string_lossy());
+        assert!(code.join("app/README.md").exists());
+        // Again: the same checkout, not an error.
+        let again = repos
+            .clone_repo_in(bare.to_str().unwrap(), code.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(again, repo);
+        // A folder that isn't there is refused, not created.
+        let err = repos
+            .clone_repo_in(
+                bare.to_str().unwrap(),
+                root.path().join("nope").to_str().unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("No such folder"), "{err}");
+    }
+
+    #[test]
+    fn clone_folder_name_is_the_last_segment_and_stays_inside() {
+        for (url, name) in [
+            ("https://github.com/acme/app.git", "app"),
+            ("https://github.com/acme/app/", "app"),
+            ("git@github.com:acme/app.git", "app"),
+            ("git@github.com:app.git", "app"),
+            ("/srv/git/app.git", "app"),
+            (r"C:\Users\me\code\app.git", "app"),
+            (r"C:\Users\me\code\app\", "app"),
+            ("https://example.com/acme/..", "repo"),
+            ("https://example.com/acme/.", "repo"),
+            (r"C:\..", "repo"),
+            ("", "repo"),
+        ] {
+            assert_eq!(clone_folder_name(url), name, "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clone_repo_is_idempotent_for_the_same_origin_only() {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@example.com")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@example.com")
+                .output()
+                .unwrap();
+            assert!(status.status.success(), "git {args:?}: {status:?}");
+        };
+        // Two different upstreams that would both clone into `repos/src`.
+        let mut upstreams = Vec::new();
+        for dir in ["a", "b"] {
+            let work = root.path().join(dir).join("work");
+            std::fs::create_dir_all(&work).unwrap();
+            git(&["init", "-q", "-b", "main"], &work);
+            std::fs::write(work.join("README.md"), dir).unwrap();
+            git(&["add", "."], &work);
+            git(&["commit", "-q", "-m", "init"], &work);
+            let bare = root.path().join(dir).join("src.git");
+            git(
+                &[
+                    "clone",
+                    "-q",
+                    "--bare",
+                    work.to_str().unwrap(),
+                    bare.to_str().unwrap(),
+                ],
+                root.path(),
+            );
+            upstreams.push(bare);
+        }
+        let data = root.path().join("data");
+        let repos = Repos::new(&data, "device-1");
+        let first = repos
+            .clone_repo(upstreams[0].to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(first.path, data.join("repos").join("src").to_string_lossy());
+        // Same repository again (different spelling): the same success reply.
+        let again = repos
+            .clone_repo(&format!("file://{}/", upstreams[0].display()))
+            .await
+            .unwrap();
+        assert_eq!(again, first);
+        assert_eq!(repos.list().await.len(), 1, "registered once");
+        // A different repository with the same folder name stays an error.
+        let err = repos
+            .clone_repo(upstreams[1].to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Already exists"), "{err}");
+    }
+
+    #[test]
     fn session_home_requires_an_explicit_usable_directory() {
         let home = tempfile::tempdir().unwrap();
         assert_eq!(
@@ -3235,6 +3545,77 @@ tmpfs /run tmpfs rw 0 0
                 .await
                 .is_none()
         );
+    }
+
+    async fn git(cwd: &Path, args: &[&str]) {
+        let output = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "test")
+            .env("GIT_AUTHOR_EMAIL", "test@test")
+            .env("GIT_COMMITTER_NAME", "test")
+            .env("GIT_COMMITTER_EMAIL", "test@test")
+            .output()
+            .await
+            .expect("git spawns");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_checkout_accepts_every_linked_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("repo");
+        let branch = tmp.path().join("branch");
+        let detached = tmp.path().join("detached");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&root).expect("repo dir");
+        std::fs::create_dir_all(&elsewhere).expect("unrelated dir");
+        git(&root, &["init", "-b", "main"]).await;
+        git(&root, &["commit", "--allow-empty", "-m", "initial"]).await;
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                &branch.to_string_lossy(),
+            ],
+        )
+        .await;
+        git(
+            &root,
+            &["worktree", "add", "--detach", &detached.to_string_lossy()],
+        )
+        .await;
+        let data = tmp.path().join("data");
+        let repos = Repos::with_worktrees_root(&data, "device", data.join("worktrees"));
+
+        for checkout in [&root, &branch, &detached] {
+            assert_eq!(
+                repos.workspace_checkout(&root, checkout).await,
+                std::fs::canonicalize(checkout).ok(),
+                "{}",
+                checkout.display()
+            );
+        }
+        // A newline in a worktree's path must not smuggle in another entry.
+        #[cfg(unix)]
+        {
+            let forged = tmp
+                .path()
+                .join(format!("forged\nworktree {}", elsewhere.display()));
+            git(
+                &root,
+                &["worktree", "add", "--detach", &forged.to_string_lossy()],
+            )
+            .await;
+        }
+        assert!(repos.workspace_checkout(&root, &elsewhere).await.is_none());
     }
 
     #[tokio::test]

@@ -1515,14 +1515,16 @@ impl<V: 'static> Select<V> {
 
 /// Settings actions share one size, corner radius, and hover language. Use
 /// outlined for selectors, quiet for secondary actions, filled for row
-/// actions on a block (the dropdown trigger's glass wash), and solid for
-/// commits.
+/// actions on a block (the dropdown trigger's glass wash), solid for
+/// commits, and danger for destructive actions behind a confirmation.
 #[derive(Clone, Copy)]
 pub enum ActionTone {
     Quiet,
-    Outlined,
+    /// The secondary action: a borderless filled pill, the same as a
+    /// dropdown trigger beside it.
     Filled,
     Solid,
+    Danger,
 }
 
 pub fn action_button(theme: &Theme, tone: ActionTone) -> gpui::Div {
@@ -1541,12 +1543,6 @@ pub fn action_button(theme: &Theme, tone: ActionTone) -> gpui::Div {
         ActionTone::Quiet => button
             .text_color(theme.text_muted)
             .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text)),
-        ActionTone::Outlined => button
-            .bg(theme.input_glass_bg())
-            .border_1()
-            .border_color(theme.border)
-            .text_color(theme.text)
-            .hover(|s| s.bg(theme.glass_hover()).border_color(theme.border_strong)),
         ActionTone::Filled => {
             let lifted = select_fill(theme, true);
             button
@@ -1558,6 +1554,11 @@ pub fn action_button(theme: &Theme, tone: ActionTone) -> gpui::Div {
             .bg(theme.solid)
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(theme.on_solid)
+            .hover(|s| s.opacity(0.9)),
+        // The dialogs' destructive fill (`popover::btn_danger`).
+        ActionTone::Danger => button
+            .bg(theme.danger_strong)
+            .text_color(gpui::white())
             .hover(|s| s.opacity(0.9)),
     }
 }

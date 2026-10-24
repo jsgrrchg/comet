@@ -30,8 +30,10 @@ pub enum RowKind {
     User,
     Tools,
     Chip,
+    Notice,
     Image,
     Working,
+    Visual,
 }
 
 /// A user message awaiting its host echo (client-minted id = the echo's id).
@@ -83,6 +85,13 @@ pub(crate) struct Chip {
     pub text: PText,
 }
 
+/// An error, as a card: a red wash with lighter red text, and, when signing
+/// in fixes it (signed out, a usage limit), a button that starts that.
+pub(crate) struct Notice {
+    pub text: PText,
+    pub action: Option<(&'static str, &'static str)>,
+}
+
 // Cores are built once and shared behind Arc; boxing variants only adds a hop.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Content {
@@ -90,8 +99,11 @@ pub(crate) enum Content {
     User(UserBubble),
     Tools(ToolGroup),
     Chip(Chip),
+    Notice(Notice),
     Image { reference: String },
     Working { since_ms: Option<i64>, streaming: bool },
+    /// An agent visual: its height comes from its worker.
+    Visual(Arc<crate::visual::VisualSlot>),
 }
 
 /// A width-independent row: identity, top gap class and prepared content.
@@ -139,8 +151,13 @@ pub(crate) mod geom {
     pub const THUMB: f32 = 76.0;
     pub const FILE_PILL: f32 = 32.0;
     pub const CHIP_LINE: f32 = 32.0;
+    /// Error cards: inner padding, and their action button.
+    pub const NOTICE_PAD: f32 = 12.0;
+    pub const NOTICE_BUTTON: f32 = 32.0;
+    pub const NOTICE_BUTTON_W: f32 = 80.0;
     pub const IMAGE: f32 = 260.0;
     pub const WORKING: f32 = 36.0;
+    pub const VISUAL_LOADING: f32 = 18.0;
 }
 
 impl Gap {
@@ -184,6 +201,9 @@ pub(crate) struct RowBuilder {
     pub collapsed: HashSet<u64>,
     /// Per-tool inline detail overrides (row detail key → open).
     pub detail_open: HashMap<u64, bool>,
+    /// Visual rows' links to their workers, by visual id (kept across
+    /// rebuilds: the worker holds the same slot).
+    pub visual_slots: HashMap<String, Arc<crate::visual::VisualSlot>>,
 }
 
 pub(crate) fn quick_hash(s: &str) -> u64 {
@@ -404,6 +424,23 @@ impl RowBuilder {
                             });
                             rows.push(Placed { core, gap });
                         }
+                        MessagePart::Visual { id, path, title } => {
+                            let gap = gap_for(&rows, false);
+                            let slot = self
+                                .visual_slots
+                                .entry(id.clone())
+                                .or_insert_with(|| crate::visual::VisualSlot::new(id, path, title))
+                                .clone();
+                            let core = Arc::new(RowCore {
+                                key: row_key(&format!("{}#{}", entry.id, id)),
+                                version: next_version(),
+                                kind: RowKind::Visual,
+                                entry_id: Arc::from(entry.id.as_str()),
+                                content: Content::Visual(slot),
+                                copy_text: title.clone(),
+                            });
+                            rows.push(Placed { core, gap });
+                        }
                         MessagePart::Input { id, questions, resolved, .. } => {
                             let text = if *resolved {
                                 "Answered a question".to_owned()
@@ -415,12 +452,19 @@ impl RowBuilder {
                         }
                         MessagePart::Error { id, message } => {
                             let gap = gap_for(&rows, false);
-                            rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "exclamationmark.triangle", ColorRole::Danger, message)), gap });
+                            rows.push(Placed { core: Arc::new(notice_row(ctx, &entry.id, id, message)), gap });
                         }
                         MessagePart::Fork { id, source_title, .. } => {
                             let gap = gap_for(&rows, false);
                             let text = format!("Forked from {source_title}");
                             rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "arrow.triangle.branch", ColorRole::TextTertiary, &text)), gap });
+                        }
+                        MessagePart::Switch { id, from, to, from_harness, to_harness } => {
+                            let gap = gap_for(&rows, false);
+                            rows.push(Placed {
+                                core: Arc::new(switch_row(ctx, &entry.id, id, (from, from_harness.as_deref()), (to, to_harness.as_deref()))),
+                                gap,
+                            });
                         }
                         _ => {}
                     }
@@ -460,6 +504,8 @@ impl RowBuilder {
                 .map(|(_, core)| core.clone());
             let core = reuse.unwrap_or_else(|| {
                 let id = format!("{pkey}.{bi}");
+                // Each block is its own row: its formulas share one budget.
+                ctx.math_area = 0.0;
                 let content = prepare_block(ctx, &block.block, 0, false);
                 Arc::new(RowCore {
                     key: row_key(&id),
@@ -637,6 +683,7 @@ fn prepare_user_text(ctx: &mut Ctx, body: &str, style: super::style::Resolved, l
             pad_start: pad.0,
             pad_end: pad.1,
             atomic,
+            inline_box: None,
         });
         paints.push(super::markdown::SpanPaint {
             color: ColorRole::Text,
@@ -677,6 +724,8 @@ fn prepare_user_text(ctx: &mut Ctx, body: &str, style: super::style::Resolved, l
         links,
         chip: ((lh - chip_h) / 2.0, chip_h),
         badges,
+        marks: Vec::new(),
+        math: Vec::new(),
     }
 }
 
@@ -698,12 +747,97 @@ fn chip_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, icon: &'static str, co
     }
 }
 
+fn notice_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, message: &str) -> RowCore {
+    let (size, lh) = TYPE.small;
+    let style = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
+    let lh = ctx.typo.px(lh);
+    let action = zeron_proto::run_errors::provider_problem(message).map(|problem| ("sign-in", problem.action_label()));
+    RowCore {
+        key: row_key(&format!("{entry_id}#{part_id}")),
+        version: next_version(),
+        kind: RowKind::Notice,
+        entry_id: Arc::from(entry_id),
+        content: Content::Notice(Notice {
+            text: prepare_plain(ctx, message, style, lh, ColorRole::DangerSoft, WhiteSpace::Normal),
+            action,
+        }),
+        copy_text: message.to_owned(),
+    }
+}
+
+/// The provider-switch seam: "Switched from [logo] to [logo]", each
+/// provider by its logo alone (its name stays in the copied text). A seam
+/// written without harness ids names them instead.
+fn switch_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, from: (&str, Option<&str>), to: (&str, Option<&str>)) -> RowCore {
+    let (size, lh) = TYPE.small;
+    let style = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
+    let lh = ctx.typo.px(lh);
+    let mark = ctx.typo.px(14.0);
+    let mut text = String::new();
+    let mut spans = Vec::new();
+    let mut marks = Vec::new();
+    let mut push = |text: &mut String, piece: &str, harness: Option<&str>| {
+        let start = text.len();
+        // A logo stands in for the name: a zero-width word joiner carries the
+        // padding the logo is drawn in.
+        text.push_str(if harness.is_some() { "\u{2060}" } else { piece });
+        let pad = if harness.is_some() { mark + 4.0 } else { 0.0 };
+        spans.push(zeron_text::Span { range: start..text.len(), style: style.id, pad_start: pad, pad_end: 0.0, atomic: harness.is_some(), inline_box: None });
+        if let Some(harness) = harness {
+            marks.push((spans.len() - 1, format!("brand:{harness}")));
+        }
+    };
+    push(&mut text, "Switched from ", None);
+    push(&mut text, from.0, from.1.filter(|h| !h.is_empty()));
+    push(&mut text, " to ", None);
+    push(&mut text, to.0, to.1.filter(|h| !h.is_empty()));
+    let paints = spans
+        .iter()
+        .map(|_| super::markdown::SpanPaint { color: ColorRole::TextSecondary, decoration: super::display::Decoration::None, link: None, chip: false })
+        .collect();
+    let p = zeron_text::prepare(
+        &ctx.typo.book,
+        ctx.cache,
+        &text,
+        &spans,
+        &zeron_text::PrepareOptions { white_space: WhiteSpace::Normal, overflow_wrap: zeron_text::OverflowWrap::Anywhere, ..Default::default() },
+    );
+    let copy_text = format!("Switched from {} to {}", from.0, to.0);
+    RowCore {
+        key: row_key(&format!("{entry_id}#{part_id}")),
+        version: next_version(),
+        kind: RowKind::Chip,
+        entry_id: Arc::from(entry_id),
+        content: Content::Chip(Chip {
+            icon: "arrow.left.arrow.right",
+            color: ColorRole::TextTertiary,
+            text: PText { p, lh, base: super::style::baseline(lh, style), paints, links: Vec::new(), chip: (0.0, 0.0), badges: Vec::new(), marks, math: Vec::new() },
+        }),
+        copy_text,
+    }
+}
+
+/// The message column's width in a viewport `width` wide.
+pub(crate) fn column_width(px: Px, width: f32) -> f32 {
+    use geom::*;
+    // Comfortable measure on iPad/landscape: cap the column, center it.
+    (width - px.v(MARGIN_X) * 2.0).clamp(40.0, px.v(READING_WIDTH))
+}
+
 /// Lays out (and optionally paints) one row at `width` (full viewport width).
-pub(crate) fn place_row(core: &RowCore, gap: Gap, px: Px, width: f32, mut out: Option<&mut DisplayBuilder>) -> f32 {
+/// `visual` is a visual row's measured height (its slot's, read with the
+/// frame's version).
+pub(crate) fn place_row(
+    core: &RowCore,
+    gap: Gap,
+    px: Px,
+    width: f32,
+    visual: Option<f32>,
+    mut out: Option<&mut DisplayBuilder>,
+) -> f32 {
     use geom::*;
     let margin = px.v(MARGIN_X);
-    // Comfortable measure on iPad/landscape: cap the column, center it.
-    let cw = (width - margin * 2.0).clamp(40.0, px.v(READING_WIDTH));
+    let cw = column_width(px, width);
     let x = ((width - cw) / 2.0).max(margin).floor();
     let top = gap.px(px);
     let body = match &core.content {
@@ -723,6 +857,40 @@ pub(crate) fn place_row(core: &RowCore, gap: Gap, px: Px, width: f32, mut out: O
             let th = place_text(&c.text, x + px.v(24.0), top + px.v(4.0), cw - px.v(24.0), out);
             h.max(th + px.v(8.0))
         }
+        Content::Notice(n) => {
+            // Card: padding, the warning glyph beside the text, and the
+            // action button trailing it; text and button centered on each
+            // other.
+            let pad = px.v(NOTICE_PAD);
+            let icon = px.v(16.0);
+            let gap = px.v(10.0);
+            let text_x = x + pad + icon + gap;
+            let button = n.action.map(|_| (px.v(NOTICE_BUTTON_W), px.v(NOTICE_BUTTON)));
+            let trailing = button.map_or(0.0, |(w, _)| w + gap);
+            let text_w = (cw - (text_x - x) - pad - trailing).max(px.v(40.0));
+            // Measure first (no output), then paint the card under the text.
+            let th = place_text(&n.text, text_x, top + pad, text_w, None);
+            let body = button.map_or(th, |(_, bh)| th.max(bh));
+            let h = body + pad * 2.0;
+            let text_y = top + pad + (body - th) / 2.0;
+            if let Some(out) = out.as_deref_mut() {
+                out.fill(x, top, cw, h, px.v(14.0), ColorRole::DangerWash);
+                out.widget(
+                    WidgetKind::Icon { name: "exclamationmark.triangle.fill".into(), color: ColorRole::DangerSoft },
+                    (x + pad, text_y + (n.text.lh - icon) / 2.0, icon, icon),
+                    None,
+                );
+            }
+            place_text(&n.text, text_x, text_y, text_w, out.as_deref_mut());
+            if let (Some((action, label)), Some((bw, bh)), Some(out)) = (n.action, button, out) {
+                out.widget(
+                    WidgetKind::Action { action: action.into(), label: label.into() },
+                    (x + cw - pad - bw, top + pad + (body - bh) / 2.0, bw, bh),
+                    None,
+                );
+            }
+            h
+        }
         Content::Image { reference } => {
             let side = px.v(IMAGE).min(cw);
             if let Some(out) = out {
@@ -730,6 +898,14 @@ pub(crate) fn place_row(core: &RowCore, gap: Gap, px: Px, width: f32, mut out: O
                 out.widget(WidgetKind::Image { reference: reference.clone() }, (x, top, side, side), None);
             }
             side
+        }
+        Content::Visual(slot) => {
+            // Until its worker has measured it: the loading line.
+            let h = visual.unwrap_or(px.v(VISUAL_LOADING));
+            if let Some(out) = out {
+                out.widget(WidgetKind::Visual { id: slot.id.clone() }, (x, top, cw, h), None);
+            }
+            h
         }
         Content::Working { since_ms, streaming } => {
             let h = px.v(WORKING);
@@ -852,16 +1028,24 @@ fn place_user(u: &UserBubble, px: Px, x: f32, y: f32, cw: f32, out: Option<&mut 
 
 /// Heap held by a row's prepared text (diagnostics; blocks recurse).
 pub(crate) fn content_heap_bytes(content: &Content) -> usize {
+    fn formula_bytes(f: &zatex::Formula) -> usize {
+        f.items.capacity() * std::mem::size_of::<zatex::Item>()
+    }
+    // The side table itself, then each formula's items.
+    fn math_bytes(t: &PText) -> usize {
+        t.math.capacity() * std::mem::size_of::<(usize, zatex::Formula)>() + t.math.iter().map(|(_, f)| formula_bytes(f)).sum::<usize>()
+    }
     fn block(b: &PBlock) -> usize {
         match b {
-            PBlock::Text(t) | PBlock::Heading(t) => t.p.heap_bytes(),
+            PBlock::Text(t) | PBlock::Heading(t) => t.p.heap_bytes() + math_bytes(t),
             PBlock::Code(c) => c.body.p.heap_bytes() + c.source.len() + c.label.as_ref().map_or(0, |l| l.p.heap_bytes()),
+            PBlock::Math(m) => formula_bytes(&m.formula),
             PBlock::Quote(children) => children.iter().map(block).sum(),
             PBlock::List { items, .. } => items
                 .iter()
                 .map(|i| i.children.iter().map(block).sum::<usize>() + i.marker.as_ref().map_or(0, |m| m.p.heap_bytes()))
                 .sum(),
-            PBlock::Table(t) => t.cells.iter().flatten().map(|c| c.p.heap_bytes()).sum(),
+            PBlock::Table(t) => t.cells.iter().flatten().map(|c| c.p.heap_bytes() + math_bytes(c)).sum(),
             PBlock::Rule => 0,
         }
     }
@@ -870,7 +1054,8 @@ pub(crate) fn content_heap_bytes(content: &Content) -> usize {
         Content::User(u) => u.text.p.heap_bytes() + u.more.p.heap_bytes() + u.files.iter().map(|(_, n)| n.p.heap_bytes()).sum::<usize>(),
         Content::Tools(t) => super::tools::heap_bytes(t),
         Content::Chip(c) => c.text.p.heap_bytes(),
+        Content::Notice(n) => n.text.p.heap_bytes(),
         Content::Image { reference } => reference.len(),
-        Content::Working { .. } => 0,
+        Content::Working { .. } | Content::Visual(_) => 0,
     }
 }

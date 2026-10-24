@@ -23,8 +23,50 @@ pub enum HarnessId {
     /// google's antigravity agent over acp (`agy_acp_server`, installed from
     /// its pinned release archive).
     Antigravity,
+    /// Meta's Muse Code agent, driven natively over the Muse Session Protocol
+    /// (MSP: `muse` speaking JSON-RPC on stdio).
+    Muse,
     /// Test harness; never shown in production pickers.
     Mock,
+}
+
+impl HarnessId {
+    /// Every harness, in declaration order.
+    pub const ALL: [HarnessId; 11] = [
+        HarnessId::ClaudeCode,
+        HarnessId::Codex,
+        HarnessId::Cursor,
+        HarnessId::Devin,
+        HarnessId::Grok,
+        HarnessId::Hermes,
+        HarnessId::Pi,
+        HarnessId::Opencode,
+        HarnessId::Antigravity,
+        HarnessId::Muse,
+        HarnessId::Mock,
+    ];
+
+    /// The wire slug (`claude-code`, `codex`, ...) — what serde writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HarnessId::ClaudeCode => "claude-code",
+            HarnessId::Codex => "codex",
+            HarnessId::Cursor => "cursor",
+            HarnessId::Devin => "devin",
+            HarnessId::Grok => "grok",
+            HarnessId::Hermes => "hermes",
+            HarnessId::Pi => "pi",
+            HarnessId::Opencode => "opencode",
+            HarnessId::Antigravity => "antigravity",
+            HarnessId::Muse => "muse",
+            HarnessId::Mock => "mock",
+        }
+    }
+
+    /// Inverse of [`Self::as_str`]; `None` for a slug this build does not know.
+    pub fn from_slug(slug: &str) -> Option<HarnessId> {
+        Self::ALL.into_iter().find(|id| id.as_str() == slug)
+    }
 }
 
 /// Durable user preference for one agent's independently-installed CLI.
@@ -91,6 +133,21 @@ pub struct HarnessUpdateFailure {
     pub message: String,
     #[serde(default)]
     pub retryable: bool,
+    /// What failed: looking for a release, or installing one. An engine that
+    /// predates the field only ever reported failed checks.
+    #[serde(default)]
+    pub kind: HarnessUpdateFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessUpdateFailureKind {
+    /// The version probe or release lookup failed; checking again retries.
+    #[default]
+    Check,
+    /// The updater or its verification failed; the release is still known,
+    /// so the update itself can be retried.
+    Install,
 }
 
 /// One row in the device-local harness-update stream.
@@ -123,6 +180,38 @@ pub struct HarnessUpdateStatus {
     /// Provider command shown when mutation cannot be safely automated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manual_command: Option<String>,
+    /// The installed release is known not to work with (or isn't supported
+    /// by) this engine's zeron.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<HarnessCompatibility>,
+    /// A newer release exists, but zeron won't install it: it is known not
+    /// to work. Such a release is never reported as available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_back: Option<HarnessCompatibility>,
+}
+
+/// How well a CLI release works with this zeron (see the engine's
+/// compatibility policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessCompatibilityStatus {
+    Supported,
+    /// Outside the releases this zeron was built and tested against.
+    Unsupported,
+    /// Known not to work with this zeron.
+    Broken,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCompatibility {
+    pub status: HarnessCompatibilityStatus,
+    /// The release this is about.
+    pub version: String,
+    /// One line for the user, naming the release to use instead when known.
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommended_version: Option<String>,
 }
 
 impl HarnessUpdateStatus {
@@ -208,7 +297,7 @@ pub struct ModelOptionChoice {
     pub label: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
     pub prompt: String,
@@ -251,6 +340,53 @@ pub struct RunRequest {
     /// no Zeron tools; title runs never carry it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpServer>,
+    /// Host-resolved environment for the spawned agent process (credential
+    /// broker secrets on a Cloud device: `CODEX_HOME`, `GH_TOKEN`,
+    /// `ANTHROPIC_API_KEY`, …). Filled by the HOST right before the request
+    /// reaches the harness; every driver applies it to the child it spawns.
+    /// `serde(skip)` in BOTH directions: secrets must never ride the command
+    /// plane, the session doc, the run journal, or a log line — and a remote
+    /// sender can never inject environment into a host's agents.
+    #[serde(skip)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Hand-written so a `{:?}` can never print a credential: `env` shows its
+/// keys only. Destructured without `..`, so a new field fails to compile
+/// until it is listed here.
+impl std::fmt::Debug for RunRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let RunRequest {
+            prompt,
+            harness,
+            model,
+            reasoning,
+            model_options,
+            cwd,
+            sandbox,
+            auto_approve,
+            resume,
+            attachments,
+            worktree,
+            mcp,
+            env,
+        } = self;
+        f.debug_struct("RunRequest")
+            .field("prompt", prompt)
+            .field("harness", harness)
+            .field("model", model)
+            .field("reasoning", reasoning)
+            .field("model_options", model_options)
+            .field("cwd", cwd)
+            .field("sandbox", sandbox)
+            .field("auto_approve", auto_approve)
+            .field("resume", resume)
+            .field("attachments", attachments)
+            .field("worktree", worktree)
+            .field("mcp", mcp)
+            .field("env", &env.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 /// A stdio MCP server the harness should add to the agent's session, on top
@@ -415,6 +551,32 @@ pub const SUBAGENT_INPUT_KEEP: [&str; 5] = [
     "subagent_type",
 ];
 
+/// Bounds on an agent's inline visual ([`AgentEvent::Visual`]): a Luau
+/// script Zeron runs in a sandbox and renders natively.
+pub const VISUAL_MAX_BYTES: usize = 256 * 1024;
+pub const VISUAL_MAX_TITLE_CHARS: usize = 200;
+/// Files a visual may ship with (models, textures, environment maps).
+pub const VISUAL_MAX_ASSETS: usize = 16;
+pub const VISUAL_MAX_ASSET_BYTES: usize = 8 * 1024 * 1024;
+pub const VISUAL_MAX_TOTAL_ASSET_BYTES: usize = 10 * 1024 * 1024;
+
+// The MCP server sends a visual to the engine in one WebSocket message, its
+// assets base64-encoded; that message must fit the engine's 16 MiB frame
+// (tungstenite's default), with room for the script escaped as JSON.
+const _: () = assert!(
+    VISUAL_MAX_TOTAL_ASSET_BYTES.div_ceil(3) * 4 + VISUAL_MAX_BYTES * 6 + 64 * 1024 < 16 * 1024 * 1024
+);
+
+/// Whether `name` can name a visual's asset: a plain file name.
+pub fn valid_visual_asset_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
 /// Where one checklist item stands. Claude's TodoWrite, OpenCode and ACP plans
 /// distinguish the item being worked on from those still waiting; Codex and
 /// Cursor only report done / not done.
@@ -571,6 +733,15 @@ pub enum AgentEvent {
         name: String,
         mime_type: String,
     },
+    /// An agent-authored visual shown inline in the reply: a Luau script
+    /// that builds native UI (`zeron-visual`). The engine emits it when the
+    /// agent calls Zeron's `show_visual` MCP tool; `path` is the stored
+    /// script on the host device.
+    Visual {
+        id: String,
+        path: String,
+        title: String,
+    },
     ReasoningDelta {
         text: String,
     },
@@ -602,6 +773,15 @@ pub enum AgentEvent {
     ContextUsage {
         tokens: Option<u64>,
         window: Option<u64>,
+    },
+    /// The subscription's usage as the provider reported it mid-run (Muse's
+    /// `usage/changed`): the engine records it on the account the run used,
+    /// for the Providers meters. Never persisted to docs.
+    #[serde(rename_all = "camelCase")]
+    PlanUsage {
+        windows: Vec<crate::AgentUsageWindow>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_label: Option<String>,
     },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
@@ -782,6 +962,38 @@ mod tests {
         assert_eq!(round.worktree, req.worktree);
     }
 
+    /// Credential-broker secrets ride `RunRequest::env` from the host to the
+    /// harness only: they must never reach the wire, the session doc, or the
+    /// journal, and a sender can never inject them.
+    #[test]
+    fn run_request_env_never_serializes_or_deserializes() {
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let mut req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(req.env.is_empty());
+        req.env
+            .insert("GH_TOKEN".into(), "ghu_secret_token_value".into());
+        req.env
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ant-secret".into());
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("ghu_secret_token_value"), "{json}");
+        assert!(!json.contains("sk-ant-secret"), "{json}");
+        assert!(!json.contains("GH_TOKEN"), "{json}");
+        assert!(!json.contains("\"env\""), "{json}");
+        let round: RunRequest = serde_json::from_str(&json).unwrap();
+        assert!(round.env.is_empty());
+        // A hostile sender spelling the field out is ignored too.
+        let injected = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null,"env":{"LD_PRELOAD":"/tmp/x.so"}}"#;
+        let req: RunRequest = serde_json::from_str(injected).unwrap();
+        assert!(req.env.is_empty());
+        // Debug shows which variables were set, never their values.
+        let mut req = req;
+        req.env
+            .insert("GH_TOKEN".into(), "ghu_secret_token_value".into());
+        let printed = format!("{req:?}");
+        assert!(printed.contains("GH_TOKEN"), "{printed}");
+        assert!(!printed.contains("ghu_secret_token_value"), "{printed}");
+    }
+
     #[test]
     fn harness_id_uses_kebab_case() {
         assert_eq!(
@@ -805,8 +1017,12 @@ mod tests {
             error: None,
             can_apply: true,
             manual_command: Some("claude update".into()),
+            compatibility: None,
+            held_back: None,
         };
         let json = serde_json::to_value(&status).unwrap();
+        // Older peers neither send nor expect the compatibility fields.
+        assert!(json.get("compatibility").is_none() && json.get("heldBack").is_none());
         assert_eq!(json["harness"], "claude-code");
         assert_eq!(json["installedVersion"], "1.0.0");
         assert_eq!(json["policy"], "auto-when-idle");

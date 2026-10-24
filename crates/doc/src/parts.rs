@@ -134,6 +134,14 @@ pub enum MessagePart {
         name: String,
         mime_type: String,
     },
+    /// An agent-authored visual (`show_visual`): a Luau script stored on the
+    /// host at `path`, rendered natively. Old desktop builds' unknown-kind
+    /// fallback yields an empty text part (invisible); iOS drops unknown kinds.
+    Visual {
+        id: String,
+        path: String,
+        title: String,
+    },
     /// Model thinking. Carries its body in a dedicated doc field (`reasoning`,
     /// never `text`) so pre-reasoning desktop builds — whose unknown-kind
     /// fallback renders `text` as prose — degrade to an invisible empty text
@@ -218,6 +226,24 @@ pub enum MessagePart {
         /// source does not rewrite history.
         source_title: String,
     },
+    /// The seam where a chat changed provider: the turns above ran on
+    /// `from`, the turns below run on `to`. Written by the host engine when
+    /// the first run after a harness change is dispatched. Labels are
+    /// display names ("Claude Code", "Codex"), frozen as of the switch.
+    /// `from_harness` / `to_harness` are the harness slugs (`claude-code`,
+    /// `codex`, ...) the UI draws provider logos from; absent on a seam written
+    /// without them. Old builds' unknown-kind fallback yields an invisible empty
+    /// text part.
+    #[serde(rename_all = "camelCase")]
+    Switch {
+        id: String,
+        from: String,
+        to: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_harness: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_harness: Option<String>,
+    },
 }
 
 impl MessagePart {
@@ -225,11 +251,13 @@ impl MessagePart {
         match self {
             MessagePart::Text { id, .. }
             | MessagePart::Image { id, .. }
+            | MessagePart::Visual { id, .. }
             | MessagePart::Reasoning { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
             | MessagePart::Error { id, .. }
-            | MessagePart::Fork { id, .. } => id,
+            | MessagePart::Fork { id, .. }
+            | MessagePart::Switch { id, .. } => id,
         }
     }
 
@@ -261,12 +289,14 @@ impl MessagePart {
                 name,
                 mime_type,
             } => id.len() + path.len() + name.len() + mime_type.len(),
+            MessagePart::Visual { id, path, title } => id.len() + path.len() + title.len(),
             MessagePart::Error { message, .. } => message.len(),
             MessagePart::Fork {
                 source_chat_id,
                 source_title,
                 ..
             } => source_chat_id.len() + source_title.len(),
+            MessagePart::Switch { from, to, .. } => from.len() + to.len(),
         }
     }
 }
@@ -316,6 +346,18 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 *existing = image;
             } else {
                 out.push(image);
+            }
+        }
+        AgentEvent::Visual { id, path, title } => {
+            let visual = MessagePart::Visual {
+                id: id.clone(),
+                path: path.clone(),
+                title: title.clone(),
+            };
+            if let Some(existing) = out.iter_mut().find(|p| p.id() == id) {
+                *existing = visual;
+            } else {
+                out.push(visual);
             }
         }
         AgentEvent::ReasoningDelta { text } => {
@@ -497,6 +539,7 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // subagent sink writes it), never a part of the assistant message.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
+        | AgentEvent::PlanUsage { .. }
         | AgentEvent::ContextUsage { .. }
         | AgentEvent::AvailableCommands { .. }
         | AgentEvent::UserMessage { .. } => {}

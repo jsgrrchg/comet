@@ -6,6 +6,8 @@ members = [
     "crates/voice-session",
     "crates/orb",
     "crates/veil",
+    "crates/term",
+    "crates/term-link",
     "crates/theme",
     "crates/audio",
     "crates/proto",
@@ -17,17 +19,21 @@ members = [
     "crates/rpc",
     "crates/update",
     "crates/ui",
+    "crates/notify",
     "crates/syntax",
     "crates/markdown",
     "crates/mobile",
     "crates/client",
     "crates/mcp",
     "crates/text",
+    "crates/visual",
+    "crates/visual-gpu",
+    "crates/zatex",
     "apps/zeron",
 ]
 
 [workspace.package]
-version = "0.2.112"
+version = "0.2.122"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -36,6 +42,8 @@ publish = false
 zeron-voice-session = { path = "crates/voice-session" }
 zeron-orb = { path = "crates/orb" }
 zeron-veil = { path = "crates/veil" }
+zeron-term = { path = "crates/term" }
+zeron-term-link = { path = "crates/term-link" }
 zeron-voice-media = { path = "crates/voice-media" }
 zeron-audio = { path = "crates/audio" }
 zeron-proto = { path = "crates/proto" }
@@ -47,6 +55,7 @@ zeron-engine = { path = "crates/engine" }
 zeron-rpc = { path = "crates/rpc" }
 zeron-update = { path = "crates/update" }
 zeron-ui = { path = "crates/ui" }
+zeron-notify = { path = "crates/notify" }
 zeron-syntax = { path = "crates/syntax" }
 zeron-markdown = { path = "crates/markdown" }
 zeron-mobile = { path = "crates/mobile" }
@@ -54,6 +63,9 @@ zeron-client = { path = "crates/client" }
 zeron-theme = { path = "crates/theme" }
 zeron-mcp = { path = "crates/mcp" }
 zeron-text = { path = "crates/text" }
+zatex = { path = "crates/zatex" }
+zeron-visual = { path = "crates/visual" }
+zeron-visual-gpu = { path = "crates/visual-gpu" }
 
 # CRDT
 loro = "1.13"
@@ -88,15 +100,16 @@ loro-protocol = "0.3"
 # Paint-time rounded image masks (#9), bounded Windows backdrop blur and
 # translucent compositing, plus blur-aware scene batching (#10).
 # Per-pixel rounded clipping (`Window::with_rounded_clip`, 361ff20).
-gpui = { git = "https://github.com/zeronsh/zui", rev = "361ff20b919fdfb80199ee6d9aed725300cb7d54" }
-gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "361ff20b919fdfb80199ee6d9aed725300cb7d54", features = [
+# Drags need the button held and 4px of travel (0dc69aa).
+gpui = { git = "https://github.com/zeronsh/zui", rev = "0dc69aa254841738b1e84ac743fa0aa435ad71b1" }
+gpui_platform = { git = "https://github.com/zeronsh/zui", rev = "0dc69aa254841738b1e84ac743fa0aa435ad71b1", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "361ff20b919fdfb80199ee6d9aed725300cb7d54" }
-gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "701ca97af7983bf85343d2d1d404ab528b18ec96" }
+gpui_tokio = { git = "https://github.com/zeronsh/zui", rev = "0dc69aa254841738b1e84ac743fa0aa435ad71b1" }
+gpui-base = { git = "https://github.com/zeronsh/gpui-component", rev = "6ffe5e575bd0db31d69764773a823cdeb8913d8e" }
 
 # diffs
 similar = "2"
@@ -169,6 +182,13 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Scenes rasterize in software every frame the camera moves.
+[profile.dev.package.zeron-visual]
+opt-level = 3
+
+[profile.dev.package.zeron-visual-gpu]
+opt-level = 3
 
 # Mobile core (scripts/ios/build-core.sh). Always optimized — layout and sync
 # run on the phone's hot paths, so even Debug app builds link an -O core.

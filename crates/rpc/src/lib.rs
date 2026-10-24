@@ -51,6 +51,10 @@ pub mod methods {
     /// replies with the device's fresh `ListHarnesses` catalog.
     pub const GET_TITLE_SETTINGS: &str = "GetTitleSettings";
     pub const SET_TITLE_SETTINGS: &str = "SetTitleSettings";
+    /// Whether agents' commits on this device credit Zeron
+    /// (`{enabled, cloud}`; set with `{enabled}`).
+    pub const GET_COMMIT_CREDIT: &str = "GetCommitCredit";
+    pub const SET_COMMIT_CREDIT: &str = "SetCommitCredit";
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_SKILLS: &str = "ListSkills";

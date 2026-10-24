@@ -467,6 +467,24 @@ impl ClientInner {
         }
     }
 
+    /// A host stream (terminal output, a subagent's transcript): the relay's
+    /// subscription live, the demo host's channel offline.
+    pub(crate) async fn host_subscribe(
+        self: &Arc<Self>,
+        device_id: &str,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<crate::host_stream::HostStream> {
+        match self.backend() {
+            Backend::Demo(demo) => demo.host_subscribe(device_id, method, params).await,
+            Backend::Live(live) => live
+                .relay
+                .subscribe(device_id, method, params)
+                .await
+                .map(crate::host_stream::HostStream::Live),
+        }
+    }
+
     /// Fresh socket for the chat's room (retry delivery).
     pub(crate) fn kick_room(&self, chat_id: &str) {
         if let Some(room) = self.session_core(chat_id).and_then(|c| c.room()) {
@@ -778,6 +796,72 @@ impl Client {
         let id = chat.id.clone();
         self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;
         Ok(id)
+    }
+
+    /// A fresh side chat under `parent_id`: same host, folder, checkout and
+    /// agent settings as its parent, an empty conversation (the desktop's
+    /// "New side chat"; agent-spawned side chats have the same shape).
+    pub fn create_side_chat(&self, parent_id: &str) -> Result<String> {
+        let parent = self
+            .inner
+            .workspace
+            .chat(parent_id)
+            .ok_or_else(|| ClientError::NotFound(parent_id.to_owned()))?;
+        // One level deep: a side chat's own side chat hangs off the root.
+        let root = parent.parent_chat_id.clone().unwrap_or_else(|| parent.id.clone());
+        let mut chat = parent;
+        chat.id = crate::new_id();
+        chat.parent_chat_id = Some(root);
+        chat.title = None;
+        chat.archived = false;
+        chat.created_at = Utc::now();
+        chat.last_message_at = None;
+        chat.last_message_preview = None;
+        chat.last_seen_at = None;
+        chat.harness_session_id = None;
+        chat.harness_session_cwd = None;
+        chat.harness_session_harness = None;
+        chat.room_gen = Some(2);
+        let id = chat.id.clone();
+        self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;
+        Ok(id)
+    }
+
+    /// Fork `source_id` through its latest completed reply into a side chat
+    /// (`ForkSideChat`, answered by the source's host, which copies the
+    /// conversation). A side chat forks as a sibling, under the same parent.
+    pub async fn fork_side_chat(&self, source_id: &str) -> Result<String> {
+        let source = self
+            .inner
+            .workspace
+            .chat(source_id)
+            .ok_or_else(|| ClientError::NotFound(source_id.to_owned()))?;
+        let parent = source.parent_chat_id.clone().unwrap_or_else(|| source.id.clone());
+        let chat_id = crate::new_id();
+        let reply = self
+            .inner
+            .host_rpc(
+                &source.device_id,
+                zeron_rpc::methods::FORK_SIDE_CHAT,
+                serde_json::json!({
+                    "chatId": chat_id,
+                    "sourceChatId": source.id,
+                    "parentChatId": parent,
+                }),
+            )
+            .await?;
+        // The host writes the fork's row; it reaches this device through
+        // registry sync on its own time. Hold the reply's copy now so the
+        // fork opens at once (the same row converges when sync lands).
+        match serde_json::from_value::<Chat>(reply) {
+            Ok(chat) => {
+                if self.inner.workspace.chat(&chat.id).is_none() {
+                    self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;
+                }
+                Ok(chat.id)
+            }
+            Err(_) => Ok(chat_id),
+        }
     }
 
     fn chat_write(

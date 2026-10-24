@@ -38,6 +38,8 @@ final class AppModel {
     }
 
     @MainActor lazy var voice = RemoteVoiceController(app: self)
+    /// Every chat's terminals (shells on their hosts).
+    @MainActor lazy var terminals = TerminalStore(app: self)
     /// Cloud for this account (status, GitHub, agent logins, billing).
     @MainActor lazy var cloud = CloudStore(app: self)
     private(set) var client: CoreClient?
@@ -231,6 +233,7 @@ final class AppModel {
 
     @MainActor func signOutLocally() {
         voice.stop()
+        terminals.signOut()
         endDeliveryBackgroundTask()
         lastDeliveryActivity = .distantPast
         client?.shutdown()
@@ -413,6 +416,7 @@ final class AppModel {
         let changed = rowsChanged || page != frontPage || archivedVMs != archived || counts != live || hosts != lastHosts
         lastHosts = hosts
         live = counts
+        if !freshSideChats.isEmpty { sweepFreshSideChats() }
         frontPage = page
         archived = archivedVMs
         if changed { observers.values.forEach { $0() } }
@@ -555,6 +559,67 @@ final class AppModel {
             NSLog("open session failed: \(error)")
             return nil
         }
+    }
+
+    // MARK: Companions (side chats, subagents)
+
+    /// A session's side chats, newest first.
+    func sideChats(of chatId: String) -> [SessionRowVM] {
+        (client?.childSessions(parentId: chatId) ?? []).filter { !$0.archived }.map(Self.vm)
+    }
+
+    /// The subagents a session's agent spawned (its open transcript).
+    func sessionSubagents(_ chatId: String) -> [SubagentRow] {
+        guard let client, !chatId.contains("--sub--") else { return [] }
+        return (client.session(chatId: chatId) ?? (try? client.openSession(chatId: chatId)))?.subagents() ?? []
+    }
+
+    /// Side chats started here that nothing has been sent in yet: closed
+    /// unused, they go (the desktop only writes one at its first send).
+    /// Kept across launches, so one left open when the app was killed goes
+    /// too.
+    private(set) var freshSideChats = Set(UserDefaults.standard.stringArray(forKey: "freshSideChats") ?? []) {
+        didSet { UserDefaults.standard.set(Array(freshSideChats), forKey: "freshSideChats") }
+    }
+
+    func forgetFreshSideChat(_ id: String) {
+        freshSideChats.remove(id)
+    }
+
+    /// Fresh side chats nobody has open: empty a minute on, they go; one
+    /// that got a message (from any device) is just a side chat now.
+    private func sweepFreshSideChats() {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        for id in freshSideChats {
+            guard let row = rows[id] ?? client?.sessionRow(chatId: id) else { continue }
+            if row.preview != nil {
+                freshSideChats.remove(id)
+            } else if SessionViewController.live(id) == nil, now - row.createdAtMs > 60_000 {
+                freshSideChats.remove(id)
+                delete(id)
+            }
+        }
+    }
+
+    /// A fresh side chat under `parentId`; nil when it couldn't be made.
+    func createSideChat(parentId: String) -> String? {
+        do {
+            let id = try client?.createSideChat(parentId: parentId)
+            if let id { freshSideChats.insert(id) }
+            refreshWorkspace()
+            return id
+        } catch {
+            NSLog("side chat failed: \(error)")
+            return nil
+        }
+    }
+
+    /// Fork `sourceId` into a side chat (its host copies the conversation).
+    func forkSideChat(sourceId: String) async throws -> String {
+        guard let client else { throw CoreError.Closed }
+        let id = try await client.forkSideChat(sourceId: sourceId)
+        await MainActor.run { refreshWorkspace() }
+        return id
     }
 
     // MARK: New session

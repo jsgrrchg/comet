@@ -12,6 +12,7 @@
 //! (`snapshot()` / `subscribe()`), never over FFI.
 
 mod cloud;
+pub(crate) mod companions;
 mod notes;
 mod providers;
 pub use providers::UsageWindowInfo;

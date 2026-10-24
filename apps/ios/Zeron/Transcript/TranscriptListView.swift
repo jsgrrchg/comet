@@ -121,6 +121,8 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
     var onFollowChange: ((Bool) -> Void)?
     /// A row's button was tapped (`sign-in` on an error card).
     var onAction: ((String) -> Void)?
+    /// A subagent card was tapped (doc id, title, still running).
+    var onSubagent: ((String, String, Bool) -> Void)?
     var onDistanceFromBottom: ((CGFloat) -> Void)?
     var imageLoader: ((String, UIImageView) -> Void)?
     /// An attachment's picture, for an image chip opened full size.
@@ -423,7 +425,15 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
             for i in 0..<frame.rowCount() { if let p = frame.placement(index: i) { knownKeys.insert(p.key) } }
             contentOffset.y = maxOffsetY
         } else if following {
-            if !isTracking { startSpring() }
+            // A reflow for a new width (rotation, iPhone Duo folding) lands
+            // on the tail at once; the follow spring visibly glided there
+            // under the system's fold animation.
+            if let old, old.width() != frame.width() {
+                stopSpring()
+                contentOffset.y = maxOffsetY
+            } else if !isTracking {
+                startSpring()
+            }
         } else if let anchor, let i = frame.indexOf(key: anchor.key), let p = frame.placement(index: i) {
             let target = CGFloat(p.y) + anchor.delta
             if abs(target - contentOffset.y) > 0.5 {
@@ -676,6 +686,10 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
 
     func rowView(_ view: RowView, perform action: String) {
         onAction?(action)
+    }
+
+    func rowView(_ view: RowView, openSubagent docId: String, title: String, running: Bool) {
+        onSubagent?(docId, title, running)
     }
 
     func rowView(_ view: RowView, open url: URL) {

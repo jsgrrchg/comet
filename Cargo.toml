@@ -6,6 +6,7 @@ members = [
     "crates/voice-session",
     "crates/orb",
     "crates/veil",
+    "crates/term",
     "crates/theme",
     "crates/audio",
     "crates/proto",
@@ -31,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.118"
+version = "0.2.121"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -40,6 +41,7 @@ publish = false
 zeron-voice-session = { path = "crates/voice-session" }
 zeron-orb = { path = "crates/orb" }
 zeron-veil = { path = "crates/veil" }
+zeron-term = { path = "crates/term" }
 zeron-voice-media = { path = "crates/voice-media" }
 zeron-audio = { path = "crates/audio" }
 zeron-proto = { path = "crates/proto" }

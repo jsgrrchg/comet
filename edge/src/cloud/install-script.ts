@@ -56,7 +56,7 @@ case "$(uname -m)" in
 esac
 
 # (No pipefail in POSIX sh: a failed fetch yields an empty version, refused below.)
-ver="$(curl -fsSL --retry 3 "$ZERON_EDGE_URL/releases/latest.txt" | tr -d '[:space:]')"
+ver="$(curl -fsSL --retry 3 --max-time 30 "$ZERON_EDGE_URL/releases/latest.txt" | tr -d '[:space:]')"
 case "$ver" in
   "" | *[!A-Za-z0-9._+-]*) echo "zeron cloud install: bad release version '$ver'" >&2; exit 1 ;;
 esac
@@ -68,7 +68,11 @@ if [ -x "$dest/zeron" ]; then
 else
   tmp="$(mktemp -d "$data/.download.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT
-  curl -fsSL --retry 3 -o "$tmp/zeron.tar.gz" "$ZERON_EDGE_URL/releases/zeron-$ver-linux-$arch.tar.gz"
+  # A stalled connection is dropped and redialed (curl retries the timeout):
+  # without a floor one bad connection trickled for good, holding the lock
+  # every retried install then queued behind.
+  curl -fsSL --retry 3 --connect-timeout 15 --speed-limit 1048576 --speed-time 15 \\
+    -o "$tmp/zeron.tar.gz" "$ZERON_EDGE_URL/releases/zeron-$ver-linux-$arch.tar.gz"
   mkdir "$tmp/unpacked"
   tar -xzf "$tmp/zeron.tar.gz" -C "$tmp/unpacked" --strip-components=1
   # Probe before switching: a binary that cannot start must not replace one that can.
@@ -205,6 +209,12 @@ export const installCommand = (env: SessionEnv): string => {
 
 /** Wake fallback when the engine doesn't come back on its own after resume. */
 export const RESTART_ENGINE_COMMAND = `sudo systemctl restart ${CLOUD_UNIT_NAME}`;
+
+/** A wake's first command once the sandbox runs: the sleep stopped the unit
+ * before the provider snapshotted the machine, and a resume from that
+ * snapshot can bring systemd back with the unit still stopped. Idempotent:
+ * a no-op when the engine is already running. */
+export const START_ENGINE_COMMAND = `sudo systemctl start ${CLOUD_UNIT_NAME}`;
 
 /** A sleep's first step: the engine starts no new work, so nothing begins that
  * the stop would cut off; what arrives meanwhile waits for the woken machine.

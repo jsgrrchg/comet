@@ -57,6 +57,11 @@ final class CoreSessionSource: SessionSource {
         handle.setViewAttached(attached: false)
     }
 
+    var isUnused: Bool {
+        let t = handle.transcriptStatus()
+        return t.entryCount == 0 && t.pendingCount == 0 && handle.composer().queue.isEmpty
+    }
+
     func reattach() {
         handle.setViewAttached(attached: true)
     }
@@ -166,6 +171,7 @@ final class CoreSessionSource: SessionSource {
         do {
             if mode == .interrupt, chrome.running { try handle.interrupt() }
             _ = try handle.send(request: SendRequest(text: text, attachments: images.map(\.outgoing), worktree: nil, busy: mode == .steer ? .steer : .queue))
+            app?.forgetFreshSideChat(chatId)
             app?.noteDeliveryActivity()
             sendFailure = nil
             return true
@@ -299,7 +305,7 @@ final class CoreSessionSource: SessionSource {
         #if DEBUG
         // Screenshots: `-all-providers` offers every agent there is.
         if ProcessInfo.processInfo.arguments.contains("-all-providers") {
-            tabs = [tabs[0]] + ["claude-code", "codex", "opencode", "cursor", "devin", "grok", "hermes", "pi", "antigravity"]
+            tabs = [tabs[0]] + ["claude-code", "codex", "opencode", "cursor", "devin", "grok", "hermes", "pi", "antigravity", "muse"]
                 .filter { $0 != harness }
                 .map { id in ModelPickerTab(harness: id, label: HarnessNames.label(id)) { await rows(id) } }
         }
@@ -326,6 +332,18 @@ final class CoreSessionSource: SessionSource {
                 $0.model = model.id
             }
         }
+    }
+
+    /// The chat's provider, where it runs: Cloud's account for a Cloud chat,
+    /// else the computer hosting it.
+    func signInTarget() -> AgentAccountsViewController.Target? {
+        guard let row = app?.row(chatId) else { return nil }
+        let harness = row.harness ?? "claude-code"
+        if row.isCloud {
+            return CloudStore.agents.first { $0.harness == harness }.map { .cloud($0) }
+        }
+        guard !hostDevice.isEmpty, let app else { return nil }
+        return .device(id: hostDevice, name: app.deviceName(hostDevice), harness: harness, label: row.harnessLabel ?? HarnessNames.label(harness))
     }
 
     /// The model a chat without one runs: the host's default for its

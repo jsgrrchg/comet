@@ -854,3 +854,71 @@ async fn a_cloud_project_names_its_repository() {
 
     a.shutdown().await;
 }
+
+/// A Cloud project and a full clone of the same repository are one project:
+/// the Cloud row takes the clone's commit identity, whether it was created
+/// before the clone was known (healed) or after (stamped).
+#[tokio::test]
+async fn cloud_projects_group_with_a_full_clone_of_their_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = assemble(dir.path(), "dev-a");
+    a.workspace
+        .create_cloud_space(
+            "cloud-early",
+            "cloud-acct",
+            "/home/user/app",
+            None,
+            "acme/app",
+        )
+        .expect("create Cloud project");
+    a.workspace
+        .create_space("local", "dev-a", "/src/app", None, true)
+        .expect("create local project");
+    a.workspace
+        .set_space_git("local", true, None, Some("commit:root1"), Some("Acme/App"))
+        .expect("stamp the clone");
+    let repo_of = |id: &str| {
+        a.workspace
+            .read_spaces()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.repository_id)
+    };
+
+    // Healed: the clone's identity, never the other way round.
+    assert_eq!(
+        a.workspace
+            .align_cloud_spaces("acme/app", "commit:root1")
+            .unwrap(),
+        1
+    );
+    assert_eq!(repo_of("cloud-early").as_deref(), Some("commit:root1"));
+    assert_eq!(
+        a.workspace
+            .align_cloud_spaces("acme/app", "github.com/acme/app")
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        a.workspace
+            .align_cloud_spaces("acme/app", "commit:other")
+            .unwrap(),
+        0
+    );
+    assert_eq!(repo_of("cloud-early").as_deref(), Some("commit:root1"));
+
+    // Stamped: a Cloud project created once the clone is known.
+    a.workspace
+        .create_cloud_space(
+            "cloud-late",
+            "cloud-two",
+            "/home/user/app",
+            None,
+            "acme/app",
+        )
+        .expect("create on another Cloud device");
+    assert_eq!(repo_of("cloud-late").as_deref(), Some("commit:root1"));
+
+    a.shutdown().await;
+}

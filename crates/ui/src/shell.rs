@@ -4430,7 +4430,38 @@ impl Shell {
                     cx,
                 );
             }
+            TranscriptEvent::SignIn { chat_id } => self.sign_in_for_chat(chat_id, cx),
         }
+    }
+
+    /// An error card's "Log in": Providers, aimed at the device the chat
+    /// runs on (Cloud's logins for Cloud chats), with its agent open and the
+    /// sign-in started.
+    fn sign_in_for_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        let (target, harness) = {
+            let state = self.state.read(cx);
+            let Some(chat) = state.chats.iter().find(|chat| chat.id == chat_id) else {
+                return;
+            };
+            let Some(harness) = chat.config.as_ref().map(|config| config.harness) else {
+                return;
+            };
+            let target = if zeron_proto::is_cloud_device(&chat.device_id, "") {
+                Some(zeron_proto::CLOUD_ACCOUNTS_DEVICE.to_string())
+            } else if state.local_device_id.as_deref() == Some(chat.device_id.as_str()) {
+                None
+            } else {
+                Some(chat.device_id.clone())
+            };
+            (target, harness)
+        };
+        self.open_settings(SettingsSection::Harnesses, cx);
+        let state = self.state.clone();
+        let page = self
+            .harnesses_page
+            .get_or_insert_with(|| cx.new(|cx| HarnessesPage::new(state, cx)))
+            .clone();
+        page.update(cx, |page, cx| page.sign_in(target, harness, cx));
     }
 
     /// A spawn chip's "Open subagent": focus the existing tab for that doc,

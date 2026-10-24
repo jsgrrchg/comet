@@ -6,11 +6,14 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Host-side answers to terminal queries (terminals/replies.rs).
+alacritty_terminal.workspace = true
 zeron-preview.workspace = true
 zeron-proto.workspace = true
 zeron-doc.workspace = true
 zeron-sync.workspace = true
 zeron-harness.workspace = true
+semver = "1"
 zeron-rpc.workspace = true
 zeron-update.workspace = true
 zeron-notify.workspace = true
@@ -18,6 +21,7 @@ zeron-visual.workspace = true
 loro.workspace = true
 tokio.workspace = true
 futures.workspace = true
+zeron-term-link.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

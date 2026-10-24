@@ -49,7 +49,7 @@ use crate::markdown::parser::{
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _};
-use crate::notice::{NoticeChipIcon::Tile, notice_chip};
+use crate::notice::{NoticeChipIcon::Tile, notice_chip_with_action};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
@@ -3386,6 +3386,9 @@ pub struct Transcript {
     bottom_clearance: f32,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
+    /// The rail's tick stack bounds (painted last frame): maps pointer y to
+    /// a prompt index.
+    rail_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
     /// strip (zeron chat-view.tsx `group-hover`; the rows report hover
     /// themselves). Keyed by ROW so a row→row move within one entry can't
@@ -3459,6 +3462,9 @@ enum BlobFetch {
 /// Shell-facing events (the transcript itself hosts no surfaces).
 #[derive(Debug, Clone)]
 pub enum TranscriptEvent {
+    /// An error card's "Log in": sign in to the provider this chat's run
+    /// was refused by (signed out, or out of usage).
+    SignIn { chat_id: String },
     /// A spawn chip's "Open subagent" affordance: open the subagent's
     /// transcript as a right-pane tab. `chat_id` is the doc the chip lives
     /// in (the frozen blob is keyed `{chat_id}/{doc_id}`); `frozen` means
@@ -3709,6 +3715,7 @@ impl Transcript {
             rail_enabled,
             bottom_clearance: 0.0,
             rail_hover: None,
+            rail_bounds: Rc::new(Cell::new(None)),
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
@@ -3788,6 +3795,14 @@ impl Transcript {
 
     pub(crate) fn set_rail_hover(&mut self, hover: Option<usize>) {
         self.rail_hover = hover;
+    }
+
+    pub(crate) fn rail_bounds(&self) -> &Rc<Cell<Option<Bounds<Pixels>>>> {
+        &self.rail_bounds
+    }
+
+    pub(crate) fn bottom_clearance(&self) -> f32 {
+        self.bottom_clearance
     }
 
     pub(crate) fn rows(&self) -> &[Row] {
@@ -4271,7 +4286,7 @@ impl Transcript {
     /// carries the titlebar chrome inside its own box (the first row's
     /// top gap), so the hold adds nothing — adding the inset on top parked
     /// a new chat's first prompt a double-chrome ~66px low (user report).
-    fn own_send_inset(anchor_ix: usize) -> f32 {
+    pub(crate) fn own_send_inset(anchor_ix: usize) -> f32 {
         if anchor_ix == 0 {
             0.0
         } else {
@@ -7639,7 +7654,22 @@ impl Transcript {
             RowKind::Visual { owner, path, title } => {
                 self.render_visual(&row.id, owner, path, title, cx)
             }
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ErrorChip { message } => {
+                let problem = zeron_proto::run_errors::provider_problem(message);
+                let sign_in = self
+                    .chat_id
+                    .clone()
+                    .filter(|_| problem.is_some())
+                    .map(|chat_id| {
+                        let chat_id = chat_id.to_string();
+                        cx.listener(move |_, _: &gpui::ClickEvent, _, cx| {
+                            cx.emit(TranscriptEvent::SignIn {
+                                chat_id: chat_id.clone(),
+                            });
+                        })
+                    });
+                error_chip(message.clone(), problem, sign_in, &theme)
+            }
             RowKind::ForkMarker { source_title, .. } => fork_marker(source_title.clone(), &theme),
             RowKind::SwitchMarker {
                 from,
@@ -9123,21 +9153,63 @@ fn user_file_pill(name: &str, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// The transcript ErrorChip — the shared [`notice_chip`] in its tile
+/// The transcript ErrorChip — the shared [`notice_chip_with_action`] in its tile
 /// treatment (a port of zeron chat-view.tsx `ErrorChip`, restacked for long
 /// payloads: header row with the red-washed tile and the medium "Error"
 /// label, then the human message below). Unlike the web port, the message
 /// WRAPS instead of truncating: startup-crash errors carry the agent's exit
 /// status and stderr, and a one-line ellipsis was exactly what made
 /// zeronsh/comet#95 undiagnosable from the screenshot.
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+///
+/// A refusal that signing in fixes (signed out, out of usage) says so in the
+/// label and carries a "Log in" button for that chat's provider.
+fn error_chip(
+    message: SharedString,
+    problem: Option<zeron_proto::run_errors::ProviderProblem>,
+    sign_in: Option<impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static>,
+    theme: &Theme,
+) -> AnyElement {
+    use zeron_proto::run_errors::ProviderProblem;
+    let label = match problem {
+        Some(ProviderProblem::SignedOut) => "Signed out",
+        Some(ProviderProblem::LimitReached) => "Limit reached",
+        None => "Error",
+    };
+    let button = sign_in.map(|on_click| {
+        // The app's button metrics (popover::btn_*), compact for the card,
+        // tinted in the card's red rather than a solid fill.
+        let danger = theme.danger;
+        div()
+            .id("error-sign-in")
+            .flex_none()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .bg(danger.opacity(0.14))
+            .text_color(theme.danger_muted)
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_size(crate::typography::ui_rems(12.0))
+            .cursor_pointer()
+            .hover(move |s| s.bg(danger.opacity(0.22)))
+            .on_click(on_click)
+            .child(problem.map_or("Log in", ProviderProblem::action_label))
+    });
     div()
         .py(px(4.0))
         .w_full()
         .child(
-            notice_chip(theme, false, "Error", message, Tile)
-                .overflow_hidden()
-                .w_full(),
+            notice_chip_with_action(
+                theme,
+                false,
+                label,
+                message,
+                Tile,
+                button.map(IntoElement::into_any_element),
+            )
+            .overflow_hidden()
+            .w_full(),
         )
         .into_any_element()
 }

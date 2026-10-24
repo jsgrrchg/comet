@@ -2,7 +2,7 @@ import { SELF, env, introspectWorkflow, runDurableObjectAlarm, runInDurableObjec
 import { describe, expect, it } from "vitest";
 import { authenticate } from "../../src/auth";
 import { handleAuthRoute } from "../../src/auth-routes";
-import { QUIESCE_ENGINE_COMMAND, STOP_ENGINE_COMMAND } from "../../src/cloud/install-script";
+import { QUIESCE_ENGINE_COMMAND, START_ENGINE_COMMAND, STOP_ENGINE_COMMAND } from "../../src/cloud/install-script";
 import { listLedger, listSandboxes, listUsage } from "../../src/cloud/metering";
 import { cloudAccountName } from "../../src/cloud/policy";
 import type { Env } from "../../src/env";
@@ -155,6 +155,33 @@ describe("sessions get their own machines", () => {
     // The room is this user's: nobody else can queue into it.
     const other = newUser();
     expect((await call("POST", `/device/${session.deviceId}/nudge`, userBearer(other), { chatId: "chat-early" })).status).toBe(403);
+  });
+
+  it("starts a user's sessions on the machine size an operator set for them", async () => {
+    const admin = "Bearer test-admin-token";
+    const big = newUser();
+    const other = newUser();
+    const setSize = (u: TestUser, machine: unknown) =>
+      call("POST", "/admin/cloud/machine", admin, { orgId: u.orgId, userId: u.userId, machine });
+    expect((await setSize(big, "huge")).status).toBe(400);
+    expect((await call("POST", "/admin/cloud/machine", undefined, { orgId: big.orgId, userId: big.userId, machine: "xlarge" })).status).toBe(401);
+    expect(await (await setSize(big, "xlarge")).json()).toEqual({ machine: "xlarge" });
+
+    const sizeOf = async (u: TestUser, chatId: string) => {
+      const { spaceId } = await enableCloud(u);
+      const view = (await (await createSession(u, chatId, spaceId)).json()) as SessionView;
+      await sandboxFor(view.deviceId);
+      const create = (await boatState()).calls.find(
+        (c) => c.method === "POST" && c.path === "/sandboxes" && c.headers["idempotency-key"]?.startsWith(view.deviceId)
+      );
+      return (create?.body as { type?: string } | undefined)?.type;
+    };
+    expect(await sizeOf(big, "chat-big")).toBe("xlarge");
+    // Everyone else keeps the server's size.
+    expect(await sizeOf(other, "chat-other")).toBe("default");
+    // Cleared: back to the server's size for new sessions.
+    expect(await (await setSize(big, null)).json()).toEqual({ machine: null });
+    expect(await sizeOf(big, "chat-big-2")).toBe("default");
   });
 
   it("starts a session from the branch picked in the composer", async () => {
@@ -503,6 +530,16 @@ describe("idle sleep, waking on sends and the awake cap", () => {
       .poll(async () => (await boatState()).calls.some((c) => c.path.endsWith("/resume") && c.sandboxId === sandboxId))
       .toBe(true);
     expect((await boatState()).calls.find((c) => c.path.endsWith("/resume") && c.sandboxId === sandboxId)!.body).toEqual({ ttlSeconds: 7200 });
+    // The engine is started right after the resume, not left to the unit:
+    // the sleep stopped it before the snapshot.
+    await expect
+      .poll(async () => {
+        const calls = (await boatState()).calls.filter((c) => c.sandboxId === sandboxId);
+        const resume = calls.findIndex((c) => c.path.endsWith("/resume"));
+        const start = calls.findIndex((c) => c.path.endsWith("/commands") && c.body?.command === START_ENGINE_COMMAND);
+        return resume >= 0 && start > resume;
+      })
+      .toBe(true);
     await runnerToken(u, deviceId, key);
     await waitForSession(u, chatId, "ready");
   });

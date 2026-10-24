@@ -1206,6 +1206,14 @@ impl AccountsPage {
         )
     }
 
+    /// Sign in with the provider's first option (a failed run's "Log in").
+    pub(crate) fn start_first_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        let provider = login_options(harness)
+            .first()
+            .and_then(|option| option.provider);
+        self.start_login(harness, provider, cx);
+    }
+
     fn retry_login(&mut self, cx: &mut Context<Self>) {
         if let Some((harness, provider)) = self.login.as_ref().map(|f| (f.harness, f.provider)) {
             self.start_login(harness, provider, cx);
@@ -2031,6 +2039,7 @@ impl Render for AccountsPage {
             HarnessId::Pi => (crate::icons::PI_MARK, None),
             HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
+            HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),

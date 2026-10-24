@@ -30,6 +30,7 @@ pub enum RowKind {
     User,
     Tools,
     Chip,
+    Notice,
     Image,
     Working,
     Visual,
@@ -84,6 +85,13 @@ pub(crate) struct Chip {
     pub text: PText,
 }
 
+/// An error, as a card: a red wash with lighter red text, and, when signing
+/// in fixes it (signed out, a usage limit), a button that starts that.
+pub(crate) struct Notice {
+    pub text: PText,
+    pub action: Option<(&'static str, &'static str)>,
+}
+
 // Cores are built once and shared behind Arc; boxing variants only adds a hop.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Content {
@@ -91,6 +99,7 @@ pub(crate) enum Content {
     User(UserBubble),
     Tools(ToolGroup),
     Chip(Chip),
+    Notice(Notice),
     Image { reference: String },
     Working { since_ms: Option<i64>, streaming: bool },
     /// An agent visual: its height comes from its worker.
@@ -142,6 +151,10 @@ pub(crate) mod geom {
     pub const THUMB: f32 = 76.0;
     pub const FILE_PILL: f32 = 32.0;
     pub const CHIP_LINE: f32 = 32.0;
+    /// Error cards: inner padding, and their action button.
+    pub const NOTICE_PAD: f32 = 12.0;
+    pub const NOTICE_BUTTON: f32 = 32.0;
+    pub const NOTICE_BUTTON_W: f32 = 80.0;
     pub const IMAGE: f32 = 260.0;
     pub const WORKING: f32 = 36.0;
     pub const VISUAL_LOADING: f32 = 18.0;
@@ -439,7 +452,7 @@ impl RowBuilder {
                         }
                         MessagePart::Error { id, message } => {
                             let gap = gap_for(&rows, false);
-                            rows.push(Placed { core: Arc::new(chip_row(ctx, &entry.id, id, "exclamationmark.triangle", ColorRole::Danger, message)), gap });
+                            rows.push(Placed { core: Arc::new(notice_row(ctx, &entry.id, id, message)), gap });
                         }
                         MessagePart::Fork { id, source_title, .. } => {
                             let gap = gap_for(&rows, false);
@@ -734,6 +747,24 @@ fn chip_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, icon: &'static str, co
     }
 }
 
+fn notice_row(ctx: &mut Ctx, entry_id: &str, part_id: &str, message: &str) -> RowCore {
+    let (size, lh) = TYPE.small;
+    let style = ctx.typo.style(Family::Sans, Weight::Medium, false, size);
+    let lh = ctx.typo.px(lh);
+    let action = zeron_proto::run_errors::provider_problem(message).map(|problem| ("sign-in", problem.action_label()));
+    RowCore {
+        key: row_key(&format!("{entry_id}#{part_id}")),
+        version: next_version(),
+        kind: RowKind::Notice,
+        entry_id: Arc::from(entry_id),
+        content: Content::Notice(Notice {
+            text: prepare_plain(ctx, message, style, lh, ColorRole::DangerSoft, WhiteSpace::Normal),
+            action,
+        }),
+        copy_text: message.to_owned(),
+    }
+}
+
 /// The provider-switch seam: "Switched from [logo] to [logo]", each
 /// provider by its logo alone (its name stays in the copied text). A seam
 /// written without harness ids names them instead.
@@ -825,6 +856,40 @@ pub(crate) fn place_row(
             }
             let th = place_text(&c.text, x + px.v(24.0), top + px.v(4.0), cw - px.v(24.0), out);
             h.max(th + px.v(8.0))
+        }
+        Content::Notice(n) => {
+            // Card: padding, the warning glyph beside the text, and the
+            // action button trailing it; text and button centered on each
+            // other.
+            let pad = px.v(NOTICE_PAD);
+            let icon = px.v(16.0);
+            let gap = px.v(10.0);
+            let text_x = x + pad + icon + gap;
+            let button = n.action.map(|_| (px.v(NOTICE_BUTTON_W), px.v(NOTICE_BUTTON)));
+            let trailing = button.map_or(0.0, |(w, _)| w + gap);
+            let text_w = (cw - (text_x - x) - pad - trailing).max(px.v(40.0));
+            // Measure first (no output), then paint the card under the text.
+            let th = place_text(&n.text, text_x, top + pad, text_w, None);
+            let body = button.map_or(th, |(_, bh)| th.max(bh));
+            let h = body + pad * 2.0;
+            let text_y = top + pad + (body - th) / 2.0;
+            if let Some(out) = out.as_deref_mut() {
+                out.fill(x, top, cw, h, px.v(14.0), ColorRole::DangerWash);
+                out.widget(
+                    WidgetKind::Icon { name: "exclamationmark.triangle.fill".into(), color: ColorRole::DangerSoft },
+                    (x + pad, text_y + (n.text.lh - icon) / 2.0, icon, icon),
+                    None,
+                );
+            }
+            place_text(&n.text, text_x, text_y, text_w, out.as_deref_mut());
+            if let (Some((action, label)), Some((bw, bh)), Some(out)) = (n.action, button, out) {
+                out.widget(
+                    WidgetKind::Action { action: action.into(), label: label.into() },
+                    (x + cw - pad - bw, top + pad + (body - bh) / 2.0, bw, bh),
+                    None,
+                );
+            }
+            h
         }
         Content::Image { reference } => {
             let side = px.v(IMAGE).min(cw);
@@ -989,6 +1054,7 @@ pub(crate) fn content_heap_bytes(content: &Content) -> usize {
         Content::User(u) => u.text.p.heap_bytes() + u.more.p.heap_bytes() + u.files.iter().map(|(_, n)| n.p.heap_bytes()).sum::<usize>(),
         Content::Tools(t) => super::tools::heap_bytes(t),
         Content::Chip(c) => c.text.p.heap_bytes(),
+        Content::Notice(n) => n.text.p.heap_bytes(),
         Content::Image { reference } => reference.len(),
         Content::Working { .. } | Content::Visual(_) => 0,
     }

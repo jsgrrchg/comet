@@ -38,6 +38,8 @@ final class AppModel {
     }
 
     @MainActor lazy var voice = RemoteVoiceController(app: self)
+    /// Every chat's terminals (shells on their hosts).
+    @MainActor lazy var terminals = TerminalStore(app: self)
     /// Cloud for this account (status, GitHub, agent logins, billing).
     @MainActor lazy var cloud = CloudStore(app: self)
     private(set) var client: CoreClient?
@@ -52,7 +54,6 @@ final class AppModel {
     private var workspaceRevision: UInt64 = 0
     private var observers: [UUID: () -> Void] = [:]
     private var sessionObservers: [String: [UUID: () -> Void]] = [:]
-    private var workspaceObservers: [UUID: () -> Void] = [:]
     private lazy var bridge = ListenerBridge(app: self)
     private var refreshScheduled = false
     private var clock: Timer?
@@ -232,6 +233,7 @@ final class AppModel {
 
     @MainActor func signOutLocally() {
         voice.stop()
+        terminals.signOut()
         endDeliveryBackgroundTask()
         lastDeliveryActivity = .distantPast
         client?.shutdown()
@@ -329,14 +331,6 @@ final class AppModel {
         return Token { [weak self] in self?.observers[id] = nil }
     }
 
-    /// Every workspace revision, including changes no list on the front page
-    /// shows (a session's side chats): `observe` fires only when it changes.
-    func observeWorkspace(_ handler: @escaping () -> Void) -> AnyObject {
-        let id = UUID()
-        workspaceObservers[id] = handler
-        return Token { [weak self] in self?.workspaceObservers[id] = nil }
-    }
-
     func observeSession(_ chatId: String, _ handler: @escaping () -> Void) -> AnyObject {
         let id = UUID()
         sessionObservers[chatId, default: [:]][id] = handler
@@ -382,7 +376,6 @@ final class AppModel {
     private func refreshWorkspace() {
         guard let client else { return }
         let ws = client.workspace()
-        let revised = ws.revision != workspaceRevision
         workspaceRevision = ws.revision
         var all: [String: SessionRow] = [:]
         func vm(_ r: SessionRow) -> SessionRowVM {
@@ -423,10 +416,10 @@ final class AppModel {
         let changed = rowsChanged || page != frontPage || archivedVMs != archived || counts != live || hosts != lastHosts
         lastHosts = hosts
         live = counts
+        if !freshSideChats.isEmpty { sweepFreshSideChats() }
         frontPage = page
         archived = archivedVMs
         if changed { observers.values.forEach { $0() } }
-        if revised { workspaceObservers.values.forEach { $0() } }
     }
 
     /// Like the desktop's project grouping: checkouts of one repository
@@ -489,9 +482,7 @@ final class AppModel {
             timeLabel: r.timeLabel,
             unseen: r.unseen,
             pinned: r.pinned,
-            sendFailed: r.sendState == .failed,
-            runningSubagents: Int(r.runningSubagents),
-            workingSideChats: Int(r.workingSideChats)
+            sendFailed: r.sendState == .failed
         )
     }
 
@@ -501,18 +492,6 @@ final class AppModel {
 
     func row(_ id: String) -> SessionRow? {
         rows[id] ?? client?.sessionRow(chatId: id)
-    }
-
-    /// Side chats and agent-spawned chats hanging off `chatId` (archived
-    /// ones left out), recency order.
-    func children(of chatId: String) -> [SessionRowVM] {
-        (client?.childSessions(parentId: chatId) ?? []).filter { !$0.archived }.map(Self.vm)
-    }
-
-    /// Subagents `chatId`'s agent spawned, in spawn order (its open
-    /// transcript's spawn chips; empty while the session isn't open).
-    func subagents(of chatId: String) -> [SubagentInfo] {
-        client?.session(chatId: chatId)?.subagents() ?? []
     }
 
     func sessions(inFolder id: String) -> [SessionRowVM] {
@@ -583,38 +562,65 @@ final class AppModel {
         }
     }
 
-    /// A subagent's transcript (a spawn card's doc), read-only. Finished
-    /// subagents read their frozen copy, so this can wait on the network.
-    @MainActor
-    func openSubagent(docId: String, frozen: Bool) async -> SessionHandle? {
-        guard let client else { return nil }
+    // MARK: Companions (side chats, subagents)
+
+    /// A session's side chats, newest first.
+    func sideChats(of chatId: String) -> [SessionRowVM] {
+        (client?.childSessions(parentId: chatId) ?? []).filter { !$0.archived }.map(Self.vm)
+    }
+
+    /// The subagents a session's agent spawned (its open transcript).
+    func sessionSubagents(_ chatId: String) -> [SubagentRow] {
+        guard let client, !chatId.contains("--sub--") else { return [] }
+        return (client.session(chatId: chatId) ?? (try? client.openSession(chatId: chatId)))?.subagents() ?? []
+    }
+
+    /// Side chats started here that nothing has been sent in yet: closed
+    /// unused, they go (the desktop only writes one at its first send).
+    /// Kept across launches, so one left open when the app was killed goes
+    /// too.
+    private(set) var freshSideChats = Set(UserDefaults.standard.stringArray(forKey: "freshSideChats") ?? []) {
+        didSet { UserDefaults.standard.set(Array(freshSideChats), forKey: "freshSideChats") }
+    }
+
+    func forgetFreshSideChat(_ id: String) {
+        freshSideChats.remove(id)
+    }
+
+    /// Fresh side chats nobody has open: empty a minute on, they go; one
+    /// that got a message (from any device) is just a side chat now.
+    private func sweepFreshSideChats() {
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        for id in freshSideChats {
+            guard let row = rows[id] ?? client?.sessionRow(chatId: id) else { continue }
+            if row.preview != nil {
+                freshSideChats.remove(id)
+            } else if SessionViewController.live(id) == nil, now - row.createdAtMs > 60_000 {
+                freshSideChats.remove(id)
+                delete(id)
+            }
+        }
+    }
+
+    /// A fresh side chat under `parentId`; nil when it couldn't be made.
+    func createSideChat(parentId: String) -> String? {
         do {
-            return try await client.openSubagent(docId: docId, frozen: frozen)
+            let id = try client?.createSideChat(parentId: parentId)
+            if let id { freshSideChats.insert(id) }
+            refreshWorkspace()
+            return id
         } catch {
-            NSLog("open subagent failed: \(error)")
+            NSLog("side chat failed: \(error)")
             return nil
         }
     }
 
-    /// Fork `sourceId` through its last completed reply into a side chat on
-    /// its host. Nil (and a toast with the host's reason) when it can't.
-    @MainActor
-    func forkSideChat(of sourceId: String) async -> String? {
-        guard let client else { return nil }
-        do {
-            let id = try await client.forkSideChat(sourceId: sourceId)
-            refreshWorkspace()
-            return id
-        } catch {
-            let message: String = switch error as? CoreError {
-            case let .HostError(message)?: message
-            case let .HostUnavailable(message)?: "The host is unreachable (\(message))."
-            default: "Couldn't fork this session."
-            }
-            let window = UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first
-            Toast.show(message, in: window)
-            return nil
-        }
+    /// Fork `sourceId` into a side chat (its host copies the conversation).
+    func forkSideChat(sourceId: String) async throws -> String {
+        guard let client else { throw CoreError.Closed }
+        let id = try await client.forkSideChat(sourceId: sourceId)
+        await MainActor.run { refreshWorkspace() }
+        return id
     }
 
     // MARK: New session
@@ -754,17 +760,11 @@ final class AppModel {
         (try? await client?.githubBranches(repo: repo)) ?? []
     }
 
-    /// Create the chat, open it, and send the first message. `sideOf` makes
-    /// it a side chat of that session (its checkout and host; the draft only
-    /// picks the model).
-    func createSession(draft: NewSessionDraft, text: String, images: [StagedImage], sideOf parentId: String? = nil) -> String? {
+    /// Create the chat, open it, and send the first message.
+    func createSession(draft: NewSessionDraft, text: String, images: [StagedImage]) -> String? {
         guard let client else { return nil }
         let target: SessionTarget
-        if let parentId {
-            // Ignored by the core for a side chat; the parent's host fills it.
-            guard let parent = row(parentId) else { return nil }
-            target = .projectless(deviceId: parent.deviceId)
-        } else if let p = draft.projectId {
+        if let p = draft.projectId {
             target = .project(spaceId: p)
         } else if let h = draft.hostId {
             target = .projectless(deviceId: h)
@@ -773,10 +773,10 @@ final class AppModel {
         }
         let config = ChatConfig(harness: draft.harness, model: draft.model, reasoning: draft.effort, modelOptions: [:], sandbox: .workspaceWrite)
         do {
-            let chatId = try client.createSession(newSession: NewSession(target: target, config: config, branch: draft.worktree ? nil : draft.branch, cwd: nil, title: nil, parentChatId: parentId))
+            let chatId = try client.createSession(newSession: NewSession(target: target, config: config, branch: draft.worktree ? nil : draft.branch, cwd: nil, title: nil))
             let handle = try client.openSession(chatId: chatId)
             let project = rawProjects.first { $0.id == draft.projectId }
-            let worktree = draft.worktree && parentId == nil ? project.map { WorktreeSpec(repoPath: $0.path, base: draft.branch ?? "HEAD", spaceId: $0.id) } : nil
+            let worktree = draft.worktree ? project.map { WorktreeSpec(repoPath: $0.path, base: draft.branch ?? "HEAD", spaceId: $0.id) } : nil
             _ = try handle.send(request: SendRequest(text: text, attachments: images.map(\.outgoing), worktree: worktree, busy: .queue))
             noteDeliveryActivity()
             refreshWorkspace()

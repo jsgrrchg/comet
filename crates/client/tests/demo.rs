@@ -73,7 +73,13 @@ fn front_page_mirrors_the_desktop_sidebar() {
     assert_eq!(ids(&ws.archived), ["chat-oklch", "chat-presence"]);
     assert_eq!(
         ids(ws.children("chat-veil")),
-        ["chat-side-2", "chat-side-3", "chat-side", "chat-side-4"]
+        [
+            "chat-side-2",
+            "chat-side-easing",
+            "chat-side-3",
+            "chat-side",
+            "chat-side-4"
+        ]
     );
 
     let veil = ws.session("chat-veil").unwrap();
@@ -162,24 +168,31 @@ fn spawn_chips_open_their_subagent_transcript() {
     // One chat shows both: a side chat and a subagent.
     assert_eq!(
         ids(ws.children("chat-veil")),
-        ["chat-side-2", "chat-side-3", "chat-side", "chat-side-4"]
+        [
+            "chat-side-2",
+            "chat-side-easing",
+            "chat-side-3",
+            "chat-side",
+            "chat-side-4"
+        ]
     );
     let veil_sub = spawned("chat-veil").expect("chat-veil carries a linked spawn chip");
-    // Its spawned subagents, in spawn order: four finished, four running.
+    // Its spawned subagents, in spawn order (its own eight and the
+    // companions panel's three): six finished, five running.
     let agents = client
         .open_session("chat-veil")
         .unwrap()
         .snapshot()
         .subagents();
     let count = |state| agents.iter().filter(|a| a.state == state).count();
-    assert_eq!(count(zeron_client::SubagentState::Running), 4);
-    assert_eq!(count(zeron_client::SubagentState::Done), 3);
-    assert_eq!(count(zeron_client::SubagentState::Failed), 1);
+    assert_eq!(count(zeron_client::session::SubagentState::Running), 5);
+    assert_eq!(count(zeron_client::session::SubagentState::Done), 5);
+    assert_eq!(count(zeron_client::session::SubagentState::Failed), 1);
     assert_eq!(agents[0].title, "Map how the veil splits chunks");
     assert_eq!(agents[0].model.as_deref(), Some("haiku"));
     let running = agents
         .iter()
-        .find(|a| a.state == zeron_client::SubagentState::Running)
+        .find(|a| a.state == zeron_client::session::SubagentState::Running)
         .unwrap();
     assert!(running.tail.is_some());
     let runtime = zeron_client::runtime::shared();
@@ -844,7 +857,9 @@ fn sends_to_an_offline_host_park_as_queued_not_working() {
 fn provider_switch_needs_a_host_that_switches() {
     let (client, _dir) = demo(fast());
     let switched = |chat: &str| {
-        let mut config = client.session_config(chat).expect("demo chats have a config");
+        let mut config = client
+            .session_config(chat)
+            .expect("demo chats have a config");
         use zeron_proto::HarnessId;
         config.harness = if config.harness == HarnessId::Codex {
             HarnessId::ClaudeCode

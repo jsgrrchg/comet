@@ -3935,7 +3935,7 @@ async fn drive_run(
     let mut final_completed_turn = None;
     let mut final_outcome = None;
     let final_status = loop {
-        let mut event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
+        let event: AgentEvent = if let Some(event) = prepared_events.pop_front() {
             event
         } else {
             let raw_event = tokio::select! {

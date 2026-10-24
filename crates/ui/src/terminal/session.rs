@@ -3,7 +3,8 @@
 
 use super::emulator::Emulator;
 use super::panel::{backoff_ms, decode_base64, encode_base64, exit_message, with_target};
-use super::view::{COALESCE_MS, InputCoalescer, InputFlush, RESIZE_DEBOUNCE_MS};
+use super::predict::Predictor;
+use super::view::{InputQueue, RESIZE_DEBOUNCE_MS};
 use crate::state::{AppState, EngineHandle};
 use gpui::{App, Context, Entity, SharedString, Task};
 use std::time::{Duration, Instant};
@@ -18,16 +19,27 @@ pub(crate) struct TerminalSessionModel {
     pub(crate) terminal_id: Option<String>,
     pub(crate) target_device_id: Option<String>,
     pub(crate) emulator: Emulator,
+    /// How far past `display_offset` the view sits, in rows (0..1): history
+    /// scrolls by the pixel, so a trackpad glides instead of stepping.
     pub(super) scroll_remainder: f32,
+    /// Fractional wheel rows owed to a program (reports / arrow keys).
+    pub(super) wheel_remainder: f32,
     pub(crate) exited: Option<i32>,
     pub(crate) last_seq: u64,
-    /// `WriteTerminal` ordering stamp: the host applies this session's frames
-    /// in `seq` order even when concurrent RPC handling swaps them. It lives
-    /// with the session, so a tab moved to another view keeps its sequence.
-    writer_id: String,
-    next_write_seq: u64,
-    coalescer: InputCoalescer,
-    flush_task: Option<Task<()>>,
+    /// Keys on their way to the PTY, one write in flight. It lives with the
+    /// session, so a tab moved to another view keeps its order.
+    pub(super) input: InputQueue,
+    /// Local echo for a terminal on another device.
+    pub(super) predictor: Predictor,
+    /// Withdraws stale predictions when the host stays silent.
+    predict_task: Option<Task<()>>,
+    /// Shows a synchronized update the program never closed.
+    sync_task: Option<Task<()>>,
+    /// Input-method composition in progress.
+    pub(super) marked_text: Option<String>,
+    /// The host answers terminal queries itself; this emulator's answers
+    /// would arrive second (and late, across a network) and read as input.
+    host_replies: bool,
     resize_task: Option<Task<()>>,
     _run: Option<Task<()>>,
     closed: bool,
@@ -49,12 +61,15 @@ impl TerminalSessionModel {
             target_device_id: None,
             emulator: Emulator::new(80, 24),
             scroll_remainder: 0.0,
+            wheel_remainder: 0.0,
             exited: None,
             last_seq: 0,
-            writer_id: uuid::Uuid::new_v4().to_string(),
-            next_write_seq: 0,
-            coalescer: InputCoalescer::default(),
-            flush_task: None,
+            input: InputQueue::default(),
+            predictor: Predictor::default(),
+            predict_task: None,
+            sync_task: None,
+            marked_text: None,
+            host_replies: false,
             resize_task: None,
             _run: None,
             closed: false,
@@ -129,7 +144,8 @@ impl TerminalSessionModel {
             return;
         }
         self.closed = true;
-        self.flush_task = None;
+        self.predict_task = None;
+        self.sync_task = None;
         self.resize_task = None;
         // An in-flight open must finish so it can release the returned PTY.
         // Its weak entity check below rejects closed/released models.
@@ -170,6 +186,8 @@ impl TerminalSessionModel {
                 .update(cx, |model, _| (model.emulator.cols() as u16, model.emulator.rows() as u16))
                 .unwrap_or((80, 24));
 
+            // A PTY someone else opened has whatever size they gave it.
+            let opened_elsewhere = existing_session.is_some();
             let session = match existing_session {
                 Some(session) => session,
                 None => {
@@ -207,19 +225,53 @@ impl TerminalSessionModel {
             let terminal_id = session.id.clone();
             let attached = this
                 .update(cx, |model, cx| {
-                    if !model.closed {
-                        model.terminal_id = Some(terminal_id.clone());
-                        model.target_device_id = target.clone();
-                        // The destination may have resized while OpenTerminal
-                        // was pending, after its initial dimensions were sent.
-                        model.schedule_resize(cx);
-                        cx.notify();
-                        true
-                    } else {
-                        false
+                    if model.closed {
+                        return None;
                     }
+                    model.terminal_id = Some(terminal_id.clone());
+                    model.target_device_id = target.clone();
+                    model.host_replies = session.host_replies;
+                    let size = (model.emulator.cols() as u16, model.emulator.rows() as u16);
+                    // Keys typed while the PTY was still opening.
+                    model.pump_input(cx);
+                    cx.notify();
+                    Some(size)
                 })
-                .unwrap_or(false);
+                .ok()
+                .flatten();
+            // The grid may have been measured (or resized, or moved to another
+            // view) while the open was in flight — a remote open easily
+            // outlasts the resize debounce, which has no terminal to address
+            // yet and gives up. Tell the PTY the size actually on screen, or
+            // the shell wraps at the wrong column (zsh's `%` end-of-line
+            // marker is the first casualty).
+            // Sent alongside the subscription rather than ahead of it: the
+            // stream needn't wait a round trip for the PTY to learn its size.
+            if let Some((now_cols, now_rows)) = attached
+                && (opened_elsewhere || (now_cols, now_rows) != (cols, rows))
+            {
+                let (engine, terminal_id, target) =
+                    (engine.clone(), terminal_id.clone(), target.clone());
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = engine
+                            .client()
+                            .call(
+                                methods::RESIZE_TERMINAL,
+                                with_target(
+                                    serde_json::json!({
+                                        "terminalId": terminal_id,
+                                        "cols": now_cols,
+                                        "rows": now_rows,
+                                    }),
+                                    &target,
+                                ),
+                            )
+                            .await;
+                    })
+                    .detach();
+            }
+            let attached = attached.is_some();
             if !attached {
                 // Tab was closed before the open completed — release the PTY.
                 let _ = engine
@@ -237,19 +289,23 @@ impl TerminalSessionModel {
 
             let mut attempt: u32 = 0;
             loop {
-                let Ok(after_seq) = this.update(cx, |model, _| {
-                    (!model.closed).then_some(model.last_seq)
+                let Ok(resume) = this.update(cx, |model, _| {
+                    (!model.closed).then_some((model.last_seq, model.host_replies))
                 }) else {
                     return; // entity released
                 };
-                let Some(after_seq) = after_seq else { return }; // tab closed
+                let Some((after_seq, host_replies)) = resume else { return }; // tab closed
 
                 let subscribed = engine
                     .client()
                     .subscribe(
                         methods::SUBSCRIBE_TERMINAL,
                         with_target(
-                            serde_json::json!({ "terminalId": terminal_id, "afterSeq": after_seq }),
+                            serde_json::json!({
+                                "terminalId": terminal_id,
+                                "afterSeq": after_seq,
+                                "hostReplies": host_replies,
+                            }),
                             &target,
                         ),
                     )
@@ -276,7 +332,7 @@ impl TerminalSessionModel {
                     };
                     attempt = 0;
                     let outcome = this.update(cx, |model, cx| {
-                        model.apply_stream_event(&engine, event, cx)
+                        model.apply_stream_event(event, cx)
                     });
                     match outcome {
                         Ok(StreamDisposition::Continue) => {}
@@ -302,12 +358,7 @@ impl TerminalSessionModel {
         })
     }
 
-    fn apply_stream_event(
-        &mut self,
-        engine: &EngineHandle,
-        event: TerminalEvent,
-        cx: &mut Context<Self>,
-    ) -> StreamDisposition {
+    fn apply_stream_event(&mut self, event: TerminalEvent, cx: &mut Context<Self>) -> StreamDisposition {
         if self.closed {
             return StreamDisposition::Stop;
         }
@@ -315,13 +366,20 @@ impl TerminalSessionModel {
             TerminalEvent::Data { seq, data } => {
                 self.last_seq = seq;
                 let responses = self.emulator.feed(&decode_base64(&data));
-                if !responses.is_empty()
-                    && let Some(id) = self.terminal_id.clone()
-                {
-                    // Query responses (DSR etc.) go straight back, no coalescing,
-                    // but share the keyboard's sequence so neither overtakes.
-                    let params = self.write_params(id, &responses);
-                    send_write(engine, params, cx);
+                if self.emulator.alt_screen() {
+                    self.predictor.reset();
+                }
+                self.predictor.output(&self.emulator, Instant::now());
+                let sync_deadline = self.emulator.sync_deadline();
+                if !responses.is_empty() && !self.host_replies {
+                    // Query responses (DSR etc.) share the key queue, so they
+                    // reach the PTY in order with what was typed. Hosts that
+                    // answer queries themselves get none from here.
+                    self.input.push(&responses);
+                    self.pump_input(cx);
+                }
+                if let Some(deadline) = sync_deadline {
+                    self.schedule_sync_flush(deadline, cx);
                 }
                 cx.notify();
                 StreamDisposition::Continue
@@ -329,6 +387,8 @@ impl TerminalSessionModel {
             TerminalEvent::Exit { seq, exit_code, .. } => {
                 self.last_seq = seq;
                 self.exited = Some(exit_code);
+                self.predictor.reset();
+                self.marked_text = None;
                 self.emulator.feed(&exit_message(exit_code));
                 cx.notify();
                 StreamDisposition::Stop
@@ -336,66 +396,133 @@ impl TerminalSessionModel {
         }
     }
 
-    /// `WriteTerminal` params for `bytes`, stamped with this session's next seq.
-    fn write_params(&mut self, terminal_id: String, bytes: &[u8]) -> serde_json::Value {
-        let seq = self.next_write_seq;
-        self.next_write_seq += 1;
-        with_target(
-            serde_json::json!({
-                "terminalId": terminal_id,
-                "data": encode_base64(bytes),
-                "writerId": self.writer_id,
-                "seq": seq,
-            }),
-            &self.target_device_id,
-        )
-    }
-
-    /// Queue keyboard bytes: sent at once when idle, else at the end of the
-    /// 12 ms window opened by the previous send.
+    /// Send keyboard bytes now (or right after the write already in flight).
     pub(super) fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if self.closed || self.exited.is_some() {
             return;
         }
         // A keypress while scrolled back snaps to the live bottom (xterm).
-        if self.emulator.display_offset() > 0 {
+        if self.emulator.display_offset() > 0 || self.scroll_remainder != 0.0 {
             self.emulator.scroll_to_bottom();
+            self.scroll_remainder = 0.0;
         }
-        match self.coalescer.push(bytes, Instant::now()) {
-            InputFlush::Now => self.flush_input(cx),
-            InputFlush::After(delay) => self.flush_task = Some(Self::schedule_flush(delay, cx)),
-            InputFlush::Pending => {}
-        }
+        self.input.push(bytes);
+        self.pump_input(cx);
     }
 
-    fn schedule_flush(delay: Duration, cx: &mut Context<Self>) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(delay).await;
-            let _ = this.update(cx, |model, cx| model.flush_input(cx));
-        })
-    }
-
-    fn flush_input(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
+    /// Send bytes the PROGRAM asked for (focus, pointer and wheel reports):
+    /// in order with typing, but without a keystroke's side effects — the
+    /// view stays where the user scrolled it.
+    pub(super) fn send_report(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         if self.closed {
             return;
         }
-        if self.coalescer.is_empty() {
+        self.input.push(bytes);
+        self.pump_input(cx);
+    }
+
+    /// Typed text from the keyboard or an input method.
+    pub(super) fn type_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let predictable = self.target_device_id.is_some()
+            && !self.emulator.alt_screen()
+            && self.emulator.display_offset() == 0
+            && self.emulator.cursor().is_some();
+        if predictable {
+            let cursor = self.emulator.live_cursor();
+            let cols = self.emulator.cols();
+            self.predictor.typed(text, cursor, cols, Instant::now());
+        } else {
+            self.predictor.interrupt();
+        }
+        self.schedule_prediction_expiry(cx);
+        self.queue_input(text.as_bytes(), cx);
+    }
+
+    /// Start the next `WriteTerminal` unless one is in flight; its completion
+    /// pumps again, so a burst drains as fast as the engine acks.
+    fn pump_input(&mut self, cx: &mut Context<Self>) {
+        if self.closed {
             return;
         }
-        let Some(id) = self.terminal_id.clone() else {
-            // OpenTerminal still in flight — keep the buffer, retry shortly.
-            if self.exited.is_none() {
-                let retry = Duration::from_millis(COALESCE_MS);
-                self.flush_task = Some(Self::schedule_flush(retry, cx));
-            }
+        let Some(engine) = self.engine(cx) else {
             return;
         };
-        let bytes = self.coalescer.take(Instant::now());
-        let params = self.write_params(id, &bytes);
-        send_write(&engine, params, cx);
+        // OpenTerminal still in flight: the attach pumps once it lands.
+        let Some(id) = self.terminal_id.clone() else {
+            return;
+        };
+        let Some(bytes) = self.input.start() else {
+            return;
+        };
+        let target = self.target_device_id.clone();
+        if target.is_some() {
+            self.predictor.sent(Instant::now());
+        }
+        let data = encode_base64(&bytes);
+        cx.spawn(async move |this, cx| {
+            let _ = engine
+                .client()
+                .call(
+                    methods::WRITE_TERMINAL,
+                    with_target(
+                        serde_json::json!({ "terminalId": id, "data": data }),
+                        &target,
+                    ),
+                )
+                .await;
+            let _ = this.update(cx, |model, cx| {
+                model.input.finish();
+                model.pump_input(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Withdraw predictions if the host leaves them unconfirmed past their
+    /// deadline.
+    fn schedule_prediction_expiry(&mut self, cx: &mut Context<Self>) {
+        let Some(deadline) = self.predictor.next_deadline() else {
+            return;
+        };
+        self.predict_task = Some(cx.spawn(async move |this, cx| {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            cx.background_executor()
+                .timer(wait + Duration::from_millis(1))
+                .await;
+            let _ = this.update(cx, |model, cx| {
+                if model.predictor.expire(Instant::now()) {
+                    cx.notify();
+                }
+            });
+        }));
+    }
+
+    /// Show a synchronized update at its deadline even if the program never
+    /// ends it (a crashed TUI must not freeze the screen).
+    fn schedule_sync_flush(&mut self, deadline: Instant, cx: &mut Context<Self>) {
+        self.sync_task = Some(cx.spawn(async move |this, cx| {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            cx.background_executor()
+                .timer(wait + Duration::from_millis(1))
+                .await;
+            let _ = this.update(cx, |model, cx| {
+                if model.closed {
+                    return;
+                }
+                if model
+                    .emulator
+                    .sync_deadline()
+                    .is_some_and(|due| due <= Instant::now())
+                {
+                    let responses = model.emulator.finish_sync();
+                    if !responses.is_empty() && !model.host_replies {
+                        model.input.push(&responses);
+                        model.pump_input(cx);
+                    }
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     /// Resize the emulator immediately; debounce only the host RPC. Timers
@@ -407,6 +534,8 @@ impl TerminalSessionModel {
             return;
         }
         self.emulator.resize(cols, rows);
+        // The shell redraws for the new width; nothing predicted still holds.
+        self.predictor.reset();
         self.schedule_resize(cx);
     }
 
@@ -451,16 +580,4 @@ impl TerminalSessionModel {
 enum StreamDisposition {
     Continue,
     Stop,
-}
-
-fn send_write(
-    engine: &EngineHandle,
-    params: serde_json::Value,
-    cx: &mut Context<TerminalSessionModel>,
-) {
-    let engine = engine.clone();
-    cx.spawn(async move |_, _| {
-        let _ = engine.client().call(methods::WRITE_TERMINAL, params).await;
-    })
-    .detach();
 }

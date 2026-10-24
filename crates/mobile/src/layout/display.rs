@@ -261,9 +261,6 @@ pub enum WidgetKind {
     ToolRail { trunk_x: f32, bend: f32, branch_end: f32, row_mid: f32, tops: Vec<f32>, heights: Vec<f32> },
     /// Tap target toggling one tool row's inline detail.
     ToolToggle { detail: u64, open: bool },
-    /// Tap target over a subagent spawn card: opens the subagent's
-    /// transcript (`doc_id`, read-only). `frozen` = it finished (done/failed).
-    SubagentLink { doc_id: String, title: String, frozen: bool },
     /// Shimmer sweep over the active group's title (text drawn by the canvas
     /// underneath; the painter re-draws those runs brighter through a moving
     /// gradient).
@@ -273,6 +270,9 @@ pub enum WidgetKind {
     /// A button the app acts on: `action` names what (`sign-in`), `label`
     /// is its title (an error card's "Log in").
     Action { action: String, label: String },
+    /// A subagent spawn's card: opens the child's transcript (`doc_id`;
+    /// `None` while the host hasn't bound one yet).
+    Subagent { doc_id: Option<String>, title: String, running: bool, failed: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]

@@ -470,6 +470,7 @@ fn live_stream_input_and_remote_target_follow_transfer_without_reopening(cx: &mu
                 id: "live-pty".into(),
                 cwd: "/remote".into(),
                 shell: "bash".into(),
+                host_replies: false,
             },
             Some("remote-host".into()),
             cx
@@ -601,6 +602,7 @@ fn pending_action_handle_attaches_after_move_and_rejects_after_close(cx: &mut Te
                     id: "action-pty".into(),
                     cwd: "/project".into(),
                     shell: "bash".into(),
+                    host_replies: false,
                 },
                 None,
                 cx
@@ -626,6 +628,7 @@ fn pending_action_handle_attaches_after_move_and_rejects_after_close(cx: &mut Te
                     id: "late-result".into(),
                     cwd: "/project".into(),
                     shell: "bash".into(),
+                    host_replies: false,
                 },
                 None,
                 cx
@@ -778,7 +781,7 @@ fn closing_terminal_during_open_releases_the_late_pty(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn writes_keep_one_ordered_sequence_across_a_transfer(cx: &mut TestAppContext) {
+fn a_moved_tab_keeps_its_queued_keys_behind_the_write_in_flight(cx: &mut TestAppContext) {
     use zeron_rpc::methods;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -788,13 +791,14 @@ fn writes_keep_one_ordered_sequence_across_a_transfer(cx: &mut TestAppContext) {
     let (shell, sessions, cx) = setup(cx, 1, 0);
     let session = &sessions[0];
     let key = session.read_with(cx, |model, _| model.key);
-    let (_replies, mut rx) = test_connection(&shell, cx);
+    let (replies, mut rx) = test_connection(&shell, cx);
     session.update(cx, |model, cx| {
         assert!(model.attach_reserved_session(
             zeron_proto::TerminalSession {
                 id: "seq-pty".into(),
                 cwd: "/project".into(),
                 shell: "bash".into(),
+                host_replies: false,
             },
             None,
             cx
@@ -823,16 +827,21 @@ fn writes_keep_one_ordered_sequence_across_a_transfer(cx: &mut TestAppContext) {
     pump(&runtime, cx);
     cx.executor().advance_clock(Duration::from_millis(100));
     pump(&runtime, cx);
+    // One write in flight: "b" waits for "a" even across the move.
     let writes: Vec<_> = requests(&mut rx)
         .into_iter()
         .filter(|frame| frame.method.as_deref() == Some(methods::WRITE_TERMINAL))
         .collect();
-    assert_eq!(writes.len(), 2, "{writes:?}");
+    assert_eq!(writes.len(), 1, "{writes:?}");
     assert_eq!(writes[0].params["data"], encode(b"a"));
-    assert_eq!(writes[1].params["data"], encode(b"b"));
-    let writer = &writes[0].params["writerId"];
-    assert!(writer.is_string());
-    assert_eq!(&writes[1].params["writerId"], writer, "the move kept the writer");
-    assert_eq!(writes[0].params["seq"], 0);
-    assert_eq!(writes[1].params["seq"], 1);
+    replies
+        .try_send(serde_json::json!({ "id": writes[0].id, "ok": { "ok": true } }).to_string())
+        .unwrap();
+    pump(&runtime, cx);
+    let writes: Vec<_> = requests(&mut rx)
+        .into_iter()
+        .filter(|frame| frame.method.as_deref() == Some(methods::WRITE_TERMINAL))
+        .collect();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(writes[0].params["data"], encode(b"b"));
 }

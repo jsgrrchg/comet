@@ -65,10 +65,6 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
 
     /// Embedded in the iPad split's main column (no sheet chrome).
     private let embedded: Bool
-    /// A side chat of this chat: pushed over it, run in its checkout on its
-    /// host, so only the model and effort are picked (any harness, until
-    /// the first send mints the row).
-    private let sideOf: String?
     private var composerRest: NSLayoutConstraint?
     private var backgroundObserver: NSObjectProtocol?
 
@@ -85,32 +81,12 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
         self.focusOnAppear = !embedded
         self.onCreated = onCreated
         self.draft = app.lastDraft
-        self.sideOf = nil
         super.init(nibName: nil, bundle: nil)
         // Pick up where the page was left (closed without sending).
         composer.text = prompt ?? app.newSessionText
         composer.images = app.newSessionImages
     }
 
-    /// A new, empty side chat of `parentId`, starting on the parent's model.
-    /// Nothing is written until the first send; leaving first leaves nothing.
-    init(app: AppModel, sideOf parentId: String, onCreated: @escaping (String, DraftHandoff?) -> Void) {
-        self.app = app
-        self.embedded = true
-        self.focusOnAppear = true
-        self.onCreated = onCreated
-        self.sideOf = parentId
-        let parent = app.row(parentId)
-        var draft = NewSessionDraft()
-        draft.harness = parent?.harness ?? draft.harness
-        draft.model = parent?.model
-        draft.effort = parent?.reasoning
-        self.draft = draft
-        super.init(nibName: nil, bundle: nil)
-        hidesBottomBarWhenPushed = true
-    }
-
-    private var parentRow: SessionRow? { sideOf.flatMap { app.row($0) } }
     /// A session was created from this page: nothing to keep.
     private var created = false
     fileprivate var cloudStarting = false
@@ -120,8 +96,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
     /// Closed (swipe down, ✕, or replaced in the iPad column) without
     /// sending: keep what was typed and picked for next time.
     private func rememberDraft() {
-        // A side chat's draft is its own: it never seeds the next new session.
-        guard !created, sideOf == nil else { return }
+        guard !created else { return }
         app.lastDraft = draft
         app.newSessionText = composer.text
         app.newSessionImages = composer.images
@@ -146,13 +121,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
         dismissTap.delegate = self
         view.addGestureRecognizer(dismissTap)
         view.backgroundColor = Palette.background
-        title = sideOf == nil ? "New Session" : "New Side Chat"
-        if sideOf != nil {
-            let titleView = SessionTitleView()
-            titleView.set(title: "New Side Chat", subtitle: parentRow.map { "Side chat · \($0.title)" } ?? "Side chat")
-            navigationItem.titleView = titleView
-            navigationItem.largeTitleDisplayMode = .never
-        }
+        title = "New Session"
         if !embedded {
             navigationItem.leftBarButtonItem = UIBarButtonItem(systemItem: .close, primaryAction: UIAction { [weak self] _ in
                 self?.dismiss(animated: true)
@@ -162,7 +131,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
         mark.image = BrandMarks.image(for: draft.harness, side: 34)
         mark.tintColor = Palette.text
         mark.contentMode = .center
-        hero.text = sideOf == nil ? "What are we building?" : "Ask on the side"
+        hero.text = "What are we building?"
         hero.numberOfLines = 2
         hero.font = Fonts.ui(.sansSemibold, 22)
         hero.textColor = Palette.text
@@ -188,12 +157,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             self.present(self.modelPicker(), animated: true)
         }
         composer.mentionSearch = { [weak self] q in
-            guard let self else { return [] }
-            if self.sideOf != nil {
-                guard let parent = self.parentRow, let space = parent.project?.id else { return [] }
-                return await self.app.searchFiles(deviceId: parent.deviceId, spaceId: space, query: q)
-            }
-            guard let p = self.project else { return [] }
+            guard let self, let p = self.project else { return [] }
             return await self.app.searchFiles(deviceId: p.device, spaceId: p.id, query: q)
         }
         composer.onSend = { [weak self] text, images, _ in
@@ -227,8 +191,8 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
             fill,
         ])
         composerRest = pinAboveKeyboard(composer)
-        if sideOf == nil, draft.projectId == nil, draft.hostId == nil { draft.projectId = app.projectOptions.first?.id }
-        if sideOf == nil, draft.projectId == nil, draft.hostId == nil {
+        if draft.projectId == nil, draft.hostId == nil { draft.projectId = app.projectOptions.first?.id }
+        if draft.projectId == nil, draft.hostId == nil {
             // No projects yet: run on the first reachable host.
             draft.hostId = app.hostOptions.first(where: \.online)?.id ?? app.hostOptions.first?.id
         }
@@ -331,7 +295,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
     }
 
     private var project: ProjectOption? { app.projectOptions.first { $0.id == draft.projectId } }
-    private var deviceId: String { sideOf != nil ? parentRow?.deviceId ?? "" : project?.device ?? draft.hostId ?? "" }
+    private var deviceId: String { project?.device ?? draft.hostId ?? "" }
 
     /// Checkouts of the picked project, one per row of the host menu.
     private var checkouts: [ProjectOption] {
@@ -343,9 +307,7 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
 
     private func refreshChips() {
         var chips: [ComposerChip] = []
-        if sideOf != nil {
-            // The parent's checkout and host: nothing to pick there.
-        } else if let p = project, runsOnCloud {
+        if let p = project, runsOnCloud {
             // On its own Cloud machine, from a branch of the repository.
             chips.append(ComposerChip(id: "project", title: p.groupName, symbol: nil, icon: ProjectTile.image(name: p.groupName, colorIndex: p.colorIndex)))
             chips.append(ComposerChip(id: "host", title: "Cloud", symbol: "cloud"))
@@ -572,17 +534,6 @@ final class NewSessionViewController: UIViewController, UIGestureRecognizerDeleg
 
     /// False when the session couldn't be created (the prompt stays put).
     private func create(text: String, images: [StagedImage]) -> Bool {
-        if let parentId = sideOf {
-            guard let chatId = app.createSession(draft: draft, text: text, images: images, sideOf: parentId) else {
-                let alert = UIAlertController(title: "Couldn't start the side chat", message: "Its session is no longer available.", preferredStyle: .alert)
-                alert.addAction(UIAlertAction(title: "OK", style: .default))
-                present(alert, animated: true)
-                return false
-            }
-            created = true
-            onCreated(chatId, DraftHandoff.capture(from: self, composer: composer, text: text))
-            return true
-        }
         app.lastDraft = draft
         if runsOnCloud {
             createOnCloud(text: text, images: images)

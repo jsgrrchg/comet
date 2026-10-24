@@ -121,13 +121,12 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
     var onFollowChange: ((Bool) -> Void)?
     /// A row's button was tapped (`sign-in` on an error card).
     var onAction: ((String) -> Void)?
+    /// A subagent card was tapped (doc id, title, still running).
+    var onSubagent: ((String, String, Bool) -> Void)?
     var onDistanceFromBottom: ((CGFloat) -> Void)?
     var imageLoader: ((String, UIImageView) -> Void)?
     /// An attachment's picture, for an image chip opened full size.
     var imageFetcher: ((String) async -> UIImage?)?
-    /// A subagent spawn card was tapped: open its transcript (doc id, title,
-    /// finished).
-    var onOpenSubagent: ((String, String, Bool) -> Void)?
 
     // MARK: Runway (desktop transcript.rs `OwnTurnAnchor`)
     //
@@ -689,6 +688,10 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
         onAction?(action)
     }
 
+    func rowView(_ view: RowView, openSubagent docId: String, title: String, running: Bool) {
+        onSubagent?(docId, title, running)
+    }
+
     func rowView(_ view: RowView, open url: URL) {
         guard let vc = findViewController() else { return }
         // An image chip opens its upload full size, as its thumbnail did.
@@ -713,10 +716,6 @@ final class TranscriptListView: UIScrollView, RowViewDelegate, UIScrollViewDeleg
 
     func rowView(_ view: RowView, imageFor reference: String, into imageView: UIImageView) {
         imageLoader?(reference, imageView)
-    }
-
-    func rowView(_ view: RowView, openSubagent docId: String, title: String, frozen: Bool) {
-        onOpenSubagent?(docId, title, frozen)
     }
 
     func rowView(_ view: RowView, visualFor id: String) -> UIView? {

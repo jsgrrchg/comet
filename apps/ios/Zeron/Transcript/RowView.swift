@@ -36,11 +36,13 @@ protocol RowViewDelegate: AnyObject {
     func rowView(_ view: RowView, toggleDetail detail: UInt64, open: Bool)
     func rowView(_ view: RowView, open url: URL)
     func rowView(_ view: RowView, imageFor reference: String, into imageView: UIImageView)
-    func rowView(_ view: RowView, openSubagent docId: String, title: String, frozen: Bool)
     /// The live view for an agent visual (kept across row reuse).
     func rowView(_ view: RowView, visualFor id: String) -> UIView?
     /// A row's button (`sign-in` on an error card).
     func rowView(_ view: RowView, perform action: String)
+    /// A subagent card was tapped: its transcript doc, title, and whether it
+    /// still runs.
+    func rowView(_ view: RowView, openSubagent docId: String, title: String, running: Bool)
 }
 
 /// A reusable transcript row: canvas + horizontal scrollers + native widgets.
@@ -316,21 +318,23 @@ final class RowView: UIView {
                 })
                 b.accessibilityIdentifier = "transcript-action-\(action)"
                 view = b
+            case let .subagent(docId, title, running, failed):
+                let card = SubagentCardControl()
+                card.accessibilityTraits = .button
+                card.accessibilityLabel = "Subagent: \(title)"
+                card.accessibilityValue = running ? "Working" : failed ? "Failed" : "Done"
+                card.accessibilityIdentifier = "subagent-card"
+                card.isEnabled = docId != nil
+                if let docId {
+                    card.addAction(UIAction { [weak self] _ in
+                        guard let self else { return }
+                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                        self.delegate?.rowView(self, openSubagent: docId, title: title, running: running)
+                    }, for: .touchUpInside)
+                }
+                view = card
             case .shimmer:
                 view = ShimmerView(model: model!, rect: rect)
-            case let .subagentLink(docId, title, frozen):
-                let b = ToolToggleControl()
-                b.layer.cornerRadius = 10
-                b.layer.cornerCurve = .continuous
-                b.accessibilityTraits = .button
-                b.accessibilityLabel = "Open subagent: \(title)"
-                b.accessibilityIdentifier = "subagent-link"
-                b.addAction(UIAction { [weak self] _ in
-                    guard let self else { return }
-                    UISelectionFeedbackGenerator().selectionChanged()
-                    self.delegate?.rowView(self, openSubagent: docId, title: title, frozen: frozen)
-                }, for: .touchUpInside)
-                view = b
             case let .visual(id):
                 view = delegate?.rowView(self, visualFor: id) ?? UIView()
                 (view as? VisualView)?.active = !isHidden

@@ -34,12 +34,15 @@ pub mod connectivity;
 mod demo;
 pub mod error;
 pub mod events;
+mod host_stream;
 mod live;
 pub mod provider_login;
 pub mod providers;
 pub mod rpc;
 pub mod runtime;
 pub mod session;
+pub mod subagents;
+pub mod terminal;
 pub mod workspace;
 
 pub use client::{
@@ -58,8 +61,9 @@ pub use session::{
     LiveStatus, LocalEcho, OutgoingAttachment, PendingKind, PendingSend, QueueEditAction,
     QueueEditFinish, QueueEditLease, QueueEditStart, QueueGate, QueueItem, RoomState, SendOutcome,
     SendRequest, SessionHandle, SessionSnapshot, SnapshotDelta, SnapshotWatch, SubagentRow,
-    SubagentState,
 };
+pub use subagents::{SubagentInfo, SubagentSink, SubagentState, SubagentWatch};
+pub use terminal::{TerminalInfo, TerminalLink, TerminalReplies, TerminalSink, TerminalUpdate};
 pub use workspace::{
     DeviceView, FrontPage, ProjectRef, ProjectView, PullRequestGroups, SearchField, SearchHit,
     SectionView, SessionRow, WorkspaceSnapshot, project_color_index, relative_time_label,

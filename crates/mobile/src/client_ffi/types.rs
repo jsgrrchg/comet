@@ -872,9 +872,6 @@ pub struct NewSession {
     /// Checkout override (an existing worktree's path).
     pub cwd: Option<String>,
     pub title: Option<String>,
-    /// A side chat of this chat: runs in its parent's checkout and host
-    /// (`target`, `cwd`, `branch` ignored).
-    pub parent_chat_id: Option<String>,
 }
 
 impl TryFrom<NewSession> for zc::NewSession {
@@ -892,7 +889,7 @@ impl TryFrom<NewSession> for zc::NewSession {
             branch: n.branch,
             cwd: n.cwd,
             title: n.title,
-            parent_chat_id: n.parent_chat_id,
+            parent_chat_id: None,
         })
     }
 }

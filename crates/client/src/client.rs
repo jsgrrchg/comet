@@ -501,6 +501,24 @@ impl ClientInner {
         }
     }
 
+    /// A host stream (terminal output, a subagent's transcript): the relay's
+    /// subscription live, the demo host's channel offline.
+    pub(crate) async fn host_subscribe(
+        self: &Arc<Self>,
+        device_id: &str,
+        method: &'static str,
+        params: serde_json::Value,
+    ) -> Result<crate::host_stream::HostStream> {
+        match self.backend() {
+            Backend::Demo(demo) => demo.host_subscribe(device_id, method, params).await,
+            Backend::Live(live) => live
+                .relay
+                .subscribe(device_id, method, params)
+                .await
+                .map(crate::host_stream::HostStream::Live),
+        }
+    }
+
     /// Fresh socket for the chat's room (retry delivery).
     pub(crate) fn kick_room(&self, chat_id: &str) {
         if let Some(room) = self.session_core(chat_id).and_then(|c| c.room()) {
@@ -748,7 +766,7 @@ impl Client {
     /// before any session doc opens, so the host never reads it as legacy.
     pub fn create_session(&self, new: NewSession) -> Result<String> {
         if let Some(parent_id) = &new.parent_chat_id {
-            return self.create_side_chat(parent_id, new.config, new.title);
+            return self.create_side_chat_with(parent_id, new.config, new.title);
         }
         let (state, _) = self.inner.workspace.state();
         let id = crate::new_id();
@@ -836,7 +854,7 @@ impl Client {
     /// does: the parent's row (host, project, checkout) with a fresh
     /// identity. The run config is the caller's pick, but the sandbox stays
     /// the parent's.
-    fn create_side_chat(
+    fn create_side_chat_with(
         &self,
         parent_id: &str,
         config: Option<ChatConfig>,
@@ -854,6 +872,7 @@ impl Client {
         chat.last_seen_at = None;
         chat.harness_session_id = None;
         chat.harness_session_cwd = None;
+        chat.harness_session_harness = None;
         chat.room_gen = Some(2);
         if let Some(mut config) = config {
             if let Some(sandbox) = parent.config.as_ref().map(|c| c.sandbox) {
@@ -864,6 +883,13 @@ impl Client {
         let id = chat.id.clone();
         self.inner.registry_write(|doc| doc.upsert_chat(&chat))?;
         Ok(id)
+    }
+
+    /// A fresh side chat under `parent_id`: same host, folder, checkout and
+    /// agent settings as its parent, an empty conversation (the desktop's
+    /// "New side chat"; agent-spawned side chats have the same shape).
+    pub fn create_side_chat(&self, parent_id: &str) -> Result<String> {
+        self.create_side_chat_with(parent_id, None, None)
     }
 
     /// Fork `source_id` through its latest completed response into a side

@@ -11,8 +11,8 @@
 //! - A toast is dismissed by swiping it off to the right.
 //!
 //! Push from anywhere with [`error`], [`success`] or [`info`] — or
-//! [`show_with_action`] for one with a trailing button ("Undo"); the shell
-//! mounts [`render_toaster`] once per window.
+//! [`show_with_action`] for one with a button; the shell mounts
+//! [`render_toaster`] once per window.
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -89,12 +89,12 @@ impl Glide {
     }
 }
 
-/// A button at the toast's trailing edge ("Undo"); clicking runs it and
-/// dismisses the toast.
+/// A toast's one button: its label and what a click does (the toast then
+/// closes).
 #[derive(Clone)]
 struct ToastAction {
     label: SharedString,
-    run: Rc<dyn Fn(&mut App)>,
+    run: Rc<dyn Fn(&mut Window, &mut App)>,
 }
 
 struct Toast {
@@ -163,15 +163,12 @@ fn push(cx: &mut App, kind: ToastKind, message: SharedString, action: Option<Toa
     }
     let now = Instant::now();
     let store = cx.default_global::<ToastStore>();
-    // A repeat of the live front toast restarts it instead of stacking (an
-    // action is tied to its own subject, so those always stack).
-    if action.is_none()
-        && let Some(front) = store
-            .toasts
-            .iter_mut()
-            .rev()
-            .find(|toast| toast.closing.is_none())
-        && front.action.is_none()
+    // A repeat of the live front toast restarts it instead of stacking.
+    if let Some(front) = store
+        .toasts
+        .iter_mut()
+        .rev()
+        .find(|toast| toast.closing.is_none())
         && front.kind == kind
         && front.message == message
     {
@@ -205,20 +202,24 @@ pub fn show(cx: &mut App, kind: ToastKind, message: impl Into<SharedString>) {
     push(cx, kind, message.into(), None);
 }
 
-/// A toast of `kind` with a trailing button (`label`) that runs `run` and
-/// dismisses the toast.
+/// A toast of `kind` with a button ("Add credits") that runs `run` in the
+/// window it was clicked in, then closes the toast.
 pub fn show_with_action(
     cx: &mut App,
     kind: ToastKind,
     message: impl Into<SharedString>,
     label: impl Into<SharedString>,
-    run: impl Fn(&mut App) + 'static,
+    run: impl Fn(&mut Window, &mut App) + 'static,
 ) {
-    let action = ToastAction {
-        label: label.into(),
-        run: Rc::new(run),
-    };
-    push(cx, kind, message.into(), Some(action));
+    push(
+        cx,
+        kind,
+        message.into(),
+        Some(ToastAction {
+            label: label.into(),
+            run: Rc::new(run),
+        }),
+    );
 }
 
 /// A failure toast.
@@ -489,20 +490,7 @@ pub fn render_toaster(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
         }
         let kind = toast.kind;
         let message = toast.message.clone();
-        let action = toast.action.clone().map(|action| {
-            let fade_key = SharedString::from(format!("toast-action-{id}"));
-            crate::popover::btn_ghost(&theme, &action.label, fade_key)
-                .id(("toast-action", id as usize))
-                .flex_none()
-                .px(px(8.0))
-                .py(px(3.0))
-                .text_color(theme.text)
-                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .on_click(move |_, _, cx| {
-                    (action.run)(cx);
-                    dismiss(id, cx);
-                })
-        });
+        let action = toast.action.clone();
         let content = div()
             .id(("toast-content", id as usize))
             .w_full()
@@ -516,7 +504,35 @@ pub fn render_toaster(window: &mut Window, cx: &mut App) -> Option<AnyElement> {
             .text_color(theme.text)
             .child(kind_icon(kind, &theme))
             .child(div().flex_1().min_w_0().child(message.clone()))
-            .children(action)
+            .children(action.map(|action| {
+                let run = action.run.clone();
+                // Sonner's action button: a small filled chip in the text
+                // color.
+                div()
+                    .id(("toast-action", id as usize))
+                    .role(gpui::Role::Button)
+                    .aria_label(action.label.clone())
+                    .flex_none()
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(6.0))
+                    .bg(theme.text)
+                    .text_color(theme.bg)
+                    .text_size(crate::typography::ui_rems(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.85))
+                    // Not the start of a swipe.
+                    .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(move |_, window, cx| {
+                        cx.stop_propagation();
+                        run(window, cx);
+                        dismiss(id, cx);
+                    })
+                    .child(action.label)
+            }))
             .child(
                 // Measure the natural height for the stack's layout.
                 gpui::canvas(
@@ -745,34 +761,28 @@ mod tests {
     }
 
     #[gpui::test]
-    fn action_toasts_stack_and_their_button_runs_once(cx: &mut gpui::TestAppContext) {
+    fn action_runs_in_the_window_and_closes_its_toast(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| cx.set_global(Theme::dark()));
         let (_, cx) = cx.add_window_view(|_, _| Host);
-        let runs = Rc::new(std::cell::Cell::new(0));
+        let clicked = Rc::new(std::cell::Cell::new(false));
+        let seen = clicked.clone();
         cx.update(|_, cx| {
-            for _ in 0..2 {
-                let runs = runs.clone();
-                show_with_action(
-                    cx,
-                    ToastKind::Info,
-                    "Added “comet”",
-                    "Undo",
-                    move |_| runs.set(runs.get() + 1),
-                );
-            }
+            show_with_action(cx, ToastKind::Error, "Out of credits", "Add credits", move |_, _| {
+                seen.set(true)
+            });
         });
         cx.run_until_parked();
-        cx.update(|_, cx| assert_eq!(messages(cx).len(), 2, "actions never merge"));
         let (id, action) = cx.update(|_, cx| {
-            let toast = &cx.global::<ToastStore>().toasts[1];
-            (toast.id, toast.action.clone().unwrap())
+            let toast = &cx.global::<ToastStore>().toasts[0];
+            (toast.id, toast.action.clone().expect("has a button"))
         });
-        cx.update(|_, cx| {
-            (action.run)(cx);
+        assert_eq!(action.label, "Add credits");
+        cx.update(|window, cx| {
+            (action.run)(window, cx);
             dismiss(id, cx);
         });
-        assert_eq!(runs.get(), 1);
-        cx.update(|_, cx| assert_eq!(messages(cx).len(), 1));
+        assert!(clicked.get());
+        cx.update(|_, cx| assert!(messages(cx).is_empty()));
     }
 
     #[test]

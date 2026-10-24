@@ -1283,6 +1283,7 @@ fn errors_render_as_cards_with_a_log_in_button_when_signing_in_fixes_them() {
     use zeron_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
     let error = |id: &str, message: &str| {
         Arc::new(SessionMessageEntry {
+            native_fork_point: None,
             id: id.into(),
             role: MessageRole::Assistant,
             parts: vec![MessagePart::Error { id: "e".into(), message: message.into() }],

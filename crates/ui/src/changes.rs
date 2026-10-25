@@ -141,7 +141,7 @@ impl DiffMode {
 // Patch model + parser (pure)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LineKind {
     Context,
     Add,
@@ -150,7 +150,7 @@ pub enum LineKind {
     Meta,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct DiffLine {
     pub kind: LineKind,
     pub old_no: Option<u32>,
@@ -220,13 +220,13 @@ impl DiffHighlights {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct Hunk {
     pub header: String,
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FileStatus {
     Added,
     Deleted,
@@ -234,7 +234,7 @@ pub enum FileStatus {
     Renamed,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 pub struct FileDiff {
     /// Display path (the post-change side).
     pub path: String,
@@ -1186,11 +1186,41 @@ struct FileHorizontalState {
 
 impl FileHorizontalState {
     fn new(file: &FileDiff) -> Self {
+        Self::with_scroll(file, gpui::ScrollHandle::new())
+    }
+
+    fn with_scroll(file: &FileDiff, scroll: gpui::ScrollHandle) -> Self {
         Self {
             geometry: DiffHorizontalGeometry::from_file(file),
-            scroll: gpui::ScrollHandle::new(),
+            scroll,
             measured: std::cell::RefCell::new(None),
         }
+    }
+
+    /// One state per file of a refreshed diff: an unchanged file keeps its
+    /// state whole (geometry and shaped width included), a changed one keeps
+    /// only its horizontal offset, a new one starts at the origin.
+    fn carry(previous: Option<ParsedDiff>, files: &[FileDiff], fingerprints: &[u64]) -> Vec<Self> {
+        let mut old: HashMap<String, (u64, Self)> = previous
+            .map(|prev| {
+                prev.files
+                    .iter()
+                    .map(|file| file.path.clone())
+                    .zip(prev.fingerprints)
+                    .zip(prev.horizontal)
+                    .map(|((path, fingerprint), state)| (path, (fingerprint, state)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        files
+            .iter()
+            .zip(fingerprints)
+            .map(|(file, fingerprint)| match old.remove(&file.path) {
+                Some((old_fingerprint, state)) if old_fingerprint == *fingerprint => state,
+                Some((_, state)) => Self::with_scroll(file, state.scroll),
+                None => Self::new(file),
+            })
+            .collect()
     }
 
     fn metrics(
@@ -1238,13 +1268,44 @@ impl FileHorizontalState {
 struct ParsedDiff {
     /// `checkout_id:checksum` — identity of the parsed content.
     key: String,
+    /// `checkout_id:scope` — what the content is a diff OF. A new key under
+    /// the same context is a refresh (the tree moved), which keeps folds,
+    /// scroll, highlights, and horizontal offsets; a new context starts over.
+    context: String,
     truncated: bool,
     additions: u32,
     deletions: u32,
     file_count: usize,
     /// Indexed like `files`; survives row virtualization and folding.
     horizontal: Vec<FileHorizontalState>,
+    /// Indexed like `files`: [`file_fingerprint`] of each.
+    fingerprints: Vec<u64>,
+    /// Indexed like `files`: each one's highlight-slot key — its content
+    /// within this context, so a refresh that leaves the file untouched
+    /// keeps its highlights. Precomputed: rows read it every frame.
+    highlight_keys: Vec<u64>,
     files: Arc<Vec<FileDiff>>,
+}
+
+impl ParsedDiff {
+    fn highlight_fingerprint(&self, file_ix: usize) -> u64 {
+        self.highlight_keys
+            .get(file_ix)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+fn highlight_keys(context: &str, fingerprints: &[u64]) -> Vec<u64> {
+    fingerprints
+        .iter()
+        .map(|fingerprint| {
+            let mut hasher = std::hash::DefaultHasher::new();
+            context.hash(&mut hasher);
+            fingerprint.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,6 +1555,312 @@ pub(crate) fn sticky_header_push_offset(next_header_y: Option<f32>) -> f32 {
         .unwrap_or(0.0)
 }
 
+// ---------------------------------------------------------------------------
+// Refresh continuity — view state a re-parse carries over (pure)
+// ---------------------------------------------------------------------------
+
+/// Content identity of one parsed file. Two snapshots that agree on it show
+/// the same rows for that file, so its per-file view state can carry over.
+pub fn file_fingerprint(file: &FileDiff) -> u64 {
+    let mut hasher = std::hash::DefaultHasher::new();
+    file.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The diff lines a row shows: a split row's two columns, a unified row's
+/// one line, nothing for headers, cards, and pads.
+fn row_lines(files: &[FileDiff], row: DiffRow) -> [Option<&DiffLine>; 2] {
+    let line = |file: u32, hunk: u32, line: Option<u32>| {
+        files
+            .get(file as usize)?
+            .hunks
+            .get(hunk as usize)?
+            .lines
+            .get(line? as usize)
+    };
+    match row {
+        DiffRow::Line {
+            file,
+            hunk,
+            line: ix,
+            ..
+        } => [line(file, hunk, Some(ix)), None],
+        DiffRow::SplitLine {
+            file,
+            hunk,
+            left,
+            right,
+        } => [line(file, hunk, right), line(file, hunk, left)],
+        _ => [None, None],
+    }
+}
+
+/// The source line a diff line stands for: deletions on the old side,
+/// everything else on the new one.
+fn line_position(line: &DiffLine) -> Option<(SourceSide, u32)> {
+    match line.kind {
+        LineKind::Del => line.old_no.map(|no| (SourceSide::Old, no)),
+        LineKind::Add | LineKind::Context => line.new_no.map(|no| (SourceSide::New, no)),
+        LineKind::Meta => None,
+    }
+}
+
+/// A diff line's number on `side`, if it exists there: context lines live
+/// on both sides, additions only on the new one, deletions only on the old.
+fn line_number_on(line: &DiffLine, side: SourceSide) -> Option<u32> {
+    match side {
+        SourceSide::Old => line.old_no,
+        SourceSide::New => line.new_no,
+    }
+}
+
+/// How far apart two diff lines sit in the source, on whichever side both
+/// exist (the closer one when they share both). Lines sharing no side are
+/// as far apart as possible.
+fn line_distance(a: &DiffLine, b: &DiffLine) -> u32 {
+    [SourceSide::Old, SourceSide::New]
+        .into_iter()
+        .filter_map(|side| Some(line_number_on(a, side)?.abs_diff(line_number_on(b, side)?)))
+        .min()
+        .unwrap_or(u32::MAX)
+}
+
+/// Where the viewport's top edge sat, in terms that survive a re-parse. Row
+/// indices do not (a file added above shifts every one); paths and source
+/// lines do.
+#[derive(Debug, Clone, PartialEq)]
+struct ScrollAnchor {
+    /// The file's index in the diff the anchor was captured over (its
+    /// neighbors there are the fallback when it leaves the diff).
+    file_ix: usize,
+    path: String,
+    /// A line near the top row and how many rows the top row sits past it
+    /// (negative above it). `None` pins the file header.
+    line: Option<(DiffLine, isize)>,
+    /// Which row the top row was: `offset_in_item` only carries onto the
+    /// same card or draft, or a row of the same kind otherwise (a card's
+    /// offset overshoots a code line or a shorter card).
+    row: AnchorRow,
+    offset_in_item: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum AnchorRow {
+    /// A comment card, by comment id (`None` when it could not be resolved,
+    /// which matches no card).
+    Card(Option<String>),
+    Draft,
+    Other(std::mem::Discriminant<DiffRow>),
+}
+
+/// The staged comment a [`DiffRow::CommentCard`] shows: `card` indexes the
+/// file's own slice of `comments`, as [`flatten_rows`] built it.
+fn card_comment<'a>(
+    files: &[FileDiff],
+    comments: &'a [ReviewComment],
+    file: u32,
+    card: u32,
+) -> Option<&'a ReviewComment> {
+    let path = &files.get(file as usize)?.path;
+    comments
+        .iter()
+        .filter(|comment| !comment.is_file() && comment.path == *path)
+        .nth(card as usize)
+}
+
+fn anchor_row(files: &[FileDiff], comments: &[ReviewComment], row: DiffRow) -> AnchorRow {
+    match row {
+        DiffRow::CommentCard { file, card } => AnchorRow::Card(
+            card_comment(files, comments, file, card).map(|comment| comment.id.clone()),
+        ),
+        DiffRow::CommentDraft { .. } => AnchorRow::Draft,
+        _ => AnchorRow::Other(std::mem::discriminant(&row)),
+    }
+}
+
+fn capture_scroll_anchor(
+    files: &[FileDiff],
+    comments: &[ReviewComment],
+    rows: &[DiffRow],
+    row_ranges: &[std::ops::Range<usize>],
+    item_ix: usize,
+    offset_in_item: f32,
+) -> Option<ScrollAnchor> {
+    let file_ix = row_ranges
+        .partition_point(|range| range.start <= item_ix)
+        .checked_sub(1)?;
+    let range = row_ranges[file_ix].clone();
+    if !range.contains(&item_ix) {
+        return None;
+    }
+    let file = files.get(file_ix)?;
+    let line_at = |ix: usize| {
+        let [first, second] = row_lines(files, rows[ix]);
+        first.or(second).map(|line| (ix, line))
+    };
+    let line = (item_ix > range.start)
+        .then(|| {
+            // The nearest line at or above the top row, else the first below
+            // it (a notice or hunk header leading the body).
+            (range.start + 1..=item_ix)
+                .rev()
+                .find_map(line_at)
+                .or_else(|| (item_ix + 1..range.end).find_map(line_at))
+        })
+        .flatten()
+        .map(|(ix, line)| (line.clone(), item_ix as isize - ix as isize));
+    // A top row with no line to hold onto (a fold tween's stand-in) lands on
+    // the header; the stand-in's offset means nothing to the steady rows.
+    let offset_in_item = if line.is_none() && item_ix > range.start {
+        0.0
+    } else {
+        offset_in_item
+    };
+    Some(ScrollAnchor {
+        file_ix,
+        path: file.path.clone(),
+        line,
+        row: anchor_row(files, comments, rows[item_ix]),
+        offset_in_item,
+    })
+}
+
+/// The `(item_ix, offset_in_item)` the anchor maps to in a re-flattened
+/// diff. Line matching prefers the identical line, then the same text at a
+/// line number it still shares, old side first (an edit above shifts only
+/// the new side), then
+/// the same text nearest its old position, then the nearest line by number;
+/// with no line to match it falls back to the file header. A card or draft
+/// that survived is found by identity first. `old_files` is the diff the
+/// anchor was captured over; `index` maps `files`' paths.
+fn resolve_scroll_anchor(
+    anchor: &ScrollAnchor,
+    old_files: &[FileDiff],
+    files: &[FileDiff],
+    comments: &[ReviewComment],
+    index: &HashMap<&str, usize>,
+    rows: &[DiffRow],
+    row_ranges: &[std::ops::Range<usize>],
+) -> Option<(usize, f32)> {
+    let Some(&file_ix) = index.get(anchor.path.as_str()) else {
+        // Its file left the diff: the next surviving file, else the
+        // nearest one above it.
+        let after = old_files.get(anchor.file_ix + 1..).unwrap_or_default();
+        let before = &old_files[..anchor.file_ix.min(old_files.len())];
+        let ix = after
+            .iter()
+            .chain(before.iter().rev())
+            .find_map(|file| index.get(file.path.as_str()).copied())?;
+        return row_ranges.get(ix).map(|range| (range.start, 0.0));
+    };
+    let range = row_ranges.get(file_ix)?.clone();
+    // The same card (or the draft) wherever it now sits, its offset capped
+    // to its current height (an edited card can shrink).
+    let body = range.start + 1..range.end.min(rows.len());
+    let same_item = rows[body.clone()]
+        .iter()
+        .zip(body.clone())
+        .find_map(|(row, ix)| match (&anchor.row, *row) {
+            (AnchorRow::Card(Some(id)), DiffRow::CommentCard { file, card }) => {
+                card_comment(files, comments, file, card)
+                    .filter(|comment| comment.id == *id)
+                    .map(|comment| (ix, comments::card_height(&comment.body)))
+            }
+            (AnchorRow::Draft, DiffRow::CommentDraft { .. }) => {
+                Some((ix, comments::DRAFT_CARD_HEIGHT))
+            }
+            _ => None,
+        });
+    if let Some((ix, height)) = same_item {
+        return Some((ix, anchor.offset_in_item.clamp(0.0, height)));
+    }
+    let Some((target, delta)) = &anchor.line else {
+        return Some((range.start, anchor.offset_in_item));
+    };
+    let candidates = || {
+        (range.start + 1..range.end)
+            .filter_map(|ix| rows.get(ix).map(|row| (ix, *row)))
+            .flat_map(|(ix, row)| {
+                row_lines(files, row)
+                    .into_iter()
+                    .flatten()
+                    .map(move |l| (ix, l))
+            })
+    };
+    let same_text = |line: &DiffLine| line.kind == target.kind && line.text == target.text;
+    let shares = |line: &DiffLine, side: SourceSide| {
+        line_number_on(target, side).is_some()
+            && line_number_on(target, side) == line_number_on(line, side)
+    };
+    // The old side first: working-tree edits move the new side's numbers,
+    // while the old side (HEAD, a base ref) stays put. Known limit: when the
+    // base itself moves (a partial commit), a repeated line can match a twin
+    // at its old number; telling the two apart needs the base's revision.
+    let matched = candidates()
+        .find(|(_, line)| *line == target)
+        .or_else(|| {
+            [SourceSide::Old, SourceSide::New]
+                .into_iter()
+                .find_map(|side| {
+                    candidates().find(|(_, line)| same_text(line) && shares(line, side))
+                })
+        })
+        .or_else(|| {
+            candidates()
+                .filter(|(_, line)| same_text(line))
+                .min_by_key(|(_, line)| line_distance(target, line))
+        })
+        .map(|(ix, _)| ix);
+    let nearest = || {
+        let (side, no) = line_position(target)?;
+        candidates()
+            .filter_map(|(ix, line)| Some((ix, line_number_on(line, side)?.abs_diff(no))))
+            .min_by_key(|(_, distance)| *distance)
+            .map(|(ix, _)| ix)
+    };
+    let Some(ix) = matched.or_else(nearest) else {
+        return Some((range.start, 0.0));
+    };
+    let ix = (ix as isize + delta).clamp(range.start as isize, range.end as isize - 1) as usize;
+    // A card or draft that did not survive lends its slot no offset.
+    let offset = match (&anchor.row, rows.get(ix)) {
+        (AnchorRow::Other(kind), Some(row))
+            if matched.is_some() && std::mem::discriminant(row) == *kind =>
+        {
+            anchor.offset_in_item
+        }
+        _ => 0.0,
+    };
+    Some((ix, offset))
+}
+
+/// The folds a refreshed diff opens with: every surviving file keeps its
+/// own, a file new to the diff follows the last collapse/expand-all, and any
+/// tween in flight settles (its stand-in row is not carried over).
+fn carried_folds(
+    folds: &HashMap<String, FileFold>,
+    files: &[FileDiff],
+    collapse_new: bool,
+) -> HashMap<String, FileFold> {
+    files
+        .iter()
+        .filter_map(|file| {
+            let fold = match folds.get(&file.path) {
+                Some(fold) => FileFold {
+                    toggled_at: None,
+                    ..*fold
+                },
+                None if collapse_new => FileFold {
+                    collapsed: true,
+                    ..FileFold::default()
+                },
+                None => return None,
+            };
+            Some((file.path.clone(), fold))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileHeaderPresentation {
     Row,
@@ -1647,7 +2014,16 @@ pub struct Changes {
     watch_task: Option<Task<()>>,
     parsed: Option<ParsedDiff>,
     parse_task: Option<Task<()>>,
+    /// Parse key of the parse in flight. State notifications stream in while
+    /// an agent works; without this each one restarted a running parse.
+    parse_inflight: Option<String>,
+    /// Parses started, so tests can tell a deduplicated sync from a restart.
+    #[cfg(test)]
+    parse_starts: usize,
     folds: HashMap<String, FileFold>,
+    /// What a file new to a refreshed diff opens as: the last collapse/expand
+    /// all, so a reviewer who folded everything is not handed an open body.
+    collapse_new_files: bool,
     highlights: HashMap<String, HighlightSlot>,
     /// The flattened row model the list virtualizes over (line granularity;
     /// collapsed bodies excluded) + each file's row span within it.
@@ -1755,7 +2131,11 @@ impl Changes {
             watch_task: None,
             parsed: None,
             parse_task: None,
+            parse_inflight: None,
+            #[cfg(test)]
+            parse_starts: 0,
             folds: HashMap::new(),
+            collapse_new_files: false,
             highlights: HashMap::new(),
             rows: Vec::new(),
             row_ranges: Vec::new(),
@@ -1991,6 +2371,11 @@ impl Changes {
             diff.checksum,
             self.scope_key()
         )
+    }
+
+    /// [`ParsedDiff::context`]: the parse key minus the checksum.
+    fn context_key(&self, diff: &CheckoutDiff) -> String {
+        format!("{}:{}", diff.checkout_id, self.scope_key())
     }
 
     /// Fetch the branch list for the selected chat's checkout (idempotent per
@@ -2295,11 +2680,14 @@ impl Changes {
         }
         self.ensure_scoped(cx);
         let Some(diff) = self.active_diff(cx) else {
+            self.parse_inflight = None;
+            self.parse_task = None;
             if self.parsed.take().is_some() {
                 self.rows.clear();
                 self.row_ranges.clear();
                 self.list.reset(0);
                 self.folds.clear();
+                self.collapse_new_files = false;
                 self.highlights.clear();
                 cx.notify();
             }
@@ -2307,9 +2695,20 @@ impl Changes {
         };
         let key = self.parse_key(&diff);
         if self.parsed.as_ref().is_some_and(|p| p.key == key) {
+            self.parse_inflight = None;
+            self.parse_task = None;
             self.sync_comment_rows(cx);
             return;
         }
+        if self.parse_inflight.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        self.parse_inflight = Some(key.clone());
+        #[cfg(test)]
+        {
+            self.parse_starts += 1;
+        }
+        let context = self.context_key(&diff);
         // Parse off the render path — patches run to megabytes.
         let patch = diff.patch.clone();
         let truncated = diff.truncated;
@@ -2317,11 +2716,18 @@ impl Changes {
         let deletions = diff.deletions;
         let file_count = diff.files.len();
         self.parse_task = Some(cx.spawn(async move |this, cx| {
-            let files = cx
+            let (files, fingerprints) = cx
                 .background_executor()
-                .spawn(async move { parse_patch(&patch) })
+                .spawn(async move {
+                    let files = parse_patch(&patch);
+                    let fingerprints = files.iter().map(file_fingerprint).collect::<Vec<_>>();
+                    (files, fingerprints)
+                })
                 .await;
             this.update(cx, |changes, cx| {
+                if changes.parse_inflight.as_deref() == Some(key.as_str()) {
+                    changes.parse_inflight = None;
+                }
                 // Late results for a superseded diff are re-checked by key.
                 let current = changes.active_diff(cx).map(|d| changes.parse_key(&d));
                 if current.as_deref() != Some(key.as_str()) {
@@ -2332,11 +2738,57 @@ impl Changes {
                 } else {
                     files.len()
                 };
-                let horizontal = files.iter().map(FileHorizontalState::new).collect();
-                changes.folds.clear();
-                changes.highlights.clear();
+                // Same context = the tree moved under the reviewer: keep what
+                // they were looking at (agent edits land mid-review; user
+                // report). A new context starts from the top, all open.
+                let previous = changes
+                    .parsed
+                    .take()
+                    .filter(|previous| previous.context == context);
                 let staged = changes.staged_comments(cx);
                 let draft = changes.draft_anchor();
+                let anchor = previous.as_ref().and_then(|previous| {
+                    let top = changes.list.logical_scroll_top();
+                    capture_scroll_anchor(
+                        &previous.files,
+                        &staged,
+                        &changes.rows,
+                        &changes.row_ranges,
+                        top.item_ix,
+                        top.offset_in_item.as_f32(),
+                    )
+                });
+                let index: HashMap<&str, usize> = files
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, file)| (file.path.as_str(), ix))
+                    .collect();
+                if previous.is_some() {
+                    changes.folds =
+                        carried_folds(&changes.folds, &files, changes.collapse_new_files);
+                    // Settled highlights of surviving files stay. One with a
+                    // full-source fetch still out is dropped: that fetch is
+                    // pinned to the old checksum and comes back stale, which
+                    // would leave the slot waiting forever.
+                    changes.highlights.retain(|path, slot| {
+                        index.contains_key(path.as_str())
+                            && match slot.state {
+                                DiffHighlightState::Ready(_) => true,
+                                DiffHighlightState::Plain => slot._fetch_task.is_none(),
+                                DiffHighlightState::Pending | DiffHighlightState::Excerpt(_) => {
+                                    false
+                                }
+                            }
+                    });
+                } else {
+                    changes.folds.clear();
+                    changes.collapse_new_files = false;
+                    changes.highlights.clear();
+                }
+                let resolve = |anchor: ScrollAnchor, rows: &[DiffRow], ranges: &[_]| {
+                    let old_files = &previous.as_ref()?.files;
+                    resolve_scroll_anchor(&anchor, old_files, &files, &staged, &index, rows, ranges)
+                };
                 let (rows, ranges) = flatten_rows(
                     &files,
                     &staged,
@@ -2344,7 +2796,12 @@ impl Changes {
                         .as_ref()
                         .map(|(path, side, line)| (path.as_str(), *side, *line)),
                     changes.mode,
-                    |_| false,
+                    |ix| {
+                        changes
+                            .folds
+                            .get(&files[ix].path)
+                            .is_some_and(|fold| fold.collapsed)
+                    },
                 );
                 changes.comment_key = comment_state_key(&staged, draft.as_ref());
                 // The uniform hint keeps offsets for never-rendered rows
@@ -2356,13 +2813,27 @@ impl Changes {
                     .reset_with_uniform_height(rows.len(), row_height);
                 changes.rows = rows;
                 changes.row_ranges = ranges;
+                if let Some((item_ix, offset)) =
+                    anchor.and_then(|anchor| resolve(anchor, &changes.rows, &changes.row_ranges))
+                {
+                    changes.list.scroll_to(gpui::ListOffset {
+                        item_ix,
+                        offset_in_item: px(offset),
+                    });
+                }
+                drop(index);
+                let horizontal = FileHorizontalState::carry(previous, &files, &fingerprints);
+                let highlight_keys = highlight_keys(&context, &fingerprints);
                 changes.parsed = Some(ParsedDiff {
                     key,
+                    context,
                     truncated,
                     additions,
                     deletions,
                     file_count,
                     horizontal,
+                    fingerprints,
+                    highlight_keys,
                     files: Arc::new(files),
                 });
                 cx.notify();
@@ -2577,6 +3048,7 @@ impl Changes {
             fold.collapsed = collapse;
             fold.toggled_at = None;
         }
+        self.collapse_new_files = collapse;
         let staged = self.staged_comments(cx);
         let draft = self.draft_anchor();
         for file_ix in (0..self.row_ranges.len().min(files.len())).rev() {
@@ -3060,11 +3532,10 @@ impl Changes {
     fn request_highlight(
         &mut self,
         file: &FileDiff,
-        parsed_key: &str,
+        fingerprint: u64,
         cx: &mut Context<Self>,
     ) -> Option<Arc<DiffHighlights>> {
         let lang = zeron_syntax::language_for_path(&file.path)?;
-        let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
             && slot.fingerprint == fingerprint
         {
@@ -3197,14 +3668,14 @@ impl Changes {
             return gpui::Empty.into_any_element();
         };
         let files = parsed.files.clone();
-        let parsed_key = parsed.key.clone();
         let Some(row) = self.rows.get(ix).copied() else {
             return gpui::Empty.into_any_element();
         };
+        let fingerprint = parsed.highlight_fingerprint(row.file());
         let theme = Theme::of(cx).clone();
         let highlight = files
             .get(row.file())
-            .and_then(|file| self.request_highlight(file, &parsed_key, cx));
+            .and_then(|file| self.request_highlight(file, fingerprint, cx));
         let horizontal = &self.parsed.as_ref().unwrap().horizontal[row.file()];
         let code_width = match files.get(row.file()) {
             Some(file) if !self.wrap_lines => DiffCodeWidth::Scrollable(horizontal.metrics(
@@ -5285,6 +5756,218 @@ mod tests {
             .unwrap();
     }
 
+    fn changes_window(cx: &mut gpui::TestAppContext) -> gpui::WindowHandle<Changes> {
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::dark());
+        });
+        cx.add_window(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.chats = vec![chat(Some("co"), "dev", Some("/repo"))];
+                state.selected_chat = Some("c1".into());
+                state
+            });
+            Changes::new(state, cx)
+        })
+    }
+
+    fn snapshot(checksum: &str, patch: &str) -> CheckoutDiff {
+        CheckoutDiff {
+            checksum: checksum.into(),
+            ..diff("co", "dev", "/repo", patch)
+        }
+    }
+
+    /// Point the pane at `diff` and sync, as a watch frame does.
+    fn show(changes: &mut Changes, diff: Option<CheckoutDiff>, cx: &mut Context<Changes>) {
+        changes.diffs = diff.into_iter().collect();
+        changes.sync(cx);
+    }
+
+    fn parsed_key(changes: &Changes) -> Option<&str> {
+        changes.parsed.as_ref().map(|parsed| parsed.key.as_str())
+    }
+
+    #[gpui::test]
+    fn repeated_syncs_never_restart_a_pending_parse(cx: &mut gpui::TestAppContext) {
+        let window = changes_window(cx);
+        window
+            .update(cx, |changes, _, cx| {
+                show(changes, Some(snapshot("a", PATCH)), cx);
+                changes.sync(cx);
+                changes.sync(cx);
+                assert_eq!(changes.parse_starts, 1);
+                assert_eq!(changes.parse_inflight.as_deref(), Some("co:a:wt"));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, cx| {
+                assert_eq!(parsed_key(changes), Some("co:a:wt"));
+                assert!(changes.parse_inflight.is_none());
+                changes.sync(cx);
+                assert_eq!(changes.parse_starts, 1);
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn returning_to_the_parsed_diff_drops_the_pending_parse(cx: &mut gpui::TestAppContext) {
+        let window = changes_window(cx);
+        window
+            .update(cx, |changes, _, cx| {
+                show(changes, Some(snapshot("a", PATCH)), cx)
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, cx| {
+                // A applied → B pending → back to A: B is dropped, not applied.
+                show(changes, Some(snapshot("b", LIB_PATCH)), cx);
+                assert_eq!(changes.parse_inflight.as_deref(), Some("co:b:wt"));
+                show(changes, Some(snapshot("a", PATCH)), cx);
+                assert!(changes.parse_inflight.is_none() && changes.parse_task.is_none());
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, cx| {
+                assert_eq!(parsed_key(changes), Some("co:a:wt"));
+                // …and B parses afresh when it comes back.
+                show(changes, Some(snapshot("b", LIB_PATCH)), cx);
+                assert_eq!(changes.parse_starts, 3);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, _| {
+                assert_eq!(parsed_key(changes), Some("co:b:wt"))
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn superseded_and_vanished_diffs_leave_nothing_pending(cx: &mut gpui::TestAppContext) {
+        let window = changes_window(cx);
+        window
+            .update(cx, |changes, _, cx| {
+                // A pending → B → A: each key replaces the previous parse.
+                show(changes, Some(snapshot("a", PATCH)), cx);
+                show(changes, Some(snapshot("b", LIB_PATCH)), cx);
+                show(changes, Some(snapshot("a", PATCH)), cx);
+                assert_eq!(changes.parse_starts, 3);
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, cx| {
+                assert_eq!(parsed_key(changes), Some("co:a:wt"));
+                // Diff gone mid-parse: the parse is dropped with it.
+                show(changes, Some(snapshot("b", LIB_PATCH)), cx);
+                show(changes, None, cx);
+                assert!(changes.parsed.is_none());
+                assert!(changes.parse_inflight.is_none() && changes.parse_task.is_none());
+                // The same key coming back parses again rather than waiting.
+                show(changes, Some(snapshot("b", LIB_PATCH)), cx);
+                assert_eq!(changes.parse_inflight.as_deref(), Some("co:b:wt"));
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, _| {
+                assert_eq!(parsed_key(changes), Some("co:b:wt"))
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
+    fn a_refresh_keeps_folds_and_scroll_but_a_new_checkout_starts_over(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let window = changes_window(cx);
+        // Tall enough below the anchored line that layout never clamps the
+        // scroll back to the top.
+        let lines: String = (0..400).map(|ix| format!("+filler_{ix}\n")).collect();
+        let other = format!(
+            "diff --git a/other.rs b/other.rs\n--- /dev/null\n+++ b/other.rs\n@@ -0,0 +1,400 @@\n{lines}"
+        );
+        window
+            .update(cx, |changes, _, cx| {
+                show(
+                    changes,
+                    Some(snapshot("a", &format!("{LIB_PATCH}{other}"))),
+                    cx,
+                )
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, cx| {
+                let files = changes.parsed.as_ref().unwrap().files.clone();
+                let top = row_of(&files, &changes.rows, "new_b");
+                changes.list.scroll_to(gpui::ListOffset {
+                    item_ix: top,
+                    offset_in_item: px(5.0),
+                });
+                // The agent edits above the line being read.
+                show(
+                    changes,
+                    Some(snapshot("b", &format!("{LIB_PATCH_SHIFTED}{other}"))),
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, cx| {
+                let files = changes.parsed.as_ref().unwrap().files.clone();
+                let top = changes.list.logical_scroll_top();
+                assert_eq!(top.item_ix, row_of(&files, &changes.rows, "new_b"));
+                assert_eq!(top.offset_in_item, px(5.0));
+
+                // Fold everything, then a file lands: it arrives folded too.
+                changes.toggle_collapse_all(cx);
+                let added = file_patch("added.rs", "n");
+                show(
+                    changes,
+                    Some(snapshot("c", &format!("{LIB_PATCH_SHIFTED}{other}{added}"))),
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, cx| {
+                assert_eq!(changes.row_ranges.len(), 3);
+                assert!(changes.row_ranges.iter().all(|range| range.len() == 1));
+                assert!(changes.all_collapsed());
+
+                // Another checkout is another context: open and at the top.
+                changes.state.update(cx, |state, _| {
+                    state.chats = vec![chat(Some("co2"), "dev", Some("/repo"))];
+                });
+                show(
+                    changes,
+                    Some(CheckoutDiff {
+                        checkout_id: "co2".into(),
+                        ..snapshot("d", LIB_PATCH)
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+        cx.run_until_parked();
+        window
+            .update(cx, |changes, _, _| {
+                assert!(!changes.all_collapsed());
+                assert!(!changes.collapse_new_files);
+                assert_eq!(changes.list.logical_scroll_top().item_ix, 0);
+                assert!(changes.row_ranges[0].len() > 1);
+            })
+            .unwrap();
+    }
+
     const PATCH: &str = "\
 diff --git a/src/main.rs b/src/main.rs
 index 111..222 100644
@@ -5511,6 +6194,392 @@ rename to new_name.rs
             -12.0
         );
         assert_eq!(sticky_header_push_offset(Some(0.0)), -FILE_HEADER_HEIGHT);
+    }
+
+    const LIB_PATCH: &str = "\
+diff --git a/lib.rs b/lib.rs
+--- a/lib.rs
++++ b/lib.rs
+@@ -50,3 +50,3 @@
+ keep_a
+-old_b
++new_b
+ keep_c
+";
+
+    /// [`LIB_PATCH`] after an edit near the top of the file: every line
+    /// below it moved down two.
+    const LIB_PATCH_SHIFTED: &str = "\
+diff --git a/lib.rs b/lib.rs
+--- a/lib.rs
++++ b/lib.rs
+@@ -1,1 +1,3 @@
+ top
++inserted_1
++inserted_2
+@@ -50,3 +52,3 @@
+ keep_a
+-old_b
++new_b
+ keep_c
+";
+
+    fn file_patch(path: &str, line: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,1 +1,1 @@\n-{line}\n+{line}!\n"
+        )
+    }
+
+    fn flat(files: &[FileDiff], mode: DiffMode) -> (Vec<DiffRow>, Vec<std::ops::Range<usize>>) {
+        flatten_rows(files, &[], None, mode, |_| false)
+    }
+
+    /// The row showing the first line whose text is `text`.
+    fn row_of(files: &[FileDiff], rows: &[DiffRow], text: &str) -> usize {
+        rows.iter()
+            .position(|row| {
+                row_lines(files, *row)
+                    .into_iter()
+                    .flatten()
+                    .any(|line| line.text == text)
+            })
+            .unwrap()
+    }
+
+    /// Capture over one parse, resolve over another.
+    fn remap(
+        old: &[FileDiff],
+        new: &[FileDiff],
+        new_collapsed: impl FnMut(usize) -> bool,
+        item_ix: usize,
+        offset: f32,
+    ) -> (Vec<DiffRow>, Option<(usize, f32)>) {
+        let (rows, ranges) = flat(old, DiffMode::Unified);
+        let anchor = capture_scroll_anchor(old, &[], &rows, &ranges, item_ix, offset).unwrap();
+        let (new_rows, new_ranges) = flatten_rows(new, &[], None, DiffMode::Unified, new_collapsed);
+        let resolved = resolve(&anchor, old, new, &[], &new_rows, &new_ranges);
+        (new_rows, resolved)
+    }
+
+    fn resolve(
+        anchor: &ScrollAnchor,
+        old: &[FileDiff],
+        new: &[FileDiff],
+        comments: &[ReviewComment],
+        rows: &[DiffRow],
+        ranges: &[std::ops::Range<usize>],
+    ) -> Option<(usize, f32)> {
+        let index = new
+            .iter()
+            .enumerate()
+            .map(|(ix, file)| (file.path.as_str(), ix))
+            .collect();
+        resolve_scroll_anchor(anchor, old, new, comments, &index, rows, ranges)
+    }
+
+    #[test]
+    fn scroll_anchor_round_trips_every_row_of_an_unchanged_diff() {
+        let files = parse_patch(PATCH);
+        let comments = [ReviewComment::new(
+            "src/main.rs",
+            CommentSide::New,
+            2,
+            "note",
+        )];
+        for mode in [DiffMode::Unified, DiffMode::Split] {
+            let (rows, ranges) = flatten_rows(&files, &comments, None, mode, |_| false);
+            assert!(
+                rows.iter()
+                    .any(|row| matches!(row, DiffRow::CommentCard { .. }))
+            );
+            for ix in 0..rows.len() {
+                let anchor =
+                    capture_scroll_anchor(&files, &comments, &rows, &ranges, ix, 3.0).unwrap();
+                let resolved = resolve(&anchor, &files, &files, &comments, &rows, &ranges);
+                let range = ranges.iter().find(|range| range.contains(&ix)).unwrap();
+                // A body with no lines (binary, pure rename) has nothing to
+                // hold onto below its header.
+                let expected = if files[rows[ix].file()].hunks.is_empty() && ix != range.start {
+                    (range.start, 0.0)
+                } else {
+                    (ix, 3.0)
+                };
+                assert_eq!(
+                    resolved,
+                    Some(expected),
+                    "{mode:?} row {ix}: {:?}",
+                    rows[ix]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scroll_anchor_follows_its_line_when_an_edit_above_shifts_numbers() {
+        let old = parse_patch(LIB_PATCH);
+        let new = parse_patch(LIB_PATCH_SHIFTED);
+        let (old_rows, _) = flat(&old, DiffMode::Unified);
+        let top = row_of(&old, &old_rows, "new_b");
+        let (new_rows, resolved) = remap(&old, &new, |_| false, top, 5.0);
+        assert_eq!(resolved, Some((row_of(&new, &new_rows, "new_b"), 5.0)));
+        assert_ne!(top, row_of(&new, &new_rows, "new_b"));
+
+        // The trailing pad holds its distance from the last line.
+        let pad = old_rows.len() - 1;
+        let (new_rows, resolved) = remap(&old, &new, |_| false, pad, 2.0);
+        assert_eq!(resolved, Some((new_rows.len() - 1, 2.0)));
+    }
+
+    #[test]
+    fn scroll_anchor_keeps_a_repeated_line_by_its_unmoved_old_number() {
+        let old = parse_patch(
+            "diff --git a/r.rs b/r.rs\n--- a/r.rs\n+++ b/r.rs\n@@ -49,3 +49,3 @@\n-x\n+y\n }\n tail\n",
+        );
+        // 40 lines land above, and with them a second `}` that now sits at
+        // the anchored line's old new-side number (50).
+        let inserted: String = (0..40).map(|ix| format!("+ins_{ix}\n")).collect();
+        let new = parse_patch(&format!(
+            "diff --git a/r.rs b/r.rs\n--- a/r.rs\n+++ b/r.rs\n@@ -9,2 +9,42 @@\n pre\n{inserted} }}\n@@ -49,3 +89,3 @@\n-x\n+y\n }}\n tail\n"
+        ));
+        let (old_rows, _) = flat(&old, DiffMode::Unified);
+        let top = row_of(&old, &old_rows, "}");
+        let (new_rows, resolved) = remap(&old, &new, |_| false, top, 5.0);
+        let (item_ix, offset) = resolved.unwrap();
+        let [line, _] = row_lines(&new, new_rows[item_ix]);
+        let line = line.unwrap();
+        assert_eq!(
+            (line.text.as_str(), line.old_no, line.new_no),
+            ("}", Some(50), Some(90))
+        );
+        assert_eq!(offset, 5.0);
+    }
+
+    #[test]
+    fn scroll_anchor_falls_back_to_the_closest_line_on_either_side() {
+        let old = parse_patch(
+            "diff --git a/n.rs b/n.rs\n--- a/n.rs\n+++ b/n.rs\n@@ -51,1 +51,1 @@\n-gone\n+gone_too\n",
+        );
+        // Nothing of the anchored line survives: the closest new-side line
+        // (50) wins over the next one (1000), even though it sits above.
+        let new = parse_patch(
+            "diff --git a/n.rs b/n.rs\n--- a/n.rs\n+++ b/n.rs\n@@ -50,1 +50,1 @@\n-near\n+near_new\n@@ -1000,1 +1000,1 @@\n-far\n+far_new\n",
+        );
+        let (old_rows, _) = flat(&old, DiffMode::Unified);
+        let top = row_of(&old, &old_rows, "gone_too");
+        let (new_rows, resolved) = remap(&old, &new, |_| false, top, 5.0);
+        assert_eq!(resolved, Some((row_of(&new, &new_rows, "near_new"), 0.0)));
+
+        // A deletion anchors on the old side, where context lines live too:
+        // its line reverted to context beats a deletion far away.
+        let top = row_of(&old, &old_rows, "gone");
+        let new = parse_patch(
+            "diff --git a/n.rs b/n.rs\n--- a/n.rs\n+++ b/n.rs\n@@ -10,1 +10,1 @@\n-del_far\n+add_far\n@@ -51,1 +51,1 @@\n ctx\n",
+        );
+        let (new_rows, resolved) = remap(&old, &new, |_| false, top, 5.0);
+        assert_eq!(resolved, Some((row_of(&new, &new_rows, "ctx"), 0.0)));
+    }
+
+    #[test]
+    fn scroll_anchor_drops_the_offset_when_it_lands_on_another_kind_of_row() {
+        let files = parse_patch(LIB_PATCH);
+        let comments = [ReviewComment::new("lib.rs", CommentSide::New, 51, "note")];
+        let (rows, ranges) = flatten_rows(&files, &comments, None, DiffMode::Unified, |_| false);
+        let card = rows
+            .iter()
+            .position(|row| matches!(row, DiffRow::CommentCard { .. }))
+            .unwrap();
+        let anchor = capture_scroll_anchor(&files, &comments, &rows, &ranges, card, 40.0).unwrap();
+        // The card is gone after the refresh: its slot now holds a code line.
+        let (rows, ranges) = flat(&files, DiffMode::Unified);
+        let resolved = resolve(&anchor, &files, &files, &[], &rows, &ranges);
+        assert_eq!(resolved, Some((card, 0.0)));
+        assert!(matches!(rows[card], DiffRow::Line { .. }));
+    }
+
+    #[test]
+    fn scroll_anchor_carries_an_offset_only_into_the_same_card() {
+        let files = parse_patch(LIB_PATCH);
+        let card = |body: &str| ReviewComment::new("lib.rs", CommentSide::New, 51, body);
+        let tall = card(&"line\n".repeat(20));
+        let other = card("other");
+        let first_card = |comments: &[ReviewComment]| {
+            let (rows, ranges) = flatten_rows(&files, comments, None, DiffMode::Unified, |_| false);
+            let ix = rows
+                .iter()
+                .position(|row| matches!(row, DiffRow::CommentCard { .. }))
+                .unwrap();
+            (rows, ranges, ix)
+        };
+        let before = [tall.clone(), other.clone()];
+        let (rows, ranges, top) = first_card(&before);
+        let anchor = capture_scroll_anchor(&files, &before, &rows, &ranges, top, 300.0).unwrap();
+        assert_eq!(anchor.row, AnchorRow::Card(Some(tall.id.clone())));
+
+        // Its card gone, the next card takes its slot but not its offset.
+        let after = [other.clone()];
+        let (rows, ranges, ix) = first_card(&after);
+        let resolved = resolve(&anchor, &files, &files, &after, &rows, &ranges);
+        assert_eq!(resolved, Some((ix, 0.0)));
+
+        // The same card, shortened: the offset stops at its new height.
+        let mut short = tall.clone();
+        short.body = "short".into();
+        let after = [short.clone(), other.clone()];
+        let (rows, ranges, ix) = first_card(&after);
+        let resolved = resolve(&anchor, &files, &files, &after, &rows, &ranges);
+        assert_eq!(resolved, Some((ix, comments::card_height("short"))));
+        assert!(comments::card_height("short") < 300.0);
+
+        // The same card, pushed down by a new one: found where it now sits.
+        let newer = card("newer");
+        let after = [newer, tall.clone(), other];
+        let (rows, ranges, ix) = first_card(&after);
+        let resolved = resolve(&anchor, &files, &files, &after, &rows, &ranges);
+        assert_eq!(
+            resolved,
+            Some((ix + 1, 300.0f32.min(comments::card_height(&tall.body))))
+        );
+    }
+
+    #[test]
+    fn scroll_anchor_falls_back_to_the_nearest_line_when_its_line_is_gone() {
+        let old = parse_patch(LIB_PATCH);
+        let new = parse_patch(
+            "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -50,3 +50,1 @@\n keep_a\n-old_b\n-keep_c\n",
+        );
+        let (old_rows, _) = flat(&old, DiffMode::Unified);
+        let top = row_of(&old, &old_rows, "keep_c");
+        let (new_rows, resolved) = remap(&old, &new, |_| false, top, 5.0);
+        // `keep_c` is now a deletion: the closest new-side line is `keep_a`.
+        assert_eq!(resolved, Some((row_of(&new, &new_rows, "keep_a"), 0.0)));
+    }
+
+    #[test]
+    fn scroll_anchor_follows_its_file_across_added_and_removed_files() {
+        let a = file_patch("a.rs", "a");
+        let b = file_patch("b.rs", "b");
+        let c = file_patch("c.rs", "c");
+        let old = parse_patch(&format!("{b}{c}"));
+        let (old_rows, _) = flat(&old, DiffMode::Unified);
+        let top = row_of(&old, &old_rows, "c!");
+
+        // A file landing above shifts every row; the anchor keeps to c.rs.
+        let new = parse_patch(&format!("{a}{b}{c}"));
+        let (new_rows, resolved) = remap(&old, &new, |_| false, top, 4.0);
+        assert_eq!(resolved, Some((row_of(&new, &new_rows, "c!"), 4.0)));
+
+        // b.rs anchored, then gone: the next file's header, else the previous.
+        let top = row_of(&old, &old_rows, "b!");
+        let new = parse_patch(&format!("{a}{c}"));
+        let (_, ranges) = flat(&new, DiffMode::Unified);
+        let (_, resolved) = remap(&old, &new, |_| false, top, 4.0);
+        assert_eq!(resolved, Some((ranges[1].start, 0.0)));
+        let old = parse_patch(&format!("{a}{b}"));
+        let (old_rows, _) = flat(&old, DiffMode::Unified);
+        let top = row_of(&old, &old_rows, "b!");
+        let new = parse_patch(&a);
+        let (_, resolved) = remap(&old, &new, |_| false, top, 4.0);
+        assert_eq!(resolved, Some((0, 0.0)));
+        // Nothing left at all: no anchor to restore.
+        let (_, resolved) = remap(&old, &[], |_| false, top, 4.0);
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn scroll_anchor_lands_on_the_header_of_a_collapsed_file() {
+        let b = file_patch("b.rs", "b");
+        let c = file_patch("c.rs", "c");
+        let files = parse_patch(&format!("{b}{c}"));
+        let (rows, ranges) = flat(&files, DiffMode::Unified);
+        let top = row_of(&files, &rows, "c!");
+        let (new_rows, resolved) = remap(&files, &files, |ix| ix == 1, top, 4.0);
+        assert_eq!(resolved, Some((ranges[1].start, 0.0)));
+        assert_eq!(new_rows[ranges[1].start], DiffRow::FileHeader { file: 1 });
+    }
+
+    #[test]
+    fn refreshed_folds_keep_their_state_and_new_files_follow_fold_all() {
+        let files = parse_patch(&format!(
+            "{}{}",
+            file_patch("kept.rs", "k"),
+            file_patch("new.rs", "n")
+        ));
+        let mut folds = HashMap::new();
+        folds.insert(
+            "kept.rs".to_string(),
+            FileFold {
+                collapsed: true,
+                epoch: 3,
+                from: 120.0,
+                to: 0.0,
+                toggled_at: Some(std::time::Instant::now()),
+            },
+        );
+        folds.insert(
+            "gone.rs".to_string(),
+            FileFold {
+                collapsed: true,
+                ..FileFold::default()
+            },
+        );
+
+        let carried = carried_folds(&folds, &files, false);
+        assert_eq!(carried.len(), 1);
+        let kept = carried["kept.rs"];
+        assert!(kept.collapsed);
+        assert_eq!(kept.epoch, 3);
+        // An in-flight tween settles: the refresh rebuilds steady rows.
+        assert!(kept.toggled_at.is_none() && !kept.animating());
+
+        let carried = carried_folds(&folds, &files, true);
+        assert!(carried["new.rs"].collapsed);
+        assert!(!carried.contains_key("gone.rs"));
+    }
+
+    #[test]
+    fn horizontal_state_carries_per_file_across_a_refresh() {
+        let old_files = parse_patch(&format!(
+            "{}{}",
+            file_patch("same.rs", "s"),
+            file_patch("edited.rs", "e")
+        ));
+        let new_files = parse_patch(&format!(
+            "{}{}{}",
+            file_patch("same.rs", "s"),
+            file_patch("edited.rs", "e2"),
+            file_patch("added.rs", "a")
+        ));
+        let fingerprints = |files: &[FileDiff]| files.iter().map(file_fingerprint).collect();
+        let old_fingerprints: Vec<u64> = fingerprints(&old_files);
+        let new_fingerprints: Vec<u64> = fingerprints(&new_files);
+        assert_eq!(old_fingerprints[0], new_fingerprints[0]);
+        assert_ne!(old_fingerprints[1], new_fingerprints[1]);
+
+        let horizontal: Vec<FileHorizontalState> =
+            old_files.iter().map(FileHorizontalState::new).collect();
+        for (ix, state) in horizontal.iter().enumerate() {
+            state
+                .scroll
+                .set_offset(gpui::Point::new(px(-10.0 * (ix + 1) as f32), px(0.0)));
+        }
+        let previous = ParsedDiff {
+            key: "c:1:wt".into(),
+            context: "c:wt".into(),
+            truncated: false,
+            additions: 0,
+            deletions: 0,
+            file_count: old_files.len(),
+            horizontal,
+            highlight_keys: highlight_keys("c:wt", &old_fingerprints),
+            fingerprints: old_fingerprints,
+            files: Arc::new(old_files),
+        };
+        let carried = FileHorizontalState::carry(Some(previous), &new_files, &new_fingerprints);
+        let offsets: Vec<f32> = carried
+            .iter()
+            .map(|state| state.scroll.offset().x.as_f32())
+            .collect();
+        assert_eq!(offsets, vec![-10.0, -20.0, 0.0]);
     }
 
     #[test]

@@ -220,7 +220,7 @@ class SessionListController: UIViewController, UICollectionViewDelegate {
             return
         }
         guard let session = SessionViewController(app: app, chatId: id) else {
-            (tabBarController as? MainTabController)?.showSessionOpenError()
+            mainShell?.showSessionOpenError()
             return
         }
         navigationController?.pushViewController(session, animated: true)
@@ -286,6 +286,7 @@ class SessionListController: UIViewController, UICollectionViewDelegate {
                 return UIMenu(children: [
                     UIAction(title: "Unarchive", image: UIImage(systemName: "tray.and.arrow.up")) { _ in self.app.unarchive(id) },
                     UIAction(title: "Rename…", image: UIImage(systemName: "pencil")) { _ in self.rename(id) },
+                    self.deleteAction(id),
                 ])
             }
             var actions: [UIMenuElement] = [
@@ -297,8 +298,15 @@ class SessionListController: UIViewController, UICollectionViewDelegate {
             return UIMenu(children: actions + [
                 self.moveMenu(id),
                 UIAction(title: "Rename…", image: UIImage(systemName: "pencil")) { _ in self.rename(id) },
-                UIAction(title: "Archive", image: UIImage(systemName: "archivebox"), attributes: .destructive) { _ in self.app.archive(id) },
+                UIAction(title: "Archive", image: UIImage(systemName: "archivebox")) { _ in self.app.archive(id) },
+                self.deleteAction(id),
             ])
+        }
+    }
+
+    private func deleteAction(_ id: String) -> UIAction {
+        UIAction(title: "Delete", image: UIImage(systemName: "trash"), attributes: .destructive) { [weak self] _ in
+            self?.confirmDelete(app: self?.app, id) {}
         }
     }
 
@@ -481,6 +489,28 @@ class SessionsViewController: SessionListController {
         navigationItem.rightBarButtonItem = UIBarButtonItem(image: UIImage(systemName: "ellipsis"), menu: optionsMenu())
     }
 
+    /// iPhone: search lives in the bottom bar (the system's toolbar-integrated
+    /// field) and filters this list in place.
+    func enableToolbarSearch() {
+        guard navigationItem.searchController == nil else { return }
+        let search = UISearchController(searchResultsController: nil)
+        search.searchResultsUpdater = self
+        search.obscuresBackgroundDuringPresentation = false
+        search.searchBar.placeholder = "Search"
+        navigationItem.searchController = search
+        navigationItem.preferredSearchBarPlacement = .integrated
+        navigationItem.searchBarPlacementAllowsToolbarIntegration = true
+        // Otherwise the list opens scrolled past the large title.
+        navigationItem.hidesSearchBarWhenScrolling = false
+    }
+
+    func activateSearch() {
+        navigationItem.searchController?.isActive = true
+        DispatchQueue.main.async { [weak self] in
+            self?.navigationItem.searchController?.searchBar.becomeFirstResponder()
+        }
+    }
+
     override func buildSections() -> [(id: String, header: String?, folders: [FolderRowVM], sessions: [SessionRowVM])] {
         if !query.trimmingCharacters(in: .whitespaces).isEmpty {
             return [("results", nil, [], app.search(query))]
@@ -581,6 +611,8 @@ final class FolderViewController: SessionListController {
     init(app: AppModel, folder: FolderRowVM) {
         self.folder = folder
         super.init(app: app)
+        // The front page's bottom bar is the front page's alone.
+        hidesBottomBarWhenPushed = true
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -650,6 +682,12 @@ final class FolderViewController: SessionListController {
         // iPad presents action sheets as popovers: anchor it to the ⋯ button.
         alert.popoverPresentationController?.barButtonItem = navigationItem.rightBarButtonItem
         present(alert, animated: true)
+    }
+}
+
+extension SessionsViewController: UISearchResultsUpdating {
+    func updateSearchResults(for searchController: UISearchController) {
+        query = searchController.searchBar.text ?? ""
     }
 }
 

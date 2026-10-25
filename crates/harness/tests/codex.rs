@@ -105,6 +105,7 @@ fn request(prompt: &str) -> RunRequest {
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        env: Default::default(),
     }
 }
 
@@ -762,28 +763,243 @@ async fn turn_failed_maps_to_errored_done() {
     );
 }
 
+/// A missing rollout, and an empty one (unreadable for good), both resume
+/// as a fresh thread with a plain-words notice.
 #[tokio::test]
 async fn resume_falls_back_to_fresh_thread() {
+    for (resume, reason) in [
+        ("resume-fail", "it isn't saved on this device"),
+        ("resume-empty", "its saved history is empty"),
+    ] {
+        let (controls, _steer, _token) = controls("Yes");
+        let mut req = request("scenario:resumed");
+        req.resume = Some(resume.into());
+        let events = run_to_end(&harness(), req, controls).await;
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::SessionStarted { session_id, .. } if session_id == "th-fresh"
+            )),
+            "fresh thread expected: {events:?}"
+        );
+        // The lost context is said out loud, once, in the new reply.
+        let notices: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "{events:?}");
+        assert_eq!(
+            notices[0],
+            format!(
+                "Couldn't restore the earlier Codex conversation ({reason}), so this reply \
+                 starts a new one without its context."
+            )
+        );
+        assert_eq!(zeron_proto::run_errors::provider_problem(notices[0]), None);
+        assert_eq!(
+            events.last(),
+            Some(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("th-fresh".into()),
+            })
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_archived_thread_is_unarchived_and_resumed() {
     let (controls, _steer, _token) = controls("Yes");
     let mut req = request("scenario:resumed");
-    req.resume = Some("resume-fail".into());
+    req.resume = Some("resume-archived".into());
     let events = run_to_end(&harness(), req, controls).await;
-
     assert!(
         events.iter().any(|e| matches!(
             e,
-            AgentEvent::SessionStarted { session_id, .. } if session_id == "th-fresh"
+            AgentEvent::SessionStarted { session_id, .. } if session_id == "th-unarchived"
         )),
-        "fresh thread expected: {events:?}"
+        "{events:?}"
     );
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+}
+
+/// A resume failure a fresh thread would share (bad configuration, a dead
+/// process) fails the run instead of silently dropping the conversation.
+#[tokio::test]
+async fn a_resume_refusal_fails_the_run_instead_of_starting_fresh() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:resumed");
+    req.resume = Some("resume-broken".into());
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. })),
+        "{events:?}"
+    );
+    match events.last() {
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            error: Some(error),
+            ..
+        }) => assert!(error.contains("failed to load configuration"), "{error}"),
+        other => panic!("expected an errored Done, got {other:?}"),
+    }
+}
+
+/// An app-server that dies under `thread/start` reports its exit and what it
+/// printed, not a bare "exited before responding".
+#[tokio::test]
+async fn a_crash_during_thread_setup_reports_its_stderr() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().join("crash-on-thread-start");
+    std::fs::create_dir(&cwd).unwrap();
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:happy");
+    req.cwd = cwd.display().to_string();
+    let events = run_to_end(&harness(), req, controls).await;
+    match events.last() {
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            error: Some(error),
+            ..
+        }) => {
+            assert!(error.contains("exit code 3"), "{error}");
+            assert!(error.contains("bad toml in mcp_servers"), "{error}");
+        }
+        other => panic!("expected an errored Done, got {other:?}"),
+    }
+}
+
+/// Codex's own retries ("Reconnecting… 2/5") are progress, not transcript
+/// errors, and the final error is reported once — by the Done — in the
+/// sign-in/limit vocabulary the UI acts on.
+#[tokio::test]
+async fn retry_notices_stay_out_of_the_transcript_and_the_final_error_lands_once() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:retry-errors"), controls).await;
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    let dones: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done { status, error, .. } => Some((*status, error.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dones.len(), 1, "{events:?}");
+    let (status, error) = &dones[0];
+    assert_eq!(*status, DoneStatus::Errored);
+    let error = error.as_deref().unwrap();
+    assert!(
+        error.starts_with("Codex usage limit reached — it resets in 2h 1"),
+        "{error}"
+    );
+    assert_eq!(
+        zeron_proto::run_errors::provider_problem(error),
+        Some(zeron_proto::run_errors::ProviderProblem::LimitReached)
+    );
+}
+
+/// A final error the app-server reported before dying mid-turn is not lost
+/// with the turn's end: the crash Done carries it, ahead of the exit and
+/// the stderr it printed.
+#[tokio::test]
+async fn a_crash_after_a_final_error_reports_both() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:crash-after-error"), controls).await;
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    match events.last() {
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            error: Some(error),
+            ..
+        }) => {
+            assert!(
+                error.starts_with("Codex's credentials were rejected. Run codex login"),
+                "{error}"
+            );
+            assert!(
+                error.contains("codex app-server exited unexpectedly")
+                    && error.contains("lost the model client"),
+                "{error}"
+            );
+            assert_eq!(
+                zeron_proto::run_errors::provider_problem(error),
+                Some(zeron_proto::run_errors::ProviderProblem::SignedOut)
+            );
+        }
+        other => panic!("expected an errored Done, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_turn_interrupted_elsewhere_is_not_a_completed_answer() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:foreign-interrupt"), controls).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                error: None,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+
+/// Permission approvals grant what was asked; MCP elicitations are asked
+/// (a flat form) or declined (a URL flow) — never refused with a JSON-RPC
+/// error, which failed the MCP tool call. Unknown requests still are.
+#[tokio::test]
+async fn permission_and_elicitation_requests_get_valid_replies() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:server-requests"), controls).await;
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
             status: DoneStatus::Completed,
             result: None,
             error: None,
-            session_id: Some("th-fresh".into()),
-        })
+            session_id: Some("th-1".into()),
+        }),
+        "{events:?}"
+    );
+}
+
+/// An app-server that predates notification opt-outs refuses the handshake
+/// capability; the run asks again without it instead of failing.
+#[tokio::test]
+async fn a_refused_notification_opt_out_is_retried_without_it() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:resumed");
+    req.env
+        .insert("FAKE_CODEX_REJECT_OPT_OUT".into(), "1".into());
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
     );
 }
 
@@ -2002,4 +2218,96 @@ async fn external_voice_keeps_canonical_events_without_any_local_helper() {
     assert!(!wire.contains("appendAudio"));
     token.cancel();
     pump.abort();
+}
+
+/// A wrapper around the fake app-server that dies (printing `reason`) on its
+/// first `fail` launches, then runs the fake. Counts launches in `count`.
+fn flaky_app_server(dir: &std::path::Path, fail: u32, reason: &str) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let count = dir.join("launches");
+    let script = dir.join("codex");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nn=$(cat '{count}' 2>/dev/null || echo 0)\nn=$((n+1))\necho $n > '{count}'\n\
+             if [ \"$n\" -le {fail} ]; then echo '{reason}' >&2; exit 1; fi\nexec '{fake}' \"$@\"\n",
+            count = count.display(),
+            fake = fixture_path().display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, count)
+}
+
+#[tokio::test]
+async fn an_app_server_that_dies_before_answering_is_relaunched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (script, count) = flaky_app_server(dir.path(), 1, "cold start: not ready");
+    let (controls, _steer, _token) = controls("Yes");
+    let harness = CodexHarness::new().with_executable(script);
+    // As the happy-path test asks for it (the fake checks both).
+    let mut req = request("scenario:happy");
+    req.cwd = "/tmp".into();
+    req.model_options.insert(
+        "serviceTier".into(),
+        serde_json::Value::String("fast".into()),
+    );
+    let events = run_to_end(&harness, req, controls).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. })),
+        "the second launch runs the turn: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{:?}",
+        events.last()
+    );
+    assert_eq!(std::fs::read_to_string(count).unwrap().trim(), "2");
+}
+
+#[tokio::test]
+async fn an_app_server_that_keeps_dying_reports_what_it_printed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (script, count) = flaky_app_server(dir.path(), 99, "missing libssl.so.3");
+    let (controls, _steer, _token) = controls("Yes");
+    let harness = CodexHarness::new().with_executable(script);
+    let stream = harness
+        .run(request("scenario:happy"), controls)
+        .await
+        .expect("run starts");
+    // Three relaunches, 1 + 3 + 8 s apart.
+    let events = tokio::time::timeout(
+        Duration::from_secs(30),
+        stream.map(|r| r.expect("stream event")).collect::<Vec<_>>(),
+    )
+    .await
+    .expect("gives up in time");
+    match events.last() {
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            error: Some(error),
+            ..
+        }) => {
+            assert!(error.starts_with("initialize:"), "{error}");
+            assert!(
+                error.contains("missing libssl.so.3"),
+                "the stderr tail: {error}"
+            );
+        }
+        other => panic!("expected an errored Done, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(count).unwrap().trim(),
+        "4",
+        "one launch + three relaunches"
+    );
 }

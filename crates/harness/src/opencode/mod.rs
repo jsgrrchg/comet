@@ -682,6 +682,8 @@ struct Server {
     /// Wire generation, resolved once via the health endpoints.
     protocol: tokio::sync::OnceCell<Protocol>,
     version: tokio::sync::OnceCell<ServerVersion>,
+    /// Keeps preview discovery off our own server's port while it lives.
+    _port: Option<crate::agent_ports::Reservation>,
 }
 
 /// The attached server's wire generation: the 1.x "v1" global namespace
@@ -785,6 +787,7 @@ impl Server {
             stderr_tail: crate::StderrTail::default(),
             protocol: tokio::sync::OnceCell::new(),
             version: tokio::sync::OnceCell::new(),
+            _port: None,
         }
     }
 
@@ -990,6 +993,7 @@ impl Server {
             stderr_tail,
             protocol: tokio::sync::OnceCell::new(),
             version: tokio::sync::OnceCell::new(),
+            _port: Some(crate::agent_ports::reserve(port)),
         };
 
         // Readiness: the server binds a few seconds into the process's life
@@ -1289,6 +1293,7 @@ impl Server {
             stderr_tail: crate::StderrTail::default(),
             protocol: self.protocol.clone(),
             version: self.version.clone(),
+            _port: None,
         }
     }
 

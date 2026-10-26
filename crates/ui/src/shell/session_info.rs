@@ -1,5 +1,7 @@
-//! The session card: where this chat runs (device, project, branch), its
-//! side-chat actions, and the project's run actions, in one toggleable card.
+//! The session card: where this chat runs (device, project, branch) and the
+//! project's run actions, with the ports card (the servers its agents and
+//! terminals started) and the lanes card (its side chats and subagents, see
+//! `session_lanes`) stacked under it, all behind one toggle.
 //! While the column has room, the card shows at its right on its own (until
 //! the user hides it), the transcript and composer shifting left as needed
 //! to clear it. Once clearing it would narrow the transcript, the card hides,
@@ -13,6 +15,8 @@ use crate::project_actions::{ProjectActionsStatus, action_icon};
 pub(super) const SESSION_CARD_WIDTH: f32 = 272.0;
 const SESSION_CARD_INSET: f32 = 12.0;
 const SESSION_CARD_GAP: f32 = 24.0;
+/// The gap between the session card and the lanes card under it.
+const SESSION_CARDS_GAP: f32 = 8.0;
 /// The transcript's own side gutters (its rows pad 48px each side).
 const TRANSCRIPT_GUTTER: f32 = 48.0;
 
@@ -28,6 +32,63 @@ pub(super) fn session_card_reserve(main: f32, transcript: f32) -> Option<f32> {
     let reserve = (main + transcript - 2.0 * (card_left - SESSION_CARD_GAP)).max(0.0);
     (main - reserve - 2.0 * TRANSCRIPT_GUTTER >= transcript - 0.5).then_some(reserve)
 }
+
+/// The branch's diff over its base, for the branch row's `+N −M`: the
+/// Changes pane's *Branch changes* scope, kept without the pane. The
+/// `WatchCheckoutDiffs` stream only says when to re-capture: its checksum
+/// moves with the working tree and HEAD.
+#[derive(Default)]
+pub(super) struct SessionDiffs {
+    diffs: Vec<zeron_proto::CheckoutDiff>,
+    /// Device the running watch targets: `None` the connected engine, else
+    /// a remote chat's host (diffs are produced where the checkout lives).
+    target: Option<Option<String>>,
+    _watch: Option<Task<()>>,
+    /// The comparison base per `device:cwd`, from `ListBranches`.
+    base: Option<(String, String)>,
+    /// `chat|cwd` the totals belong to, and those totals.
+    branch: Option<(String, (u32, u32))>,
+    /// `chat|cwd|checksum` last fetched (or in flight).
+    fetched: Option<String>,
+    _fetch: Option<Task<()>>,
+}
+
+impl SessionDiffs {
+    /// The working-tree diff's checksum for `chat`: a branch capture is
+    /// stale once it moves.
+    fn checksum(&self, chat: &zeron_proto::Chat) -> Option<String> {
+        crate::changes::resolve_diff(&self.diffs, chat).map(|diff| diff.checksum.clone())
+    }
+
+    /// The branch's line totals over its base; `None` while clean or unknown.
+    fn totals(&self, chat: &zeron_proto::Chat) -> Option<(u32, u32)> {
+        let context = format!("{}|{}", chat.id, chat.cwd.as_deref()?);
+        self.branch
+            .as_ref()
+            .filter(|(key, _)| *key == context)
+            .map(|&(_, totals)| totals)
+            .filter(|&(adds, dels)| adds + dels > 0)
+    }
+}
+
+/// The selected chat's running servers, for the ports card: the same
+/// `WatchPreviews` stream the browser's start page lists, kept without it.
+#[derive(Default)]
+pub(super) struct SessionPreviews {
+    snapshot: zeron_proto::PreviewSnapshot,
+    /// The chat the running watch follows.
+    chat: Option<String>,
+    _watch: Option<Task<()>>,
+    /// Ports paged in past the first [`PORTS_INITIAL`]; per chat.
+    shown: usize,
+    scroll: gpui::ScrollHandle,
+    /// The card's floating scrollbar, the lanes card's treatment.
+    bar: popover::MenuScrollbarState,
+}
+
+/// The ports card lists this many, then pages in [`PORTS_PAGE`] at a time.
+const PORTS_INITIAL: usize = 3;
+const PORTS_PAGE: usize = 10;
 
 /// A non-interactive card row: icon slot, label, optional trailing detail.
 fn info_row(theme: &Theme, glyph: AnyElement, label: SharedString) -> gpui::Div {
@@ -52,6 +113,217 @@ fn row_glyph(path: &'static str, theme: &Theme) -> AnyElement {
 }
 
 impl Shell {
+    /// Watch the selected chat's host for checkout diffs (idempotent per
+    /// host); it retries every 2s while the stream fails or ends.
+    fn ensure_session_diffs(&mut self, cx: &mut Context<Self>) {
+        let (target, engine) = {
+            let state = self.state.read(cx);
+            let Some(chat) = state.selected_chat_row() else {
+                return;
+            };
+            let device = chat.device_id.clone();
+            let target =
+                (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device);
+            (target, state.engine().cloned())
+        };
+        if self.session_diffs.target.as_ref() == Some(&target) {
+            return;
+        }
+        // Engine still booting: the next render retries.
+        let Some(engine) = engine else {
+            return;
+        };
+        self.session_diffs.diffs.clear();
+        self.session_diffs.target = Some(target.clone());
+        self.session_diffs._watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let mut params = serde_json::Map::new();
+                if let Some(target) = &target {
+                    params.insert(
+                        "targetDeviceId".into(),
+                        serde_json::Value::String(target.clone()),
+                    );
+                }
+                if let Ok(mut rx) = engine
+                    .client()
+                    .subscribe(
+                        methods::WATCH_CHECKOUT_DIFFS,
+                        serde_json::Value::Object(params),
+                    )
+                    .await
+                {
+                    while let Some(value) = rx.recv().await {
+                        let alive = this.update(cx, |this, cx| {
+                            // Re-render (and so re-capture) only when the open
+                            // chat's checkout moves.
+                            let chat = this.state.read(cx).selected_chat_row().cloned();
+                            let checksum = |diffs: &SessionDiffs| {
+                                chat.as_ref().and_then(|chat| diffs.checksum(chat))
+                            };
+                            let before = checksum(&this.session_diffs);
+                            if crate::changes::apply_diff_frame(
+                                &mut this.session_diffs.diffs,
+                                value,
+                            ) && checksum(&this.session_diffs) != before
+                            {
+                                cx.notify();
+                            }
+                        });
+                        if alive.is_err() {
+                            return;
+                        }
+                    }
+                }
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+            }
+        }));
+    }
+
+    /// Watch the selected chat's running servers (idempotent per chat); it
+    /// retries every 2s while the stream fails or ends, listing nothing
+    /// meanwhile rather than servers that may have stopped.
+    fn ensure_session_previews(&mut self, chat_id: &str, cx: &mut Context<Self>) {
+        if self.session_previews.chat.as_deref() == Some(chat_id) {
+            return;
+        }
+        // Engine still booting: the next render retries.
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.session_previews = SessionPreviews {
+            chat: Some(chat_id.to_owned()),
+            ..Default::default()
+        };
+        let chat_id = chat_id.to_owned();
+        self.session_previews._watch = Some(cx.spawn(async move |this, cx| {
+            loop {
+                if let Ok(mut rx) = engine
+                    .client()
+                    .subscribe(
+                        methods::WATCH_PREVIEWS,
+                        serde_json::json!({ "chatId": chat_id }),
+                    )
+                    .await
+                {
+                    while let Some(value) = rx.recv().await {
+                        let Ok(snapshot) =
+                            serde_json::from_value::<zeron_proto::PreviewSnapshot>(value)
+                        else {
+                            continue;
+                        };
+                        let alive = this.update(cx, |this, cx| {
+                            if this.session_previews.snapshot != snapshot {
+                                this.session_previews.snapshot = snapshot;
+                                cx.notify();
+                            }
+                        });
+                        if alive.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let alive = this.update(cx, |this, cx| {
+                    if !this.session_previews.snapshot.services.is_empty() {
+                        this.session_previews.snapshot.services.clear();
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
+                }
+                cx.background_executor().timer(Duration::from_secs(2)).await;
+            }
+        }));
+    }
+
+    /// Capture `chat`'s branch diff over its base (idempotent per chat, cwd
+    /// and working-tree checksum). The base is the repo's default branch, as
+    /// the Changes pane presets it; the last totals stay while a re-capture
+    /// runs.
+    fn ensure_branch_totals(&mut self, chat: &zeron_proto::Chat, cx: &mut Context<Self>) {
+        let Some(cwd) = chat.cwd.clone() else {
+            return;
+        };
+        // Until the watch reports the checkout, there is nothing to refresh on.
+        let Some(checksum) = self.session_diffs.checksum(chat) else {
+            return;
+        };
+        let context = format!("{}|{cwd}", chat.id);
+        let key = format!("{context}|{checksum}");
+        if self.session_diffs.fetched.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let target = self.session_diffs.target.clone().flatten();
+        let repo = format!("{}:{cwd}", target.as_deref().unwrap_or("local"));
+        let known_base = self
+            .session_diffs
+            .base
+            .as_ref()
+            .filter(|(at, _)| *at == repo)
+            .map(|(_, base)| base.clone());
+        let current = chat.branch.clone();
+        self.session_diffs.fetched = Some(key.clone());
+        self.session_diffs._fetch = Some(cx.spawn(async move |this, cx| {
+            let with_target = |mut params: serde_json::Map<String, serde_json::Value>| {
+                if let Some(target) = &target {
+                    params.insert(
+                        "targetDeviceId".into(),
+                        serde_json::Value::String(target.clone()),
+                    );
+                }
+                serde_json::Value::Object(params)
+            };
+            let base = match known_base {
+                Some(base) => Some(base),
+                None => {
+                    let mut params = serde_json::Map::new();
+                    params.insert("repoPath".into(), serde_json::Value::String(cwd.clone()));
+                    engine
+                        .client()
+                        .call(methods::LIST_BRANCHES, with_target(params))
+                        .await
+                        .ok()
+                        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+                        .and_then(|branches| {
+                            crate::changes::default_base_ref(&branches, current.as_deref())
+                        })
+                }
+            };
+            let diff = match &base {
+                Some(base) => {
+                    let mut params = serde_json::Map::new();
+                    params.insert("cwd".into(), serde_json::Value::String(cwd.clone()));
+                    params.insert("mode".into(), "branch".into());
+                    params.insert("baseRef".into(), serde_json::Value::String(base.clone()));
+                    engine
+                        .client()
+                        .call(methods::GET_CHECKOUT_DIFF, with_target(params))
+                        .await
+                        .ok()
+                        .and_then(|value| {
+                            serde_json::from_value::<zeron_proto::CheckoutDiff>(value).ok()
+                        })
+                }
+                None => None,
+            };
+            this.update(cx, |this, cx| {
+                let diffs = &mut this.session_diffs;
+                if diffs.fetched.as_deref() != Some(key.as_str()) {
+                    return; // superseded by a chat switch or a newer checksum
+                }
+                if let Some(base) = base {
+                    diffs.base = Some((repo, base));
+                }
+                diffs.branch = diff.map(|diff| (context, (diff.additions, diff.deletions)));
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
     /// The card's reserve at the main column's LIVE width (see
     /// [`session_card_reserve`]): while the sidebar or a pane animates, the
     /// settled width would move or hide the card ahead of the column.
@@ -101,9 +373,20 @@ impl Shell {
         cx.notify();
     }
 
+    /// Show the card: beside the transcript when it fits there, else over it.
+    pub(super) fn show_session_info(&mut self, cx: &mut Context<Self>) {
+        if !self.session_info_fits(cx) {
+            self.session_info_overlay = true;
+        } else if self.settings.session_info_hidden {
+            self.settings.session_info_hidden = false;
+            self.schedule_save(cx);
+        }
+        cx.notify();
+    }
+
     /// Dismiss the card floating over the transcript; one shown beside it
     /// stays put.
-    fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn close_session_info_overlay(&mut self, cx: &mut Context<Self>) {
         if self.session_info_overlay {
             self.session_info_overlay = false;
             cx.notify();
@@ -114,7 +397,8 @@ impl Shell {
     /// it), its reveal, 0 (hidden) → 1 (shown), and the room the transcript
     /// holds free for it. The reveal eases on the shell's resize clock
     /// whenever the card shows or hides, by toggle or by the column crossing
-    /// the fit, and the reserve eases with it.
+    /// the fit, and the reserve eases with it. A switch between chats lands
+    /// it directly, with the destination's panels.
     pub(super) fn session_info_frame(&mut self, has_selection: bool, cx: &App) -> (bool, f32, f32) {
         let reserve = self.session_info_reserve(cx);
         if let Some(reserve) = reserve {
@@ -127,11 +411,13 @@ impl Shell {
             self.session_info_docked = reserve.is_some();
         }
         let target = if shown { 1.0 } else { 0.0 };
-        if shown != self.session_info_shown {
+        if std::mem::take(&mut self.session_info_snap) {
+            self.session_info_tween = None;
+        } else if shown != self.session_info_shown {
             let from = self.eval_tween(self.session_info_tween, 1.0 - target);
             self.session_info_tween = Some(WidthTween::new(from, target));
-            self.session_info_shown = shown;
         }
+        self.session_info_shown = shown;
         let reveal = self.eval_tween(self.session_info_tween, target);
         // Hiding as the column stops fitting, the card keeps its docked look
         // and the transcript eases back from the last room it held.
@@ -154,11 +440,14 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if reveal <= 0.001 {
+            // Nothing shows the totals: stop streaming every checkout's patch.
+            self.session_diffs = SessionDiffs::default();
+            self.session_previews = SessionPreviews::default();
             return None;
         }
         let theme = Theme::of(cx).for_popup();
         let now = Utc::now();
-        let (chat, device, local, online, project, branch) = {
+        let (chat, device, glyph, presence, project, branch) = {
             let state = self.state.read(cx);
             let chat = state.selected_chat_row()?.clone();
             let device: SharedString = state
@@ -167,7 +456,22 @@ impl Shell {
                 .to_owned()
                 .into();
             let local = state.local_device_id.as_deref() == Some(chat.device_id.as_str());
-            let online = state.device_online(&chat.device_id, now);
+            let cloud = state.is_cloud_session_device(&chat.device_id)
+                || state
+                    .devices
+                    .iter()
+                    .find(|d| d.id == chat.device_id)
+                    .is_some_and(|d| {
+                        crate::cloud::is_cloud(d) || crate::cloud::is_cloud_account(d)
+                    });
+            let glyph = if cloud {
+                icons::CLOUD
+            } else if local {
+                icons::LAPTOP
+            } else {
+                icons::MONITOR
+            };
+            let presence = state.device_presence(&chat.device_id, now);
             let project = chat
                 .space_id
                 .as_deref()
@@ -182,23 +486,27 @@ impl Shell {
                 .map(str::trim)
                 .filter(|branch| !branch.is_empty())
                 .map(|branch| SharedString::from(branch.to_owned()));
-            (chat, device, local, online, project, branch)
+            (chat, device, glyph, presence, project, branch)
         };
 
         // ── Where it runs.
-        let device_row = info_row(
-            &theme,
-            row_glyph(if local { icons::LAPTOP } else { icons::MONITOR }, &theme),
-            device,
-        )
-        .when(!online, |row| {
-            row.child(
-                icon(icons::WIFI_OFF)
-                    .size(px(12.0))
-                    .flex_none()
-                    .text_color(theme.warning.opacity(0.8)),
-            )
-        });
+        let device_row = info_row(&theme, row_glyph(glyph, &theme), device)
+            .id("session-info-device")
+            .when(presence.warns(), |row| {
+                row.child(
+                    icon(icons::WIFI_OFF)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(theme.warning.opacity(0.8)),
+                )
+            })
+            // A sleeping Cloud machine: it wakes on the next send.
+            .when(presence == crate::cloud::Presence::Asleep, |row| {
+                row.child(asleep_badge(&theme))
+                    .tooltip(crate::settings::widgets::text_tooltip(
+                        "Asleep — wakes when you send",
+                    ))
+            });
         let project_row = match project {
             Some((name, path)) => info_row(
                 &theme,
@@ -211,37 +519,53 @@ impl Shell {
             None => info_row(&theme, row_glyph(icons::HOME, &theme), "No project".into())
                 .into_any_element(),
         };
+        self.ensure_session_diffs(cx);
+        self.ensure_branch_totals(&chat, cx);
+        let totals = self.session_diffs.totals(&chat);
         let branch_row = branch.map(|branch| {
             info_row(&theme, row_glyph(icons::GIT_BRANCH, &theme), branch.clone())
                 .id("session-info-branch")
                 .tooltip(crate::settings::widgets::text_tooltip(branch))
+                // What the branch adds over its base; it opens that diff.
+                .children(totals.map(|(adds, dels)| {
+                    let stat = |text: String, color: gpui::Hsla| {
+                        div()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(color)
+                            .child(SharedString::from(text))
+                    };
+                    div()
+                        .id("session-info-diff")
+                        .debug_selector(|| "session-info-diff".into())
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .px(px(5.0))
+                        .mr(px(-5.0))
+                        .py(px(2.0))
+                        .rounded(px(5.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(crate::theme::ink(0.08)))
+                        .tooltip(crate::settings::widgets::text_tooltip("Branch changes"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.close_session_info_overlay(cx);
+                            this.add_branch_diff_surface(window, cx);
+                        }))
+                        .child(stat(format!("+{adds}"), crate::changes::add_color(&theme)))
+                        .child(stat(format!("−{dels}"), crate::changes::del_color(&theme)))
+                }))
         });
-
-        // ── This conversation.
-        let busy = self.side_chat_creating;
-        let side_chat = popover::picker_row(&theme, false, false, "session-info-side-chat")
-            .id("session-info-side-chat")
-            .debug_selector(|| "session-info-side-chat".into())
-            .when(busy, |row| row.opacity(0.5))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.close_session_info_overlay(cx);
-                this.create_child_chat(None, cx)
-            }))
-            .child(popover::picker_icon_slot(row_glyph(icons::PLUS, &theme)))
-            .child(div().flex_1().child("New side chat"));
-        let fork = popover::picker_row(&theme, false, false, "session-info-fork")
-            .id("session-info-fork")
-            .debug_selector(|| "session-info-fork".into())
-            .when(busy, |row| row.opacity(0.5))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.close_session_info_overlay(cx);
-                this.create_side_chat(cx)
-            }))
-            .child(popover::picker_icon_slot(row_glyph(icons::FORK, &theme)))
-            .child(div().flex_1().child("Fork chat"));
 
         // ── The project's run actions.
         let actions = self.render_session_info_actions(&theme, cx);
+
+        // ── What runs alongside it.
+        // It stops at half the window's height, however much runs.
+        let lanes_height = self.viewport_height / 2.0;
+        let lanes = self.render_session_lanes(&chat, !docked, lanes_height, &theme, cx);
 
         let body = div()
             .id("session-info-body")
@@ -256,13 +580,19 @@ impl Shell {
             .child(device_row)
             .child(project_row)
             .children(branch_row)
-            .child(popover::picker_divider())
-            .child(side_chat)
-            .child(fork)
             .children(actions);
 
+        // ── The ports its agents and terminals serve, at most a third of the
+        // window tall before they scroll.
+        let ports_height = self.viewport_height / 3.0;
+        let ports = self.render_session_ports(&chat.id, !docked, ports_height, &theme, cx);
+
+        // The session and ports cards keep their height; only the lanes give.
         let card = div()
             .w(px(SESSION_CARD_WIDTH))
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
             .rounded(px(popover::CARD_RADIUS))
             .overflow_hidden()
             .border_1()
@@ -270,6 +600,8 @@ impl Shell {
             .bg(popover::surface_bg(&theme))
             .when(!docked && !theme.is_frost(), |card| card.shadow_lg())
             .child(body);
+        let frosted =
+            |card| crate::frost::frosted(popover::CARD_RADIUS, crate::frost::MENU_BLUR, card);
 
         // Docked, the card slides in from the right beside the column;
         // floating, it drops in from just above. Either way it is placed from
@@ -287,6 +619,12 @@ impl Shell {
                 .absolute()
                 .top(px(Theme::TITLEBAR_HEIGHT + 12.0 + dy))
                 .right(px(SESSION_CARD_INSET - dx))
+                // The lanes card scrolls inside what the session card leaves
+                // it below the titlebar.
+                .max_h(px(max_height.max(240.0)))
+                .flex()
+                .flex_col()
+                .gap(px(SESSION_CARDS_GAP))
                 .opacity(ease)
                 .occlude()
                 // Over the transcript it is a popover: a press elsewhere, or
@@ -296,11 +634,156 @@ impl Shell {
                         cx.listener(|this, _, _, cx| this.close_session_info_overlay(cx)),
                     )
                 })
-                .child(crate::frost::frosted(
-                    popover::CARD_RADIUS,
-                    crate::frost::MENU_BLUR,
-                    card,
-                ))
+                .child(frosted(card.into_any_element()))
+                .children(ports.map(frosted))
+                .child(frosted(lanes))
+                .into_any_element(),
+        )
+    }
+
+    /// The ports card: a row per server this chat can preview (one a Zeron
+    /// agent or terminal started in its checkout, or one this chat's agent or
+    /// terminals started anywhere), opening it in a browser tab: the first
+    /// [`PORTS_INITIAL`], then a page more per "Show more", scrolling past
+    /// `max_height`. `None` while nothing runs; `floating` over the
+    /// transcript, it casts the popover's shadow.
+    fn render_session_ports(
+        &mut self,
+        chat_id: &str,
+        floating: bool,
+        max_height: f32,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        self.ensure_session_previews(chat_id, cx);
+        let snapshot = &self.session_previews.snapshot;
+        if snapshot.services.is_empty() {
+            return None;
+        }
+        let note = |text: SharedString| {
+            div()
+                .px(px(9.0))
+                .py(px(5.0))
+                .text_size(crate::typography::ui_rems(12.0))
+                .line_height(px(18.0))
+                .text_color(theme.text_muted)
+                .child(text)
+                .into_any_element()
+        };
+        let mut rows: Vec<AnyElement> =
+            vec![popover::menu_heading(theme, "Ports").into_any_element()];
+        let available = snapshot.error.is_none();
+        let shown = self.session_previews.shown.max(PORTS_INITIAL);
+        let hidden = snapshot.services.len().saturating_sub(shown);
+        for service in snapshot.services.iter().take(shown) {
+            let url = service.url(snapshot.proxy_port);
+            let row_id = SharedString::from(format!("session-info-preview-{}", service.id));
+            let port = SharedString::from(format!(":{}", service.port));
+            let detail = SharedString::from(if snapshot.remote {
+                format!("{} · {url}", service.device_name)
+            } else {
+                url.clone()
+            });
+            rows.push(
+                popover::picker_row(theme, false, false, row_id.clone())
+                    .id(row_id)
+                    .tooltip(crate::settings::widgets::text_tooltip(detail))
+                    .when(!available, |row| row.opacity(0.5).cursor_default())
+                    .when(available, |row| {
+                        row.on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_session_info_overlay(cx);
+                            this.browser_context.register_preview(&url);
+                            this.set_surfaces_open(true, cx);
+                            this.add_browser_surface(Some(url.clone()), window, cx);
+                        }))
+                    })
+                    .child(popover::picker_icon_slot(row_glyph(icons::GLOBE, theme)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(service.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child(port),
+                    )
+                    .into_any_element(),
+            );
+        }
+        if hidden > 0 {
+            rows.push(
+                popover::picker_row(theme, false, false, "session-ports-more")
+                    .id("session-ports-more")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        let previews = &mut this.session_previews;
+                        previews.shown = previews.shown.max(PORTS_INITIAL) + PORTS_PAGE;
+                        cx.notify();
+                    }))
+                    .child(popover::picker_icon_slot(div().into_any_element()))
+                    .child(
+                        div()
+                            .text_size(crate::typography::ui_rems(12.0))
+                            .text_color(theme.text_muted)
+                            .child(format!("Show {} more", hidden.min(PORTS_PAGE))),
+                    )
+                    .into_any_element(),
+            );
+        }
+        // Listed but unreachable: why.
+        if let Some(error) = &snapshot.error {
+            rows.push(note(error.clone().into()));
+        }
+        let body = div()
+            .id("session-ports-body")
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&self.session_previews.scroll)
+            .p(px(popover::CARD_INSET))
+            .flex()
+            .flex_col()
+            .gap(px(popover::MENU_GAP))
+            .children(rows);
+        // The rail shows only once the ports outgrow the card and scroll.
+        let scrollbar = popover::rail_for(
+            self,
+            popover::RailAccess {
+                bar: |this: &mut Self| &mut this.session_previews.bar,
+                scroll: |this: &Self| this.session_previews.scroll.clone(),
+            },
+            "session-ports-scrollbar",
+            theme,
+            cx,
+        );
+        Some(
+            div()
+                .id("session-ports")
+                .debug_selector(|| "session-ports".into())
+                .relative()
+                .w(px(SESSION_CARD_WIDTH))
+                .max_h(px(max_height))
+                .flex_shrink_0()
+                .flex()
+                .flex_col()
+                .rounded(px(popover::CARD_RADIUS))
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme.border)
+                .bg(popover::surface_bg(theme))
+                .when(floating && !theme.is_frost(), |card| card.shadow_lg())
+                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                    if this.session_previews.bar.set_list_hovered(*hovered) {
+                        cx.notify();
+                    }
+                }))
+                .child(body)
+                .children(scrollbar)
                 .into_any_element(),
         )
     }
@@ -456,6 +939,26 @@ impl Shell {
         );
         rows
     }
+}
+
+/// The pull-request badge's pill, in frosted grey: a sleeping Cloud machine.
+fn asleep_badge(theme: &Theme) -> impl IntoElement {
+    crate::frost::frosted(
+        6.0,
+        crate::frost::MENU_BLUR,
+        div()
+            .h(px(20.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .px(px(7.0))
+            .rounded(px(6.0))
+            .bg(theme.text_muted.opacity(0.14))
+            .text_size(px(11.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text_muted)
+            .child("Asleep"),
+    )
 }
 
 #[cfg(test)]

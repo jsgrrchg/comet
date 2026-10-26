@@ -8,6 +8,8 @@ publish.workspace = true
 [features]
 voice-experimental = [] # Compatibility flag; native subscription voice uses Codex's packaged helper.
 project-palette-fixture = []
+# New project's typed path against a real engine, filmed in process.
+project-path-fixture = ["gpui_platform/test-support"]
 compact-picker-fixture = ["gpui_platform/test-support"]
 
 # Native captures explicitly present the freshly drawn scene, including when
@@ -39,6 +41,10 @@ name = "appshots-fixture"
 required-features = ["appshots-fixture"]
 
 [[example]]
+name = "program-status-fixture"
+required-features = ["appshots-fixture", "resource-profile"]
+
+[[example]]
 name = "tool-images-fixture"
 required-features = ["appshots-fixture"]
 
@@ -47,8 +53,24 @@ name = "pull-request-fixture"
 required-features = ["pull-request-fixture"]
 
 [[example]]
+name = "pull-request-destination-fixture"
+required-features = ["pull-request-fixture", "browser-fixture"]
+
+[[example]]
 name = "new-project-fixture"
 required-features = ["project-palette-fixture"]
+
+[[example]]
+name = "new-project-path-fixture"
+required-features = ["project-path-fixture"]
+
+[[example]]
+name = "rail-fixture"
+required-features = ["appshots-fixture"]
+
+[[example]]
+name = "message-captions-fixture"
+required-features = ["appshots-fixture"]
 
 [[example]]
 name = "sidebar-fixture"
@@ -72,6 +94,7 @@ zeron-engine.workspace = true
 zeron-harness.workspace = true
 zeron-rpc.workspace = true
 zeron-update.workspace = true
+zeron-notify.workspace = true
 zeron-syntax.workspace = true
 zeron-theme.workspace = true
 zeron-visual.workspace = true
@@ -89,8 +112,10 @@ serde.workspace = true
 serde_json.workspace = true
 pulldown-cmark.workspace = true
 zeron-markdown.workspace = true
+zatex = { workspace = true, features = ["bundled"] }
 html5ever = "0.39"
 alacritty_terminal.workspace = true
+zeron-term.workspace = true
 base64 = "0.22"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
 usvg = "0.46"

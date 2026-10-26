@@ -228,6 +228,23 @@ pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     }
 }
 
+/// A forked skill's chip once it runs: a spawn named after the skill
+/// (`Agent: /review`), like an Agent call is after its description.
+fn forked_skill_call(input: Value) -> ToolCall {
+    let name = match input
+        .get("skill")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        Some(skill) => format!("Agent: /{skill}"),
+        None => "Agent".into(),
+    };
+    ToolCall::Unknown {
+        name,
+        input: (!input.is_null()).then_some(input),
+    }
+}
+
 fn new_message_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
@@ -298,6 +315,11 @@ pub(crate) struct Normalizer {
     agent_tasks: std::collections::HashMap<String, String>,
     /// Later tool calls that wake the same task → its original spawn.
     agent_tool_spawns: std::collections::HashMap<String, String>,
+    /// Parent-feed `Skill` calls, tool_use id → input, until their task
+    /// starts (a `context: fork` skill runs as a subagent under its Skill
+    /// call's id, and its `task_started` re-decodes the chip as a spawn) or
+    /// their result shows they ran inline.
+    skill_calls: std::collections::HashMap<String, Value>,
     /// tool_use ids of Agent/Task spawn calls, recorded from their own
     /// assistant frames (plus `task_started`'s agent-task pairing). Gates
     /// `task_notification`: background SHELL tasks settle through the same
@@ -328,6 +350,7 @@ impl Normalizer {
             last_model: None,
             agent_tasks: std::collections::HashMap::new(),
             agent_tool_spawns: std::collections::HashMap::new(),
+            skill_calls: std::collections::HashMap::new(),
             agent_spawn_tools: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
             session_id: None,
@@ -550,7 +573,19 @@ impl Normalizer {
                     self.agent_spawn_tools.insert(spawn.clone());
                     self.agent_tool_spawns
                         .insert(tool.to_owned(), spawn.clone());
-                    return Vec::new();
+                    // A `context: fork` skill runs as a subagent under its
+                    // Skill call's id, and this start precedes all of its
+                    // traffic (live-verified 2.1.310). Re-decoded as a spawn,
+                    // the chip gives that traffic a card and a tab to feed.
+                    return self
+                        .skill_calls
+                        .remove(tool)
+                        .map(|input| AgentEvent::ToolCall {
+                            id: tool.to_owned(),
+                            call: forked_skill_call(input),
+                        })
+                        .into_iter()
+                        .collect();
                 }
                 // The CLI retrying a failed API call waits between attempts
                 // with nothing on the wire: keep the turn visibly alive, and
@@ -685,7 +720,7 @@ impl Normalizer {
                     let parent = self.agent_tool_spawns.get(parent).unwrap_or(parent);
                     // Subagent content, attributed. The 2.1.x wire streams NO
                     // tagged partial deltas (live-verified): a subagent's text
-                    // arrives only as full text blocks on its tagged
+                    // and thinking arrive only as full blocks on its tagged
                     // assistant frames — emit them, in block order with the
                     // tool calls, or subagent transcripts are tool-chips-only.
                     let mut out: Vec<AgentEvent> = f
@@ -696,6 +731,12 @@ impl Normalizer {
                                 parent,
                                 AgentEvent::TextDelta {
                                     text: format!("{}\n\n", b.text.trim_end()),
+                                },
+                            )),
+                            "thinking" if !b.thinking.trim().is_empty() => Some(tag(
+                                parent,
+                                AgentEvent::ReasoningDelta {
+                                    text: format!("{}\n\n", b.thinking.trim_end()),
                                 },
                             )),
                             "tool_use" => Some(tag(
@@ -719,10 +760,21 @@ impl Normalizer {
                     return out;
                 }
                 // Record spawn tool ids up front: `task_notification` keys on
-                // them; a task may finish before a `task_started` arrives.
+                // them; a task may finish before a `task_started` arrives. A
+                // Skill call waits for its task start: only a forked skill
+                // gets one.
                 for b in f.message.blocks() {
-                    if b.kind == "tool_use" && matches!(b.name.as_str(), "Agent" | "Task") {
-                        self.agent_spawn_tools.insert(b.id.clone());
+                    if b.kind != "tool_use" {
+                        continue;
+                    }
+                    match b.name.as_str() {
+                        "Agent" | "Task" => {
+                            self.agent_spawn_tools.insert(b.id.clone());
+                        }
+                        "Skill" => {
+                            self.skill_calls.insert(b.id.clone(), b.input.clone());
+                        }
+                        _ => {}
                     }
                 }
                 let mut out: Vec<AgentEvent> = f
@@ -862,11 +914,16 @@ impl Normalizer {
                 f.message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_result")
-                    .map(|b| AgentEvent::ToolResult {
-                        id: b.tool_use_id.clone(),
-                        is_error: b.is_error.unwrap_or(false),
-                        output: None,
-                        diff: None,
+                    .map(|b| {
+                        // A skill whose result came back without a task
+                        // start ran inline: it never forks now.
+                        self.skill_calls.remove(&b.tool_use_id);
+                        AgentEvent::ToolResult {
+                            id: b.tool_use_id.clone(),
+                            is_error: b.is_error.unwrap_or(false),
+                            output: None,
+                            diff: None,
+                        }
                     })
                     .collect()
             }
@@ -1629,6 +1686,85 @@ mod tests {
     }
 
     #[test]
+    fn a_forked_skill_becomes_a_spawn_when_its_task_starts() {
+        // Shapes from a live 2.1.310 capture. A `context: fork` skill runs as
+        // a subagent under its Skill call's id, and its `task_started` comes
+        // before any of that traffic. An inline skill starts no task and
+        // stays an ordinary tool.
+        let feed = |norm: &mut Normalizer, raw: &str| {
+            norm.normalize(
+                crate::claude::wire::parse_frame(raw).expect("parses"),
+                false,
+            )
+        };
+        let skill_call = |id: &str, skill: &str| {
+            format!(
+                r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Skill","input":{{"skill":"{skill}"}}}}]}}}}"#
+            )
+        };
+        let task_started = |task: &str, tool: &str| {
+            format!(
+                r#"{{"type":"system","subtype":"task_started","task_id":"{task}","tool_use_id":"{tool}","subagent_type":"general-purpose","task_type":"local_agent","is_backgrounded":false}}"#
+            )
+        };
+        let skill_text = r#"{"type":"user","parent_tool_use_id":"toolu_skill","message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: /p/.claude/skills/fanout"}]}}"#;
+        let mut norm = Normalizer::new();
+        let events = feed(&mut norm, &skill_call("toolu_skill", "fanout"));
+        assert!(
+            matches!(&events[0], AgentEvent::ToolCall { id, call } if id == "toolu_skill" && !call.is_subagent_spawn()),
+            "{events:?}"
+        );
+        // Its task start turns the chip into a spawn, ahead of its traffic.
+        assert_eq!(
+            feed(&mut norm, &task_started("a1", "toolu_skill")),
+            [AgentEvent::ToolCall {
+                id: "toolu_skill".into(),
+                call: ToolCall::Unknown {
+                    name: "Agent: /fanout".into(),
+                    input: Some(json!({"skill": "fanout"})),
+                },
+            }]
+        );
+        let events = feed(&mut norm, skill_text);
+        assert!(
+            matches!(&events[..], [AgentEvent::Subagent { parent_tool_use_id, event }]
+                if parent_tool_use_id == "toolu_skill"
+                    && matches!(event.as_ref(), AgentEvent::UserMessage { .. })),
+            "its traffic passes as is: {events:?}"
+        );
+        let events = feed(
+            &mut norm,
+            r#"{"type":"system","subtype":"task_notification","task_id":"a1","tool_use_id":"toolu_skill","status":"completed"}"#,
+        );
+        assert!(
+            matches!(&events[..], [AgentEvent::Subagent { parent_tool_use_id, event }]
+                if parent_tool_use_id == "toolu_skill"
+                    && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })),
+            "it settles like any spawn: {events:?}"
+        );
+        // An agent the skill spawns starts a task and sends traffic too, but
+        // its call is on the skill's own feed: nothing here is re-decoded.
+        assert!(feed(&mut norm, &task_started("a2", "toolu_nested")).is_empty());
+        assert!(matches!(
+            &feed(
+                &mut norm,
+                r#"{"type":"assistant","parent_tool_use_id":"toolu_nested","message":{"content":[{"type":"text","text":"alpha"}]}}"#,
+            )[..],
+            [AgentEvent::Subagent { parent_tool_use_id, .. }] if parent_tool_use_id == "toolu_nested"
+        ));
+        // An inline skill's result comes back untagged, with no task start:
+        // it stays a tool, and nothing waits on it any more.
+        feed(&mut norm, &skill_call("toolu_inline", "lint"));
+        feed(
+            &mut norm,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_inline","content":"Launching skill: lint"}]}}"#,
+        );
+        assert!(norm.skill_calls.is_empty(), "{:?}", norm.skill_calls);
+        // So a late task start for it re-decodes nothing.
+        assert!(feed(&mut norm, &task_started("a3", "toolu_inline")).is_empty());
+    }
+
+    #[test]
     fn shell_task_notification_never_settles_a_subagent() {
         // `Bash` with `run_in_background` settles through the SAME
         // `task_notification` subtype, carrying the Bash call's own id.
@@ -1653,24 +1789,38 @@ mod tests {
     }
 
     #[test]
-    fn subagent_assistant_text_blocks_emit_tagged_text() {
+    fn subagent_assistant_blocks_emit_tagged_reasoning_text_and_calls() {
         // No tagged partial deltas exist on the 2.1.x wire: a subagent's text
-        // arrives only as full blocks on its tagged assistant frames.
+        // and thinking arrive only as full blocks on its tagged assistant
+        // frames. Each ends on a blank line, so blocks that fold together
+        // stay apart; a signature-only thinking block carries nothing.
         let ev = normalize_one(
-            r#"{"type":"assistant","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"text","text":"working on it"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            r#"{"type":"assistant","parent_tool_use_id":"toolu_sub","message":{"content":[{"type":"thinking","thinking":"","signature":"sig"},{"type":"thinking","thinking":"Plan it. "},{"type":"thinking","thinking":"Then list."},{"type":"text","text":"working on it"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
         );
-        assert_eq!(ev.len(), 2);
+        let tagged = |event: AgentEvent| AgentEvent::Subagent {
+            parent_tool_use_id: "toolu_sub".into(),
+            event: Box::new(event),
+        };
         assert_eq!(
-            ev[0],
-            AgentEvent::Subagent {
-                parent_tool_use_id: "toolu_sub".into(),
-                event: Box::new(AgentEvent::TextDelta {
+            ev,
+            [
+                tagged(AgentEvent::ReasoningDelta {
+                    text: "Plan it.\n\n".into()
+                }),
+                tagged(AgentEvent::ReasoningDelta {
+                    text: "Then list.\n\n".into()
+                }),
+                tagged(AgentEvent::TextDelta {
                     text: "working on it\n\n".into()
                 }),
-            }
+                tagged(AgentEvent::ToolCall {
+                    id: "t1".into(),
+                    call: ToolCall::Exec {
+                        command: "ls".into()
+                    },
+                }),
+            ]
         );
-        assert!(matches!(&ev[1], AgentEvent::Subagent { event, .. }
-            if matches!(event.as_ref(), AgentEvent::ToolCall { .. })));
     }
 
     #[test]

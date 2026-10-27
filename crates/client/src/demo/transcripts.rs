@@ -782,6 +782,7 @@ fn picker(host: &str, now: i64) -> Vec<SessionMessageEntry> {
                         },
                     ],
                     resolved: false,
+                    answers: None,
                 },
             ],
         ),

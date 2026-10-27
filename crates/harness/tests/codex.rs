@@ -2296,6 +2296,67 @@ async fn idle_voice_runtime_has_no_initial_turn_and_preserves_mcp() {
     drop(stream);
 }
 
+/// A run whose Zeron server is side-chats-only starts its thread without
+/// Codex's agent tools, as a title run does; any other run keeps them.
+#[tokio::test]
+async fn a_side_chats_only_thread_starts_without_agent_tools() {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-codex-voice.py");
+    let driver = CodexHarness::new()
+        .with_executable(fixture)
+        .with_graces(Duration::from_millis(10), Duration::from_millis(100));
+    for side_chats_only in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut req = request("delegate this");
+        req.cwd = dir.path().display().to_string();
+        let mut server = zeron_proto::McpServer {
+            name: "zeron".into(),
+            command: "zeron".into(),
+            args: vec!["mcp".into()],
+            env: Default::default(),
+        };
+        if side_chats_only {
+            server.env.insert(
+                zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV.into(),
+                "1".into(),
+            );
+        }
+        req.mcp = Some(server);
+        let (controls, _steer, token) = controls("Yes");
+        let mut stream = driver.run(req, controls).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                if matches!(event.unwrap(), AgentEvent::Done { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        token.cancel();
+        drop(stream);
+        let wire = std::fs::read_to_string(dir.path().join("voice-wire.jsonl")).unwrap();
+        let start = wire
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|frame| frame["method"] == "thread/start")
+            .expect("a thread starts");
+        let config = &start["params"]["config"];
+        assert_eq!(config["mcp_servers.zeron.command"], "zeron", "{config}");
+        for key in [
+            "features.multi_agent",
+            "features.multi_agent_v2",
+            "agents.enabled",
+        ] {
+            assert_eq!(
+                config.get(key) == Some(&serde_json::Value::Bool(false)),
+                side_chats_only,
+                "{key}: {config}"
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn external_voice_keeps_canonical_events_without_any_local_helper() {

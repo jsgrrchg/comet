@@ -1091,6 +1091,7 @@ impl Pickers {
             | ComposerInputEvent::PastedPaths(_)
             | ComposerInputEvent::PastedText { .. }
             | ComposerInputEvent::OpenAttachment(_)
+            | ComposerInputEvent::AnnotationHovered(_)
             | ComposerInputEvent::CursorMoved
             | ComposerInputEvent::ViewportChanged
             | ComposerInputEvent::MentionNavigate(_)
@@ -3636,10 +3637,15 @@ impl Pickers {
             return;
         }
         // ⌘1…⌘9 jump-picks the Nth visible model row (t3 modelPickerKeys;
-        // the chips on the rows advertise these).
+        // the chips on the rows advertise these). Read the digit through the
+        // layout: AZERTY types ⌘1 as ⌘&.
         if self.open_kind() == Some(PickerKind::HarnessModel)
             && event.keystroke.modifiers.platform
-            && let Ok(n) = event.keystroke.key.parse::<usize>()
+            && let Some(n) = crate::settings::canonical_key(
+                &event.keystroke.key,
+                &crate::settings::key_equivalents(cx),
+            )
+            .and_then(|key| key.parse::<usize>().ok())
             && (1..=9).contains(&n)
         {
             self.activate_model_index(n - 1, cx);
@@ -4890,6 +4896,9 @@ impl Pickers {
         tabs = tabs.child(
             div()
                 .id("model-tab-favorites")
+                .role(gpui::Role::Tab)
+                .aria_label("Starred")
+                .aria_selected(favorites_view)
                 .relative()
                 .w(px(32.0))
                 .h(px(32.0))
@@ -4901,6 +4910,7 @@ impl Pickers {
                 .when(!favorites_view, |el| {
                     el.hover(|s| s.bg(crate::theme::ink(0.06)))
                 })
+                .tooltip(|_, cx| cx.new(|_| compact::PickerHint("Starred".into())).into())
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.setting_menu = None;
                     this.model_rail = ModelRail::Favorites;
@@ -4927,10 +4937,14 @@ impl Pickers {
             let harness = descriptor.id;
             let is_viewed = !favorites_view && effective == Some(harness);
             let (icon_path, tint) = harness_brand_icon(harness);
+            let name: SharedString = descriptor.name.clone().into();
             tabs =
                 tabs.child(
                     div()
                         .id(("harness-tab", ix))
+                        .role(gpui::Role::Tab)
+                        .aria_label(name.clone())
+                        .aria_selected(is_viewed)
                         .relative()
                         .w(px(32.0))
                         .h(px(32.0))
@@ -4940,6 +4954,7 @@ impl Pickers {
                         .justify_center()
                         .cursor_pointer()
                         .when(!is_viewed, |el| el.hover(|s| s.bg(crate::theme::ink(0.06))))
+                        .tooltip(move |_, cx| cx.new(|_| compact::PickerHint(name.clone())).into())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.setting_menu = None;
                             this.model_rail = ModelRail::Harness;
@@ -5297,7 +5312,8 @@ impl Pickers {
             }))
             .child(body);
         if ix < 9 {
-            el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
+            let key = crate::settings::bound_key(&(ix + 1).to_string());
+            el = el.child(popover::kbd_hint(&theme, &format!("⌘{key}")));
         }
         // A model configured in place opens its settings card on hover.
         // The title picker has no settings, so no card either.
@@ -5376,6 +5392,14 @@ impl Pickers {
                 ));
             }
         }
+        // The compact picker's wording: the name tells a screen reader's
+        // list of stars apart.
+        let star_hint: SharedString = if is_fav {
+            format!("Remove {} from favorites", row.model.label)
+        } else {
+            format!("Add {} to favorites", row.model.label)
+        }
+        .into();
         el = el.child(
             div()
                 .id(("model-star", ix))
@@ -5388,6 +5412,14 @@ impl Pickers {
                 .justify_center()
                 .cursor_pointer()
                 .hover(|s| s.bg(crate::theme::ink(0.08)))
+                .role(gpui::Role::Button)
+                .aria_label(star_hint.clone())
+                .aria_toggled(if is_fav {
+                    gpui::Toggled::True
+                } else {
+                    gpui::Toggled::False
+                })
+                .tooltip(move |_, cx| cx.new(|_| compact::PickerHint(star_hint.clone())).into())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
                     this.toggle_model_favorite(harness, &star_model, cx);

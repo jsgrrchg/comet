@@ -34,6 +34,8 @@ pub enum ChipKind {
     Chat,
     /// A pull request, dropped from its tab.
     PullRequest,
+    /// An element picked in the browser.
+    Annotation,
 }
 
 /// What a chip's icon is painted from: a monochrome glyph tinted like the
@@ -183,6 +185,7 @@ pub(crate) fn chip_icon(
             None => ChipIcon::Glyph(crate::icons::CHAT_ROUND_LINE),
         },
         ChipKind::PullRequest => ChipIcon::Glyph(crate::icons::PULL_REQUEST),
+        ChipKind::Annotation => ChipIcon::Glyph(crate::icons::CURSOR),
         ChipKind::File => ChipIcon::FileTheme(asset_path(FileIconIdentity::file(path), appearance)),
         ChipKind::Directory => ChipIcon::FileTheme(asset_path(
             FileIconIdentity::directory(path.trim_end_matches('/'), false),

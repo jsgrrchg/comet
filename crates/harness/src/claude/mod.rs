@@ -46,6 +46,7 @@
 pub mod catalog;
 mod discovery;
 mod fork;
+mod fork_tail;
 mod normalize;
 pub mod refresh_lock;
 mod wire;
@@ -70,6 +71,7 @@ use crate::process::owned::Child;
 use crate::process::{ChildStdin, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal};
 use catalog::{apply_ultrathink, to_effort};
+use fork_tail::ForkTail;
 use normalize::{Normalizer, Transcript};
 use wire::{ControlRequestFrame, Frame, allow_response, control_error_line, control_response_line};
 
@@ -375,6 +377,17 @@ impl ClaudeHarness {
             // (no `--strict-mcp-config`): the CLI merges an inline JSON
             // config with settings-sourced ones.
             cmd.args(["--mcp-config", &mcp_config_arg(mcp)]);
+            // Delegation goes through that server's side chats only. A bare
+            // tool name "removes the matching tools from Claude's context"
+            // (https://code.claude.com/docs/en/cli-reference), so the model
+            // never calls them: a call refused at run time would stay
+            // running (#893). The model calls the spawn tool `Agent`, the
+            // init frame lists it as `Task`, and `Workflow` runs agents of
+            // its own; with the rule, the init frame lists neither `Task`
+            // nor `Workflow` (live-verified 2.1.310).
+            if mcp.side_chats_only() {
+                cmd.arg("--disallowedTools=Agent,Task,Workflow");
+            }
         }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
@@ -1201,6 +1214,9 @@ async fn run_session(session: Session) {
     // [`crate::shutdown_agent`]).
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut torn_down: Vec<crate::process::Tracked> = Vec::new();
+    // The typed fork whose transcript is read off disk (see [`fork_tail`]).
+    let claude_root = config_root(&launched.env);
+    let mut tail: Option<ForkTail> = None;
 
     'main: loop {
         if std::mem::take(&mut relaunch) {
@@ -1243,6 +1259,14 @@ async fn run_session(session: Session) {
             }
         }
         let control_deadline = pending_controls.values().map(|(_, _, at)| *at).min();
+        match norm.fork_to_follow() {
+            Some(fork) if tail.as_ref().is_none_or(|t| t.chip != fork.0) => {
+                tail = Some(ForkTail::new(&claude_root, fork));
+            }
+            Some(_) => {}
+            None => tail = None,
+        }
+        let tail_at = tail.as_ref().and_then(ForkTail::next_read);
         tokio::select! {
             line = stdout_lines.next_line() => match line {
                 Ok(Some(line)) => {
@@ -1497,6 +1521,17 @@ async fn run_session(session: Session) {
                 }
             },
 
+            // The typed fork's records, as it writes them.
+            _ = tokio::time::sleep_until(tail_at.unwrap_or_else(tokio::time::Instant::now)),
+                if tail_at.is_some() => {
+                let records = tail.as_mut().map_or_else(Vec::new, ForkTail::read);
+                for ev in records.into_iter().flat_map(|record| norm.fork_record(record)) {
+                    if event_tx.send(Ok(ev)).await.is_err() {
+                        break 'main;
+                    }
+                }
+            },
+
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     // A message of ours now owns whatever result comes next.
@@ -1584,9 +1619,19 @@ async fn run_session(session: Session) {
                         error: None,
                         session_id: norm.session_id.clone(),
                     });
+                    // No result came to settle a typed fork: it ends here,
+                    // with the turn, or its chip runs on in the parked run.
+                    for ev in norm.settle_typed_fork(DoneStatus::Interrupted) {
+                        if event_tx.send(Ok(ev)).await.is_err() {
+                            break 'main;
+                        }
+                    }
                     if event_tx.send(Ok(done)).await.is_err() {
                         break 'main;
                     }
+                    // The turn's tools ended with it, as on a normalized
+                    // Done: none may hold the next message back (`next`).
+                    open_tools.clear();
                     turn_open = false;
                     stop_done_at = Some(tokio::time::Instant::now());
                     active_since_stop = false;
@@ -1892,14 +1937,23 @@ fn handle_control_request(
         // input part into the doc whose id no resolver knew — the QuestionPanel
         // answered that unanswerable twin and the run never resumed.
         //
-        // A dropped sender (caller went away) degrades to empty answers so the
-        // agent is unblocked rather than wedged.
+        // No answers — the person closed the questions, or a dropped sender
+        // (caller went away) — is a decline: deny the tool so the agent reads
+        // that it went unanswered, rather than an empty pick, and is
+        // unblocked rather than wedged.
         let answers = (request_input)(questions.clone()).await.unwrap_or_default();
-        let updated = updated_input_with_answers(&input, &questions, &answers);
-        let line = control_response_line(&request_id, allow_response(updated));
+        let response = if answers.is_empty() {
+            serde_json::json!({ "behavior": "deny", "message": QUESTIONS_DISMISSED })
+        } else {
+            allow_response(updated_input_with_answers(&input, &questions, &answers))
+        };
+        let line = control_response_line(&request_id, response);
         let _ = stdin_tx.send(StdinMsg::Line(line));
     });
 }
+
+/// What a declined `AskUserQuestion` tells the agent.
+const QUESTIONS_DISMISSED: &str = "The user dismissed the questions without answering.";
 
 /// Parse Claude's `AskUserQuestion` tool input into [`UserInputQuestion`]s
 /// (tolerant of `header`/`title`, `question`/`prompt`, string or object

@@ -222,6 +222,42 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
     );
 }
 
+/// A run whose Zeron server is side-chats-only launches the CLI without its
+/// subagent tools (`Agent`, which the init frame lists as `Task`, and
+/// `Workflow`); any other run keeps them.
+#[tokio::test]
+async fn a_side_chats_only_run_launches_without_subagent_tools() {
+    let mut server = zeron_proto::McpServer {
+        name: "zeron".into(),
+        command: "zeron".into(),
+        args: vec!["mcp".into()],
+        env: Default::default(),
+    };
+    let mut tools = Vec::new();
+    for side_chats_only in [false, true] {
+        if side_chats_only {
+            server.env.insert(
+                zeron_proto::McpServer::SIDE_CHATS_ONLY_ENV.into(),
+                "1".into(),
+            );
+        }
+        let mut req = request("scenario:native-subagents");
+        req.mcp = Some(server.clone());
+        let (controls, _steer, _token) = controls("A");
+        let events = run_to_end(&harness(), req, controls).await;
+        tools.push(
+            events
+                .iter()
+                .find_map(|e| match e {
+                    AgentEvent::SessionStarted { tools, .. } => Some(tools.clone()),
+                    _ => None,
+                })
+                .expect("the session starts"),
+        );
+    }
+    assert_eq!(tools, [vec!["Bash", "Task", "Workflow"], vec!["Bash"]]);
+}
+
 #[tokio::test]
 async fn native_fork_points_follow_the_accepted_completion_not_a_held_result() {
     for (scenario, expected_uuid) in [
@@ -453,6 +489,36 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
         Some(&AgentEvent::Done {
             status: DoneStatus::Completed,
             result: Some("answered".into()),
+            error: None,
+            session_id: Some("sess-ask".into()),
+        })
+    );
+}
+
+#[tokio::test]
+async fn questions_closed_unanswered_deny_the_tool() {
+    // No answers is the person closing the questions: the CLI must read a
+    // deny that says so, not an allow with empty picks.
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let _steer = steer_tx;
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        request_input: Box::new(|_| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: CancellationToken::new(),
+        turn: Default::default(),
+    };
+    let events = run_to_end(&harness(), request("scenario:closed-question"), controls).await;
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: Some("declined".into()),
             error: None,
             session_id: Some("sess-ask".into()),
         })
@@ -708,7 +774,11 @@ async fn replay_fixture(name: &str) -> Vec<AgentEvent> {
     }
     let harness = ClaudeHarness::new().with_executable(&cli);
     let (controls, _steer, _token) = controls("A");
-    run_to_end(&harness, request("replay"), controls).await
+    // Its own config root: a typed fork's transcript is looked for there.
+    let mut req = request("replay");
+    req.env
+        .insert("CLAUDE_CONFIG_DIR".into(), dir.path().display().to_string());
+    run_to_end(&harness, req, controls).await
 }
 
 #[tokio::test]
@@ -919,6 +989,106 @@ async fn captured_live_forwarded_foreground_subagent_replays_in_order() {
         ["thinking", "sky", "exec", "thinking", "grass"],
         "{events:?}"
     );
+}
+
+#[tokio::test]
+async fn captured_live_typed_forked_command_replays_into_its_chip() {
+    // Frames from claude 2.1.310 run with Zeron's launch flags and
+    // CLAUDE_CODE_FORWARD_SUBAGENT_TEXT=1 (2026-10-25): `/fanout` typed as the
+    // prompt, a `context: fork` skill whose two foreground agents sleep, then
+    // reply alpha and bravo. The fork starts with no tool id, and its
+    // notification and the session's init come before its transcript, which
+    // is replayed tagged `forked-command-fanout`. Cut like the forked-skill
+    // capture, the agents' own work too; two thoughts are reworded and
+    // unsigned (sanitized).
+    let events = replay_fixture("live-2.1.310-typed-forked-command.jsonl").await;
+    const CHIP: &str = "forked-command-fanout-a4d8fe55a62c09757";
+    let spawns: Vec<(usize, &str, &ToolCall)> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match e {
+            AgentEvent::ToolCall { id, call } if call.is_subagent_spawn() => {
+                Some((i, id.as_str(), call))
+            }
+            _ => None,
+        })
+        .collect();
+    let started = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::SessionStarted { .. }))
+        .expect("init");
+    // The fork's chip is the feed's one spawn, from its task start: before
+    // the init the CLI sends only once the fork is over.
+    assert!(
+        matches!(&spawns[..], [(i, id, ToolCall::Unknown { name, .. })]
+            if *id == CHIP && name == "Agent: /fanout" && *i < started),
+        "{events:?}"
+    );
+    let shape: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Subagent {
+                parent_tool_use_id,
+                event,
+            } if *parent_tool_use_id == CHIP => match event.as_ref() {
+                AgentEvent::UserMessage { text }
+                    if text.starts_with("Base directory for this skill:") =>
+                {
+                    Some("prompt")
+                }
+                AgentEvent::ReasoningDelta { text } if !text.is_empty() => Some("thinking"),
+                AgentEvent::ToolCall { call, .. } if call.is_subagent_spawn() => Some("agent"),
+                AgentEvent::ToolResult { .. } => Some("result"),
+                AgentEvent::TextDelta { text } if text.starts_with("alpha bravo") => Some("reply"),
+                AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    ..
+                } => Some("done"),
+                _ => Some("other"),
+            },
+            _ => None,
+        })
+        .collect();
+    // Its prompt once (the replay's echo dropped), its replay, then done.
+    assert_eq!(
+        shape,
+        [
+            "prompt", "thinking", "agent", "agent", "result", "result", "thinking", "reply", "done"
+        ],
+        "{events:?}"
+    );
+    // Settled once, just before the turn's Done, its notification long gone
+    // (the native fork point the run loop holds for the Done rides between).
+    let events: Vec<_> = events
+        .into_iter()
+        .filter(|e| !matches!(e, AgentEvent::NativeForkReady { .. }))
+        .collect();
+    let done = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("the turn's Done");
+    assert!(
+        matches!(&events[done - 2..=done], [
+            AgentEvent::Subagent { parent_tool_use_id, event },
+            AgentEvent::ToolResult { id, is_error: false, .. },
+            AgentEvent::Done { status: DoneStatus::Completed, .. },
+        ] if parent_tool_use_id == CHIP && id == CHIP
+            && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. })),
+        "{events:?}"
+    );
+    // The agents it ran stream under their own ids.
+    for agent in [
+        "toolu_01USxAVdw1ZUxX6QKE3PogsG",
+        "toolu_01LbgVmu6g5jVM5sn2dtSM7c",
+    ] {
+        assert!(
+            events.iter().any(|e| matches!(e,
+                AgentEvent::Subagent { parent_tool_use_id, event }
+                    if parent_tool_use_id == agent
+                        && matches!(event.as_ref(), AgentEvent::UserMessage { .. }))),
+            "{agent}: {events:?}"
+        );
+    }
 }
 
 /// Live smoke against the REAL claude CLI (2.1.x, must be installed + authed):
@@ -1268,6 +1438,92 @@ async fn a_message_queued_behind_a_finishing_turn_owns_the_turn_end() {
     assert!(matches!(events.last(), Some(AgentEvent::Done { .. })));
 }
 
+/// A message sent while a typed fork runs waits it out (`next`: the chip is
+/// an open tool), so the fork's result is only that message's boundary: 2.1.310
+/// starts the message after it. The chip settles at that result, before the
+/// turn splits. Settled after the split, its tool result reached the engine
+/// as a stale echo of the turn before, and the chip never resolved.
+#[tokio::test]
+async fn a_typed_fork_settles_before_a_message_waiting_on_it_splits_the_turn() {
+    let (controls, steer, _token) = controls("A");
+    let mut stream = harness()
+        .run(request("scenario:typed-fork-steer-boundary"), controls)
+        .await
+        .expect("run starts");
+    macro_rules! next {
+        () => {
+            tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("event in time")
+                .expect("stream open")
+                .expect("stream event")
+        };
+    }
+    const CHIP: &str = "forked-command-probe-t1";
+    // The chip, then the prompt its tab opens with: the fork is running.
+    loop {
+        if matches!(next!(), AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == CHIP && matches!(event.as_ref(), AgentEvent::UserMessage { .. }))
+        {
+            break;
+        }
+    }
+    steer.send(steer_msg("follow up")).await.unwrap();
+    let mut events = Vec::new();
+    loop {
+        let event = next!();
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    let chip_done_at = events.iter().position(|e| {
+        matches!(e, AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == CHIP
+                && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Completed, .. }))
+    });
+    let chip_result_at = events.iter().position(
+        |e| matches!(e, AgentEvent::ToolResult { id, is_error: false, .. } if id == CHIP),
+    );
+    let steered_at = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }));
+    let (Some(chip_done_at), Some(chip_result_at), Some(steered_at)) =
+        (chip_done_at, chip_result_at, steered_at)
+    else {
+        panic!("no settle or no split: {events:?}");
+    };
+    assert!(
+        chip_done_at < chip_result_at && chip_result_at < steered_at,
+        "the chip settled after the turn split: {events:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::Steered { .. }))
+            .count(),
+        1,
+        "{events:?}"
+    );
+    // The run's first Done is the message's own, after its reply: the
+    // fork's result was only the boundary.
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done { status: DoneStatus::Completed, result: Some(result), .. })
+                if result == "second answer"
+        ),
+        "{events:?}"
+    );
+    assert!(
+        events[steered_at..].contains(&AgentEvent::TextDelta {
+            text: "second answer".into()
+        }),
+        "{events:?}"
+    );
+}
+
 /// "Send now" while a turn end is held for a queued steer: the stop's one
 /// Done waits for the stop to settle, so the replacement prompt — sent the
 /// moment that Done arrives — runs to its own end, never settled by the
@@ -1452,6 +1708,67 @@ async fn a_stopped_turns_delayed_duplicate_result_is_dropped() {
             .any(|e| matches!(e, AgentEvent::Done { .. } | AgentEvent::Usage { .. })),
         "the stopped turn's late duplicate was forwarded: {after:?}"
     );
+}
+
+/// A typed fork in flight when a stop goes unreported (answered, but no
+/// result before the settle window closes) settles with the turn the driver
+/// ends itself. Otherwise its chip runs on in the parked session, and keeps
+/// the next message waiting for it (`next`).
+#[tokio::test]
+async fn a_stop_the_cli_never_reports_settles_its_typed_fork() {
+    use zeron_harness::TurnControl;
+    let (mut controls, steer, _token) = controls("A");
+    let turn = TurnControl::default();
+    controls.turn = turn.clone();
+    let mut stream = harness()
+        .run(request("scenario:stop-typed-fork"), controls)
+        .await
+        .expect("run starts");
+    macro_rules! next {
+        () => {
+            tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("event in time")
+                .expect("stream open")
+                .expect("stream event")
+        };
+    }
+    const CHIP: &str = "forked-command-probe-t1";
+    // The chip, then the prompt its tab opens with.
+    loop {
+        if matches!(next!(), AgentEvent::Subagent { parent_tool_use_id, event }
+            if parent_tool_use_id == CHIP && matches!(event.as_ref(), AgentEvent::UserMessage { .. }))
+        {
+            break;
+        }
+    }
+    turn.stop_turn();
+    let mut events = Vec::new();
+    loop {
+        let event = next!();
+        let done = matches!(event, AgentEvent::Done { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+    assert!(
+        matches!(&events[..], [
+            AgentEvent::Subagent { parent_tool_use_id, event },
+            AgentEvent::ToolResult { id, is_error: false, .. },
+            AgentEvent::Done { status: DoneStatus::Interrupted, .. },
+        ] if parent_tool_use_id == CHIP && id == CHIP
+            && matches!(event.as_ref(), AgentEvent::Done { status: DoneStatus::Interrupted, .. })),
+        "{events:?}"
+    );
+    // The chip's tool ended with the turn: nothing holds the next message.
+    steer.send(steer_msg("Again.")).await.unwrap();
+    loop {
+        if let AgentEvent::TextDelta { text } = next!() {
+            assert_eq!(text, "priority:now");
+            break;
+        }
+    }
 }
 
 /// A queued message the CLI cancels before starting releases the held turn

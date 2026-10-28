@@ -129,6 +129,8 @@ fn setup(dir: &std::path::Path, harness: Arc<NativeStore>) -> EngineCore {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                access: Default::default(),
+                plan: false,
             }),
             Some("/tmp".into()),
         )

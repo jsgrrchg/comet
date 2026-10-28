@@ -229,6 +229,8 @@ fn new_side_chats_inherit_the_checkout_but_pick_their_own_harness() {
         reasoning: None,
         model_options: Default::default(),
         sandbox: SandboxLevel::ReadOnly,
+        access: Default::default(),
+        plan: false,
     };
     let side = |parent: &str, harness| {
         client

@@ -10316,6 +10316,8 @@ impl Composer {
                         cwd,
                         sandbox: SandboxLevel::WorkspaceWrite,
                         auto_approve: false,
+                        access: resolved.access,
+                        plan: resolved.plan,
                         resume: None,
                         resume_policy: Default::default(),
                         attachments: attachment_paths,

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::{Deserialize, Serialize};
 
 use zeron_harness::{Harness, HarnessError, mock::MockHarness};
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, ReasoningLevel, SteeringMode};
+use zeron_proto::{AccessMode, AgentEvent, DoneStatus, HarnessId, ReasoningLevel, SteeringMode};
 
 /// What `ListHarnesses` reports per harness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +38,14 @@ pub struct HarnessDescriptor {
     /// "unknown": consumers fall back to detection (see [`descriptor_enabled`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// The access modes this harness honors, least to most trusting. Empty
+    /// — a catalog from an engine predating modes — offers no choice: those
+    /// engines run every chat with full access.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_modes: Vec<AccessMode>,
+    /// Whether this harness honors plan mode.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supports_plan: bool,
 }
 
 impl HarnessDescriptor {
@@ -81,6 +89,8 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         installed: harness.installed(),
         can_install: false,
         enabled: None,
+        access_modes: harness.access_modes().to_vec(),
+        supports_plan: harness.supports_plan(),
     }
 }
 
@@ -796,6 +806,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: AccessMode::ALL.to_vec(),
+            supports_plan: true,
         },
         Box::new(|| zeron_harness::ClaudeHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
@@ -824,6 +836,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: AccessMode::ALL.to_vec(),
+            supports_plan: true,
         },
         Box::new(|| zeron_harness::CodexHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::CodexHarness::new()) as Arc<dyn Harness>)),
@@ -841,6 +855,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: vec![AccessMode::FullAccess],
+            supports_plan: false,
         },
         Box::new(|| zeron_harness::CursorHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::CursorHarness::new()) as Arc<dyn Harness>)),
@@ -859,6 +875,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: vec![AccessMode::FullAccess],
+            supports_plan: false,
         },
         Box::new(|| zeron_harness::AcpHarness::devin().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
@@ -881,6 +899,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: vec![AccessMode::FullAccess],
+            supports_plan: false,
         },
         Box::new(|| zeron_harness::AcpHarness::grok().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
@@ -899,6 +919,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: vec![AccessMode::FullAccess],
+            supports_plan: false,
         },
         Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
@@ -914,6 +936,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: vec![AccessMode::FullAccess],
+            supports_plan: false,
         },
         Box::new(|| zeron_harness::PiHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::PiHarness::new()) as Arc<dyn Harness>)),
@@ -939,6 +963,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: AccessMode::ALL.to_vec(),
+            supports_plan: true,
         },
         Box::new(|| zeron_harness::OpencodeHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::OpencodeHarness::new()) as Arc<dyn Harness>)),
@@ -957,6 +983,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: AccessMode::ALL.to_vec(),
+            supports_plan: false,
         },
         Box::new(|| zeron_harness::AcpHarness::antigravity().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::antigravity()) as Arc<dyn Harness>)),
@@ -973,6 +1001,8 @@ fn full_registry() -> HarnessRegistry {
             installed: true,
             can_install: false,
             enabled: None,
+            access_modes: vec![AccessMode::Supervised, AccessMode::FullAccess],
+            supports_plan: false,
         },
         Box::new(|| zeron_harness::MuseHarness::new().installed()),
         Box::new(|| Ok(Arc::new(zeron_harness::MuseHarness::new()) as Arc<dyn Harness>)),
@@ -995,6 +1025,8 @@ mod tests {
             installed: true,
             can_install: false,
             enabled: Some(true),
+            access_modes: Vec::new(),
+            supports_plan: false,
         };
         assert!(descriptor.steers_mid_turn());
 
@@ -1022,6 +1054,8 @@ mod tests {
                 installed: true,
                 can_install: false,
                 enabled: None,
+                access_modes: Vec::new(),
+                supports_plan: false,
             },
             Box::new(|| false),
             Box::new(move || {
@@ -1041,6 +1075,23 @@ mod tests {
         );
         assert!(registry.resolve(HarnessId::Mock).is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// The composer offers what the catalog lists before any harness has
+    /// resolved, so each lazy descriptor must offer the modes its harness
+    /// honors once it does.
+    #[test]
+    fn lazy_descriptors_offer_the_modes_their_harness_honors() {
+        let registry = full_registry();
+        for described in registry.descriptors() {
+            let harness = registry.resolve(described.id).unwrap();
+            assert_eq!(
+                (described.access_modes.as_slice(), described.supports_plan),
+                (harness.access_modes(), harness.supports_plan()),
+                "{:?}",
+                described.id
+            );
+        }
     }
 
     #[test]
@@ -1170,6 +1221,8 @@ mod tests {
                 installed: true,
                 can_install: false,
                 enabled: None,
+                access_modes: Vec::new(),
+                supports_plan: false,
             },
             Box::new(move || installed),
             Box::new(|| Err(HarnessError::NotInstalled("test slot".into()))),
@@ -1253,6 +1306,8 @@ mod tests {
                 installed: true,
                 can_install: false,
                 enabled: None,
+                access_modes: Vec::new(),
+                supports_plan: false,
             },
             Box::new(move || probe.load(Ordering::SeqCst)),
             Box::new(|| Err(HarnessError::NotInstalled("test slot".into()))),

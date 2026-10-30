@@ -513,6 +513,7 @@ pub(crate) fn seed(
                 terminal_activity: None,
                 // chat-veil's live turn runs four subagents (its spawn chips).
                 running_subagents: if demo.id == "chat-veil" { 4 } else { 0 },
+                background_tasks: Vec::new(),
                 chat_id: demo.id.into(),
                 device_id: demo.device.into(),
                 status,

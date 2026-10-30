@@ -15462,6 +15462,7 @@ mod tests {
             last_turn_outcome: None,
             terminal_activity: None,
             running_subagents: 0,
+            background_tasks: Vec::new(),
         }
     }
 

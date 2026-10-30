@@ -475,6 +475,7 @@ impl DemoHost {
                 last_turn_outcome: None,
                 terminal_activity: None,
                 running_subagents,
+                background_tasks: Vec::new(),
                 chat_id: chat_id.to_owned(),
                 device_id: host,
                 status,
